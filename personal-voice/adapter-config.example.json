@@ -1,7 +1,7 @@
 {
   "adapter_port": 9881,
   "gpt_sovits_url": "http://127.0.0.1:9880",
-  "ref_audio_path": "__VOICE__/ref/march7.wav",
+  "ref_audio_path": "__VOICE__/gpt-sovits/ref/march7.wav",
   "prompt_text": "名字是我自己取的，大家也叫我三月、小三月…你呢？你想叫我什么？",
   "prompt_lang": "zh",
   "text_lang": "zh",

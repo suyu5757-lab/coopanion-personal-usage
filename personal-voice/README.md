@@ -53,6 +53,7 @@ GPT-SoVITS 合成，再用 `afplay` 播放。旧的整段 TTS、重复播放器�
 python3 patch-streamvoice.py          # 覆盖 streamvoice 的 speaker.ts
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.coopanion.gpt-sovits.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.coopanion.tts-adapter.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.coopanion.voice-doctor.plist
 ```
 
 `config-fragment.json` 是需要合并进 `config.json` 的 `worlds` 片段：打开 `streamvoice`，关掉
@@ -64,9 +65,25 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.coopanion.tts-adapter
 `POST http://127.0.0.1:9881/v1/audio/speech`，本地桥接再调用 GPT-SoVITS；切句、队列、`afplay`
 和打断逻辑保持原样。`speaker.original.ts` 是原文件备份，方便对比或回退。
 
+## 后台自检
+
+`install-macos.sh` 还会安装 `ai.coopanion.voice-doctor`，每 5 分钟检查一次：
+
+- GPT-SoVITS（9880）和适配器（9881）是否健康，不健康就重启对应的 LaunchAgent
+- `streamvoice/src/speaker.ts` 里是否还有 `TTS_URL`，没有就复制 `speaker.gptsovits.ts` 恢复
+- 补丁确实被覆盖时，才重启安装版 Coopanion 让新代码生效
+
+日志在 `~/Library/Application Support/Coopanion/tts/doctor.log`。手动执行：
+
+```bash
+~/Library/Application\ Support/Coopanion/tts/doctor.sh
+```
+
+这一步只保证补丁和服务；模型权重、`config.json`、API Key 仍需要自己备份。
+
 ## 更新后
 
-`streamvoice` 升级或重新安装会覆盖 `speaker.ts`。升级后重跑：
+`streamvoice` 升级或重新安装会覆盖 `speaker.ts`。正常等 doctor 最多 5 分钟自动恢复；想立即恢复就重跑：
 
 ```bash
 python3 patch-streamvoice.py

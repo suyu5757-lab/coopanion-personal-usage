@@ -36,7 +36,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 say "目录"
-mkdir -p "$GS" "$VOICE/ref" "$PM/chinese-hubert-base" "$PM/chinese-roberta-wwm-ext-large" "$PM/fast_langdetect" "$REPO/GPT_SoVITS/text"
+mkdir -p "$GS" "$GS/ref" "$PM/chinese-hubert-base" "$PM/chinese-roberta-wwm-ext-large" "$PM/fast_langdetect" "$REPO/GPT_SoVITS/text"
 
 if [ ! -d "$REPO/.git" ]; then
   say "克隆 GPT-SoVITS"
@@ -112,11 +112,15 @@ mkdir -p "$PM/march7"
 cp "$M7/三月七-e10.ckpt" "$PM/march7/march7-e10.ckpt"
 cp "$M7/三月七_e15_s4875.pth" "$PM/march7/march7_e15_s4875.pth"
 ref="$(find "$M7/参考音频" -name '*.wav' -print -quit)"
-[ -n "$ref" ] && cp "$ref" "$VOICE/ref/march7.wav"
+[ -n "$ref" ] && cp "$ref" "$GS/ref/march7.wav"
 
 say "写入推理与适配器配置"
 cp "$HERE/tts_infer.example.yaml" "$GS/tts_infer.yaml"
 cp "$HERE/adapter.py" "$VOICE/adapter.py"
+cp "$HERE/doctor.sh" "$VOICE/doctor.sh"
+cp "$HERE/speaker.gptsovits.ts" "$VOICE/speaker.gptsovits.ts"
+cp "$HERE/speaker.original.ts" "$VOICE/speaker.original.ts"
+chmod +x "$VOICE/doctor.sh"
 python3 - "$HERE/adapter-config.example.json" "$VOICE/adapter-config.json" "$VOICE" <<'PY'
 import json, sys
 src, dest, voice = sys.argv[1:4]
@@ -127,7 +131,7 @@ PY
 
 say "安装 LaunchAgents"
 mkdir -p "$HOME/Library/LaunchAgents"
-for name in ai.coopanion.gpt-sovits ai.coopanion.tts-adapter; do
+for name in ai.coopanion.gpt-sovits ai.coopanion.tts-adapter ai.coopanion.voice-doctor; do
   sed "s|__HOME__|$HOME|g" "$HERE/launchagents/$name.plist.in" > "$HOME/Library/LaunchAgents/$name.plist"
   launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/$name.plist" 2>/dev/null || true
   launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$name.plist"
