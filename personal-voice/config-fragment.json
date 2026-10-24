@@ -1,0 +1,35 @@
+{
+  "worlds": {
+    "streamvoice": {
+      "enabled": true,
+      "voice": "march7",
+      "rate": "+0%",
+      "pitch": "+0Hz",
+      "volume": "+0%",
+      "readSay": true,
+      "readAsk": true,
+      "readOptions": true,
+      "chunkMinChars": 6,
+      "chunkMaxChars": 60,
+      "gapMs": 0,
+      "prewarm": false,
+      "verbose": false,
+      "allowSelfTuning": false
+    },
+    "tts": {
+      "enabled": false,
+      "autoSpeak": false
+    },
+    "audio-play": {
+      "enabled": false
+    },
+    "desktop-pet": {
+      "speech": {
+        "enabled": false
+      },
+      "sounds": {
+        "talk": false
+      }
+    }
+  }
+}
