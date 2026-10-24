@@ -1,6 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { AffectionLedger } from './affection.ts';
 import type { HindsightMemory } from './hindsight.ts';
 
 export interface JournalLog {
@@ -9,7 +8,6 @@ export interface JournalLog {
 
 export interface JournalOptions {
   memory: HindsightMemory;
-  affection: AffectionLedger;
   rootDir: string;
   timezone: string;
   enabled: boolean;
@@ -39,7 +37,6 @@ function dayIn(timezone: string, date = new Date()): string {
 
 export class RelationshipJournal {
   private memory: HindsightMemory | null = null;
-  private affection: AffectionLedger | null = null;
   private rootDir: string | null = null;
   private timezone = 'UTC';
   private enabled = false;
@@ -50,7 +47,6 @@ export class RelationshipJournal {
 
   configure(opts: JournalOptions): void {
     this.memory = opts.memory;
-    this.affection = opts.affection;
     this.rootDir = opts.rootDir;
     this.timezone = opts.timezone;
     this.enabled = opts.enabled;
@@ -98,40 +94,31 @@ export class RelationshipJournal {
   async runDue(): Promise<void> {
     if (!this.enabled || this.running) return;
     const memory = this.memory;
-    const affection = this.affection;
-    if (!memory?.enabled() || !affection?.enabled()) return;
+    if (!memory?.enabled()) return;
     this.running = true;
     try {
       const today = dayIn(this.timezone, this.now());
       const yesterday = addDays(today, -1);
       const saved = this.readLastDay();
       if (!saved) {
-        const quiet = affection.eventsOn(yesterday).length === 0;
         this.writeLastDay(yesterday);
-        if (quiet) return;
+        return;
       }
-      let cursor = saved ?? addDays(yesterday, -1);
+      let cursor = saved;
       if (cursor < addDays(yesterday, -MAX_CATCH_UP_DAYS + 1)) cursor = addDays(yesterday, -MAX_CATCH_UP_DAYS + 1);
       let wrote = false;
       while (addDays(cursor, 1) <= yesterday) {
         const day = addDays(cursor, 1);
-        const events = affection.eventsOn(day);
-        if (events.length > 0) {
-          const summary = affection.summary(day);
-          const question = `Write Coo's private diary entry for ${day} about the relationship with the person. `
-            + `Use these affection events and the day's long-term memories: ${summary}. `
-            + 'Mention what the person did, how Coo responded, and anything worth carrying forward. '
-            + 'Two to four sentences, first person, warm and concrete. No diagnosis, no heading, no bullet list.';
-          const answer = await memory.reflect(question, { tags: ['scope:affection'], tagsMatch: 'any', timeoutMs: 120_000 });
-          const text = answer || `Today: ${summary}.`;
-          memory.retainJournal(text, day);
-          wrote = true;
-        } else if (day === yesterday) {
-          memory.retainJournal(`A quiet day. ${affection.snapshot() || 'No affection events were recorded.'}`, day);
-          wrote = true;
-        }
+        const question = `Write Coo's private diary entry for ${day} about the relationship with the person. `
+          + 'Use that day\'s affection events, affinity changes and long-term memories. '
+          + 'If nothing happened, say it was a quiet day. '
+          + 'Two to four sentences, first person, warm and concrete. No diagnosis, no heading, no bullet list.';
+        const answer = await memory.reflect(question, { tags: ['scope:affection'], tagsMatch: 'any', timeoutMs: 120_000 });
+        const text = answer || 'A quiet day. Nothing much happened, and that was fine.';
+        memory.retainJournal(text, day);
         this.writeLastDay(day);
         cursor = day;
+        wrote = true;
       }
       if (wrote) {
         await memory.refreshModel('relationship');

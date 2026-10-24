@@ -6,7 +6,6 @@ import { join } from 'node:path';
 import { HindsightClient, HindsightError } from '@vectorize-io/hindsight-client';
 import { formatPortrait, formatRecall } from './format.ts';
 import { sanitizeForMemory } from './policy.ts';
-import type { AffectionEvent } from './affection.ts';
 import { loadHindsightConfig, type HindsightConfig, type HindsightFileConfig } from './config.ts';
 
 export interface MemoryLog {
@@ -332,16 +331,43 @@ export class HindsightMemory {
     return 'stored';
   }
 
-  retainAffection(event: AffectionEvent, meta: { session?: string } = {}): void {
-    const body = `On ${event.ts.slice(0, 10)} the app recorded an affection event (${event.kind}, ${event.delta > 0 ? '+' : ''}${event.delta}) between the person and Coo.${event.reason ? ` ${event.reason}` : ''}`;
+  retainTouch(touch: { kind?: unknown; count?: unknown; crashed?: unknown }, meta: { session?: string; cursor?: number; at?: string } = {}): void {
+    const kind = String(touch.kind ?? 'touch');
+    const count = typeof touch.count === 'number' && touch.count > 1 ? ` ×${Math.trunc(touch.count)}` : '';
+    const at = meta.at ?? new Date().toISOString();
+    const body = `On ${at.slice(0, 10)} the person touched Coo: ${kind}${count}${touch.crashed === true ? ' (crashed)' : ''}.`;
     const safe = sanitizeForMemory(body);
     if (!safe.text || safe.skip) return;
     this.enqueue({
       content: safe.text,
-      documentId: `affection:${event.id}`,
-      context: "This is an affection event recorded by the Coopanion app. It is a fact about the person's interaction with Coo.",
-      tags: ['scope:affection', 'source:affection', `session:${meta.session ?? 'main'}`],
-      timestamp: event.ts,
+      documentId: `touch:${meta.session ?? 'main'}:${meta.cursor ?? hash(body)}`,
+      context: "This is a touch event recorded by the desktop pet app. It is a fact about the person's interaction with Coo.",
+      tags: ['scope:affection', 'source:touch', `session:${meta.session ?? 'main'}`],
+      timestamp: at,
+    });
+  }
+
+  retainAffinityChange(meta: Record<string, unknown>): void {
+    const subject = typeof meta.subject === 'string' || typeof meta.subject === 'number' ? String(meta.subject) : '';
+    const score = typeof meta.score === 'number' ? meta.score : null;
+    const delta = typeof meta.delta === 'number' ? meta.delta : null;
+    const kind = typeof meta.kind === 'string' ? meta.kind : '';
+    const reason = typeof meta.reason === 'string' ? meta.reason : '';
+    const slot = meta.slot === null ? 'cleared' : typeof meta.slot === 'string' ? meta.slot : '';
+    const at = typeof meta.at === 'string' ? meta.at : new Date().toISOString();
+    const parts = [`Affinity update${subject ? ` for ${subject}` : ''}: score ${score ?? '?'}`];
+    if (delta) parts.push(`${delta > 0 ? '+' : ''}${delta}`);
+    if (kind) parts.push(`feeling ${kind}`);
+    if (slot) parts.push(`relationship slot ${slot}`);
+    if (reason) parts.push(reason);
+    const safe = sanitizeForMemory(parts.join('. '));
+    if (!safe.text || safe.skip) return;
+    this.enqueue({
+      content: safe.text,
+      documentId: `affinity-change:${subject}:${at}:${hash(safe.text)}`,
+      context: 'This is an affinity change recorded by the Coopanion affinity extension. It is a fact about the relationship between the person and Coo.',
+      tags: ['scope:affection', 'source:affinity', 'session:main'],
+      timestamp: at,
     });
   }
 

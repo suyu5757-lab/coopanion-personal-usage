@@ -1,0 +1,35 @@
+{
+  "name": "cortico-world-affinity-alont1",
+  "version": "0.1.17",
+  "type": "module",
+  "description": "好感度 World（Coopanion 桌宠本地改版）：按桌宠里的这个人记住关系分数、格子和情绪；变化会同步到长期记忆",
+  "license": "MIT",
+  "author": "ALonT1",
+  "keywords": [
+    "cortico-world",
+    "cortico"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "./src/index.ts",
+  "cortico": {
+    "kind": "world",
+    "api": 6,
+    "describe": "describe.json"
+  },
+  "files": [
+    "src",
+    "describe.json",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "cortico": "^0.2.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

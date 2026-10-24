@@ -16,8 +16,8 @@ const zh = {
   maxTokensDesc: 'recall 每次最多带回多少 token 的记忆，默认 900。',
   timeout: 'recall 超时（毫秒）',
   timeoutDesc: '超过这个时间就跳过本轮记忆，默认 800。',
-  affection: '记录好感事件',
-  affectionDesc: '把摸头、戳、认真聊天等事件写进本地账本。',
+  affection: '每日关系日记',
+  affectionDesc: '每天把好感事件、关系变化和长期记忆整理成一篇日记写进 Hindsight；后台静默运行。',
 };
 
 const en: typeof zh = {
@@ -34,8 +34,8 @@ const en: typeof zh = {
   maxTokensDesc: 'How much memory text one recall may bring back. Default 900.',
   timeout: 'Recall timeout (ms)',
   timeoutDesc: 'Skip memory for this turn after this long. Default 800.',
-  affection: 'Record affection events',
-  affectionDesc: 'Write pats, pokes and real conversations into the local ledger.',
+  affection: 'Daily relationship journal',
+  affectionDesc: 'Once a day, turn affection events, relationship changes and long-term memories into a journal entry in Hindsight. Runs silently in the background.',
 };
 
 const TEXT = { zh, en };

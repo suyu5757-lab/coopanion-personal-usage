@@ -3,7 +3,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { RecallResult } from '@vectorize-io/hindsight-client';
-import { AffectionLedger } from '../core/memory/affection.ts';
 import { loadHindsightConfig } from '../core/memory/config.ts';
 import { hindsightConfigGroup } from '../core/memory/config-group.ts';
 import { cleanSpeech, formatPortrait, formatRecall } from '../core/memory/format.ts';
@@ -105,65 +104,5 @@ describe('memory formatting', () => {
     expect(sanitizeForMemory('我的密码是 hunter2')).toEqual({ text: '', skip: 'sensitive' });
     expect(sanitizeForMemory('token=abcdef1234567890')).toEqual({ text: '', skip: 'sensitive' });
     expect(sanitizeForMemory('I like tea')).toEqual({ text: 'I like tea' });
-  });
-});
-
-describe('affection ledger', () => {
-  const ledger = (file: string | null = null) => {
-    const l = new AffectionLedger();
-    l.configure(file, { now: fixedNow, dailyPositive: 5, dailyNegative: 5 });
-    return l;
-  };
-
-  it('accumulates petting and stops at the daily positive cap', () => {
-    const l = ledger();
-    for (let i = 0; i < 8; i++) l.record('pet', { id: `pet-${i}` });
-    const state = l.state();
-    expect(state.bond).toBe(5);
-    expect(state.level).toBe(1);
-    expect(state.events).toBe(5);
-  });
-
-  it('is idempotent by event id', () => {
-    const l = ledger();
-    l.record('pet', { id: 'same' });
-    expect(l.record('pet', { id: 'same' })).toBeNull();
-    expect(l.state().bond).toBe(1);
-  });
-
-  it('caps negative events and never goes below zero', () => {
-    const l = ledger();
-    l.record('conflict', { id: 'c1' });
-    l.record('throw', { id: 't1' });
-    expect(l.record('crash', { id: 'c2' })).toBeNull();
-    expect(l.state().bond).toBe(0);
-  });
-
-  it('reloads the same events from disk', () => {
-    const file = join(workspace(), 'affection.jsonl');
-    const first = ledger(file);
-    first.record('pet', { id: 'p1' });
-    first.record('comfort', { id: 'p2' });
-    const second = ledger(file);
-    expect(second.state().bond).toBe(first.state().bond);
-    expect(second.state().events).toBe(2);
-  });
-
-  it('maps touches and ignores neutral ones', () => {
-    const l = ledger();
-    expect(l.recordTouch({ kind: 'pet', count: 2 }, { session: 'main', cursor: 7 })).not.toBeNull();
-    expect(l.recordTouch({ kind: 'poke', count: 1 }, { session: 'main', cursor: 8 })).toBeNull();
-    expect(l.recordTouch({ kind: 'throw', crashed: true }, { session: 'main', cursor: 9 })).not.toBeNull();
-    expect(l.state().bond).toBe(0);
-    expect(l.state().levelName).toBe('stranger');
-  });
-
-  it('describes the current bond without exposing the raw ledger', () => {
-    const l = ledger();
-    for (let i = 0; i < 3; i++) l.record('pet', { id: `p-${i}`, reason: 'patted' });
-    expect(l.snapshot()).toContain('Bond Lv.');
-    expect(l.snapshot()).toContain('mood +');
-    expect(l.clear()).toContain('cleared');
-    expect(l.state().events).toBe(0);
   });
 });

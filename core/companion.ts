@@ -70,9 +70,9 @@ import { petToolDescriber } from './pet-status.ts';
 import { appLanguage, modelLanguage, replyLanguage } from './language.ts';
 import { CONSOLE_PORT, DEPLOYMENT, DISPLAY_NAME, followLanguage as followPersonaLanguage, personaOf, seed } from './seed.ts';
 import { coopanionPersona, type CoopanionPersona, type MemoryDeps } from './persona.ts';
-import { AffectionLedger } from './memory/affection.ts';
 import { HindsightMemory } from './memory/hindsight.ts';
 import { RelationshipJournal } from './memory/journal.ts';
+import { AffinitySync } from './memory/affinity-sync.ts';
 import { loadHindsightConfig, type HindsightFileConfig } from './memory/config.ts';
 import { hindsightConfigGroup } from './memory/config-group.ts';
 import { memoryToolDescribes } from './memory/tools.ts';
@@ -482,9 +482,9 @@ export async function main(): Promise<void> {
   const settingsGroup = companionGroup('zh');
   const hindsightGroup = hindsightConfigGroup('zh');
   const longTerm = new HindsightMemory();
-  const affection = new AffectionLedger();
   const journal = new RelationshipJournal();
-  const base = await cormini({ memory: longTerm, affection });
+  const affinitySync = new AffinitySync();
+  const base = await cormini({ memory: longTerm });
   /** Coo's Persona, once the bot is built. */
   let coo: CoopanionPersona | null = null;
   const definitionBase: BotDefinition<CorminiConfig> = {
@@ -492,7 +492,7 @@ export async function main(): Promise<void> {
     declares: [CONSOLE.id, DESKTOP_PET.id, NOTICE.id],
     // Cormini's tools under the same names; the memory differs by PARTNER.md and the version history
     describe: {
-      tools: [...(base.definition.describe?.tools ?? []), ...memoryToolDescribes({ memory: () => null, affection: () => null })],
+      tools: [...(base.definition.describe?.tools ?? []), ...memoryToolDescribes({ memory: () => null })],
       memory: {
         form: {
           zh: '工作区里的文本文件（CONSTITUTION.md、PARTNER.md、partner/）加 Git 版本历史,再接本机 Hindsight 长期记忆：每轮对话自动写入，会话开始时注入画像和关系摘要，记不清时用 memory_search 查。',
@@ -520,15 +520,9 @@ export async function main(): Promise<void> {
         error: (message: string, data?: unknown) => console.error(message, data ?? ''),
       };
       longTerm.configure(loaded.rootDir, memoryLog, memoryOverrides);
-      affection.configure(memoryConfig.affection.enabled ? join(loaded.rootDir, 'affection.jsonl') : null, {
-        dailyPositive: memoryConfig.affection.dailyPositive,
-        dailyNegative: memoryConfig.affection.dailyNegative,
-        timezone: cfg.timezone,
-        log: memoryLog,
-      });
+      affinitySync.configure({ file: join(loaded.dataDir, 'affinity-events.jsonl'), memory: longTerm, log: memoryLog });
       journal.configure({
         memory: longTerm,
-        affection,
         rootDir: loaded.rootDir,
         timezone: cfg.timezone,
         enabled: memoryConfig.enabled && memoryConfig.affection.enabled,
@@ -638,6 +632,7 @@ export async function main(): Promise<void> {
   });
   stats.start();
   journal.start();
+  affinitySync.start();
   process.send?.({ type: 'companion:ready', port, dataDir: loaded.dataDir, keyMissing, language: language() });
   const guideDeps: GuideDeps = {
     pet: () => pet,
@@ -661,6 +656,7 @@ export async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     journal.stop();
+    affinitySync.stop();
     const done = await Promise.race([
       Promise.all([bot.shutdown(reason), stats.stop()]).then(() => true),
       new Promise<false>((r) => setTimeout(() => r(false), 30_000)),

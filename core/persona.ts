@@ -21,7 +21,6 @@ import type { EventEnvelope, PersonaWebUiDecl, SessionOpeningReason, StoragePart
 import type { Language } from 'cortico/core/language.ts';
 import type { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import type { GitAuthor, WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
-import type { AffectionLedger } from './memory/affection.ts';
 import { memoryTools } from './memory/tools.ts';
 import type { HindsightMemory } from './memory/hindsight.ts';
 import { memoryStorageText } from './memory/strings.ts';
@@ -114,7 +113,6 @@ ${readFileSync(join(dir, name), 'utf8')}`, 'utf8');
 /** Coo's Persona class on `Base`, Cormini as the staged Cortico has it. */
 export interface MemoryDeps {
   memory?: HindsightMemory;
-  affection?: AffectionLedger;
 }
 
 export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
@@ -122,7 +120,6 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     /** Commits wait for the one before: Git's index takes one writer, and a turn often writes several files. */
     private commits: Promise<unknown> = Promise.resolve();
     private readonly longTerm = deps.memory ?? null;
-    private readonly affection = deps.affection ?? null;
 
     private get git(): WorkspaceGit {
       return this.memory.git;
@@ -181,7 +178,7 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
 
     protected override tools(): ToolDef[] {
       const base = super.tools().map((t) => (WRITES[t.name] ? this.committed(t, WRITES[t.name]!) : t));
-      return [...base, ...memoryTools({ memory: () => this.longTerm, affection: () => this.affection })];
+      return [...base, ...memoryTools({ memory: () => this.longTerm })];
     }
 
     /** The tool, committing the workspace after each call that succeeded. */
@@ -224,19 +221,6 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
           clear: () => this.longTerm!.clear(),
         });
       }
-      if (this.affection?.enabled()) {
-        storage.push({
-          key: 'affection',
-          label: t.affectionLabel,
-          kind: 'disk',
-          location: 'affection.jsonl',
-          danger: true,
-          note: t.affectionNote,
-          order: 21,
-          stat: () => t.affectionStat(this.affection!.state().events),
-          clear: () => this.affection!.clear(),
-        });
-      }
       const baseInvoke = decl.invoke;
       const invoke = async (panel: string, method: string, args: unknown[]): Promise<unknown> => {
         if (panel === 'hindsight') return this.hindsightInvoke(method, args);
@@ -271,12 +255,10 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
 
     override onOpening(ctx: { reason: SessionOpeningReason }): void {
       this.core?.injectInternal(ctx.reason === 'restarted' ? '[system] The app restarted; the session carries on.' : '[system] The session has started.', 'opening');
-      if (!this.longTerm?.enabled() && !this.affection?.enabled()) return;
+      if (!this.longTerm?.enabled()) return;
       this.core?.injectDeferred('memory', async () => {
         const briefing = await this.longTerm?.sessionBriefing().catch(() => null);
-        const affection = this.affection?.snapshot();
-        const parts = [briefing?.text ?? '', affection ?? ''].filter((part) => !!part.trim());
-        return parts.length ? parts.join('\n\n') : null;
+        return briefing?.text?.trim() ? briefing.text : null;
       });
     }
 
@@ -289,6 +271,11 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
 
     /** Cormini's delivery: the heartbeat's quiet time starts over, and one line counts the events. */
     override async onDelivery(ctx: { events: EventEnvelope[] }): Promise<void> {
+      for (const event of ctx.events) {
+        if (event.type !== 'affinity.changed') continue;
+        const meta = event.meta as Record<string, unknown> | undefined;
+        if (meta) this.longTerm?.retainAffinityChange(meta);
+      }
       const external = ctx.events.filter((e) => e.origin === 'external');
       const n = external.length;
       if (n === 0) return;
@@ -300,10 +287,7 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
       for (const event of external) {
         if (event.type === 'desktop-pet.touch') {
           const touch = event.meta?.touch as { kind?: unknown; count?: unknown; crashed?: unknown } | undefined;
-          if (touch) {
-            const recorded = this.affection?.recordTouch(touch, { session: 'main', cursor: event.cursor, ts: event.ts });
-            if (recorded) this.longTerm?.retainAffection(recorded, { session: 'main' });
-          }
+          if (touch) this.longTerm?.retainTouch(touch, { session: 'main', cursor: event.cursor, at: event.ts });
           continue;
         }
         if (event.type !== 'desktop-pet.message' && event.type !== 'desktop-pet.speech' && event.type !== 'desktop-pet.answer') continue;
