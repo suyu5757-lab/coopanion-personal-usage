@@ -106,6 +106,12 @@ export class ConsolePageHost {
       if (next && next.protocolVersion !== CONSOLE_PROTOCOL_VERSION) {
         throw new Error(S.protocolMismatch(String(next.protocolVersion), String(CONSOLE_PROTOCOL_VERSION)));
       }
+      for (const page of next.providers) {
+        if (page.kind !== 'memory') continue;
+        for (const panel of page.panels ?? []) {
+          if (panel.id === 'hindsight' && panel.builtin === undefined) panel.builtin = 'hindsight';
+        }
+      }
       this.snapshot = next;
     } catch (err) {
       this.deps.onError(err);

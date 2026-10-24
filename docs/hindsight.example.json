@@ -1,0 +1,28 @@
+{
+  "enabled": true,
+  "autostart": false,
+  "apiUrl": "http://127.0.0.1:8888",
+  "apiToken": "",
+  "bankId": "coopanion:my-pet",
+  "recall": {
+    "maxTokens": 900,
+    "budget": "low",
+    "timeoutMs": 800,
+    "types": [
+      "observation",
+      "world",
+      "experience"
+    ]
+  },
+  "retain": {
+    "async": true
+  },
+  "portrait": {
+    "maxTokens": 500
+  },
+  "affection": {
+    "enabled": true,
+    "dailyPositive": 10,
+    "dailyNegative": 5
+  }
+}

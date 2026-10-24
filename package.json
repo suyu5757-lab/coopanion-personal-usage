@@ -27,6 +27,7 @@
     "typecheck:worlds": "tsc -p tsconfig.worlds.json"
   },
   "dependencies": {
+    "@vectorize-io/hindsight-client": "^1.1.0",
     "cortico-provider-coo": "workspace:*",
     "cortico-world-desktop-pet": "workspace:*",
     "electron-updater": "^6.8.9",

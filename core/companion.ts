@@ -69,7 +69,14 @@ import { coreText } from './i18n/index.ts';
 import { petToolDescriber } from './pet-status.ts';
 import { appLanguage, modelLanguage, replyLanguage } from './language.ts';
 import { CONSOLE_PORT, DEPLOYMENT, DISPLAY_NAME, followLanguage as followPersonaLanguage, personaOf, seed } from './seed.ts';
-import { coopanionPersona, type CoopanionPersona } from './persona.ts';
+import { coopanionPersona, type CoopanionPersona, type MemoryDeps } from './persona.ts';
+import { AffectionLedger } from './memory/affection.ts';
+import { HindsightMemory } from './memory/hindsight.ts';
+import { RelationshipJournal } from './memory/journal.ts';
+import { loadHindsightConfig, type HindsightFileConfig } from './memory/config.ts';
+import { hindsightConfigGroup } from './memory/config-group.ts';
+import { memoryToolDescribes } from './memory/tools.ts';
+import { cleanSpeech } from './memory/format.ts';
 import type { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import type { contextStageConfigGroup } from '../vendor/cortico/bots/cormini/persona/config.ts';
 import type { CorminiConfig } from '../vendor/cortico/bots/cormini/index.ts';
@@ -389,14 +396,14 @@ async function introduce(deps: GuideDeps, run: (deps: GuideDeps) => Promise<void
 }
 
 /** Cormini's bot definition, its Persona class and its context config group, from the staged Cortico. */
-async function cormini() {
+async function cormini(deps: MemoryDeps) {
   const load = <T>(...path: string[]) => import(pathToFileURL(join(repoRoot(), 'bots', 'cormini', ...path)).href) as Promise<T>;
   const [definition, persona, config] = await Promise.all([
     load<{ default: BotDefinition<CorminiConfig> }>('index.ts'),
     load<{ Cormini: typeof Cormini }>('persona', 'persona.ts'),
     load<{ contextStageConfigGroup: typeof contextStageConfigGroup }>('persona', 'config.ts'),
   ]);
-  return { definition: definition.default, Persona: coopanionPersona(persona.Cormini), contextGroup: config.contextStageConfigGroup('cormini') };
+  return { definition: definition.default, Persona: coopanionPersona(persona.Cormini, deps), contextGroup: config.contextStageConfigGroup('cormini') };
 }
 
 export async function main(): Promise<void> {
@@ -473,7 +480,11 @@ export async function main(): Promise<void> {
   });
   /** Coopanion's config group; the console reads this object, retitled in place when the app language changes. */
   const settingsGroup = companionGroup('zh');
-  const base = await cormini();
+  const hindsightGroup = hindsightConfigGroup('zh');
+  const longTerm = new HindsightMemory();
+  const affection = new AffectionLedger();
+  const journal = new RelationshipJournal();
+  const base = await cormini({ memory: longTerm, affection });
   /** Coo's Persona, once the bot is built. */
   let coo: CoopanionPersona | null = null;
   const definitionBase: BotDefinition<CorminiConfig> = {
@@ -481,11 +492,11 @@ export async function main(): Promise<void> {
     declares: [CONSOLE.id, DESKTOP_PET.id, NOTICE.id],
     // Cormini's tools under the same names; the memory differs by PARTNER.md and the version history
     describe: {
-      tools: base.definition.describe?.tools ?? [],
+      tools: [...(base.definition.describe?.tools ?? []), ...memoryToolDescribes({ memory: () => null, affection: () => null })],
       memory: {
         form: {
-          zh: '工作区目录里的文本文件,有 Git 时每次改动存为一个版本;CONSTITUTION.md、PARTNER.md 与文件清单进系统前缀,其余按需用文件工具读写。',
-          en: 'Text files in a workspace directory, each change kept as a version where Git is available; CONSTITUTION.md, PARTNER.md and the file listing are in the system prefix, the rest is read and written with the file tools.',
+          zh: '工作区里的文本文件（CONSTITUTION.md、PARTNER.md、partner/）加 Git 版本历史,再接本机 Hindsight 长期记忆：每轮对话自动写入，会话开始时注入画像和关系摘要，记不清时用 memory_search 查。',
+          en: 'Text files in the workspace (CONSTITUTION.md, PARTNER.md, partner/) with Git history, plus a local Hindsight long-term memory: each turn is retained automatically, a portrait and relationship summary are injected at session start, and memory_search looks things up on demand.',
         },
       },
     },
@@ -502,6 +513,27 @@ export async function main(): Promise<void> {
     // Cormini's own build with Coo's Persona class; the workspace is snapshotted before Coo can write to it
     build: (loaded, worlds) => {
       const cfg = loaded.config;
+      const memoryOverrides = getByPath(loaded.config as unknown as Record<string, unknown>, 'hindsight') as Partial<HindsightFileConfig> | undefined;
+      const memoryConfig = loadHindsightConfig(loaded.rootDir, memoryOverrides);
+      const memoryLog = {
+        warn: (message: string, data?: unknown) => console.warn(message, data ?? ''),
+        error: (message: string, data?: unknown) => console.error(message, data ?? ''),
+      };
+      longTerm.configure(loaded.rootDir, memoryLog, memoryOverrides);
+      affection.configure(memoryConfig.affection.enabled ? join(loaded.rootDir, 'affection.jsonl') : null, {
+        dailyPositive: memoryConfig.affection.dailyPositive,
+        dailyNegative: memoryConfig.affection.dailyNegative,
+        timezone: cfg.timezone,
+        log: memoryLog,
+      });
+      journal.configure({
+        memory: longTerm,
+        affection,
+        rootDir: loaded.rootDir,
+        timezone: cfg.timezone,
+        enabled: memoryConfig.enabled && memoryConfig.affection.enabled,
+        log: memoryLog,
+      });
       const persona = new base.Persona({
         memoryDir: loaded.memoryDir,
         context: () => cfg.context,
@@ -518,7 +550,7 @@ export async function main(): Promise<void> {
         onStart: () => persona.startRhythm(),
         onStop: () => persona.stopRhythm(),
         webUi: {
-          configGroups: [base.contextGroup, settingsGroup],
+          configGroups: [base.contextGroup, settingsGroup, hindsightGroup],
           status: () => ({ context: { maxTokens: cfg.context.maxTokens, softRatio: cfg.context.softRatio } }),
           configOptions: (kind) => (kind === LANGUAGE_OPTIONS ? LANGUAGES.map((value) => ({ value, label: LANGUAGE_NAMES[value] })) : []),
         },
@@ -541,8 +573,10 @@ export async function main(): Promise<void> {
   const loaded = loadDeployment(definition, deployDir, repoRoot(), join(repoRoot(), 'bots', 'cormini'), providersRoot());
   config = loaded.config;
   Object.assign(settingsGroup, companionGroup(language()));
+  Object.assign(hindsightGroup, hindsightConfigGroup(language()));
   watchLanguage(loaded.config, (next) => {
     Object.assign(settingsGroup, companionGroup(next));
+    Object.assign(hindsightGroup, hindsightConfigGroup(next));
     followPersonaLanguage(loaded.memoryDir, next);
     process.send?.({ type: 'companion:language', language: next });
     (pet as DesktopPetWorld | null)?.refresh();
@@ -568,6 +602,19 @@ export async function main(): Promise<void> {
   });
   telemetry = stats;
   countUse(bot.core, loaded.config, stats);
+  const writeTool = bot.core.toolLog.write.bind(bot.core.toolLog);
+  bot.core.toolLog.write = (input) => {
+    const entry = writeTool(input);
+    if (!input.failed && input.args) {
+      const said = input.tool === 'pet_say' && typeof input.args.script === 'string'
+        ? cleanSpeech(input.args.script)
+        : input.tool === 'pet_ask' && typeof input.args.question === 'string'
+          ? cleanSpeech(input.args.question)
+          : '';
+      if (said) longTerm.retainCoo(said, { session: input.role, callId: entry.call, timestamp: entry.ts });
+    }
+    return entry;
+  };
   hintFailures(bot.core, loaded.config, () => pet);
   // set by app/core-host.cjs when this Core replaces one that exited unasked
   const exited = process.env.COOPANION_CORE_EXIT;
@@ -590,6 +637,7 @@ export async function main(): Promise<void> {
     throw err;
   });
   stats.start();
+  journal.start();
   process.send?.({ type: 'companion:ready', port, dataDir: loaded.dataDir, keyMissing, language: language() });
   const guideDeps: GuideDeps = {
     pet: () => pet,
@@ -612,6 +660,7 @@ export async function main(): Promise<void> {
   const shutdown = async (reason: string) => {
     if (stopping) return;
     stopping = true;
+    journal.stop();
     const done = await Promise.race([
       Promise.all([bot.shutdown(reason), stats.stop()]).then(() => true),
       new Promise<false>((r) => setTimeout(() => r(false), 30_000)),

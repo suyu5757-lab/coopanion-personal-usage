@@ -52,6 +52,57 @@ describe('first-run seed', () => {
     expect(readFileSync(constitution, 'utf8')).toBe(readFileSync(personaFile('coo', 'zh'), 'utf8'));
   });
 
+  it('seeds Coo’s operating rules and moves a pre-Hindsight memory section forward', () => {
+    const home = mkdtempSync(join(tmpdir(), 'cc-seed-'));
+    seed(home, 'zh');
+    const file = join(home, DEPLOYMENT, 'prompts', 'ORIENTATION.md');
+    expect(readFileSync(file, 'utf8')).toContain('Hindsight');
+    const old = `# 基础运行约定
+
+## 记忆
+
+每次开新的 session，我醒来时不会记得上一段聊天的原话，但我会读工作区里的记忆文件：使用者档案（PARTNER.md）、Memory，以及我自己写下的东西。那些就是我，不是别人递给我的资料。
+不确定以前发生过什么，我先去翻文件，不猜、不编。翻不到就承认忘了，别扭一下，然后问。
+
+## 自定义
+
+保留这一段。`;
+    writeFileSync(file, old);
+    seed(home, 'zh');
+    const next = readFileSync(file, 'utf8');
+    expect(next).toContain('memory_search');
+    expect(next).toContain('## 自定义');
+    expect(next).toContain('保留这一段。');
+    expect(next).not.toContain('但我会读工作区里的记忆文件');
+  });
+
+  it('seeds the effective Hindsight settings into config.json once', () => {
+    const home = mkdtempSync(join(tmpdir(), 'cc-seed-'));
+    seed(home, 'zh');
+    const deploy = join(home, DEPLOYMENT);
+    const cfg = join(deploy, 'config.json');
+    writeFileSync(join(deploy, 'hindsight.json'), JSON.stringify({
+      enabled: true,
+      apiUrl: 'http://127.0.0.1:9999',
+      bankId: 'coopanion:seed-test',
+      recall: { maxTokens: 1100, timeoutMs: 700 },
+      affection: { enabled: false },
+    }));
+    seed(home, 'zh');
+    expect(read(cfg).hindsight).toEqual({
+      enabled: true,
+      autostart: false,
+      apiUrl: 'http://127.0.0.1:9999',
+      bankId: 'coopanion:seed-test',
+      recall: { maxTokens: 1100, timeoutMs: 700 },
+      affection: { enabled: false },
+    });
+    const current = read(cfg);
+    writeFileSync(cfg, JSON.stringify({ ...current, hindsight: { ...(current.hindsight as Record<string, unknown>), enabled: false } }));
+    seed(home, 'zh');
+    expect((read(cfg).hindsight as Record<string, unknown>).enabled).toBe(false);
+  });
+
   it('ships every persona in every app language, each told apart from the others', () => {
     const workspace = mkdtempSync(join(tmpdir(), 'cc-persona-'));
     for (const id of PERSONAS) for (const language of LANGUAGES) {

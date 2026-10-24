@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@vectorize-io/hindsight-client':
+        specifier: ^1.1.0
+        version: 1.1.0
       cortico-provider-coo:
         specifier: workspace:*
         version: link:packages/cortico-provider-coo
@@ -1150,6 +1153,9 @@ packages:
 
   '@types/ws@8.18.1':
     resolution: {integrity: sha512-ThVF6DCVhA8kUGy+aazFQ4kXQ7E1Ty7A3ypFOe0IcJV8O/M511G99AW24irKrW56Wt44yG9+ij8FaqoBGkuBXg==}
+
+  '@vectorize-io/hindsight-client@1.1.0':
+    resolution: {integrity: sha512-Tqx7SKEbKZnf9L1tnla3vIDNt83eKFCneHe8GsSQJbmAn0rY8U13fT9Jg5ZP8G/phns5Fk5tZWmagaUlVTzpCA==}
 
   '@vitest/expect@2.1.9':
     resolution: {integrity: sha512-UJCIkTBenHeKT1TTlKMJWy1laZewsRIzYighyYiJKZreqtdxSos/S1t+ktRMQWu2CKqaarrkeszJx1cgC5tGZw==}
@@ -3688,6 +3694,8 @@ snapshots:
   '@types/ws@8.18.1':
     dependencies:
       '@types/node': 22.20.4
+
+  '@vectorize-io/hindsight-client@1.1.0': {}
 
   '@vitest/expect@2.1.9':
     dependencies:

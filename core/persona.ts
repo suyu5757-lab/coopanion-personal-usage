@@ -17,9 +17,14 @@
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
-import type { EventEnvelope, SessionOpeningReason, ToolDef, WorldLifecycleEvent } from 'cortico/core/types.ts';
+import type { EventEnvelope, PersonaWebUiDecl, SessionOpeningReason, StoragePart, ToolDef, WorldLifecycleEvent } from 'cortico/core/types.ts';
+import type { Language } from 'cortico/core/language.ts';
 import type { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import type { GitAuthor, WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
+import type { AffectionLedger } from './memory/affection.ts';
+import { memoryTools } from './memory/tools.ts';
+import type { HindsightMemory } from './memory/hindsight.ts';
+import { memoryStorageText } from './memory/strings.ts';
 
 /** The workspace file that goes into the prefix as Coo's notes on the person. */
 export const PARTNER_FILE = 'PARTNER.md';
@@ -107,10 +112,17 @@ ${readFileSync(join(dir, name), 'utf8')}`, 'utf8');
 }
 
 /** Coo's Persona class on `Base`, Cormini as the staged Cortico has it. */
-export function coopanionPersona(Base: typeof Cormini) {
+export interface MemoryDeps {
+  memory?: HindsightMemory;
+  affection?: AffectionLedger;
+}
+
+export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
   return class CoopanionPersona extends Base {
     /** Commits wait for the one before: Git's index takes one writer, and a turn often writes several files. */
     private commits: Promise<unknown> = Promise.resolve();
+    private readonly longTerm = deps.memory ?? null;
+    private readonly affection = deps.affection ?? null;
 
     private get git(): WorkspaceGit {
       return this.memory.git;
@@ -168,7 +180,8 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
     }
 
     protected override tools(): ToolDef[] {
-      return super.tools().map((t) => (WRITES[t.name] ? this.committed(t, WRITES[t.name]!) : t));
+      const base = super.tools().map((t) => (WRITES[t.name] ? this.committed(t, WRITES[t.name]!) : t));
+      return [...base, ...memoryTools({ memory: () => this.longTerm, affection: () => this.affection })];
     }
 
     /** The tool, committing the workspace after each call that succeeded. */
@@ -190,8 +203,81 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
       };
     }
 
+    override webUi(language: Language = 'zh'): PersonaWebUiDecl {
+      const decl = super.webUi(language);
+      const storage: StoragePart[] = [...(decl.memory?.storage ?? [])];
+      const panels = [...(decl.memory?.panels ?? [])];
+      const t = memoryStorageText(language);
+      if (this.longTerm) {
+        panels.push({ id: 'hindsight', title: t.hindsightLabel, description: t.hindsightPanelDesc });
+      }
+      if (this.longTerm?.enabled()) {
+        storage.push({
+          key: 'hindsight',
+          label: t.hindsightLabel,
+          kind: 'disk',
+          location: 'Hindsight',
+          danger: true,
+          note: t.hindsightNote,
+          order: 20,
+          stat: () => t.hindsightStat(this.longTerm?.bankId() ?? '?'),
+          clear: () => this.longTerm!.clear(),
+        });
+      }
+      if (this.affection?.enabled()) {
+        storage.push({
+          key: 'affection',
+          label: t.affectionLabel,
+          kind: 'disk',
+          location: 'affection.jsonl',
+          danger: true,
+          note: t.affectionNote,
+          order: 21,
+          stat: () => t.affectionStat(this.affection!.state().events),
+          clear: () => this.affection!.clear(),
+        });
+      }
+      const baseInvoke = decl.invoke;
+      const invoke = async (panel: string, method: string, args: unknown[]): Promise<unknown> => {
+        if (panel === 'hindsight') return this.hindsightInvoke(method, args);
+        if (!baseInvoke) throw new Error(`No handler for panel ${panel}`);
+        return baseInvoke(panel, method, args);
+      };
+      return {
+        ...decl,
+        invoke,
+        ...(decl.memory ? { memory: { ...decl.memory, panels, storage } } : { memory: { panels, storage } }),
+      };
+    }
+
+    private async hindsightInvoke(method: string, args: unknown[]): Promise<unknown> {
+      const memory = this.longTerm;
+      if (!memory) throw new Error('Hindsight memory is not configured');
+      switch (method) {
+        case 'status':
+          return memory.status();
+        case 'search':
+          return memory.searchResults(String(args[0] ?? ''));
+        case 'forget':
+          return memory.forget(String(args[0] ?? ''));
+        case 'clear':
+          return memory.clear();
+        case 'remember':
+          return memory.remember(String(args[0] ?? ''), { session: 'console' });
+        default:
+          throw new Error(`Unknown Hindsight method: ${method}`);
+      }
+    }
+
     override onOpening(ctx: { reason: SessionOpeningReason }): void {
       this.core?.injectInternal(ctx.reason === 'restarted' ? '[system] The app restarted; the session carries on.' : '[system] The session has started.', 'opening');
+      if (!this.longTerm?.enabled() && !this.affection?.enabled()) return;
+      this.core?.injectDeferred('memory', async () => {
+        const briefing = await this.longTerm?.sessionBriefing().catch(() => null);
+        const affection = this.affection?.snapshot();
+        const parts = [briefing?.text ?? '', affection ?? ''].filter((part) => !!part.trim());
+        return parts.length ? parts.join('\n\n') : null;
+      });
     }
 
     override onWorldLifecycle(event: WorldLifecycleEvent): void {
@@ -202,12 +288,34 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
     }
 
     /** Cormini's delivery: the heartbeat's quiet time starts over, and one line counts the events. */
-    override onDelivery(ctx: { events: EventEnvelope[] }): void {
-      const n = ctx.events.filter((e) => e.origin === 'external').length;
+    override async onDelivery(ctx: { events: EventEnvelope[] }): Promise<void> {
+      const external = ctx.events.filter((e) => e.origin === 'external');
+      const n = external.length;
       if (n === 0) return;
       // Cormini keeps its heartbeat private; the bracket access is TypeScript's way in for a subclass
       this['heartbeat'].noteActivity();
       this.core?.injectInternal(`[system] ${n} new event${n === 1 ? '' : 's'}.`, 'notice');
+
+      let latest: string | null = null;
+      for (const event of external) {
+        if (event.type === 'desktop-pet.touch') {
+          const touch = event.meta?.touch as { kind?: unknown; count?: unknown; crashed?: unknown } | undefined;
+          if (touch) {
+            const recorded = this.affection?.recordTouch(touch, { session: 'main', cursor: event.cursor, ts: event.ts });
+            if (recorded) this.longTerm?.retainAffection(recorded, { session: 'main' });
+          }
+          continue;
+        }
+        if (event.type !== 'desktop-pet.message' && event.type !== 'desktop-pet.speech' && event.type !== 'desktop-pet.answer') continue;
+        const said = typeof event.meta?.text === 'string' ? event.meta.text.trim() : event.text.trim();
+        if (!said) continue;
+        latest = said;
+        this.longTerm?.retainUser(said, { session: 'main', cursor: event.cursor, timestamp: event.ts });
+      }
+
+      if (!latest || !this.longTerm?.enabled()) return;
+      const block = await this.longTerm.recallBlock(latest, { timeoutMs: 700 });
+      if (block) this.core?.injectInternal(block, 'memory');
     }
 
     protected override pressureNote(): string {
