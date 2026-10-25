@@ -975,6 +975,26 @@
       "seconds": 1.5
     },
     {
+      "id": "tail-whip",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "甩尾巴",
+          "甩尾",
+          "抽尾巴"
+        ],
+        "en": [
+          "whip",
+          "lash"
+        ]
+      },
+      "about": {
+        "zh": "把尾巴高高扬起,再用力甩到地上,尾鳍拍出一片水花",
+        "en": "raises the tail high, then slams it down hard, the fluke throwing up a splash"
+      },
+      "seconds": 1.3
+    },
+    {
       "id": "dance",
       "kind": "motion",
       "names": {

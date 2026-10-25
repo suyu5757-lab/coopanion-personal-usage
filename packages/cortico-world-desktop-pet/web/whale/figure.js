@@ -26,6 +26,8 @@ const SVGNS = 'http://www.w3.org/2000/svg';
 const FACE = { x: 520, y: 578, w: 390, h: 252 };
 // the head's parallax warps act over this rect (rig units); the long hair below it stays put
 const HEAD = [30, 12, 215, 168];
+// the fluke's outer tip in rig units, where a tail whip throws its splash
+const TAIL_TIP = [24.3, 192.7];
 
 /**
  * A leg's warp: from 14 units below the hip pivot down it turns about the pivot by `a` degrees as a rigid
@@ -39,6 +41,17 @@ function hinge([px, py], a, ty) {
     const w = smooth(py - 6, py + 14, y), lx = x - px, ly = y - py;
     return [(lx * c - ly * s - lx) * w, ((lx * s + ly * c - ly) + ty) * w];
   };
+}
+
+/**
+ * The tail's angle through a whip, in degrees: up for the wind-up, down hard, then a few smaller
+ * swings. `k` is the gesture's progress, 0 to 1.
+ */
+function whipAngle(k) {
+  if (k < .28) return 34 * smooth(0, .28, k);
+  if (k < .42) return lerp(34, -58, smooth(.28, .42, k));
+  const u = (k - .42) / .58;
+  return -58 * Math.exp(-4.2 * u) * Math.cos(u * Math.PI * 2.2);
 }
 
 /* ---------- springs ---------- */
@@ -457,6 +470,8 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
     ahoge: spring(140, 6, 38), head: spring(70, 10, 16), armN: spring(60, 9, 125), armF: spring(60, 9, 95),
   };
   let lastT = null, prevTilt = 0, prevYaw = 0, prevLow = 0, headTilt = 0, fx = '';
+  // a tail whip's wind-up tip, the splash's start and origin, and this frame's fluke tip
+  let whipStart = null, splashAt = -1, splashAtP = null, whipTip = null;
   // the angle each hanging piece's root was last turned to (see the pendulums)
   let rootWas = {};
   // the kit tips Coo's whole round body to listen, nod, doze or wobble; she keeps her feet on the floor and
@@ -559,6 +574,12 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
     const bow = g?.kind === 'bow' ? env(.25, .7) : 0;        // the upper body tips forward about the waist
     const shiver = g?.kind === 'shiver' ? env(.08, .85) : 0; // arms hugged in, trembling, fins down
     const flap = g?.kind === 'flap' ? env(.05, .75) : 0;     // fins, tail, ahoge and arms all flutter
+    const whip = g?.kind === 'tail-whip' ? g.k : -1;         // her own hard tail lash
+    const whipA = whip < 0 ? 0 : whipAngle(whip);
+    const whipAmp = whip < 0 ? 0 : smooth(.1, .28, whip) * (1 - smooth(.55, 1, whip));
+    // the wind-up pulls the tail out past her hair, and the strike settles the whole body for a moment
+    const wind = whip < 0 ? 0 : smooth(0, .26, whip) * (1 - smooth(.26, .38, whip));
+    const whipHit = whip < 0 ? 0 : smooth(.37, .42, whip) * (1 - smooth(.42, .62, whip));
     const gNeck = nod * 7 + shake * 2.5 + bow * 10 + wave * 4, gYaw = shake * 1.1;
     const headA = headTilt + gNeck;
     const tiltVel = (headA - prevTilt) / Math.max(dt, 1e-3); prevTilt = headA;
@@ -580,11 +601,13 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
     wagAmp = lerp(wagAmp, wg, ease(3, dt));
     tailMood = lerp(tailMood, mode === 'sleep' || face === 'sad' || face === 'cry' || face === 'scared' ? -1 : 0, ease(3, dt));
     // fast flutters go on after the springs, which would smooth them away
-    const fins = sp.fins.step(finMood * 14 + sway * 10, dt) + (face === 'angry' ? 2.5 * Math.sin(t * 40) : 0) + flap * 13 * Math.sin(t * 26);
+    const fins = sp.fins.step(finMood * 14 + sway * 10, dt) + (face === 'angry' ? 2.5 * Math.sin(t * 40) : 0) + flap * 13 * Math.sin(t * 26)
+      + (whip < 0 ? 0 : 12 * Math.sin(Math.PI * clamp((whip - .28) / .3, 0, 1)) * (1 - smooth(.62, 1, whip)));
     const ahoge = sp.ahoge.step(-tiltVel * .12 - yawVel * .5 + sway * 18 + (face === 'surprised' ? -16 : 0) + (face === 'confused' ? 20 : 0) + (mode === 'sleep' ? 22 : 0) - hairY * 12, dt)
       + flap * 12 * Math.sin(t * 19);
     const tail = sp.tail.step(sway * 14 + tailMood * 12, dt) + wagAmp * 13 * Math.sin(t * (4 + 5 * wagAmp)) + Math.sin(t * 1.3) * 3
       + flap * 14 * Math.sin(t * 17);
+    const tailA = tail + whipA;
 
     /* legs: the kit hands hip→foot segments sized for Coo; keep their angle (forward = foot to the right) */
     const legA = o.legs.map(l => -Math.atan2(l[2] - l[0], Math.max(4, l[3] - l[1])) * 180 / Math.PI);
@@ -619,7 +642,7 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
 
     /* deformer states */
     // the kit sinks the hips 29 when seated; the sitting drawing's lowest point is 19.4 above the soles
-    st.body = { a: -sway * 1.2 + (held ? o.swing * .15 : 0), ty: low - 9.6 * sitK, sx: (1 + .006 * breath + .04 * plop) * (1 - .03 * shiver), sy: 1 - .012 * breath - .06 * plop };
+    st.body = { a: -sway * 1.2 + (held ? o.swing * .15 : 0) + 3 * whipHit, ty: low - 9.6 * sitK + 3 * whipHit, sx: (1 + .006 * breath + .04 * plop + .04 * whipHit) * (1 - .03 * shiver), sy: 1 - .012 * breath - .06 * plop - .04 * whipHit };
     st.waist = { a: bow * 20 };
     st.skirt = {
       fn: (u, v) => {
@@ -642,8 +665,8 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
     const behind = o.legs.map(l => Math.max(0, l[0] - l[2]) * .3 * walkK);
     st.legBack = { fn: hinge(L.PV.legBack, lerp(legA[0], -55, sitK), (-lift[0] * .9 - behind[0]) * (1 - sitK)) };
     st.legFront = { fn: hinge(L.PV.legFront, lerp(legA[1], -60, sitK), (-lift[1] * .9 - behind[1]) * (1 - sitK)) };
-    st.tail = { a: tail - 10 * sitK };
-    st.tailBend = { fn: u => [0, -tail * .5 * u * u] };
+    st.tail = { a: tailA - 10 * sitK, tx: -14 * wind, ty: -4 * wind };
+    st.tailBend = { fn: u => [0, -tailA * .5 * (1 - .7 * whipAmp) * u * u] };
     // the head stays up while she leans forward for the ninja run
     st.neck = { a: headA + clamp(bend * .8, -10, 12) - runK * 12, ty: (mode === 'sleep' ? 2.5 : 0) + breath * .35 };
     const parallax = (k, ky) => (u, v) => [angleX * k * bump(u) * (.4 + .6 * bump(v)), angleY * ky * bump(v) * (.4 + .6 * bump(u))];
@@ -732,15 +755,31 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
       img = own; fg = fg1;
       rig.upload('faceFx@mix', faceCv2);
     }
+    // the fluke's tip this frame, and the fixed points a whip's trail and splash are drawn from
+    whipTip = rig.point('tailBend', st, TAIL_TIP[0], TAIL_TIP[1]);
+    if (whip >= 0) {
+      if (whip < .28) { whipStart = null; splashAt = -1; splashAtP = null; }
+      const atTail = (angle, tx = 0, ty = 0) => {
+        const pose = { ...st, tail: { a: angle - 10 * sitK, tx, ty }, tailBend: { fn: u => [0, -angle * .5 * .3 * u * u] } };
+        return rig.point('tailBend', pose, TAIL_TIP[0], TAIL_TIP[1]);
+      };
+      if (whip >= .28 && !whipStart) whipStart = atTail(34, -14, -4);
+      if (whip >= .42 && splashAt < 0) {
+        const p = atTail(-58);
+        splashAtP = [p[0], Math.min(p[1], 256)];
+        splashAt = t;
+        opts.host?.sound?.('slap', 'move');
+      }
+    }
     rig.render(st);
     if (opts.raster) { fo.setAttribute('href', canvas.toDataURL('image/png')); decoded = fo.decode ? fo.decode().catch(() => {}) : null; }
     if (fade && st.mix >= 1) endFade();
-    drawFx(fc, t);
+    drawFx(fc, t, whip);
   }
 
   /* ---------- effects over the figure (SVG, like the built-in figure's) ---------- */
   const at = (x, y) => rig.point('neck', st, x, y);
-  function drawFx(fc, t) {
+  function drawFx(fc, t, whip) {
     let s = '';
     const ac = accent();
     const top = at(124, 34), side = at(204, 52);
@@ -778,6 +817,46 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
       const c = at(206, 36), k = 1 + .06 * Math.sin(t * 3);
       s += `<g transform="translate(${f1(c[0])} ${f1(c[1])}) scale(${f1(k)})"><path fill="none" stroke="#252049" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" d="M-8 -9Q-8 -19 0 -19Q9 -19 9 -11Q9 -4 0 -1V4"/><circle fill="#252049" cx="0" cy="14" r="4.5"/></g>`;
     }
+    // the fluke's trail through the strike, then the splash it throws at the floor
+    if (whip >= .28 && whipStart && whipTip) {
+      const arc = whip < .42 ? smooth(.28, .42, whip) : 1 - smooth(.42, .68, whip);
+      if (arc > 0) {
+        const [px, py] = L.PV.tail, [sx, sy] = whipStart, [ex, ey] = whip < .42 ? whipTip : (splashAtP ?? whipTip);
+        const r0 = Math.hypot(sx - px, sy - py), r1 = Math.hypot(ex - px, ey - py);
+        const a0 = Math.atan2(sy - py, sx - px), a1 = Math.atan2(ey - py, ex - px);
+        let da = a1 - a0;
+        while (da > Math.PI) da -= Math.PI * 2;
+        while (da < -Math.PI) da += Math.PI * 2;
+        const pts = [];
+        for (let i = 0; i <= 12; i++) {
+          const u = i / 12, a = a0 + da * u, r = lerp(r0, r1, u);
+          pts.push(`${f1(px + r * Math.cos(a))} ${f1(py + r * Math.sin(a))}`);
+        }
+        const d = `M${pts.join('L')}`;
+        s += `<path fill="none" stroke="#8fd0ff" stroke-width="8" stroke-linecap="round" opacity="${f1(.22 * arc)}" d="${d}"/>`;
+        s += `<path fill="none" stroke="#eaf9ff" stroke-width="3.2" stroke-linecap="round" opacity="${f1(.8 * arc)}" d="${d}"/>`;
+      }
+    }
+    const splashAge = splashAt >= 0 ? t - splashAt : Infinity;
+    if (splashAge >= 0 && splashAge < .55 && splashAtP) {
+      const [ox, oy] = splashAtP, k = clamp(splashAge / .55, 0, 1), fade = 1 - smooth(.7, 1, k);
+      s += `<ellipse cx="${f1(ox)}" cy="${f1(oy)}" rx="${f1(7 + 24 * k)}" ry="${f1(2 + 7 * k)}" fill="none" stroke="#9fdcff" stroke-width="2.4" opacity="${f1(.55 * (1 - smooth(.1, .7, k)))}"/>`;
+      s += `<ellipse cx="${f1(ox)}" cy="${f1(oy)}" rx="${f1(5 + 28 * k)}" ry="${f1(1.2 + 8 * k)}" fill="#eaf9ff" opacity="${f1(.6 * (1 - smooth(0, .25, k)))}"/>`;
+      for (let i = 0; i < 9; i++) {
+        const a = -Math.PI / 2 + (i - 4) * .23, r0 = 5 + 5 * k, r1 = 16 + 46 * k;
+        const x0 = ox + r0 * Math.cos(a), y0 = oy + r0 * Math.sin(a);
+        const x1 = ox + r1 * Math.cos(a), y1 = oy + r1 * Math.sin(a);
+        const cx = ox + (r0 + (r1 - r0) * .45) * Math.cos(a + .35), cy = oy + (r0 + (r1 - r0) * .45) * Math.sin(a + .35);
+        s += `<path fill="none" stroke="#e8f8ff" stroke-width="2.6" stroke-linecap="round" opacity="${f1(.9 * fade)}" d="M${f1(x0)} ${f1(y0)}Q${f1(cx)} ${f1(cy)} ${f1(x1)} ${f1(y1)}"/>`;
+      }
+      for (let i = 0; i < 11; i++) {
+        const a = -Math.PI / 2 + (i - 5) * .26, v = 90 + (i % 3) * 36;
+        const x = ox + Math.cos(a) * v * splashAge, y = oy + Math.sin(a) * v * splashAge + 170 * splashAge * splashAge;
+        const r = (5.4 - 3 * k) * (1 - .16 * (i % 2)), o = (1 - smooth(.55, 1, k)) * (.95 - .05 * (i % 3));
+        s += `<circle cx="${f1(x)}" cy="${f1(y)}" r="${f1(r)}" fill="#bfe9ff" opacity="${f1(o)}"/>`;
+        s += `<circle cx="${f1(x - r * .3)}" cy="${f1(y - r * .35)}" r="${f1(r * .38)}" fill="#fff" opacity="${f1(o)}"/>`;
+      }
+    }
     if (fx !== s) { fxG.innerHTML = s; fx = s; }
   }
 
@@ -785,7 +864,7 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
     draw,
     groupTilt,
     /** The gestures she draws herself, from the frame's `gesture` (the kit leaves them off the body). */
-    gestures: ['nod', 'shake', 'wave', 'bow'],
+    gestures: ['nod', 'shake', 'wave', 'bow', 'tail-whip'],
     setScheme,
     /** Forgets the motion state (springs, clocks), for callers that replay a timeline from its start. */
     /**
@@ -814,6 +893,7 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
       endFade();
       for (const k in sp) { sp[k].x = 0; sp[k].v = 0; }
       lastT = null; rootWas = {}; prevTilt = 0; prevYaw = 0; prevLow = 0; headTilt = 0; wTilt = 0; wLean = 0; finMood = 0; tailMood = 0; wagAmp = 0; sitK = 0; walkK = 0; runK = 0; swingK = 0;
+      whipStart = null; splashAt = -1; splashAtP = null; whipTip = null;
     },
     /** Loads every scheme's and outfit's textures, so later switches are immediate. */
     preload: () => Promise.all(SCHEMES.flatMap(sc => OUTFITS.map(of => loadScheme(sc.id, of.id)))),
@@ -831,7 +911,15 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
   };
 }
 
+/** The whale's own words, beyond the kit's: the kit hands each to her figure as `frame.gesture`. */
+export const WHALE_WORDS = {
+  'tail-whip': { motion: { seconds: 1.3, sound: 'whoosh' } },
+};
+
 /** The whale pack's entry (figure.json): her body for the figure frame, the kit's body drawn by her figure. */
 export async function createWhaleBody(base, opts) {
-  return opts.kit.createBody(opts.host, { figure: await createWhaleFigure(base, opts) });
+  return opts.kit.createBody(opts.host, {
+    figure: await createWhaleFigure(base, opts),
+    words: WHALE_WORDS,
+  });
 }

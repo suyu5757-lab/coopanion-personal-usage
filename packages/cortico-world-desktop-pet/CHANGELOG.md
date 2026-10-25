@@ -9,6 +9,7 @@
 - The pet window's socket (`host=window`) and the OBS overlay source (`role=overlay-source`) put that credential in the `/socket` query as `key`; a socket without it or with another one is answered 403.
 - Browser writes (every method but GET and HEAD) and the WebSocket are accepted only with the service's own HTTP origin, port included (`http://127.0.0.1:<port>` or `http://localhost:<port>`); any other Origin is answered 421. A client that sends no Origin is accepted.
 - `POST /api/figures/import/install` answers 409 with `{ conflicts: [id, …] }` when a chosen pack's id is installed or `figures/<id>/` exists, and then changes no file and keeps the staged import. The same request with the same `token` and `replace: [id, …]` naming every conflicting id replaces them. An install without conflicts takes no new field. Once an install passes these checks its token is spent.
+- The whale has a hard motion of her own, `tail-whip`: the fluke rises past her hair, snaps down to the floor with an arc trail, a splash and a slap.
 
 ## 0.2.0
 

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { BUILTIN_PACKS, figurePacks, lookOf, lookPatch, readManifest, scanPacks } from '../src/packs.ts';
+import { vocabId } from '../src/script.ts';
 
 function pack(manifest: Record<string, unknown>, files: string[] = []): string {
   const dir = mkdtempSync(join(tmpdir(), 'pack-'));
@@ -19,6 +20,14 @@ describe('figure packs', () => {
     const { packs, problems } = figurePacks([]);
     expect(problems).toEqual([]);
     expect(packs.map((p) => p.id)).toEqual(['coo', 'whale']);
+  });
+
+  it('gives the whale a tail whip by every name she answers to', () => {
+    const whale = figurePacks([]).packs.find((p) => p.id === 'whale')!;
+    expect(vocabId('甩尾巴', whale.manifest.vocab)).toBe('tail-whip');
+    expect(vocabId('甩尾', whale.manifest.vocab)).toBe('tail-whip');
+    expect(vocabId('抽尾巴', whale.manifest.vocab)).toBe('tail-whip');
+    expect(vocabId('whip', whale.manifest.vocab)).toBe('tail-whip');
   });
 
   it('refuses a pack whose files lie outside it', () => {

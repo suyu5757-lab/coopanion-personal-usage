@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { createPet, FACES, KIT_EXPRESSIONS, KIT_MOTIONS, STAND } from '../packages/cortico-world-desktop-pet/web/kit/body.js';
 import { cooFigure, defaultSkin, figure } from '../packages/cortico-world-desktop-pet/web/coo/coo.js';
+import { WHALE_WORDS } from '../packages/cortico-world-desktop-pet/web/whale/figure.js';
 import { createSfx } from '../packages/cortico-world-desktop-pet/web/sound.js';
 import { haloRect, readLayout, touchGate } from '../packages/cortico-world-desktop-pet/web/body-host.js';
 
@@ -19,11 +20,12 @@ function barePet(onEvent, opts = {}) {
 const run = (pet, seconds) => { for (let i = 0; i < seconds * 60; i++) { pet.step(1 / 60); pet.render(); } };
 
 describe('the words the model can use', () => {
-  it('Coo and the whale do every word of their vocabularies on the kit, and the kit does no word they leave out', () => {
+  it('Coo and the whale list exactly the words their bodies take: the kit\'s, plus the whale\'s own', () => {
     for (const pack of ['coo', 'whale']) {
       const words = (kind) => vocabOf(pack).filter((v) => v.kind === kind).map((v) => v.id).sort();
+      const own = pack === 'whale' ? Object.keys(WHALE_WORDS).filter((w) => WHALE_WORDS[w].motion) : [];
       expect(words('expression'), pack).toEqual([...KIT_EXPRESSIONS].sort());
-      expect(words('motion'), pack).toEqual([...KIT_MOTIONS].sort());
+      expect(words('motion'), pack).toEqual([...KIT_MOTIONS, ...own].sort());
     }
   });
 

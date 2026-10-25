@@ -6,7 +6,7 @@
  */
 /** Which kind each sound belongs to; a kind can be silenced on its own (`sfx.configure`). */
 export const SOUND_KINDS = {
-  move: ['step', 'skid', 'jump', 'land', 'whoosh', 'chirps', 'shake', 'nod', 'spin', 'shiver', 'dance', 'look'],
+  move: ['step', 'skid', 'jump', 'land', 'whoosh', 'slap', 'chirps', 'shake', 'nod', 'spin', 'shiver', 'dance', 'look'],
   touch: ['grab', 'squeak', 'purr', 'poke'],
   face: ['happy', 'wink', 'love', 'surprised', 'angry', 'sad', 'shy', 'yawn'],
   snore: ['snore'],
@@ -105,6 +105,10 @@ export function createSfx({ storageKey = 'cortico-pet.sound.v1', volume = .55 } 
     grab() { tone({ type: 'triangle', f0: 680, f1: 1500, dur: .14, vol: .18, vib: 60, vibRate: 30 }); },
     squeak() { tone({ type: 'triangle', f0: R(900, 1200), f1: R(1300, 1700), dur: .09, vol: .08, vib: 40, vibRate: 35 }); },
     whoosh() { noise({ f0: 300, f1: 2400, q: 1.4, dur: .38, vol: .22, attack: .08 }); },
+    slap() {
+      tone({ type: 'triangle', f0: 250, f1: 70, dur: .12, vol: .3 });
+      noise({ f0: 3200, f1: 800, q: .7, dur: .09, vol: .3, attack: .001 });
+    },
     chirps() { for (let i = 0; i < 3; i++) tone({ f0: 2300 + i * 120, f1: 3200, dur: .06, vol: .06, at: i * .11 }); },
     shake() { for (let i = 0; i < 5; i++) tone({ type: 'square', f0: 180, f1: 160, dur: .05, vol: .05, at: i * .06, filter: 900 }); },
     hmm() { tone({ type: 'triangle', f0: 330, f1: 360, dur: .12, vol: .08 }); tone({ type: 'triangle', f0: 392, f1: 470, dur: .16, vol: .08, at: .14 }); },
