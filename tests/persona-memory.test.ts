@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { EventEnvelope } from 'cortico/core/types.ts';
 import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import { coopanionPersona } from '../core/persona.ts';
-import type { HindsightMemory } from '../core/memory/hindsight.ts';
+import { HindsightMemory } from '../core/memory/hindsight.ts';
 
 const event = (over: Partial<EventEnvelope>): EventEnvelope => ({
   cursor: 1,
@@ -47,6 +47,23 @@ function personaWith() {
 }
 
 describe('Coo with long-term memory and the affinity extension', () => {
+  it('keeps the feeling and the unresolved matter in long-term memory, not the score', () => {
+    const memory = new HindsightMemory();
+    const calls: Array<{ content: string }> = [];
+    (memory as unknown as { enabled: () => boolean }).enabled = () => true;
+    (memory as unknown as { enqueue: (item: { content: string }) => void }).enqueue = (item) => calls.push(item);
+    memory.retainAffinityChange({
+      subject: 7, score: 99, delta: -2, kind: 'angry', reason: 'he forgot the promise',
+      emotion: { expression: 'hint', need: 'recognition' }, unresolved: { resolved: false }, at: '2026-10-25T10:00:00Z',
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.content).toContain('feeling angry');
+    expect(calls[0]!.content).toContain('need recognition');
+    expect(calls[0]!.content).toContain('still unresolved');
+    expect(calls[0]!.content).not.toContain('99');
+    expect(calls[0]!.content).not.toContain('-2');
+  });
+
   it('retains the person’s line, a touch, and an affinity change, then injects recall', async () => {
     const { p, calls, retainUser, retainTouch, retainAffinityChange, recallBlock } = personaWith();
     await p.onDelivery({

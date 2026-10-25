@@ -349,17 +349,26 @@ export class HindsightMemory {
 
   retainAffinityChange(meta: Record<string, unknown>): void {
     const subject = typeof meta.subject === 'string' || typeof meta.subject === 'number' ? String(meta.subject) : '';
-    const score = typeof meta.score === 'number' ? meta.score : null;
-    const delta = typeof meta.delta === 'number' ? meta.delta : null;
     const kind = typeof meta.kind === 'string' ? meta.kind : '';
     const reason = typeof meta.reason === 'string' ? meta.reason : '';
     const slot = meta.slot === null ? 'cleared' : typeof meta.slot === 'string' ? meta.slot : '';
     const at = typeof meta.at === 'string' ? meta.at : new Date().toISOString();
-    const parts = [`Affinity update${subject ? ` for ${subject}` : ''}: score ${score ?? '?'}`];
-    if (delta) parts.push(`${delta > 0 ? '+' : ''}${delta}`);
+    const emotion = meta.emotion && typeof meta.emotion === 'object' ? meta.emotion as Record<string, unknown> : null;
+    const expression = typeof emotion?.expression === 'string' ? emotion.expression : '';
+    const need = typeof emotion?.need === 'string' ? emotion.need : '';
+    const unresolved = meta.unresolved && typeof meta.unresolved === 'object' ? meta.unresolved as Record<string, unknown> : null;
+    const repair = meta.repair && typeof meta.repair === 'object' ? meta.repair as Record<string, unknown> : null;
+    const parts = [`Affinity shift${subject ? ` for ${subject}` : ''}`];
     if (kind) parts.push(`feeling ${kind}`);
-    if (slot) parts.push(`relationship slot ${slot}`);
     if (reason) parts.push(reason);
+    if (slot) parts.push(`relationship slot ${slot}`);
+    if (need) parts.push(`need ${need}`);
+    if (expression) parts.push(`expression ${expression}`);
+    if (unresolved) parts.push(unresolved.resolved === true ? 'the matter is over' : 'the matter is still unresolved');
+    if (repair) {
+      const note = typeof repair.note === 'string' ? repair.note : '';
+      parts.push(repair.resolved === true ? `repaired${note ? `: ${note}` : ''}` : `a partial repair${note ? `: ${note}` : ''}`);
+    }
     const safe = sanitizeForMemory(parts.join('. '));
     if (!safe.text || safe.skip) return;
     this.enqueue({

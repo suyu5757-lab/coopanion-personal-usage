@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defaultRegion, endpointName, firstVendor } from 'cortico-provider-coo/src/vendors.ts';
@@ -74,6 +74,58 @@ describe('first-run seed', () => {
     expect(next).toContain('## 自定义');
     expect(next).toContain('保留这一段。');
     expect(next).not.toContain('但我会读工作区里的记忆文件');
+  });
+
+  it('seeds the inner-life files and leaves a self the person or Coo wrote alone', () => {
+    for (const [language, selfText, marker] of [
+      ['zh', '现在的我', '## 自己的念头与自我迭代'],
+      ['en', '## Now', '## Inner life and self-review'],
+    ] as const) {
+      const home = mkdtempSync(join(tmpdir(), 'cc-seed-'));
+      seed(home, language);
+      const workspace = join(home, DEPLOYMENT, 'workspace');
+      for (const file of ['SELF.md', 'SELF.history.md', 'agenda/now.md', 'mind/README.md', 'mind/now.md', 'mind/intentions.md', 'self-review/README.md', 'self-review/TEMPLATE.md']) {
+        expect(existsSync(join(workspace, file)), file).toBe(true);
+      }
+      expect(readFileSync(join(workspace, 'SELF.md'), 'utf8')).toContain(selfText);
+      expect(readFileSync(join(home, DEPLOYMENT, 'prompts', 'ORIENTATION.md'), 'utf8')).toContain(marker);
+      writeFileSync(join(workspace, 'SELF.md'), '# mine');
+      seed(home, language);
+      expect(readFileSync(join(workspace, 'SELF.md'), 'utf8')).toBe('# mine');
+    }
+  });
+
+  it('adds the inner-life rules to an existing ORIENTATION once', () => {
+    const home = mkdtempSync(join(tmpdir(), 'cc-seed-'));
+    seed(home, 'zh');
+    const file = join(home, DEPLOYMENT, 'prompts', 'ORIENTATION.md');
+    const marker = '## 自己的念头与自我迭代';
+    const full = readFileSync(file, 'utf8');
+    expect(full).toContain(marker);
+    expect(full).toContain('self-review/README.md');
+    writeFileSync(file, `${full.slice(0, full.indexOf(marker)).trimEnd()}\n`);
+    seed(home, 'zh');
+    const next = readFileSync(file, 'utf8');
+    expect(next).toContain(marker);
+    expect(next).toContain('self-review/README.md');
+    seed(home, 'zh');
+    expect(readFileSync(file, 'utf8')).toBe(next);
+  });
+
+  it('moves an existing affinity note to the felt-sense wording once', () => {
+    const home = mkdtempSync(join(tmpdir(), 'cc-seed-'));
+    seed(home, 'zh');
+    const file = join(home, DEPLOYMENT, 'prompts', 'ORIENTATION.md');
+    const old = '- 好感度：由 affinity 扩展维护。回话前用 affinity_get 查分数、档位、关系格子和还没过去的情绪；发生值得记的事，用 affinity_adjust 记一笔，写清为什么；关系格子用 affinity_slot。分数变动会自动写进长期记忆，你不需要再记一遍。';
+    const full = readFileSync(file, 'utf8');
+    expect(full).toContain('affinity_feel');
+    writeFileSync(file, full.replace('- 好感度：由 affinity 扩展维护。回话前用 affinity_get 感受你们现在的关系、你心里那股劲和还没过去的事；数字是账本，不给你看。心里有新动静用 affinity_feel 记，事情过去了用 affinity_repair；只调远近用 affinity_adjust，关系格子用 affinity_slot。变化会自动写进长期记忆，你不需要再记一遍。', old));
+    seed(home, 'zh');
+    const next = readFileSync(file, 'utf8');
+    expect(next).toContain('affinity_feel');
+    expect(next).not.toContain('查分数、档位');
+    seed(home, 'zh');
+    expect(readFileSync(file, 'utf8')).toBe(next);
   });
 
   it('seeds the effective Hindsight settings into config.json once', () => {

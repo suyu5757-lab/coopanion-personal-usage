@@ -1,8 +1,8 @@
 {
   "name": "cortico-world-affinity-alont1",
-  "version": "0.1.17",
+  "version": "0.2.0",
   "type": "module",
-  "description": "好感度 World（Coopanion 桌宠本地改版）：按桌宠里的这个人记住关系分数、格子和情绪；变化会同步到长期记忆",
+  "description": "好感度 World（Coopanion 桌宠本地改版）：记住关系、情绪、表达方式和还没过去的事；数字留在账本里，变化同步到长期记忆",
   "license": "MIT",
   "author": "ALonT1",
   "keywords": [

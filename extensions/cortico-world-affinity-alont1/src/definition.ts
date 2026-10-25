@@ -28,11 +28,13 @@ export const AFFINITY: WorldDefinition<AffinityConfigSection> = withWorldPanel({
     botDir: ctx.botDir,
   }),
   describe: {
-    tools: describeTools(affinityToolDecls(AFFINITY_DEFAULTS), {
-      affinity_get: { zh: '查某个人在你这里的交情分数。', en: "Looks up someone's closeness score." },
-      affinity_adjust: { zh: '记一笔交情的变化,或者只记一股情绪。', en: 'Records a change in closeness, or just a feeling.' },
+    tools: describeTools(affinityToolDecls(), {
+      affinity_get: { zh: '查你此刻对他的感觉、关系和还没过去的事。', en: 'Reads how you feel about the person right now, the relationship, and what is still unresolved.' },
+      affinity_adjust: { zh: '记一笔亲疏的变化,或者只记一股情绪。', en: 'Records a change in closeness, or just a feeling.' },
+      affinity_feel: { zh: '记一股情绪：多强、为什么、碰到哪条需要、要不要说出来。', en: 'Records a feeling: how strong, why, which need it touched, and whether to show it.' },
+      affinity_repair: { zh: '记一次修复：他做了什么、你接不接受、这件事过去没有。', en: 'Records a repair: what the person did, whether it helped, and whether the thing is over.' },
       affinity_slot: { zh: '给某个人定「关系格子」——他算你的什么人。', en: 'Sets what someone is to you.' },
-      affinity_list: { zh: '看交情排行的前几名。', en: 'Lists the closest people.' },
+      affinity_list: { zh: '看心里排前面的几个人。', en: 'Lists the people closest to you.' },
     }),
     events: [
       {
@@ -41,7 +43,7 @@ export const AFFINITY: WorldDefinition<AffinityConfigSection> = withWorldPanel({
       },
       {
         type: 'affinity.changed',
-        description: { zh: '好感度分数、关系格子或情绪发生变化。', en: 'The affinity score, relationship slot or feeling changed.' },
+        description: { zh: '亲疏、关系格子、情绪或还没过去的事发生变化。', en: 'The closeness, relationship slot, a feeling, or something unresolved changed.' },
       },
     ],
   },

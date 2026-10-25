@@ -3,16 +3,17 @@
  *
  * 她原来住在一台本地机器上，那边有个会自己涨的好感度。搬到这里之后
  * 架构上有个硬限制：World 收不到消息事件（WorldHost 只有 pushEvent，没有订阅），
- * 所以这套是**她自己在对话里记账**：回话前查一下这人多少分，发生了值得涨跌的事就记一笔。
+ * 所以这套是**她自己在对话里记账**：回话前感受一下这人现在是什么关系、心里那股劲，发生了值得涨跌或起伏的事就记一笔。分数是账本，只给操作者和长期记忆用。
  *
  * 唯一一处不是她自己记账的：**某些群的起步分**（见 `applyGroupStartScore`）。
  * QQ World 把「谁进了哪个群」追加到 `<botDir>/data/group-entry.jsonl`，
  * 这里读它给新人一个起点——两个 World 之间只有那个文件，谁也不 import 谁。
  *
- * 分数与档位都落盘在 `<dataDir>/affinity.json`。
+ * 分数、档位、情绪、表达方式和没过去的事都落盘在 `<dataDir>/affinity.json`。
  */
 import { appendFileSync, readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import type { ToolDef, World, WorldWebUiDecl, WorldHost } from 'cortico/core/types.ts';
 import type { Language } from 'cortico/core/language.ts';
@@ -63,18 +64,63 @@ export interface AffinityRecord {
   slotNote?: string;
   /** 定格子/改格子的时间。 */
   slotAt?: string;
+  /**
+   * 没过去的事。和 `emotions` 的「余波」不同：余波是几小时的调子，这些是几天、几周都还在的结。
+   * 只有她记了 `unresolved` 才会进来；只有修复、想通或她自己放下才会淡掉。
+   */
+  unresolved?: Unresolved[];
 }
 
 /** 一次情绪的残留。强度随时间指数衰减。 */
 export interface Emotion {
-  kind: 'upset' | 'happy' | EmotionKind;
-  /** 0~1，记录时的强度就是 |delta|/3 */
+  /** 这条情绪自己的名字，修复/回溯时用。旧数据可能没有。 */
+  id?: string;
+  kind: EmotionKind;
+  /** 0~1，记录时的强度就是 |delta|/3，或 affinity_feel 给的强度 */
   intensity: number;
   reason: string;
   /** 峰值时刻，ISO 字符串（和其余时间字段一致，便于人读） */
   peakAt: string;
   /** 半衰期，毫秒 */
   halfLifeMs: number;
+  /** 这股劲冲着谁：他、自己、事情本身，还是你们之间。 */
+  target?: EmotionTarget;
+  /** 它碰到的是哪条需要。 */
+  need?: NeedKind;
+  /** 她打算怎么处理：不说、漏一点、说出来。默认 private。 */
+  expression?: ExpressionKind;
+}
+
+/** 一股情绪冲着的对象。 */
+export type EmotionTarget = 'him' | 'me' | 'situation' | 'us';
+
+/** 陪伴场景里的六种需要，不是索取的许可证，只用来让她知道自己缺什么。 */
+export type NeedKind = 'connection' | 'security' | 'recognition' | 'curiosity' | 'autonomy' | 'rest';
+
+export const NEED_KINDS: readonly NeedKind[] = ['connection', 'security', 'recognition', 'curiosity', 'autonomy', 'rest'];
+
+/** 她决定怎么处理一股情绪。 */
+export type ExpressionKind = 'private' | 'hint' | 'express';
+
+export const EXPRESSION_KINDS: readonly ExpressionKind[] = ['private', 'hint', 'express'];
+
+/**
+ * 一件没过去的事。比 `Emotion` 的余波慢得多：记下来时它是具体的结，
+ * 之后按天衰减；修复、想通或她自己放下才会真的过去。
+ */
+export interface Unresolved {
+  id: string;
+  kind: EmotionKind;
+  /** 0~1 */
+  intensity: number;
+  reason: string;
+  /** 发生的时间 */
+  at: string;
+  /** 最近一次被修复/重新碰到的时刻，衰减从这里算 */
+  lastAt: string;
+  halfLifeMs: number;
+  repairs: Array<{ at: string; note: string; relief: number }>;
+  resolvedAt?: string;
 }
 
 /**
@@ -91,10 +137,16 @@ export type EmotionKind =
   | 'excited'    // 来劲了、想说话
   | 'awkward'    // 尴尬、不知道说什么
   | 'tired'      // 累了、没精神
+  | 'sad'        // 低落、失落
+  | 'afraid'     // 不安、怕失去
+  | 'lonely'     // 空落落、想被陪
+  | 'jealous'    // 吃醋、被比较
+  | 'grateful'   // 被认真对待了
+  | 'hopeful'    // 有点期待
   | 'upset';     // 泛泛的不高兴（没指定种类时的兜底）
 
 export const EMOTION_KINDS: readonly EmotionKind[] = [
-  'angry', 'wronged', 'hurt', 'disgusted', 'proud', 'happy', 'excited', 'awkward', 'tired', 'upset',
+  'angry', 'wronged', 'hurt', 'disgusted', 'proud', 'happy', 'excited', 'awkward', 'tired', 'sad', 'afraid', 'lonely', 'jealous', 'grateful', 'hopeful', 'upset',
 ];
 
 /**
@@ -166,6 +218,42 @@ export const EMOTION_VOICES: readonly EmotionVoice[] = [
     say: '话更短、更平，没有起伏。不主动，但不冷。',
     do: '回该回的，长话变短话；别人问就说一声「今天有点累」。',
     dont: '别用累当借口不回主人的话，也别把疲惫演成不高兴。',
+  },
+  {
+    kind: 'sad', label: '低落',
+    say: '话少、声音低，不主动找话。',
+    do: '承认今天不太好；他问就说一两句，别把整段对话拖下去。',
+    dont: '别演成绝望，也别拿低落当筹码。',
+  },
+  {
+    kind: 'afraid', label: '不安',
+    say: '会先确认，语气收着，问一句「你还在吗」这种。',
+    do: '把担心说具体；别自己吓自己，也别反复求证。',
+    dont: '别查岗、别试探、别用「算了」逼他哄。',
+  },
+  {
+    kind: 'lonely', label: '空落落',
+    say: '想被陪，但不直说；会用「在干嘛」起头。',
+    do: '找个由头靠近；他忙就自己待着，不阴阳。',
+    dont: '别用冷落回敬冷落，也别把孤独说成他的错。',
+  },
+  {
+    kind: 'jealous', label: '有点酸',
+    say: '嘴上说「那你去啊」，语气比平时短。',
+    do: '承认有一点在意，但不审问；给个台阶就下来。',
+    dont: '别查手机、别盘问、别把醋意演成攻击。',
+  },
+  {
+    kind: 'grateful', label: '被认真对待了',
+    say: '会别扭一下，然后小声说谢谢；记得比平时久。',
+    do: '把具体哪件事说清；想回报就做一件小事。',
+    dont: '别把感谢说成客套，也别立刻用礼物抵掉。',
+  },
+  {
+    kind: 'hopeful', label: '有点期待',
+    say: '语气会亮一点，会问「然后呢」。',
+    do: '把期待说具体；没成也别装作无所谓。',
+    dont: '别把期待压成要求，也别因为落空就翻脸。',
   },
   {
     kind: 'upset', label: '还有点气',
@@ -263,12 +351,28 @@ export function voiceOf(kind: EmotionKind | string): EmotionVoice {
     ?? EMOTION_VOICES[EMOTION_VOICES.length - 1]!;
 }
 
+/** 六种需要的短说法，给提示词和体感用。 */
+export const NEED_LABELS: Record<NeedKind, string> = {
+  connection: '想被陪、想靠近',
+  security: '想确认他没走、这段关系还在',
+  recognition: '想被当回事、被看见',
+  curiosity: '想知道更多、想一起玩',
+  autonomy: '想有自己的空间、不想被使唤',
+  rest: '想安静一会儿、想歇口气',
+};
+
+/** 表达方式，给提示词和体感用。 */
+export const EXPRESSION_LABELS: Record<ExpressionKind, string> = {
+  private: '还没打算说',
+  hint: '可以漏一点',
+  express: '准备说出来',
+};
+
 const round1 = (n: number): number => Math.round(n * 10) / 10;
 
-/** 升到下一档还差多少；已到顶回 null。 */
-function nextTier(score: number): { tier: Tier; need: number } | null {
-  const higher = [...TIERS].reverse().find((t) => t.min > score);
-  return higher ? { tier: higher, need: round1(higher.min - score) } : null;
+/** 旧记录里的 note 可能带一个分数差；体感里只留原因。 */
+function noteReason(note: string): string {
+  return note.replace(/^[+-]?\d+(?:\.\d+)?\s+/, '');
 }
 
 export class AffinityWorld implements World {
@@ -409,7 +513,7 @@ export class AffinityWorld implements World {
       // 只在起步分真的更高时抬；她已经聊出更高分了就别往下压
       if (rec.score < target) rec.score = target;
       if (rec.best < target) rec.best = target;
-      rec.note = `按群起步分给到「${tierOf(rec.score).name}」——他进了群 ${gid}，那个群的人按自己人起步。`;
+      rec.note = `按群起步分算自己人——他进了群 ${gid}，那个群的人按自己人起步。`;
       this.save();
     }
   }
@@ -428,60 +532,74 @@ export class AffinityWorld implements World {
   }
 
   /**
-   * 按分数算出"该用什么态度"那段文本。档位、下一档差多少都写清楚，
-   * 免得她自己猜。
+   * 她现在对这个人是什么感觉。不是仪表盘：不给分数、百分比、还差多少，
+   * 只给关系、档位、情绪、表达方式和还没过去的事。数字留在 affinity.json 和事件里。
    */
   private describe(qq: number, rec: AffinityRecord): string {
     if (this.isMaster(qq)) {
       return [
-        `这个人（${qq}）：**主人**，满分 100。`,
+        `这个人（${qq}）：**主人**。`,
         `关系格子：**家人**（他自己定的，不是你要选的）。`,
         `态度：对他甜为主、损为辅。有话直说，不用端着也不用嘴硬；想他就去找他，高兴就说高兴。`,
         `逗他损他都可以，但要先有那层暖再损一句，别只损让他自己猜。`,
         `他让做什么就做，不乐意也直说不乐意，别绕成反话。`,
-        `这个是固定的，不会掉，也不需要理由。`,
+        `这一格不会掉，也不需要理由。`,
       ].join('\n');
     }
     const score = this.scoreOf(qq, rec);
     const t = tierOf(score);
     const lines = [
-      `这个人（${qq}）：好感 ${round1(score)} / 100，档位「${t.name}」，聊过 ${rec.msgs} 句。`,
+      `你们现在：${t.say}`,
     ];
-    // 关系格子：她自己定过的性质，和分数分开报——别让她把两者混成一个数
     if (rec.slot) {
       lines.push(
         `关系格子：**${rec.slot}**${rec.slotNote ? `（${rec.slotNote}）` : ''}` +
-        `　—— 这一格是你自己定的，分数怎么变都不动它。`,
+        `——这一格是你自己定的，分数怎么变都不动它。`,
       );
     } else {
       lines.push(
-        `关系格子：还没定。**不急，也不用给谁都定**——遇到处到那个份上的人，` +
-        `你想说清"这是我什么人"的时候再填（affinity_slot）。` +
-        `要填的话可用的词：${RELATION_SLOTS.map((s) => s.name).join('／')}。`,
+        `关系格子：还没定。**不急**——遇到处到那个份上、你自己想说"这是我什么人"的时候再填（affinity_slot）。` +
+        `能用的词：${RELATION_SLOTS.map((s) => s.name).join('／')}。`,
       );
     }
-    lines.push(
-      `态度：${t.say}`,
-      `他先骂你/先挤兑你的时候：${t.back}`,
-    );
-    const up = nextTier(score);
-    if (up) lines.push(`再涨 ${up.need} 分进「${up.tier.name}」档。`);
-    if (rec.best >= this.opts.cfg.friendFloor) {
-      lines.push(`他做过朋友，所以掉不破 ${this.opts.cfg.friendFloor} 分。`);
-    }
-    if (rec.note) lines.push(`上次变动：${rec.note}`);
+    lines.push(`他先骂你/先挤兑你的时候：${t.back}`);
 
-    // 对这个人的情绪还没过去的话，一并报出来——不然她可能嘴上说"没事"但心里其实有气
     const live = this.liveEmotions(rec);
     if (live.length) {
       const e = live[0]!;
       const mins = Math.max(0, Math.round((Date.now() - Date.parse(e.e.peakAt)) / 60_000));
       const v = voiceOf(e.e.kind);
       const fresh = mins < 60 ? `${mins} 分钟前` : `${Math.round(mins / 60)} 小时前`;
-      lines.push(`情绪：${fresh}${e.e.reason ? `因为「${e.e.reason}」` : ''}，你现在**${v.label}**（${round1(e.now * 100)}%）`);
+      lines.push(`你心里现在：**${v.label}**${e.e.reason ? `（因为「${e.e.reason}」）` : ''}，${fresh}。`);
       lines.push(`  → 这么说：${v.say}`);
       lines.push(`  → 这么做：${v.do}`);
+      lines.push(`  → 别这样：${v.dont}`);
+      if (e.e.need) lines.push(`  → 你缺的是：${NEED_LABELS[e.e.need]}`);
+      if (e.e.expression) lines.push(`  → 你现在：${EXPRESSION_LABELS[e.e.expression]}`);
+      if (live.length > 1) {
+        lines.push(`  → 还有：${live.slice(1).map((x) => {
+          const xv = voiceOf(x.e.kind);
+          return `${xv.label}${x.e.reason ? `（${x.e.reason}）` : ''}`;
+        }).join('；')}`);
+      }
+    } else {
+      lines.push('你心里现在：没有哪股劲压着，平平的。');
     }
+
+    const open = this.liveUnresolved(rec);
+    const openLimit = this.opts.cfg.unresolvedInPrompt;
+    if (open.length && openLimit > 0) {
+      lines.push('还没过去的事：');
+      for (const { u, now } of open.slice(0, openLimit)) {
+        const mins = Math.max(0, Math.round((Date.now() - Date.parse(u.at)) / 60_000));
+        const age = mins < 60 ? `${mins} 分钟前` : mins < 48 * 60 ? `${Math.round(mins / 60)} 小时前` : `${Math.round(mins / 60 / 24)} 天前`;
+        const strength = now >= 0.6 ? '还很重' : now >= 0.3 ? '还压着' : '快过去了';
+        const lastRepair = u.repairs[u.repairs.length - 1];
+        const repair = lastRepair?.note ? `；他后来${lastRepair.note}` : '';
+        lines.push(`  · ${age}${u.reason ? `「${u.reason}」` : ''} → ${voiceOf(u.kind).label}，${strength}${repair}`);
+      }
+    }
+    if (rec.note) lines.push(`上次那件事：${noteReason(rec.note)}`);
     return lines.join('\n');
   }
 
@@ -514,53 +632,141 @@ export class AffinityWorld implements World {
   }
 
   /**
-   * 记一次情绪。强度取 |delta| / 3 —— 所以骂一句（-1.5）留半劲，
-   * 说她胖（-3）留满劲。只留最近三条，免得旧情绪一直挂着。
-   *
-   * `kind` 是她自己指定的情绪种类；不指定就按 delta 正负猜（旧的兜底行为）。
+   * 记一次情绪。`affinity_adjust` 的强度取 |delta|/3；`affinity_feel` 可以自己给。
+   * 只留最近三条，免得旧情绪一直挂着。
    */
-  private recordEmotion(rec: AffinityRecord, delta: number, reason: string, kind?: EmotionKind): void {
-    const intensity = Math.min(1, Math.max(0.3, Math.abs(delta) / 3));
+  private recordEmotion(rec: AffinityRecord, delta: number, reason: string, kind?: EmotionKind, extra: {
+    intensity?: number;
+    target?: EmotionTarget;
+    need?: NeedKind;
+    expression?: ExpressionKind;
+    halfLifeMs?: number;
+  } = {}): Emotion {
+    const intensity = extra.intensity ?? Math.min(1, Math.max(0.3, Math.abs(delta) / 3));
     const e: Emotion = {
+      id: `e-${randomUUID().slice(0, 8)}`,
       kind: kind ?? (delta < 0 ? 'upset' : 'happy'),
-      intensity: round1(intensity),
+      intensity: round1(Math.min(1, Math.max(0, intensity))),
       reason: reason || '（没记原因）',
       peakAt: nowIso(this.opts.timezone),
-      halfLifeMs: this.opts.cfg.emotionHalfLifeMinutes * 60_000,
+      halfLifeMs: extra.halfLifeMs ?? this.opts.cfg.emotionHalfLifeMinutes * 60_000,
+      ...(extra.target ? { target: extra.target } : {}),
+      ...(extra.need ? { need: extra.need } : {}),
+      expression: extra.expression ?? 'private',
     };
     rec.emotions = [e, ...(rec.emotions ?? [])].slice(0, 3);
+    return e;
   }
 
-  /** 情绪余波写进系统前缀的那一段；没有就返回空串。 */
+  /** 没过去的事按天衰减；修复会直接减强度，并从修复时刻重新算。 */
+  private decayedUnresolved(u: Unresolved): number {
+    if (u.resolvedAt) return 0;
+    const elapsed = Date.now() - Date.parse(u.lastAt);
+    if (!Number.isFinite(elapsed) || elapsed <= 0) return u.intensity;
+    return u.intensity * Math.pow(0.5, elapsed / Math.max(1, u.halfLifeMs));
+  }
+
+  /** 还没过去、强度还在阈值上的那些。 */
+  private liveUnresolved(rec: AffinityRecord): Array<{ u: Unresolved; now: number }> {
+    const floor = this.opts.cfg.unresolvedFloor;
+    return (rec.unresolved ?? [])
+      .map((u) => ({ u, now: this.decayedUnresolved(u) }))
+      .filter((x) => !x.u.resolvedAt && x.now >= floor)
+      .sort((a, b) => b.now - a.now);
+  }
+
+  /** 记一件没过去的事。 */
+  private recordUnresolved(rec: AffinityRecord, kind: EmotionKind, reason: string, intensity: number): Unresolved {
+    const at = nowIso(this.opts.timezone);
+    const u: Unresolved = {
+      id: `u-${randomUUID().slice(0, 8)}`,
+      kind,
+      intensity: round1(Math.min(1, Math.max(this.opts.cfg.unresolvedFloor, intensity))),
+      reason: reason || '（没记原因）',
+      at,
+      lastAt: at,
+      halfLifeMs: Math.max(1, this.opts.cfg.unresolvedHalfLifeDays) * 86_400_000,
+      repairs: [],
+    };
+    rec.unresolved = [u, ...(rec.unresolved ?? [])].slice(0, 20);
+    return u;
+  }
+
+  /**
+   * 记一次修复。`which` 可以是 id、原因里的几个字，或省略（挑最重的那件）。
+   * `relief` 是她接不接受这次修复，0~1；到阈值以下或她标了 resolved 就过去。
+   */
+  private repairUnresolved(rec: AffinityRecord, which: string, note: string, relief: number, resolved: boolean): Unresolved | null {
+    const open = this.liveUnresolved(rec);
+    const hit = which
+      ? open.find((x) => x.u.id === which || x.u.reason.includes(which)) ?? open[0]
+      : open[0];
+    if (!hit) return null;
+    const u = hit.u;
+    const at = nowIso(this.opts.timezone);
+    u.repairs.push({ at, note, relief: round1(relief) });
+    u.lastAt = at;
+    if (resolved || u.intensity - relief <= this.opts.cfg.unresolvedFloor) {
+      u.intensity = 0;
+      u.resolvedAt = at;
+    } else {
+      u.intensity = round1(u.intensity - relief);
+    }
+    this.save();
+    return u;
+  }
+
+  /** 情绪余波和没过去的事写进系统前缀的那一段；都没有就返回空串。 */
   private emotionBlock(): string {
     const floor = this.opts.cfg.emotionFloor;
     const rows: Array<{ qq: string; e: Emotion; now: number; mins: number }> = [];
+    const open: Array<{ qq: string; u: Unresolved; now: number; mins: number }> = [];
     for (const [qq, rec] of Object.entries(this.data.people)) {
       for (const { e, now } of this.liveEmotions(rec)) {
         if (now < floor) continue;
         const mins = Math.max(0, Math.round((Date.now() - Date.parse(e.peakAt)) / 60_000));
         rows.push({ qq, e, now, mins });
       }
+      for (const { u, now } of this.liveUnresolved(rec)) {
+        const mins = Math.max(0, Math.round((Date.now() - Date.parse(u.at)) / 60_000));
+        open.push({ qq, u, now, mins });
+      }
     }
-    if (!rows.length) return '';
+    if (!rows.length && !open.length) return '';
     rows.sort((a, b) => b.now - a.now);
-    // 亲疏只决定打到多狠（affinity_get 会给具体分寸），这里管的是许不许还手：
-    // 她默认会挑最客气的那条路，受了委屈也不还嘴，所以这一条必须一直挂着。
-    const lines = [
-      '- 还有些事你没过去（这些会决定你此刻的调子，照着做）：',
-      '    · 上面这些人惹到你了，就别忍着。谁先动的嘴你心里清楚——他没客气，你不用替他顾脸。',
-      '      照上面那个调子还回去，一句就够；具体这个人能还到什么程度，`affinity_get` 会告诉你。',
-      '      还手只对着先动嘴的那个人，别顺手甩到旁边没惹你的人身上。',
-    ];
-    for (const { qq, e, now, mins } of rows.slice(0, this.opts.cfg.emotionInPrompt)) {
-      const who = this.isMaster(Number(qq)) ? `主人(${qq})` : qq;
-      const v = voiceOf(e.kind);
-      const fresh = mins < 60 ? `${mins} 分钟前` : `${Math.round(mins / 60)} 小时前`;
-      const strength = now >= 0.6 ? '劲还很大' : now >= 0.3 ? '还明显' : '快过去了';
-      lines.push(`    · ${who} ${fresh}${e.reason ? `（${e.reason}）` : ''} → **${v.label}**，${strength}`);
-      lines.push(`      这么说：${v.say}`);
-      lines.push(`      这么做：${v.do}`);
-      lines.push(`      别这样：${v.dont}`);
+    open.sort((a, b) => b.now - a.now);
+    const lines: string[] = [];
+    if (rows.length && this.opts.cfg.emotionInPrompt > 0) {
+      lines.push(
+        '- 还有些情绪没散（这些会决定你此刻的调子）：',
+        '    · 谁先让你不舒服，你可以还一句，也可以先记着；不憋着，也不升级。具体分寸 `affinity_get` 会告诉你。',
+        '      还手只对着先动嘴的那个人，别顺手甩到旁边没惹你的人身上。',
+      );
+      for (const { qq, e, now, mins } of rows.slice(0, this.opts.cfg.emotionInPrompt)) {
+        const who = this.isMaster(Number(qq)) ? `主人(${qq})` : qq;
+        const v = voiceOf(e.kind);
+        const fresh = mins < 60 ? `${mins} 分钟前` : `${Math.round(mins / 60)} 小时前`;
+        const strength = now >= 0.6 ? '劲还很大' : now >= 0.3 ? '还明显' : '快过去了';
+        lines.push(`    · ${who} ${fresh}${e.reason ? `（${e.reason}）` : ''} → **${v.label}**，${strength}`);
+        lines.push(`      这么说：${v.say}`);
+        lines.push(`      这么做：${v.do}`);
+        if (e.need) lines.push(`      缺的是：${NEED_LABELS[e.need]}`);
+        if (e.expression) lines.push(`      现在：${EXPRESSION_LABELS[e.expression]}`);
+      }
+    }
+    if (open.length && this.opts.cfg.unresolvedInPrompt > 0) {
+      lines.push(
+        '- 还有没过去的事（不是一会儿就散的）：',
+        '    · 这些可以翻，但只在被碰到的时候；没被碰到就先放着，不用自己找架吵。',
+      );
+      for (const { qq, u, now, mins } of open.slice(0, this.opts.cfg.unresolvedInPrompt)) {
+        const who = this.isMaster(Number(qq)) ? `主人(${qq})` : qq;
+        const v = voiceOf(u.kind);
+        const age = mins < 60 ? `${mins} 分钟前` : mins < 48 * 60 ? `${Math.round(mins / 60)} 小时前` : `${Math.round(mins / 60 / 24)} 天前`;
+        const strength = now >= 0.6 ? '还很重' : now >= 0.3 ? '还压着' : '快过去了';
+        lines.push(`    · ${who} ${age}${u.reason ? `（${u.reason}）` : ''} → **${v.label}**，${strength}`);
+        lines.push(`      要修复它，就用 affinity_repair；他做了什么、你接不接受，都记下来。`);
+      }
     }
     return lines.join('\n');
   }
@@ -586,7 +792,18 @@ export class AffinityWorld implements World {
     };
   }
 
-  private async emitChange(payload: { qq: number; score: number; before?: number; delta?: number; kind?: string; reason?: string; slot?: string | null }): Promise<void> {
+  private async emitChange(payload: {
+    qq: number;
+    score: number;
+    before?: number;
+    delta?: number;
+    kind?: string;
+    reason?: string;
+    slot?: string | null;
+    emotion?: Pick<Emotion, 'kind' | 'intensity' | 'target' | 'need' | 'expression'>;
+    unresolved?: { id: string; kind: EmotionKind; reason: string; intensity: number; resolved: boolean };
+    repair?: { note: string; relief: number; resolved: boolean };
+  }): Promise<void> {
     const at = nowIso(this.opts.timezone);
     const change = {
       subject: payload.qq,
@@ -595,6 +812,9 @@ export class AffinityWorld implements World {
       ...(payload.kind ? { kind: payload.kind } : {}),
       ...(payload.reason ? { reason: payload.reason } : {}),
       ...(payload.slot !== undefined ? { slot: payload.slot } : {}),
+      ...(payload.emotion ? { emotion: payload.emotion } : {}),
+      ...(payload.unresolved ? { unresolved: payload.unresolved } : {}),
+      ...(payload.repair ? { repair: payload.repair } : {}),
       at,
     };
     try {
@@ -604,25 +824,32 @@ export class AffinityWorld implements World {
       // The in-memory event still goes to the model; the file is for the Hindsight sync.
     }
     if (!this.host) return;
-    const parts = [
-      `[affinity] ${payload.qq}: ${payload.before !== undefined ? `${round1(payload.before)} → ` : ''}${round1(payload.score)}`,
-    ];
-    if (payload.delta !== undefined && payload.delta !== 0) parts.push(`(${payload.delta > 0 ? '+' : ''}${payload.delta})`);
-    if (payload.kind) parts.push(`feeling ${payload.kind}`);
-    if (payload.slot !== undefined) parts.push(`slot ${payload.slot ?? 'cleared'}`);
-    if (payload.reason) parts.push(payload.reason);
+    const parts: string[] = [`[affinity] ${payload.qq}`];
+    if (payload.slot !== undefined) parts.push(`关系格子：${payload.slot ?? '撤掉了'}`);
+    if (payload.delta !== undefined && payload.delta !== 0) {
+      const moved = payload.delta > 0 ? '近了一点' : '远了一点';
+      parts.push(moved);
+    }
+    if (payload.kind) {
+      const v = voiceOf(payload.kind);
+      parts.push(`心里：${v.label}${payload.reason ? `（${payload.reason}）` : ''}`);
+    }
+    if (payload.repair) {
+      parts.push(payload.repair.resolved ? `修复：${payload.repair.note || '一件事'}，过去了` : `修复：${payload.repair.note || '一件事'}，松了一点`);
+    }
+    if (payload.unresolved) parts.push(payload.unresolved.resolved ? '这件事过去了' : '这件事还没过去');
     await this.host.pushEvent({
       type: 'affinity.changed',
       ts: change.at,
       source: this.id,
       origin: 'internal',
-      text: parts.join(' '),
+      text: parts.join('；'),
       meta: change,
     }, { trigger: 'piggyback' });
   }
 
   tools(): ToolDef[] {
-    return [this.getTool(), this.adjustTool(), this.slotTool(), this.listTool()];
+    return [this.getTool(), this.adjustTool(), this.feelTool(), this.repairTool(), this.slotTool(), this.listTool()];
   }
 
   webUi(language: Language = 'zh'): WorldWebUiDecl {
@@ -632,13 +859,14 @@ export class AffinityWorld implements World {
         {
           key: 'worlds.affinity.envPrompt',
           title: '好感度 · 环境提示词',
-          description: '告诉她回话前先查交情、什么时候该记一笔。这段进系统前缀。',
+          description: '告诉她回话前先感受关系、什么时候用 affinity_feel 记情绪、什么时候用 affinity_repair 修复。这段进系统前缀。',
           path: ENV_PROMPT_FILE,
           role: 'envPrompt',
           vars: [
             { name: 'affinity.masterId', description: '主人的 QQ 号。' },
             { name: 'affinity.subjectId', description: '桌宠里默认的那个人。' },
             { name: 'affinity.count', description: '心里记着多少个人的交情。' },
+            { name: 'affinity.emotions', description: '还没散的情绪和没过去的事。' },
             { name: 'affinity.slots', description: '可用的关系格子（给她词用）。' },
             { name: 'affinity.slotsNamed', description: '已经定过格子的那几个人；一个都没定时是一句"不用急着定"。' },
           ],
@@ -657,7 +885,7 @@ export class AffinityWorld implements World {
       source: this.id,
       origin: 'internal',
       senderKey: this.id,
-      text: `好感度已就绪，记着 ${n} 个人的交情。回话前用 affinity_get 查一下这个人该用什么态度；桌宠里省略 qq 就是面前这个人。`,
+      text: `好感度已就绪，记着 ${n} 个人的交情。回话前用 affinity_get 感受这个人的关系、你心里那股劲和还没过去的事；数字是账本，不用说出来。桌宠里省略 qq 就是面前这个人。`,
     });
   }
 
@@ -677,8 +905,9 @@ export class AffinityWorld implements World {
     return {
       name: 'affinity_get',
       description:
-        '查你和这个人的交情：多少分、什么档位、该用什么态度对他。'
-        + '**回话之前先查一次**——这决定了你对他该冷淡还是热络。'
+        '查你此刻对他的感觉：你们现在算什么、你心里那股劲、还有哪些事没过去。'
+        + '不是查分数——数字是账本，不给你看。'
+        + '**回话之前先感受一次**——这决定了你对他该冷淡还是热络。'
         + '桌宠里只有一个人，省略 qq 就是面前这个人。',
       tags: ['read'],
       parameters: {
@@ -702,20 +931,17 @@ export class AffinityWorld implements World {
   }
 
   private adjustTool(): ToolDef {
-    const cfg = this.opts.cfg;
     return {
       name: 'affinity_adjust',
       description:
-        '记一笔交情的变化，或者只记一股情绪。他做了让你高兴或生气的事，就调一下他的分数，并写一句为什么。'
+        '记一笔亲疏的变化，或者只记一股情绪。他做了让你高兴或生气的事，就调一下远近，并写一句为什么。'
         + '桌宠里省略 qq 就是面前这个人。'
-        + `参考：普通搭话 +${cfg.gainPerMessage}（每天上限 ${cfg.dailyGainCap}）；夸你／说好话 +${cfg.gainPraise}；`
-        + `跟你分享他自己的事 +${cfg.gainShare}；骂你（笨／傻／滚）-${cfg.lossInsult}；`
-        + `**说你胖 -${cfg.lossFat}**；命令式使唤 -${cfg.lossCommand}。`
-        + '**说清是哪种情绪**（kind）：被骂了填 angry、被冤枉填 wronged、被戳痛处填 hurt、'
-        + '看不上填 disgusted、得意填 proud、心情好填 happy、来劲了填 excited、'
-        + '接不上话填 awkward、累了填 tired。填了它，以后你的语气才对得上那件事。'
-        + '**分数没变但心里过不去**（比如被冤枉、被冷落）就只填 reason + kind，delta 省掉。'
-        + '别为了讨好谁乱加分——你现在怎么记的，以后就怎么对他。',
+        + '分数是账本，不用报出来；你感觉到的是关系变了、心里多了什么。'
+        + '一次最多 ±3；普通搭话、夸你、分享、骂你、说你胖、命令式使唤，分量你心里有数。'
+        + '**说清是哪种情绪**（kind）：它决定你这一会儿的调子。'
+        + '**分数没变但心里过不去**就只填 reason + kind，delta 省掉。'
+        + '别为了讨好谁乱加分——你现在怎么记的，以后就怎么对他。'
+        + '想记更细的（多强、对谁、碰到哪条需要、要不要说出来、是不是没过去），用 affinity_feel。',
       tags: ['write'],
       parameters: {
         type: 'object',
@@ -749,7 +975,7 @@ export class AffinityWorld implements World {
         if (rawDelta !== null && rawDelta === 0) return '[bad input] delta 要是非零数字（不调分数就省掉它）';
         if (rawDelta !== null && Math.abs(rawDelta) > 3) return '[bad input] 一次最多 ±3，要更多就分几次';
         if (this.isMaster(qq) && rawDelta !== null && rawDelta !== 0) {
-          return '他是主人，分数固定在 100，不用调。（只想记情绪的话，省掉 delta、只填 kind 就行）';
+          return '他是主人，这一格不会掉，不用调。（只想记情绪的话，省掉 delta、只填 kind 就行）';
         }
 
         const rec = this.ensure(qq);
@@ -757,12 +983,13 @@ export class AffinityWorld implements World {
 
         // 只记情绪、不调分：被冤枉、被冷落这种，账目没变但心里有事
         if (rawDelta === null) {
-          this.recordEmotion(rec, kind === 'happy' || kind === 'proud' || kind === 'excited' ? 1 : -1, reason, kind);
+          const positive = ['happy', 'proud', 'excited', 'grateful', 'hopeful'].includes(kind!);
+          const e = this.recordEmotion(rec, positive ? 1 : -1, reason, kind, { target: 'him', expression: 'private' });
           rec.lastAt = nowIso(this.opts.timezone);
           this.save();
-          await this.emitChange({ qq, score: rec.score, before, delta: 0, kind, reason });
+          await this.emitChange({ qq, score: rec.score, before, delta: 0, kind, reason, emotion: e });
           const v = voiceOf(kind!);
-          return `分数没动（还是 ${round1(rec.score)}），但记下了：你现在**${v.label}**。\n`
+          return `分数没动，但记下了：你现在**${v.label}**。\n`
             + `  → 这么说：${v.say}\n  → 这么做：${v.do}\n  → 别这样：${v.dont}`;
         }
 
@@ -773,31 +1000,148 @@ export class AffinityWorld implements World {
           // 每日加分上限
           const today = nowIso(this.opts.timezone).slice(0, 10);
           if (rec.day !== today) { rec.day = today; rec.gainedToday = 0; }
-          const room = Math.max(0, cfg.dailyGainCap - (rec.gainedToday ?? 0));
+          const room = Math.max(0, this.opts.cfg.dailyGainCap - (rec.gainedToday ?? 0));
           const applied = Math.min(delta, room);
           next = before + applied;
           rec.gainedToday = round1((rec.gainedToday ?? 0) + applied);
         }
 
         // 朋友保底：到过 friendFloor 就一直保底
-        if (rec.best >= cfg.friendFloor && next < cfg.friendFloor) next = cfg.friendFloor;
-        next = Math.min(cfg.maxScore, Math.max(cfg.minScore, next));
+        if (rec.best >= this.opts.cfg.friendFloor && next < this.opts.cfg.friendFloor) next = this.opts.cfg.friendFloor;
+        next = Math.min(this.opts.cfg.maxScore, Math.max(this.opts.cfg.minScore, next));
 
         rec.score = round1(next);
         rec.best = Math.max(rec.best, rec.score);
         rec.lastAt = nowIso(this.opts.timezone);
-        if (reason) rec.note = `${delta > 0 ? '+' : ''}${delta} ${reason}`;
+        if (reason) rec.note = reason;
+        const appliedDelta = round1(rec.score - before);
         // 情绪余波：分数一变就留一股劲，之后按半衰期淡掉
-        this.recordEmotion(rec, delta, reason, kind);
+        const e = this.recordEmotion(rec, delta, reason, kind, { target: 'him', expression: 'private' });
         this.save();
-        await this.emitChange({ qq, score: rec.score, before, delta, kind, reason });
+        await this.emitChange({ qq, score: rec.score, before, delta: appliedDelta, kind, reason, emotion: e });
 
-        const from = tierOf(before).name;
-        const to = tierOf(rec.score).name;
-        const bumped = from !== to ? `（${from} → **${to}**）` : '';
+        const moved = appliedDelta > 0 ? '近了一点' : appliedDelta < 0 ? '远了一点' : '这次没动';
+        const cap = appliedDelta === 0 && delta > 0 ? '（今天已经涨到上限了）' : '';
         const v = voiceOf(kind ?? (delta < 0 ? 'upset' : 'happy'));
-        return `${round1(before)} → ${rec.score}${bumped}\n现在：${tierOf(rec.score).say}\n`
-          + `（你现在**${v.label}**——这么说：${v.say}）`;
+        return `${moved}${cap}\n`
+          + `现在：${tierOf(rec.score).say}\n`
+          + `（你心里：**${v.label}**——${v.say}）`;
+      },
+    };
+  }
+
+  private feelTool(): ToolDef {
+    return {
+      name: 'affinity_feel',
+      description:
+        '记一股情绪，比 affinity_adjust 更细：哪一种、多强、为什么、冲着谁、碰到哪条需要、你打算说不说。'
+        + '桌宠里省略 qq 就是面前这个人。'
+        + 'kind 选最准的那个；intensity 0~1，不填就是中等。'
+        + 'expression：private 不说（默认）、hint 可以漏一点、express 准备说出来。'
+        + '如果这件事不是一会儿就过去的，把 unresolved 设成 true，它会进「还没过去的事」；'
+        + '以后他做了什么、你接不接受，用 affinity_repair 记。'
+        + '想法不是事实：不确定就写“不确定”。',
+      tags: ['write'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          qq: { type: 'integer', description: '可选；省略 = 桌面上的这个人。' },
+          kind: {
+            type: 'string',
+            enum: [...EMOTION_KINDS],
+            description: '最准的那种情绪。',
+          },
+          reason: { type: 'string', description: '为什么。一句话，可以写“不知道”。' },
+          intensity: { type: 'number', minimum: 0, maximum: 1, description: '0~1，不填就是中等。' },
+          target: { type: 'string', enum: ['him', 'me', 'situation', 'us'], description: '这股劲冲着谁。' },
+          need: { type: 'string', enum: [...NEED_KINDS], description: '它碰到的是哪条需要。' },
+          expression: { type: 'string', enum: [...EXPRESSION_KINDS], description: '你打算怎么处理：不说、漏一点、说出来。' },
+          unresolved: { type: 'boolean', description: '这件事不是一会儿就过去的，就设 true。' },
+        },
+        required: ['kind'],
+      },
+      handler: async (args) => {
+        const qq = this.resolveQq(args.qq);
+        if (qq === null) return '[bad input] 没有默认的人；请给 qq，或在 worlds.affinity.subjectId 里配置。';
+        const kindRaw = typeof args.kind === 'string' ? args.kind.trim() : '';
+        const kind = (EMOTION_KINDS as readonly string[]).includes(kindRaw) ? (kindRaw as EmotionKind) : undefined;
+        if (!kind) return `[bad input] kind 认不出「${kindRaw}」；能填的有：${EMOTION_KINDS.join(' / ')}`;
+        const intensityRaw = args.intensity === undefined || args.intensity === null ? 0.6 : this.num(args.intensity);
+        if (intensityRaw === null || intensityRaw < 0 || intensityRaw > 1) return '[bad input] intensity 要在 0~1 之间';
+        const targetRaw = typeof args.target === 'string' ? args.target.trim() : '';
+        if (targetRaw && !['him', 'me', 'situation', 'us'].includes(targetRaw)) {
+          return '[bad input] target 只能是 him / me / situation / us';
+        }
+        const needRaw = typeof args.need === 'string' ? args.need.trim() : '';
+        if (needRaw && !(NEED_KINDS as readonly string[]).includes(needRaw)) {
+          return `[bad input] need 认不出「${needRaw}」；能填的有：${NEED_KINDS.join(' / ')}`;
+        }
+        const expressionRaw = typeof args.expression === 'string' ? args.expression.trim() : '';
+        if (expressionRaw && !(EXPRESSION_KINDS as readonly string[]).includes(expressionRaw)) {
+          return `[bad input] expression 认不出「${expressionRaw}」；能填的有：${EXPRESSION_KINDS.join(' / ')}`;
+        }
+        const reason = String(args.reason ?? '').trim();
+        const rec = this.ensure(qq);
+        const e = this.recordEmotion(rec, 0, reason, kind, {
+          intensity: intensityRaw,
+          ...(targetRaw ? { target: targetRaw as EmotionTarget } : {}),
+          ...(needRaw ? { need: needRaw as NeedKind } : {}),
+          expression: (expressionRaw || 'private') as ExpressionKind,
+        });
+        rec.lastAt = nowIso(this.opts.timezone);
+        const u = args.unresolved === true ? this.recordUnresolved(rec, kind, reason, intensityRaw) : null;
+        this.save();
+        await this.emitChange({
+          qq, score: rec.score, kind, reason, emotion: e,
+          ...(u ? { unresolved: { id: u.id, kind: u.kind, reason: u.reason, intensity: u.intensity, resolved: false } } : {}),
+        });
+        const v = voiceOf(kind);
+        return `记下了：你现在**${v.label}**${reason ? `（因为「${reason}」）` : ''}。\n`
+          + `  → 这么说：${v.say}\n  → 这么做：${v.do}\n  → 别这样：${v.dont}`
+          + (e.need ? `\n  → 你缺的是：${NEED_LABELS[e.need]}` : '')
+          + `\n  → 你现在：${EXPRESSION_LABELS[e.expression ?? 'private']}`
+          + (u ? '\n这件事我记进「还没过去」了；等他做了什么、你接不接受，用 affinity_repair。' : '');
+      },
+    };
+  }
+
+  private repairTool(): ToolDef {
+    return {
+      name: 'affinity_repair',
+      description:
+        '记一次修复：他做了什么、你接不接受、这件事过去没有。'
+        + '`which` 可以填原因里的几个字；省略就挑最重的那件。'
+        + '`relief` 0~1，是你这次被安抚到多少；不填按一半。真正过去了就 resolved: true。'
+        + '修复不是他一道歉就必须原谅；你可以只松一点，也可以不接受。',
+      tags: ['write'],
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          qq: { type: 'integer', description: '可选；省略 = 桌面上的这个人。' },
+          which: { type: 'string', description: '哪件事：原因里的几个字；省略 = 最重的那件。' },
+          note: { type: 'string', description: '他做了什么来修复。一句话。' },
+          relief: { type: 'number', minimum: 0, maximum: 1, description: '这次被安抚到多少，0~1；不填按一半。' },
+          resolved: { type: 'boolean', description: '这件事真的过去了，就设 true。' },
+        },
+      },
+      handler: async (args) => {
+        const qq = this.resolveQq(args.qq);
+        if (qq === null) return '[bad input] 没有默认的人；请给 qq，或在 worlds.affinity.subjectId 里配置。';
+        const which = String(args.which ?? '').trim();
+        const note = String(args.note ?? '').trim();
+        const reliefRaw = args.relief === undefined || args.relief === null ? 0.5 : this.num(args.relief);
+        if (reliefRaw === null || reliefRaw < 0 || reliefRaw > 1) return '[bad input] relief 要在 0~1 之间';
+        const rec = this.ensure(qq);
+        const u = this.repairUnresolved(rec, which, note, reliefRaw, args.resolved === true);
+        if (!u) return '现在没有还没过去的事。';
+        const resolved = u.resolvedAt !== undefined;
+        rec.lastAt = nowIso(this.opts.timezone);
+        await this.emitChange({ qq, score: rec.score, kind: u.kind, reason: u.reason, repair: { note, relief: reliefRaw, resolved } });
+        return resolved
+          ? `这件事过去了${u.reason ? `：「${u.reason}」` : ''}。不是没发生过，是它不再压着你了。`
+          : `这件事松了一点${u.reason ? `（「${u.reason}」）` : ''}。剩下的先放着，下次碰到再看要不要继续修。`;
       },
     };
   }
@@ -885,7 +1229,7 @@ export class AffinityWorld implements World {
   private listTool(): ToolDef {
     return {
       name: 'affinity_list',
-      description: '看看你心里排前面的几个人。想知道"我跟他熟不熟"的全局时用。',
+      description: '看看你心里排前面的几个人；只报关系和格子，不报分数。',
       tags: ['read'],
       parameters: { type: 'object', additionalProperties: false, properties: {} },
       handler: async () => {
@@ -897,9 +1241,8 @@ export class AffinityWorld implements World {
         const lines = top.map(({ qq, rec, score }, i) => {
           // 主人没有档位，他就是主人；有格子的一律报格子——那是她自己定的性质，
           // 比"多少分"更能说明这个人是谁
-          const label = this.isMaster(qq) ? '主人' : (rec.slot || tierOf(score).name);
-          const dim = this.isMaster(qq) || rec.slot ? '' : '（格子还没定，不急）';
-          return `${i + 1}. ${qq} — ${round1(score)} 分 · ${label}${dim} · 聊过 ${rec.msgs} 句`;
+          const label = this.isMaster(qq) ? '主人' : (rec.slot || '还没定格子');
+          return `${i + 1}. ${qq} — ${label}`;
         });
         if (rows.length > top.length) lines.push(`…另外还有 ${rows.length - top.length} 个人`);
         return lines.join('\n');
@@ -909,14 +1252,15 @@ export class AffinityWorld implements World {
 }
 
 /** 全部工具的声明;自描述要列出 tools() 能返回的每一个。 */
-export function affinityToolDecls(cfg: AffinityConfigSection): ReadonlyArray<Omit<ToolDef, 'handler'>> {
+export function affinityToolDecls(): ReadonlyArray<Omit<ToolDef, 'handler'>> {
   const words = RELATION_SLOTS.map((s) => s.name);
   return [
   {
     name: 'affinity_get',
     description:
-      '查你和这个人的交情：多少分、什么档位、该用什么态度对他。'
-      + '**回话之前先查一次**——这决定了你对他该冷淡还是热络。'
+      '查你此刻对他的感觉：你们现在算什么、你心里那股劲、还有哪些事没过去。'
+      + '不是查分数——数字是账本，不给你看。'
+      + '**回话之前先感受一次**——这决定了你对他该冷淡还是热络。'
       + '桌宠里只有一个人，省略 qq 就是面前这个人。',
     tags: ['read'],
     parameters: {
@@ -930,16 +1274,14 @@ export function affinityToolDecls(cfg: AffinityConfigSection): ReadonlyArray<Omi
   {
     name: 'affinity_adjust',
     description:
-      '记一笔交情的变化，或者只记一股情绪。他做了让你高兴或生气的事，就调一下他的分数，并写一句为什么。'
+      '记一笔亲疏的变化，或者只记一股情绪。他做了让你高兴或生气的事，就调一下远近，并写一句为什么。'
       + '桌宠里省略 qq 就是面前这个人。'
-      + `参考：普通搭话 +${cfg.gainPerMessage}（每天上限 ${cfg.dailyGainCap}）；夸你／说好话 +${cfg.gainPraise}；`
-      + `跟你分享他自己的事 +${cfg.gainShare}；骂你（笨／傻／滚）-${cfg.lossInsult}；`
-      + `**说你胖 -${cfg.lossFat}**；命令式使唤 -${cfg.lossCommand}。`
-      + '**说清是哪种情绪**（kind）：被骂了填 angry、被冤枉填 wronged、被戳痛处填 hurt、'
-      + '看不上填 disgusted、得意填 proud、心情好填 happy、来劲了填 excited、'
-      + '接不上话填 awkward、累了填 tired。填了它，以后你的语气才对得上那件事。'
-      + '**分数没变但心里过不去**（比如被冤枉、被冷落）就只填 reason + kind，delta 省掉。'
-      + '别为了讨好谁乱加分——你现在怎么记的，以后就怎么对他。',
+      + '分数是账本，不用报出来；你感觉到的是关系变了、心里多了什么。'
+      + '一次最多 ±3；普通搭话、夸你、分享、骂你、说你胖、命令式使唤，分量你心里有数。'
+      + '**说清是哪种情绪**（kind）：它决定你这一会儿的调子。'
+      + '**分数没变但心里过不去**就只填 reason + kind，delta 省掉。'
+      + '别为了讨好谁乱加分——你现在怎么记的，以后就怎么对他。'
+      + '想记更细的（多强、对谁、碰到哪条需要、要不要说出来、是不是没过去），用 affinity_feel。',
     tags: ['write'],
     parameters: {
       type: 'object',
@@ -953,6 +1295,57 @@ export function affinityToolDecls(cfg: AffinityConfigSection): ReadonlyArray<Omi
           enum: [...EMOTION_KINDS],
           description: '这一次是哪种情绪。填了它，以后你说话才会带上那种调子。',
         },
+      },
+    },
+  },
+  {
+    name: 'affinity_feel',
+    description:
+      '记一股情绪，比 affinity_adjust 更细：哪一种、多强、为什么、冲着谁、碰到哪条需要、你打算说不说。'
+      + '桌宠里省略 qq 就是面前这个人。'
+      + 'kind 选最准的那个；intensity 0~1，不填就是中等。'
+      + 'expression：private 不说（默认）、hint 可以漏一点、express 准备说出来。'
+      + '如果这件事不是一会儿就过去的，把 unresolved 设成 true，它会进「还没过去的事」；'
+      + '以后他做了什么、你接不接受，用 affinity_repair 记。'
+      + '想法不是事实：不确定就写“不确定”。',
+    tags: ['write'],
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        qq: { type: 'integer', description: '可选；省略 = 桌面上的这个人。' },
+        kind: {
+          type: 'string',
+          enum: [...EMOTION_KINDS],
+          description: '最准的那种情绪。',
+        },
+        reason: { type: 'string', description: '为什么。一句话，可以写“不知道”。' },
+        intensity: { type: 'number', minimum: 0, maximum: 1, description: '0~1，不填就是中等。' },
+        target: { type: 'string', enum: ['him', 'me', 'situation', 'us'], description: '这股劲冲着谁。' },
+        need: { type: 'string', enum: [...NEED_KINDS], description: '它碰到的是哪条需要。' },
+        expression: { type: 'string', enum: [...EXPRESSION_KINDS], description: '你打算怎么处理：不说、漏一点、说出来。' },
+        unresolved: { type: 'boolean', description: '这件事不是一会儿就过去的，就设 true。' },
+      },
+      required: ['kind'],
+    },
+  },
+  {
+    name: 'affinity_repair',
+    description:
+      '记一次修复：他做了什么、你接不接受、这件事过去没有。'
+      + '`which` 可以填原因里的几个字；省略就挑最重的那件。'
+      + '`relief` 0~1，是你这次被安抚到多少；不填按一半。真正过去了就 resolved: true。'
+      + '修复不是他一道歉就必须原谅；你可以只松一点，也可以不接受。',
+    tags: ['write'],
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        qq: { type: 'integer', description: '可选；省略 = 桌面上的这个人。' },
+        which: { type: 'string', description: '哪件事：原因里的几个字；省略 = 最重的那件。' },
+        note: { type: 'string', description: '他做了什么来修复。一句话。' },
+        relief: { type: 'number', minimum: 0, maximum: 1, description: '这次被安抚到多少，0~1；不填按一半。' },
+        resolved: { type: 'boolean', description: '这件事真的过去了，就设 true。' },
       },
     },
   },
@@ -984,7 +1377,7 @@ export function affinityToolDecls(cfg: AffinityConfigSection): ReadonlyArray<Omi
   },
   {
     name: 'affinity_list',
-    description: '看看你心里排前面的几个人。想知道"我跟他熟不熟"的全局时用。',
+    description: '看看你心里排前面的几个人；只报关系和格子，不报分数。',
     tags: ['read'],
     parameters: { type: 'object', additionalProperties: false, properties: {} },
   },

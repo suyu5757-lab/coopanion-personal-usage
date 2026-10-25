@@ -111,6 +111,7 @@ export class RelationshipJournal {
         const day = addDays(cursor, 1);
         const question = `Write Coo's private diary entry for ${day} about the relationship with the person. `
           + 'Use that day\'s affection events, affinity changes and long-term memories. '
+          + 'Include what Coo felt but did not say, and anything still unresolved. Do not mention scores or percentages. '
           + 'If nothing happened, say it was a quiet day. '
           + 'Two to four sentences, first person, warm and concrete. No diagnosis, no heading, no bullet list.';
         const answer = await memory.reflect(question, { tags: ['scope:affection'], tagsMatch: 'any', timeoutMs: 120_000 });
