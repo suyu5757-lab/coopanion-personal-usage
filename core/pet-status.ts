@@ -1,6 +1,6 @@
 /**
  * What the pet's status bubble says for the tools this app's bot has: the Persona's memory tools, computer use, the alarms
- * (alarms.ts) and the console World, in the app language (`core/i18n`). Only the arguments named here reach the page;
+ * (alarms.ts), the browser (browser/world.ts) and the console World, in the app language (`core/i18n`). Only the arguments named here reach the page;
  * typed text, notes, window titles and coordinates never do. Wording that depends on an argument waits for the call
  * to be written out, so the bubble does not say something the call turns out not to do. A detail (a file name, a
  * pattern) is cut to 20 characters as seen for Chinese, Japanese and Korean, twice that for other languages.
@@ -61,6 +61,24 @@ export function petToolDescriber(language: () => Language): DescribeTool {
         const seconds = numberArg(args, 'seconds');
         return show('wait', s.wait, seconds === undefined ? undefined : s.seconds(seconds));
       }
+      case 'browser_open': return show('browse', s.browse);
+      case 'browser_search': {
+        const query = stringArg(args, 'query');
+        return show('search', s.search, query ? s.quoted(query) : undefined);
+      }
+      case 'browser_read': return show('browse', s.browse);
+      case 'browser_text': return show('read', s.read);
+      case 'browser_find': {
+        const query = stringArg(args, 'query');
+        return show('search', s.search, query ? s.quoted(query) : undefined);
+      }
+      case 'browser_click': return show('click', s.click);
+      case 'browser_type': return show('type', s.type);
+      case 'browser_press': return show('type', s.key, stringArg(args, 'key'));
+      case 'browser_scroll': return show('scroll', s.scroll);
+      case 'browser_play': case 'browser_watch': case 'browser_screenshot': return show('look', s.web);
+      case 'browser_back': return show('browse', s.browse);
+      case 'browser_close': return null;
       case 'alarm_set': {
         const minutes = numberArg(args, 'in_minutes');
         return show('alarm', s.alarmSet, stringArg(args, 'at') || (minutes === undefined ? undefined : s.minutesLater(minutes)));

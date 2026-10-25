@@ -41,6 +41,7 @@
     "@codemirror/commands": "^6.11.1",
     "@codemirror/state": "^6.7.5",
     "@codemirror/view": "^6.43.12",
+    "@page-agent/page-controller": "1.12.4",
     "@tailwindcss/cli": "^4.3.3",
     "@types/express": "^4.17.25",
     "@types/node": "^22.20.4",

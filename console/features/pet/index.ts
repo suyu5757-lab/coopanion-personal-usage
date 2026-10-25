@@ -1,7 +1,8 @@
 /**
  * 「习惯」: the everyday settings of the desktop pet, in sections: 通用 (language, what Coo calls you, Coo's
- * name, the app's anonymous usage statistics in the `companion` group, core/telemetry.ts), 行为与互动, 显示,
- * 音效, 电脑操作 (features/cua) and 其他 (the OBS overlay, the Chat page's context ring). Every row names its
+ * name, the app's anonymous usage statistics in the `companion` group, core/telemetry.ts), 行为与互动
+ * (including 自己的时间, `companion.selfTime`), 显示, 音效, 电脑操作 (features/cua) and 其他 (the OBS
+ * overlay, the Chat page's context ring). Every row names its
  * setting in the label column, except one that only refines the row above it. In each row the setting
  * comes first and what it means under it. An on/off setting is a switch; picks among several (sound
  * kinds, the popups) are checkboxes. Most are written to the desktop-pet World's config group through `/api/config` (only the keys shown here are sent). The pet's own menu
@@ -82,6 +83,11 @@ const KEYS = {
   saidBubbles: `${K}.saidBubbles`,
   wakeOn: `${K}.touch.wakeOn`,
   selfAdjust: `${K}.selfAdjust`,
+  selfTime: 'companion.selfTime.enabled',
+  selfTimeAfter: 'companion.selfTime.afterMinutes',
+  selfTimeSession: 'companion.selfTime.sessionMinutes',
+  selfTimeSound: 'companion.selfTime.sound',
+  selfTimeActions: 'companion.selfTime.actions',
 } as const;
 
 /** `touch.wakeOn` in the row's order, and the touches 「自定义…」 picks from (the World's TOUCH_KINDS). */
@@ -155,6 +161,29 @@ async function mount(ctx: PageContext): Promise<void> {
   const roam = ui.segmented([
     { value: 'free', label: S.roamFree }, { value: 'calm', label: S.roamCalm }, { value: 'off', label: S.roamOff },
   ], { size: 'sm', onSelect: (v) => void save(KEYS.roam, v, GROUP, behaviorMsg) });
+  // 自己的时间: a temporary browser window after a quiet stretch; it has its own logins and is muted by default
+  const selfTime = ui.checkbox(S.selfTime, { onChange: (on) => { renderSelfTime(); void save(KEYS.selfTime, on, STATS_GROUP, behaviorMsg); } });
+  const minutesBox = (min: number, max: number, key: string, initial: number) => {
+    const input = ui.input({ type: 'number' });
+    input.min = String(min); input.max = String(max); input.step = '1';
+    input.value = input.dataset.saved = String(initial);
+    const box = ui.h('div', 'companion-rangebox');
+    box.append(input, ui.h('span', 'companion-rangeval', S.selfTimeMinutes));
+    input.addEventListener('change', () => {
+      const n = Math.round(Number(input.value));
+      if (input.value === '' || !Number.isFinite(n) || n < min || n > max) { input.value = input.dataset.saved ?? String(min); return; }
+      input.value = String(n);
+      if (input.value !== input.dataset.saved) { input.dataset.saved = input.value; void save(key, n, STATS_GROUP, behaviorMsg); }
+    }, { signal });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') input.blur(); }, { signal });
+    return { input, box };
+  };
+  // 20 minutes is SELF_TIME_DEFAULTS in core/browser/config.ts, which the page cannot import from browser code
+  const selfTimeAfter = minutesBox(5, 240, KEYS.selfTimeAfter, 20);
+  const selfTimeSession = minutesBox(5, 60, KEYS.selfTimeSession, 20);
+  const selfTimeSound = ui.checkbox(S.selfTimeSound, { onChange: (on) => void save(KEYS.selfTimeSound, on, STATS_GROUP, behaviorMsg) });
+  const selfTimeActions = ui.checkbox(S.selfTimeActions, { onChange: (on) => void save(KEYS.selfTimeActions, on, STATS_GROUP, behaviorMsg) });
+  selfTimeActions.setChecked(true);
   const scaleText = ui.h('span', 'companion-rangeval');
   const scaleBox = ui.h('div', 'companion-rangebox');
   const scale = scaleSlider(root.ownerDocument, {
@@ -391,8 +420,23 @@ async function mount(ctx: PageContext): Promise<void> {
     msg,
   );
   const behavior = ui.sheet({ title: S.groupBehavior });
+  const selfTimeAfterRow = row(S.selfTimeAfter, selfTimeAfter.box);
+  const selfTimeSessionRow = row(S.selfTimeSession, selfTimeSession.box);
+  const selfTimeSoundRow = row(S.selfTimeSound, selfTimeSound.el, S.selfTimeSoundHint);
+  const selfTimeActionsRow = row(S.selfTimeActions, selfTimeActions.el, S.selfTimeActionsHint);
+  const renderSelfTime = () => {
+    const on = selfTime.checked;
+    for (const r of [selfTimeAfterRow, selfTimeSessionRow, selfTimeSoundRow, selfTimeActionsRow]) r.hidden = !on;
+    selfTimeAfter.input.disabled = !on;
+    selfTimeSession.input.disabled = !on;
+  };
   behavior.body.append(
     row(S.roam, roam.el),
+    row(S.selfTime, selfTime.el, `${S.selfTimeHint} ${S.selfTimeLogin}`),
+    selfTimeAfterRow,
+    selfTimeSessionRow,
+    selfTimeSoundRow,
+    selfTimeActionsRow,
     row(S.wake, wake.el, wakeHint),
     row(S.self, selfMode.el, selfHint),
     row(S.hover, hoverBox, S.hoverHint(MAX_HOVER)),
@@ -402,6 +446,7 @@ async function mount(ctx: PageContext): Promise<void> {
     row(S.saidBubbleLabel, saidBubbles.el, S.saidBubbleHint),
     behaviorMsg,
   );
+  renderSelfTime();
   const display = ui.sheet({ title: S.groupDisplay });
   display.body.append(
     row(S.scale, scaleBox),
@@ -606,14 +651,26 @@ async function mount(ctx: PageContext): Promise<void> {
       nameValues = d.groups?.find((g) => g.group.id === NAME_GROUP)?.values ?? {};
       cua.sync(d.groups?.find((g) => g.group.id === CUA_GROUP)?.values ?? {});
     } catch { return; }
+    const active = document.activeElement;
     if (typeof statsValues[STATS_KEY] === 'boolean') stats.setChecked(statsValues[STATS_KEY] as boolean);
     ring.setChecked(statsValues[RING_KEY] === true);
+    if (typeof statsValues[KEYS.selfTime] === 'boolean') { selfTime.setChecked(statsValues[KEYS.selfTime] as boolean); renderSelfTime(); }
+    // 0 is the config API's answer for an unset integer; the field's 20 is the real default
+    const selfTimeAfterValue = statsValues[KEYS.selfTimeAfter];
+    if (typeof selfTimeAfterValue === 'number' && selfTimeAfterValue >= 5 && active !== selfTimeAfter.input) {
+      selfTimeAfter.input.value = selfTimeAfter.input.dataset.saved = String(selfTimeAfterValue);
+    }
+    const selfTimeSessionValue = statsValues[KEYS.selfTimeSession];
+    if (typeof selfTimeSessionValue === 'number' && selfTimeSessionValue >= 5 && active !== selfTimeSession.input) {
+      selfTimeSession.input.value = selfTimeSession.input.dataset.saved = String(selfTimeSessionValue);
+    }
+    if (typeof statsValues[KEYS.selfTimeSound] === 'boolean') selfTimeSound.setChecked(statsValues[KEYS.selfTimeSound] as boolean);
+    if (typeof statsValues[KEYS.selfTimeActions] === 'boolean') selfTimeActions.setChecked(statsValues[KEYS.selfTimeActions] as boolean);
     if (typeof statsValues[LANGUAGE_KEY] === 'string' && document.activeElement !== language) {
       // before the choices arrive the select keeps the value as a lone option
       if (![...language.options].some((o) => o.value === statsValues[LANGUAGE_KEY])) language.append(Object.assign(ui.h('option', null, statsValues[LANGUAGE_KEY] as string), { value: statsValues[LANGUAGE_KEY] as string }));
       language.value = statsValues[LANGUAGE_KEY] as string;
     }
-    const active = document.activeElement;
     if (typeof values[KEYS.user] === 'string' && active !== user) {
       user.value = values[KEYS.user] as string;
       user.dataset.saved = user.value;

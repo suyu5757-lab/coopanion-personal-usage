@@ -10,6 +10,15 @@ const es419: Translation<CoreText> = {
     contextRing: { title: 'Anillo de contexto', description: 'Muestra en el cuadro de texto de la página Chat un anillo con cuánto falta para ordenar la conversación anterior.' },
     roundsSoft: { title: 'Recordatorio para cerrar', suffix: 'solicitudes', description: 'Tras esta cantidad de solicitudes al modelo en un mismo despertar, se recuerda a Coo que termine lo que está haciendo y cierre el turno.' },
     roundsHard: { title: 'Solicitudes por despertar', suffix: 'solicitudes', description: 'El máximo de solicitudes al modelo en un despertar; al llegar a él, el turno termina.' },
+    selfTime: {
+      title: 'Tiempo propio',
+      description: 'Tras un rato sin conversación, puede abrir su propio navegador y mirar. La ventana y sus sesiones son aparte.',
+      after: 'Tras el silencio', afterDescription: 'Recibe tiempo propio tras este tiempo sin conversación.',
+      session: 'Como máximo', sessionDescription: 'Un tiempo propio dura como máximo esto; al terminar, el navegador se cierra.',
+      minutes: 'min',
+      sound: 'Sonido del navegador', soundDescription: 'Silenciado por defecto. Al activarlo, se oyen los videos que mira.',
+      actions: 'Permitir me gusta, guardados y danmaku', actionsDescription: 'Desactivado, solo puede mirar. Inicia sesión y resuelve los códigos en su ventana tú mismo.',
+    },
   },
 
   failure: {
@@ -33,7 +42,7 @@ const es419: Translation<CoreText> = {
 
   status: {
     read: 'Leyendo', browse: 'Revisando', memory: 'memoria', find: 'Localizando', search: 'Buscando', write: 'Escribiendo', edit: 'Editando', append: 'Agregando a',
-    delete: 'Borrando', save: 'Guardando', screen: 'Mirando la pantalla', windows: 'Mirando las ventanas abiertas', rightClick: 'Haciendo clic derecho', doubleClick: 'Haciendo doble clic', click: 'Haciendo clic',
+    delete: 'Borrando', save: 'Guardando', screen: 'Mirando la pantalla', web: 'En una página web', windows: 'Mirando las ventanas abiertas', rightClick: 'Haciendo clic derecho', doubleClick: 'Haciendo doble clic', click: 'Haciendo clic',
     move: 'Moviendo el mouse', drag: 'Arrastrando', scroll: 'Desplazando', focus: 'Cambiando de ventana', type: 'Tecleando', key: 'Presionando', wait: 'Esperando',
     alarmSet: 'Poniendo una alarma', alarmList: 'Revisando las alarmas', alarmCancel: 'Cancelando una alarma',
     quoted: (text: string) => `“${text}”`,

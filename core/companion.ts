@@ -1,14 +1,15 @@
 /**
- * The app's Core process: Cormini as the Persona, the console, desktop-pet and coopanion Worlds, Coo Pet
- * Provider (DeepSeek and the other model services Coo offers) and its `chatgpt` module (a ChatGPT plan,
- * signed in) next to Cortico's built-in providers, and Worlds or providers installed from npm through
- * the console's extension page.
+ * The app's Core process: Cormini as the Persona, the console, desktop-pet, coopanion and browser Worlds,
+ * Coo Pet Provider (DeepSeek and the other model services Coo offers) and its `chatgpt` module (a ChatGPT
+ * plan, signed in) next to Cortico's built-in providers, and Worlds or providers installed from npm
+ * through the console's extension page.
  *
  * The desktop-pet World is wired to the app: the header of the pet's right-click menu pauses and
  * resumes the run, opens the settings window and quits the app, as the console's rail foot does.
  *
  * The `coopanion` World (`notice.ts`) tells Coo what the app has to say: the release notes after
- * an update, and the settings the person changes.
+ * an update, and the settings the person changes. The browser World (`browser/`) gives Coo her own
+ * window for time of her own; the Electron main process owns the window (`app/browser.cjs`).
  *
  * The app language (`config.language`, `language.ts`) picks the text people read and the language of
  * what Coo reads: the bundled Worlds' events, receipts and environment prompts, and the seeded persona
@@ -65,6 +66,9 @@ import { appWebUiAsset, bundledWebUiAssets } from './bundled-panels.ts';
 import { followPetLook } from './console-theme.ts';
 import { askForKey, guideDone, markDone, runGuide, type GuideDeps } from './guide.ts';
 import { NOTICE_ID, noticeDefinition, type NoticeWorld } from './notice.ts';
+import { browserDefinition, BROWSER_ID } from './browser/definition.ts';
+import { BrowserBridge } from './browser/bridge.ts';
+import { readSelfTime, SELF_TIME_DEFAULTS } from './browser/config.ts';
 import { coreText } from './i18n/index.ts';
 import { petToolDescriber } from './pet-status.ts';
 import { appLanguage, modelLanguage, replyLanguage } from './language.ts';
@@ -146,6 +150,11 @@ function companionGroup(language: Language): ConfigGroup {
         // Cormini copies `rounds` when the bot is built, so a change applies from the next start
         'rounds.soft': { type: 'integer', title: s.roundsSoft.title, minimum: 1, 'x-suffix': s.roundsSoft.suffix, 'x-hot': false, description: s.roundsSoft.description },
         'rounds.hard': { type: 'integer', title: s.roundsHard.title, minimum: 1, 'x-suffix': s.roundsHard.suffix, 'x-hot': false, description: s.roundsHard.description },
+        'companion.selfTime.enabled': { type: 'boolean', title: s.selfTime.title, description: s.selfTime.description, 'x-hot': true },
+        'companion.selfTime.afterMinutes': { type: 'integer', title: s.selfTime.after, minimum: 5, maximum: 240, 'x-suffix': s.selfTime.minutes, 'x-hot': true, description: s.selfTime.afterDescription },
+        'companion.selfTime.sessionMinutes': { type: 'integer', title: s.selfTime.session, minimum: 5, maximum: 60, 'x-suffix': s.selfTime.minutes, 'x-hot': true, description: s.selfTime.sessionDescription },
+        'companion.selfTime.sound': { type: 'boolean', title: s.selfTime.sound, description: s.selfTime.soundDescription, 'x-hot': true },
+        'companion.selfTime.actions': { type: 'boolean', title: s.selfTime.actions, description: s.selfTime.actionsDescription, 'x-hot': true },
       },
     },
   };
@@ -418,6 +427,7 @@ export async function main(): Promise<void> {
   let telemetry: Telemetry | null = null;
   let config: CoreConfig | null = null;
   let notice: NoticeWorld | null = null;
+  const browserBridge = new BrowserBridge();
   /** The introduction is running: the settings it makes are not told as changes. */
   let guiding = false;
   const guideRun = async (deps: GuideDeps) => {
@@ -484,12 +494,16 @@ export async function main(): Promise<void> {
   const longTerm = new HindsightMemory();
   const journal = new RelationshipJournal();
   const affinitySync = new AffinitySync();
-  const base = await cormini({ memory: longTerm });
+  const base = await cormini({
+    memory: longTerm,
+    selfTime: () => readSelfTime(config),
+    modelLanguage: () => modelLanguage(config?.language),
+  });
   /** Coo's Persona, once the bot is built. */
   let coo: CoopanionPersona | null = null;
   const definitionBase: BotDefinition<CorminiConfig> = {
     ...base.definition,
-    declares: [CONSOLE.id, DESKTOP_PET.id, NOTICE.id],
+    declares: [CONSOLE.id, DESKTOP_PET.id, NOTICE.id, BROWSER_ID],
     // Cormini's tools under the same names; the memory differs by PARTNER.md and the version history
     describe: {
       tools: [...(base.definition.describe?.tools ?? []), ...memoryToolDescribes({ memory: () => null })],
@@ -508,7 +522,7 @@ export async function main(): Promise<void> {
       // e2e harnesses give their persona
       rounds: { soft: 20, hard: 40 },
       context: { ...base.definition.defaults().context, maxTokens: 128_000, keepRatio: 0.25 },
-      companion: { telemetry: true, contextRing: false },
+      companion: { telemetry: true, contextRing: false, selfTime: { ...SELF_TIME_DEFAULTS } },
     }),
     // Cormini's own build with Coo's Persona class; the workspace is snapshotted before Coo can write to it
     build: (loaded, worlds) => {
@@ -535,7 +549,11 @@ export async function main(): Promise<void> {
         worlds,
         orientationOverrideFile: join(loaded.rootDir, 'prompts', 'ORIENTATION.md'),
         firstTurnDir: join(loaded.rootDir, 'prompts'),
-        tickDelayMs: () => (cfg.tick.intervalMinutes === null ? null : cfg.tick.intervalMinutes * 60_000),
+        tickDelayMs: () => {
+          const self = readSelfTime(cfg);
+          if (self.enabled) return self.afterMinutes * 60_000;
+          return cfg.tick?.intervalMinutes === null || cfg.tick?.intervalMinutes === undefined ? null : cfg.tick.intervalMinutes * 60_000;
+        },
       });
       persona.snapshot(APP_VERSION);
       coo = persona;
@@ -551,7 +569,14 @@ export async function main(): Promise<void> {
       };
     },
   };
-  const bundled = [CONSOLE, DESKTOP_PET, NOTICE] as WorldDefinition<WorldSection>[];
+  const BROWSER = browserDefinition({
+    bridge: browserBridge,
+    selfTime: () => readSelfTime(config),
+    modelLanguage: () => modelLanguage(config?.language),
+    language: () => language(),
+    onSessionEnd: () => coo?.restartRhythm(),
+  });
+  const bundled = [CONSOLE, DESKTOP_PET, NOTICE, BROWSER] as WorldDefinition<WorldSection>[];
 
   // extension providers must be registered before endpoints are resolved
   const extensions = await loadExtensions(repoRoot(), {
@@ -585,6 +610,15 @@ export async function main(): Promise<void> {
   const bot = createBot(loaded, definition, { extensions });
   bus = bot.core.bus;
   core = bot.core;
+  // turning time of her own on, or changing its quiet interval, re-arms the heartbeat now instead of at its policy recheck
+  let rhythm = readSelfTime(loaded.config);
+  const rhythmTimer = setInterval(() => {
+    const next = readSelfTime(loaded.config);
+    if (next.enabled === rhythm.enabled && next.afterMinutes === rhythm.afterMinutes) return;
+    rhythm = next;
+    coo?.restartRhythm();
+  }, 1000);
+  rhythmTimer.unref();
   const stats = new Telemetry({
     dir: deployDir,
     version: APP_VERSION,
@@ -655,12 +689,14 @@ export async function main(): Promise<void> {
   const shutdown = async (reason: string) => {
     if (stopping) return;
     stopping = true;
+    clearInterval(rhythmTimer);
     journal.stop();
     affinitySync.stop();
     const done = await Promise.race([
       Promise.all([bot.shutdown(reason), stats.stop()]).then(() => true),
       new Promise<false>((r) => setTimeout(() => r(false), 30_000)),
     ]);
+    browserBridge.close();
     process.exit(done ? 0 : 1);
   };
   const update = sayUpdates(loaded.config, () => pet, () => guiding);

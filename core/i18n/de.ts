@@ -10,6 +10,15 @@ const de: Translation<CoreText> = {
     contextRing: { title: 'Kontextring', description: 'Zeigt im Eingabefeld der Chat-Seite einen Ring, wie weit es noch ist, bis das frühere Gespräch aufgeräumt wird.' },
     roundsSoft: { title: 'Abschluss-Erinnerung', suffix: 'Anfragen', description: 'Nach so vielen Modellanfragen in einem Aufwachen wird Coo erinnert, das Laufende abzuschließen und die Runde zu beenden.' },
     roundsHard: { title: 'Anfragen pro Aufwachen', suffix: 'Anfragen', description: 'Höchstzahl der Modellanfragen in einem Aufwachen; ist sie erreicht, endet die Runde.' },
+    selfTime: {
+      title: 'Zeit für sich',
+      description: 'Nach einer Weile ohne Gespräch darf sie ihren eigenen Browser öffnen und sich umsehen. Fenster und Anmeldungen sind getrennt.',
+      after: 'Nach Ruhe', afterDescription: 'Nach so langer Ruhe bekommt sie Zeit für sich.',
+      session: 'Höchstens', sessionDescription: 'Eine Auszeit dauert höchstens so lange; danach schließt sich der Browser.',
+      minutes: 'Min.',
+      sound: 'Browser-Ton', soundDescription: 'Standardmäßig stumm. Eingeschaltet hört man die Videos, die sie ansieht.',
+      actions: 'Likes, Favoriten und Danmaku erlauben', actionsDescription: 'Aus: Sie darf nur zusehen. Anmeldung und Codes bitte selbst in ihrem Browserfenster eingeben.',
+    },
   },
 
   failure: {
@@ -33,7 +42,7 @@ const de: Translation<CoreText> = {
 
   status: {
     read: 'Liest', browse: 'Stöbert', memory: 'Gedächtnis', find: 'Sucht', search: 'Durchsucht', write: 'Schreibt', edit: 'Bearbeitet', append: 'Ergänzt',
-    delete: 'Löscht', save: 'Speichert', screen: 'Schaut auf den Bildschirm', windows: 'Schaut auf die offenen Fenster', rightClick: 'Rechtsklickt', doubleClick: 'Doppelklickt', click: 'Klickt',
+    delete: 'Löscht', save: 'Speichert', screen: 'Schaut auf den Bildschirm', web: 'Auf einer Webseite', windows: 'Schaut auf die offenen Fenster', rightClick: 'Rechtsklickt', doubleClick: 'Doppelklickt', click: 'Klickt',
     move: 'Bewegt die Maus', drag: 'Zieht', scroll: 'Scrollt', focus: 'Wechselt das Fenster', type: 'Tippt', key: 'Drückt', wait: 'Wartet',
     alarmSet: 'Stellt einen Wecker', alarmList: 'Prüft die Wecker', alarmCancel: 'Löscht einen Wecker',
     quoted: (text: string) => `„${text}“`,

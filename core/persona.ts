@@ -1,5 +1,5 @@
 /**
- * Coo's Persona: Cortico's Cormini with three changes for the desktop pet.
+ * Coo's Persona: Cortico's Cormini with four changes for the desktop pet.
  *
  * - `PARTNER.md` in the workspace goes into the system prefix whole (Cormini's partner segment), after a
  *   standing line asking Coo to keep it short and put details under `partner/`, and cannot be deleted with
@@ -10,6 +10,8 @@
  * - The lines the Persona itself puts into the context (a session opening, new events, a World
  *   switched, context pressure, the handoff, the round cap, stalls) and its workspace listing are in
  *   English whatever the app language; Coo is told which language to talk in by the desktop-pet World.
+ * - While `companion.selfTime` is on, Cormini's quiet heartbeat offers time of her own instead of only
+ *   speaking first: the browser World's tools are available and the line names the session limit.
  *
  * Cortico is staged at build time and the bots are not part of its module paths, so the base class is
  * passed in: the app loads it from the staged Cortico (`companion.ts`), the tests from vendor/cortico.
@@ -24,6 +26,9 @@ import type { GitAuthor, WorkspaceGit } from '../vendor/cortico/bots/cormini/per
 import { memoryTools } from './memory/tools.ts';
 import type { HindsightMemory } from './memory/hindsight.ts';
 import { memoryStorageText } from './memory/strings.ts';
+import type { SelfTimeConfig } from './browser/config.ts';
+import { selfTimeLine } from './browser/model-text.ts';
+import type { ModelLanguage } from './language.ts';
 
 /** The workspace file that goes into the prefix as Coo's notes on the person. */
 export const PARTNER_FILE = 'PARTNER.md';
@@ -113,6 +118,9 @@ ${readFileSync(join(dir, name), 'utf8')}`, 'utf8');
 /** Coo's Persona class on `Base`, Cormini as the staged Cortico has it. */
 export interface MemoryDeps {
   memory?: HindsightMemory;
+  /** The live `companion.selfTime`; null when the app does not have it. */
+  selfTime?: () => SelfTimeConfig | null;
+  modelLanguage?: () => ModelLanguage;
 }
 
 export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
@@ -120,6 +128,8 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     /** Commits wait for the one before: Git's index takes one writer, and a turn often writes several files. */
     private commits: Promise<unknown> = Promise.resolve();
     private readonly longTerm = deps.memory ?? null;
+    private readonly selfTimeNow = deps.selfTime ?? (() => null);
+    private readonly modelLang = deps.modelLanguage ?? (() => 'zh' as ModelLanguage);
 
     private get git(): WorkspaceGit {
       return this.memory.git;
@@ -128,6 +138,19 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     /** Whether Git runs here, so the workspace has a history. */
     gitAvailable(): boolean {
       return this.git.available();
+    }
+
+    /** With time of her own on, the quiet line offers the browser as well as speaking first. */
+    protected override tickText(quietSeconds: number): string {
+      const self = this.selfTimeNow();
+      return self?.enabled ? selfTimeLine(this.modelLang(), quietSeconds, self.sessionMinutes) : super.tickText(quietSeconds);
+    }
+
+    /** The setting turned time of her own on, or its quiet interval changed: arm the next wake-up now. */
+    restartRhythm(): void {
+      this['heartbeat'].noteActivity();
+      this.stopRhythm();
+      this.startRhythm();
     }
 
     protected override partnerDocFile(): string {
