@@ -72,7 +72,7 @@ const ko: Translation<CoreText> = {
       forge: { label: '믿음직하고 야무진', line: '뭘 하면 돼? 나한테 맡겨, 금방 끝내 줄게, Coo.' },
       heart: { label: '활발하고 늘 곁에', line: '나 왔어! 오늘도 계속 네 옆에 있을게, Coo!' },
       winter: { label: '조용하고 말 없는', line: '……응, Coo.' },
-      whale: { label: 'DeepSeek 쨩', line: '어서 와! 이건 뭐야? 나도 한번 보자, Coo...' },
+      whale: { label: 'DeepSeek 쨩', line: '흥, 왔네. ...따, 딱히 기다린 건 아니야, Coo...' },
     },
     dressHint: { text: '배색은 꾸미기 페이지에서 바꿀 수 있어', dress: '꾸미기' },
     askRoam: '평소에 조용히 있을까, 활발하게 움직일까? 눌러 보면 내가 어떻게 하는지 보여 줄게.',

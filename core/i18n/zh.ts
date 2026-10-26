@@ -85,7 +85,7 @@ export default {
       forge: { label: '靠谱的、干练的', line: '要做什么？交给我，一会儿就好，库。' },
       heart: { label: '活泼的、陪伴的', line: '我来啦！今天也一直陪着你，库！' },
       winter: { label: '安静的、沉默的', line: '……嗯，库。' },
-      whale: { label: 'DeepSeek 大肥鱼', line: '欢迎回来！这是什么？让我看看，库...' },
+      whale: { label: 'DeepSeek 大肥鱼', line: '哼，回来啦。……才、才不是特意等你，库...' },
     },
     /** 确认按钮旁的一行;`dress` 是设置窗口里装扮页的名字,画在图标后 */
     dressHint: { text: '配色可以在 装扮 中替换', dress: '装扮' },

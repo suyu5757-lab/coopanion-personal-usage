@@ -72,7 +72,7 @@ const it: Translation<CoreText> = {
       forge: { label: 'Affidabile e capace', line: "Cosa c'è da fare? Lascia fare a me, ci metto poco. Coo." },
       heart: { label: 'Vivace, sempre con te', line: 'Eccomi! Ti faccio compagnia tutto il giorno. Coo!' },
       winter: { label: 'Quieto e taciturno', line: '...Mm. Coo.' },
-      whale: { label: 'DeepSeek Chan', line: "Eccoti di nuovo! Cos'è questo? Fammi vedere. Coo..." },
+      whale: { label: 'DeepSeek Chan', line: "Hmph, sei tornato. ...N-non è che ti stessi aspettando, Coo..." },
     },
     dressHint: { text: 'I colori si cambiano in Guardaroba', dress: 'Guardaroba' },
     askRoam: 'Di solito devo starmene in pace o muovermi tanto? Clicca una scheda per vedere cosa farei.',

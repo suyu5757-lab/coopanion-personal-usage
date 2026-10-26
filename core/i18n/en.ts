@@ -86,7 +86,7 @@ const en: CoreText = {
       forge: { label: 'Reliable and capable', line: "What needs doing? Leave it to me, it won't take long. Coo." },
       heart: { label: 'Lively and always there', line: "I'm here! I'll keep you company all day. Coo!" },
       winter: { label: 'Quiet and wordless', line: '...Mm. Coo.' },
-      whale: { label: 'DeepSeek Chan', line: "Welcome back! What's that? Let me see. Coo..." },
+      whale: { label: 'DeepSeek Chan', line: "Hmph, you're back. ...I-I wasn't waiting for you or anything. Coo..." },
     },
     /** The line beside the confirm button; `dress` is the dressing page's name in the settings window, drawn after its icon. */
     dressHint: { text: 'Change the colours in Dress up', dress: 'Dress up' },

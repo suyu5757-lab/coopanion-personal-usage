@@ -72,7 +72,7 @@ const de: Translation<CoreText> = {
       forge: { label: 'Zuverlässig und tüchtig', line: "Was gibt's zu tun? Überlass das mir, dauert nicht lange. Coo." },
       heart: { label: 'Lebhaft und immer da', line: 'Da bin ich! Ich leiste dir den ganzen Tag Gesellschaft. Coo!' },
       winter: { label: 'Still und wortkarg', line: '...Mm. Coo.' },
-      whale: { label: 'DeepSeek Chan', line: 'Willkommen zurück! Was ist das? Lass mal sehen. Coo...' },
+      whale: { label: 'DeepSeek Chan', line: 'Hmpf, da bist du ja. ...I-ich habe nicht auf dich gewartet oder so. Coo...' },
     },
     dressHint: { text: 'Die Farben kannst du unter Outfit ändern', dress: 'Outfit' },
     askRoam: 'Soll ich meistens ruhig oder lebhaft sein? Klick eine Karte an, um zu sehen, was ich dann mache.',

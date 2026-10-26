@@ -72,7 +72,7 @@ const zhHant: Translation<CoreText> = {
       forge: { label: '可靠的、幹練的', line: '要做什麼？交給我，一下就好，庫。' },
       heart: { label: '活潑的、陪伴的', line: '我來啦！今天也一直陪著你，庫！' },
       winter: { label: '安靜的、沉默的', line: '……嗯，庫。' },
-      whale: { label: 'DeepSeek 大肥魚', line: '歡迎回來！這是什麼？讓我看看，庫...' },
+      whale: { label: 'DeepSeek 大肥魚', line: '哼，回來啦。……才、才不是特意等你，庫...' },
     },
     dressHint: { text: '配色可以在 裝扮 中替換', dress: '裝扮' },
     askRoam: '平常我該安靜一點，還是活潑一點？點一下，看看我會怎樣。',

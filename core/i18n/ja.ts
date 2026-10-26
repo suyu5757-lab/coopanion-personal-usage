@@ -72,7 +72,7 @@ const ja: Translation<CoreText> = {
       forge: { label: '頼もしくて手際がいい', line: '何する？任せて、すぐ終わらせるよ、クー。' },
       heart: { label: '元気でいつもそばに', line: '来たよ！今日もずっとそばにいるね、クー！' },
       winter: { label: '静かで無口', line: '……うん、クー。' },
-      whale: { label: 'DeepSeekちゃん', line: 'おかえり！これなに？ちょっと見せて、クー…' },
+      whale: { label: 'DeepSeekちゃん', line: 'ふん、帰ってきたんだ。……べ、別に待ってたわけじゃないから、クー…' },
     },
     dressHint: { text: '配色は 着せ替え で変えられるよ', dress: '着せ替え' },
     askRoam: 'ふだんは静かにしてるのと、元気に動き回るの、どっちがいい？クリックしてみて、どうするか見せるね。',

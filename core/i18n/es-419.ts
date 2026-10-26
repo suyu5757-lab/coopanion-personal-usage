@@ -72,7 +72,7 @@ const es419: Translation<CoreText> = {
       forge: { label: 'Confiable y capaz', line: '¿Qué hay que hacer? Déjamelo a mí, no tardo. Coo.' },
       heart: { label: 'Alegre y compañero', line: '¡Ya llegué! Hoy te acompaño todo el día. Coo!' },
       winter: { label: 'Tranquilo y callado', line: '...Mm. Coo.' },
-      whale: { label: 'DeepSeek Chan', line: '¡Qué bueno que volviste! ¿Qué es eso? Déjame ver. Coo...' },
+      whale: { label: 'DeepSeek Chan', line: 'Hmph, ya volviste. ...N-no es que te estuviera esperando, Coo...' },
     },
     dressHint: { text: 'Los colores se cambian en Vestuario', dress: 'Vestuario' },
     askRoam: '¿La mayor parte del tiempo me quedo en calma o me muevo mucho? Haz clic en una opción para ver qué haría.',
