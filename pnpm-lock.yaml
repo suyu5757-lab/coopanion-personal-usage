@@ -14,6 +14,9 @@ importers:
       cortico-provider-coo:
         specifier: workspace:*
         version: link:packages/cortico-provider-coo
+      cortico-world-codex:
+        specifier: workspace:*
+        version: link:packages/cortico-world-codex
       cortico-world-desktop-pet:
         specifier: workspace:*
         version: link:packages/cortico-world-desktop-pet
@@ -114,6 +117,8 @@ importers:
       '@anthropic-ai/sdk':
         specifier: 0.128.0
         version: 0.128.0
+
+  packages/cortico-world-codex: {}
 
   packages/cortico-world-desktop-pet:
     dependencies:

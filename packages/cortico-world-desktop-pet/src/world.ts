@@ -44,7 +44,7 @@ import { SENSEVOICE, SherpaAsr, WHISPER, type SherpaModelKind, type SherpaModule
 import { SystemRecognizer, systemRecognizerSupported, type SystemRecognizerState, type SystemSentence } from './asr/system-recognizer.ts';
 import { Packer, Segmenter, rmsDb, type SegmentConfig, type SegmentSink, type Utterance } from './asr/segmenter.ts';
 import { comboLabel, hotkeyBadge, hotkeyLabel, parseHotkey, splitTaps, watchHotkey, type KeyWatcher } from './asr/hotkey.ts';
-import { joinSpeech, looksHallucinated } from './asr/result.ts';
+import { joinSpeech, looksHallucinated, type TranscribeResult } from './asr/result.ts';
 import { toSimplified } from './asr/simplify.ts';
 import { estimateSeconds, parseActions, parseScript, vocabChange, vocabTable, type VocabWord } from './script.ts';
 import { ActivityGroup, ChatSockets, SELF_TYPE, chatHistory, chatItem, chatRefs, type ChatFigure } from './chat.ts';
@@ -1344,6 +1344,16 @@ export class DesktopPetWorld implements World {
   /** The recognition language: the set one, else the app language's ISO 639-1 code; FunASR and Whisper read a code they do not take as `auto`. */
   private asrLanguage(): string {
     return this.cfg.asr.language || this.appLanguage.split('-')[0]!;
+  }
+
+  /** One finished 16 kHz mono utterance from outside the microphone path, such as the browser's tab audio. */
+  async transcribePcm(pcm: Int16Array): Promise<TranscribeResult> {
+    if (!this.cfg.asr.enabled) return { text: '', ms: 0, error: this.ui.voice.notRunning };
+    const recognizer = this.recognizer();
+    if (!recognizer) return { text: '', ms: 0, error: this.ui.voice.notRunning };
+    await recognizer.start();
+    const result = await recognizer.transcribe(pcm);
+    return result.text && looksHallucinated(result.text) ? { ...result, text: '' } : result;
   }
 
   private backendState(): SherpaState | SystemRecognizerState | null {

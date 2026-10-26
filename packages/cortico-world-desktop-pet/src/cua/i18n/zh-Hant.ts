@@ -28,6 +28,7 @@ const zhHant: Translation<CuaText> = {
   },
 
   config: {
+    backgroundOnly: {"title": "僅在背景操作視窗", "description": "開啟後必須先選擇 Cua Driver 背景視窗，禁止全螢幕輸入和前景聚焦；驅動失敗時停止。"},
     group: '電腦操作',
     enabled: { title: '啟用電腦操作' },
     control: { title: '允許操作滑鼠和鍵盤', description: '關閉後只能截圖和列出視窗。' },

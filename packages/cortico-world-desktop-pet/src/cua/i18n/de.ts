@@ -28,6 +28,7 @@ const de: Translation<CuaText> = {
   },
 
   config: {
+    backgroundOnly: {"title": "Nur Hintergrundfenster bedienen", "description": "Eingaben erfordern ein Cua-Driver-Fenster. Bildschirmeingaben und Vordergrundfokus werden abgelehnt; bei Treiberfehlern stoppen."},
     group: 'Computersteuerung',
     enabled: { title: 'Computersteuerung einschalten' },
     control: { title: 'Maus und Tastatur erlauben', description: 'Wenn aus, nur Screenshots und die Fensterliste.' },

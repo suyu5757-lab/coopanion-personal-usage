@@ -181,8 +181,9 @@ function readVocab(raw: unknown, skipped: string[], t: PackText): VocabWord[] | 
     }
     const about = namesOf(w.about);
     if (!about) return t.noWordAbout(id);
+    const when = w.when === undefined ? undefined : namesOf(w.when);
     if (typeof w.seconds !== 'number' || !(w.seconds > 0) || !Number.isFinite(w.seconds)) return t.badSeconds(id);
-    out.push({ id, kind: w.kind as VocabWord['kind'], names, about, seconds: w.seconds, ...(w.lasting === true ? { lasting: true } : {}) });
+    out.push({ id, kind: w.kind as VocabWord['kind'], names, about, ...(when ? { when } : {}), seconds: w.seconds, ...(w.lasting === true ? { lasting: true } : {}) });
   }
   return out;
 }

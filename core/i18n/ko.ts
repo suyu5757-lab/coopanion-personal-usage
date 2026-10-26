@@ -20,6 +20,12 @@ const ko: Translation<CoreText> = {
       sound: '브라우저 소리', soundDescription: '기본은 음소거입니다. 켜면 보는 영상의 소리가 납니다.',
       actions: '좋아요·저장·탄막·댓글 허용', actionsDescription: '끄면 보기만 할 수 있습니다. 로그인과 인증 코드는 브라우저 창에서 직접 해 주세요.',
     },
+    growth: {
+      title: '스스로 성장하기',
+      description: '가끔 조용한 때에 최근의 경험을 돌아보고, 성격이나 일하는 방식, 말투를 바꿀 수 있습니다. 바뀐 점은 자신의 성장 기록에 남깁니다. 다음 세션부터 적용됩니다.',
+      every: '간격', everyDescription: '이 일수마다 한 번 돌아봅니다.',
+      days: '일',
+    },
   },
 
   failure: {

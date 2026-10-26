@@ -1,12 +1,12 @@
 {
   "name": "coopanion",
   "productName": "Coopanion",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "description": "A desktop companion built on Cortico: a pet on your screen that talks, listens and can operate the computer",
   "license": "AGPL-3.0-or-later",
   "author": "Pal-AI-Lab",
-  "homepage": "https://github.com/Pal-AI-Lab/Coopanion",
+  "homepage": "https://github.com/suyu5757-lab/coopanion-personal-usage",
   "type": "module",
   "main": "app/main.cjs",
   "packageManager": "pnpm@11.28.6",
@@ -24,7 +24,8 @@
     "typecheck": "tsc --noEmit",
     "typecheck:web": "tsc -p tsconfig.web.json",
     "test:worlds": "vitest run --config vitest.worlds.config.ts",
-    "typecheck:worlds": "tsc -p tsconfig.worlds.json"
+    "typecheck:worlds": "tsc -p tsconfig.worlds.json",
+    "test:codex": "node --test packages/cortico-world-codex/test/bridge.test.mjs"
   },
   "dependencies": {
     "@vectorize-io/hindsight-client": "^1.1.0",
@@ -36,7 +37,8 @@
     "pnpm": "11.28.6",
     "tsx": "^4.23.15",
     "undici": "7.29.1",
-    "ws": "^8.21.3"
+    "ws": "^8.21.3",
+    "cortico-world-codex": "workspace:*"
   },
   "devDependencies": {
     "@codemirror/commands": "^6.11.1",

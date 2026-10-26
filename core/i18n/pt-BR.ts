@@ -20,6 +20,12 @@ const ptBR: Translation<CoreText> = {
       sound: 'Som do navegador', soundDescription: 'Mudo por padrão. Ligado, os vídeos que ela assiste têm som.',
       actions: 'Permitir curtidas, salvos, danmaku e comentários', actionsDescription: 'Desligado, ela só pode olhar. Entre e resolva os códigos na janela dela você mesmo.',
     },
+    growth: {
+      title: 'Crescer sozinha',
+      description: 'De tempos em tempos, num momento tranquilo, ela revê as experiências recentes e pode mudar como é, como trabalha ou como fala; ela escreve isso no próprio diário de crescimento. As mudanças valem a partir da próxima sessão.',
+      every: 'A cada', everyDescription: 'Ela revê a si mesma depois destes dias.',
+      days: 'dias',
+    },
   },
 
   failure: {

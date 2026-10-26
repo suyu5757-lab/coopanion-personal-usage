@@ -28,6 +28,7 @@ const ptBR: Translation<CuaText> = {
   },
 
   config: {
+    backgroundOnly: {"title": "Operar apenas janelas em segundo plano", "description": "Exige uma janela Cua Driver antes da entrada. Recusa entrada na tela inteira e foco em primeiro plano; para se o driver falhar."},
     group: 'Uso do computador',
     enabled: { title: 'Ativar o uso do computador' },
     control: { title: 'Permitir o mouse e o teclado', description: 'Desligado, só capturas de tela e a lista de janelas.' },

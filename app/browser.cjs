@@ -2,8 +2,8 @@
  * Coo's browser window: one persistent, muted-by-default Chromium window that the browser World drives
  * through `{ type: 'companion:browser' }` messages relayed by core-host.cjs. The page script is
  * `build/browser-agent.js` (app/browser-agent/entry.ts, built by scripts/stage.ts); it is injected into the
- * page after every full load and exposes only reading, clicking, pointer positions, input preparation, scrolling and
- * video play/pause. The host types through Chromium so page editors receive real text input.
+ * page after every full load and exposes only reading, clicking, pointer positions, input preparation, scrolling,
+ * video play/pause and opening a share panel. The host types through Chromium so page editors receive real text input.
  *
  * The window has its own Chromium profile (`persist:coo-browser`), so signing in on Bilibili or Douyin does
  * not touch the person's browser. It is shown without focus, denies camera, microphone, location and
@@ -60,6 +60,8 @@ const isPublicHttp = (value) => {
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+/** A tab recording decodes its audio in the page after the stop; give that call more room than a page read. */
+const AUDIO_TIMEOUT_MS = 30_000;
 
 /** Runs `work` with a deadline; the page could be busy and never answer. */
 function within(work, ms, what) {
@@ -79,7 +81,13 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
   let muted = true;
   /** The last page navigation that started, so a tool result knows the page that replaced the old one. */
   let navigating = false;
+  /** A browser_watch is recording the tab; the page's display-media request is granted only then. */
+  let audioCaptureRequested = false;
   let agent = null;
+
+  const restoreMute = () => {
+    if (win && !win.isDestroyed()) win.webContents.setAudioMuted(muted);
+  };
 
   const readAgent = () => {
     if (agent === null) {
@@ -90,12 +98,12 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
     return agent;
   };
 
-  const agentCall = async (method, args = []) => {
+  const agentCall = async (method, args = [], timeout = SCRIPT_TIMEOUT_MS) => {
     if (!win || win.isDestroyed()) throw new Error('browser window is closed');
     if (!injected) throw new Error('browser page is not ready; open a page or read it again');
     const expression = `window.__cooBrowserAgent.${method}(${args.map((a) => JSON.stringify(a)).join(',')})`;
     // the arguments are strings, numbers and plain option objects
-    return within(() => win.webContents.executeJavaScript(expression, true), SCRIPT_TIMEOUT_MS, method);
+    return within(() => win.webContents.executeJavaScript(expression, true), timeout, method);
   };
 
   const ensureAgent = async () => {
@@ -181,8 +189,23 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
     const height = Math.min(WINDOW_HEIGHT, Math.max(520, area.height - 200));
     const ses = session.fromPartition(PARTITION);
     ses.setSpellCheckerEnabled(false);
-    ses.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
-    ses.setPermissionCheckHandler(() => false);
+    // only the page script's own recording may ask for display media; everything else stays denied
+    const capturePermission = (permission, details) => {
+      if (!audioCaptureRequested) return false;
+      if (permission === 'display-capture') return true;
+      if (permission !== 'media') return false;
+      // getDisplayMedia asks with no media types; a direct getUserMedia names audio or video
+      const types = details && details.mediaTypes;
+      return !Array.isArray(types) || types.length === 0;
+    };
+    ses.setPermissionRequestHandler((_contents, permission, callback, details) => callback(capturePermission(permission, details)));
+    ses.setPermissionCheckHandler((_contents, permission) => audioCaptureRequested && (permission === 'display-capture' || permission === 'media'));
+    ses.setDisplayMediaRequestHandler((request, callback) => {
+      const frame = request.frame;
+      if (!audioCaptureRequested || !frame) { callback({}); return; }
+      // the whole tab's audio, not this machine's or another window's; echo off keeps it silent
+      callback({ audio: frame });
+    });
     ses.setDevicePermissionHandler(() => false);
     ses.on('will-download', (event) => event.preventDefault());
     // no request of this window reaches this machine or the local network, not even a subresource
@@ -231,6 +254,8 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
       if (!isMainFrame || isInPlace) return;
       injected = false;
       navigating = true;
+      audioCaptureRequested = false;
+      restoreMute();
     });
     wc.on('did-finish-load', () => { injected = false; navigating = false; });
     wc.on('did-fail-load', (_event, code, description, url, isMainFrame) => {
@@ -249,6 +274,7 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
       win = null;
       injected = false;
       navigating = false;
+      audioCaptureRequested = false;
       send?.({ type: 'companion:browser-event', event: 'closed' });
     });
     return win;
@@ -277,9 +303,56 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
       if (injected) await agentCall('setMuted', [muted]);
       return { muted };
     }
+    if (op === 'audio-start') {
+      await ensureAgent();
+      audioCaptureRequested = true;
+      // the tab's own output must be live for the capture; the handler keeps it from reaching the speakers
+      win.webContents.setAudioMuted(false);
+      try {
+        const answer = await agentCall('startAudio', [], AUDIO_TIMEOUT_MS);
+        if (!answer?.ok) { audioCaptureRequested = false; restoreMute(); }
+        return answer;
+      } catch (error) {
+        audioCaptureRequested = false;
+        restoreMute();
+        throw error;
+      }
+    }
+    if (op === 'audio-stop') {
+      try {
+        await ensureAgent();
+        return await agentCall('stopAudio', [], AUDIO_TIMEOUT_MS);
+      } finally {
+        audioCaptureRequested = false;
+        restoreMute();
+      }
+    }
     if (op === 'read') { await ensureAgent(); return state(); }
     if (op === 'text') { await ensureAgent(); return agentCall('text'); }
     if (op === 'element') { await ensureAgent(); return agentCall('element', [message.index]); }
+    if (op === 'share') {
+      await ensureAgent();
+      const point = await agentCall('shareCenter');
+      if (!point || typeof point.x !== 'number' || typeof point.y !== 'number') throw new Error('no share control on this page');
+      const x = Math.round(point.x), y = Math.round(point.y);
+      // The panel renders a moment after the pointer arrives; polling avoids clicking a panel that is still opening.
+      const opened = async () => {
+        for (let i = 0; i < 20; i++) {
+          if (await agentCall('shareOpen')) return true;
+          await sleep(100);
+        }
+        return false;
+      };
+      // Douyin and Bilibili open their share panel on hover; a click would close it again on Douyin.
+      win.webContents.sendInputEvent({ type: 'mouseMove', x, y });
+      if (!await opened()) {
+        // Other sites may open the same panel on a click; Douyin never reaches this branch because its hover opened it.
+        win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+        win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+        if (!await opened()) throw new Error('the share panel did not open');
+      }
+      return { answer: { success: true, message: 'share panel opened' }, state: await settle() };
+    }
     if (op === 'click') {
       await ensureAgent();
       if (typeof message.text === 'string' && message.text.trim()) {

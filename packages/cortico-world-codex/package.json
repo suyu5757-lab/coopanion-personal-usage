@@ -1,0 +1,21 @@
+{
+  "name": "cortico-world-codex",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cortico World: delegate authorized tasks to the local Codex CLI and review results",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "cortico": {
+    "kind": "world",
+    "api": 6
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/bridge.test.mjs"
+  },
+  "license": "AGPL-3.0-or-later",
+  "types": "./index.d.mts"
+}

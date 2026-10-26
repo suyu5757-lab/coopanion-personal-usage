@@ -20,6 +20,12 @@ const zhHant: Translation<CoreText> = {
       sound: '瀏覽器聲音', soundDescription: '預設靜音。打開後，她看的影片會外放。',
       actions: '允許按讚、收藏、發送彈幕和評論', actionsDescription: '關閉後她只能看網頁和影片，不能互動。登入和驗證碼請在她的瀏覽器視窗裡自己完成。',
     },
+    growth: {
+      title: '自我成長',
+      description: '每隔一段時間，在安靜的時候回顧最近的經歷，可能改變她的性格、做事方式或說話方式，並記在自己的成長日誌裡。改動下一次 session 生效。',
+      every: '每隔', everyDescription: '隔這麼多天回顧一次。',
+      days: '天',
+    },
   },
 
   failure: {

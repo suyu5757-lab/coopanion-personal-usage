@@ -413,6 +413,29 @@ describe('voice input', () => {
     expect(asr.configs).toHaveLength(1);
   });
 
+  it('transcribes a finished utterance from outside the microphone path', async () => {
+    const { world, asr } = await setup('browser line');
+    const result = await world.transcribePcm(new Int16Array(1600).fill(1000));
+    expect(result.text).toBe('browser line');
+    expect(asr.decodes).toContain(1600);
+  });
+
+  it('drops a recognizer line that is not speech from browser audio', async () => {
+    const { world } = await setup('谢谢观看');
+    const result = await world.transcribePcm(new Int16Array(1600).fill(1000));
+    expect(result.text).toBe('');
+    expect(result.error).toBeNull();
+  });
+
+  it('does not transcribe browser audio while voice input is off', async () => {
+    const { world, asr, cfg } = await setup('browser line');
+    cfg.asr.enabled = false;
+    const result = await world.transcribePcm(new Int16Array(1600).fill(1000));
+    expect(result.text).toBe('');
+    expect(result.error).toBe(petText('zh').voice.notRunning);
+    expect(asr.decodes).toHaveLength(0);
+  });
+
   it('ignores quiet input', async () => {
     const { asr, page, world } = await setup('x');
     for (const fr of tone(1500, .002)) page.audio(fr);

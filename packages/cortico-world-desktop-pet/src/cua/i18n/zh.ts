@@ -35,6 +35,7 @@ export default {
 
   /** 控制台的配置项 */
   config: {
+    backgroundOnly: {"title": "仅后台操作窗口", "description": "开启后必须先选择 Cua Driver 后台窗口，禁止整屏输入和前台聚焦；驱动失败时停止。"},
     group: '电脑操作',
     enabled: { title: '启用电脑操作' },
     control: { title: '允许操作鼠标和键盘', description: '关闭后只能截图和列出窗口。' },

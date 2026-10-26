@@ -28,6 +28,7 @@ const ja: Translation<CuaText> = {
   },
 
   config: {
+    backgroundOnly: {"title": "バックグラウンドのウィンドウのみ操作", "description": "入力前に Cua Driver のウィンドウを選択します。画面全体への入力と前面への移動を拒否し、ドライバーの失敗時は停止します。"},
     group: 'コンピューター操作',
     enabled: { title: 'コンピューター操作を使う' },
     control: { title: 'マウスとキーボードを許可', description: 'オフのときは、スクリーンショットとウィンドウ一覧だけです。' },

@@ -20,6 +20,12 @@ const es419: Translation<CoreText> = {
       sound: 'Sonido del navegador', soundDescription: 'Silenciado por defecto. Al activarlo, se oyen los videos que mira.',
       actions: 'Permitir me gusta, guardados, danmaku y comentarios', actionsDescription: 'Desactivado, solo puede mirar. Inicia sesión y resuelve los códigos en su ventana tú mismo.',
     },
+    growth: {
+      title: 'Crecer por su cuenta',
+      description: 'Cada cierto tiempo, en un momento tranquilo, repasa las experiencias recientes y puede cambiar cómo es, cómo trabaja o cómo habla; lo escribe en su propio diario de crecimiento. Los cambios se aplican en la siguiente sesión.',
+      every: 'Cada', everyDescription: 'Vuelve sobre sí misma después de estos días.',
+      days: 'días',
+    },
   },
 
   failure: {

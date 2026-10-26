@@ -28,6 +28,7 @@ const fr: Translation<CuaText> = {
   },
 
   config: {
+    backgroundOnly: {"title": "Utiliser uniquement les fenêtres en arrière-plan", "description": "Sélectionnez une fenêtre Cua Driver avant toute saisie. Refuse les entrées plein écran et le focus au premier plan ; arrête en cas de panne."},
     group: "Contrôle de l'ordinateur",
     enabled: { title: "Activer le contrôle de l'ordinateur" },
     control: { title: 'Autoriser la souris et le clavier', description: "Désactivé : seulement les captures d'écran et la liste des fenêtres." },

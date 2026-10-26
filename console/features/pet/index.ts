@@ -89,6 +89,8 @@ const KEYS = {
   selfTimeUnlimited: 'companion.selfTime.sessionUnlimited',
   selfTimeSound: 'companion.selfTime.sound',
   selfTimeActions: 'companion.selfTime.actions',
+  growth: 'companion.growth.enabled',
+  growthDays: 'companion.growth.everyDays',
 } as const;
 
 /** `touch.wakeOn` in the row's order, and the touches 「自定义…」 picks from (the World's TOUCH_KINDS). */
@@ -164,12 +166,12 @@ async function mount(ctx: PageContext): Promise<void> {
   ], { size: 'sm', onSelect: (v) => void save(KEYS.roam, v, GROUP, behaviorMsg) });
   // 自己的时间: a temporary browser window after a quiet stretch; it has its own logins and is muted by default
   const selfTime = ui.checkbox(S.selfTime, { onChange: (on) => { renderSelfTime(); void save(KEYS.selfTime, on, STATS_GROUP, behaviorMsg); } });
-  const minutesBox = (min: number, max: number, key: string, initial: number) => {
+  const minutesBox = (min: number, max: number, key: string, initial: number, unit = S.selfTimeMinutes) => {
     const input = ui.input({ type: 'number' });
     input.min = String(min); input.max = String(max); input.step = '1';
     input.value = input.dataset.saved = String(initial);
     const box = ui.h('div', 'companion-rangebox');
-    box.append(input, ui.h('span', 'companion-rangeval', S.selfTimeMinutes));
+    box.append(input, ui.h('span', 'companion-rangeval', unit));
     input.addEventListener('change', () => {
       const n = Math.round(Number(input.value));
       if (input.value === '' || !Number.isFinite(n) || n < min || n > max) { input.value = input.dataset.saved ?? String(min); return; }
@@ -189,6 +191,9 @@ async function mount(ctx: PageContext): Promise<void> {
   const selfTimeSound = ui.checkbox(S.selfTimeSound, { onChange: (on) => void save(KEYS.selfTimeSound, on, STATS_GROUP, behaviorMsg) });
   const selfTimeActions = ui.checkbox(S.selfTimeActions, { onChange: (on) => void save(KEYS.selfTimeActions, on, STATS_GROUP, behaviorMsg) });
   selfTimeActions.setChecked(true);
+  const growth = ui.checkbox(S.growth, { onChange: (on) => { renderGrowth(); void save(KEYS.growth, on, STATS_GROUP, behaviorMsg); } });
+  growth.setChecked(true);
+  const growthDays = minutesBox(1, 60, KEYS.growthDays, 7, S.growthDays);
   const scaleText = ui.h('span', 'companion-rangeval');
   const scaleBox = ui.h('div', 'companion-rangebox');
   const scale = scaleSlider(root.ownerDocument, {
@@ -436,6 +441,11 @@ async function mount(ctx: PageContext): Promise<void> {
     selfTimeUnlimited.input.disabled = !on;
     selfTimeSession.input.disabled = !on || selfTimeUnlimited.checked;
   };
+  const growthDaysRow = row(S.growthEvery, growthDays.box);
+  const renderGrowth = () => {
+    growthDaysRow.hidden = !growth.checked;
+    growthDays.input.disabled = !growth.checked;
+  };
   behavior.body.append(
     row(S.roam, roam.el),
     row(S.selfTime, selfTime.el, `${S.selfTimeHint} ${S.selfTimeLogin}`),
@@ -443,6 +453,8 @@ async function mount(ctx: PageContext): Promise<void> {
     selfTimeSessionRow,
     selfTimeSoundRow,
     selfTimeActionsRow,
+    row(S.growth, growth.el, S.growthHint),
+    growthDaysRow,
     row(S.wake, wake.el, wakeHint),
     row(S.self, selfMode.el, selfHint),
     row(S.hover, hoverBox, S.hoverHint(MAX_HOVER)),
@@ -453,6 +465,7 @@ async function mount(ctx: PageContext): Promise<void> {
     behaviorMsg,
   );
   renderSelfTime();
+  renderGrowth();
   const display = ui.sheet({ title: S.groupDisplay });
   display.body.append(
     row(S.scale, scaleBox),
@@ -674,6 +687,12 @@ async function mount(ctx: PageContext): Promise<void> {
     }
     if (typeof statsValues[KEYS.selfTimeSound] === 'boolean') selfTimeSound.setChecked(statsValues[KEYS.selfTimeSound] as boolean);
     if (typeof statsValues[KEYS.selfTimeActions] === 'boolean') selfTimeActions.setChecked(statsValues[KEYS.selfTimeActions] as boolean);
+    if (typeof statsValues[KEYS.growth] === 'boolean') growth.setChecked(statsValues[KEYS.growth] as boolean);
+    renderGrowth();
+    const growthDaysValue = statsValues[KEYS.growthDays];
+    if (typeof growthDaysValue === 'number' && growthDaysValue >= 1 && active !== growthDays.input) {
+      growthDays.input.value = growthDays.input.dataset.saved = String(growthDaysValue);
+    }
     if (typeof statsValues[LANGUAGE_KEY] === 'string' && document.activeElement !== language) {
       // before the choices arrive the select keeps the value as a lone option
       if (![...language.options].some((o) => o.value === statsValues[LANGUAGE_KEY])) language.append(Object.assign(ui.h('option', null, statsValues[LANGUAGE_KEY] as string), { value: statsValues[LANGUAGE_KEY] as string }));

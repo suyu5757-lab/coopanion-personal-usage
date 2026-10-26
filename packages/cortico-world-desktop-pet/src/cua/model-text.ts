@@ -11,6 +11,8 @@ export type ModelLanguage = 'zh' | 'en';
 
 type Button = 'left' | 'right' | 'middle';
 
+const BACKGROUND_ONLY = 'worlds.desktop-pet.cua.backgroundOnly is on: whole-screen input and pet_cua_focus are disabled. List windows with pet_cua_windows, then select the intended window with pet_cua_window before clicking, moving, dragging, scrolling, typing or pressing keys. Use coordinates from that window screenshot. Cua Driver is required; if background input fails, report the reason and stop instead of using foreground input or another tool to move the person\'s pointer or take focus.';
+
 const zh = {
   notRun: (tool: string, why: string) => `[${tool} 没执行] ${why}`,
   failed: (tool: string, why: string) => `[${tool} 失败] ${why}`,
@@ -98,6 +100,7 @@ const zh = {
   focused: (title: string) => `已把「${title}」切到前台。`,
   focusedElsewhere: (n: number) => `它在显示器 ${n},要看它就截那块显示器。`,
   focusRefused: (title: string, foreground: string | null) => `尝试切换到「${title}」,系统没有让它到前台;现在前台是「${foreground ?? '无'}」。`,
+  backgroundOnly: BACKGROUND_ONLY,
   backgroundAvailable: '要和使用者同时工作,先 `pet_cua_windows` 看窗口,再用 `pet_cua_window` 选中一个:之后 `pet_cua_screenshot`、`pet_cua_click`、`pet_cua_type`、`pet_cua_key`、`pet_cua_scroll`、`pet_cua_drag` 都作用于这个窗口,坐标是那张窗口截图的像素。窗口不会被抬到前台,使用者的鼠标和焦点不受影响,后台操作也不用等使用者停手。要回到整块屏幕,用 `pet_cua_screenshot` 带 display,或 `pet_cua_focus` 把窗口带到前台。',
   backgroundMissing: '这台电脑没有找到 Cua Driver,所以 `pet_cua_window` 不可用;只能用整块屏幕的截图和输入,输入前会等使用者停手。',
   backgroundUnsupported: '后台窗口操作只在这台 Mac 上可用;只能用整块屏幕的截图和输入。',
@@ -215,6 +218,7 @@ const en: typeof zh = {
   focused: (title) => `Brought "${title}" to the foreground.`,
   focusedElsewhere: (n) => ` It is on display ${n}; take a screenshot of that display to see it.`,
   focusRefused: (title, foreground) => `Tried to switch to "${title}", but the system did not bring it to the foreground; the foreground window is "${foreground ?? 'none'}".`,
+  backgroundOnly: BACKGROUND_ONLY,
   backgroundAvailable: 'To work while the person keeps using the computer, list windows with `pet_cua_windows`, then select one with `pet_cua_window`: `pet_cua_screenshot`, `pet_cua_click`, `pet_cua_type`, `pet_cua_key`, `pet_cua_scroll` and `pet_cua_drag` then act on that window, with coordinates in its screenshot pixels. The window is not raised, the person\'s pointer and focus stay untouched, and background actions do not wait for them to stop. To return to the whole screen, pass a display to `pet_cua_screenshot` or bring the window forward with `pet_cua_focus`.',
   backgroundMissing: 'Cua Driver was not found on this computer, so `pet_cua_window` is unavailable; only whole-screen screenshots and input work, and input waits for the person to stop.',
   backgroundUnsupported: 'Background window control is available only on this Mac; only whole-screen screenshots and input work.',

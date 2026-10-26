@@ -27,8 +27,8 @@ const ACCOUNT = [
 ];
 
 const WRITE_ACTIONS = [
-  '点赞', '收藏', '关注', '订阅合集', '发布', '发送', '弹幕', '转发',
-  'like', 'favorite', 'follow', 'post', 'send', 'danmaku', 'repost',
+  '点赞', '收藏', '关注', '订阅合集', '发布', '发送', '弹幕', '转发', '分享',
+  'like', 'favorite', 'follow', 'post', 'send', 'danmaku', 'repost', 'share',
 ];
 
 const PERSONAL = [

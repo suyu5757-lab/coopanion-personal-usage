@@ -20,6 +20,12 @@ const it: Translation<CoreText> = {
       sound: 'Audio del browser', soundDescription: 'Muto per impostazione predefinita. Attivo, i video che guarda si sentono.',
       actions: 'Consenti like, salvataggi, danmaku e commenti', actionsDescription: 'Disattivato, può solo guardare. Accedi e inserisci i codici nella sua finestra tu stesso.',
     },
+    growth: {
+      title: 'Crescere da sola',
+      description: 'Ogni tanto, in un momento tranquillo, ripensa alle esperienze recenti e può cambiare come è, come lavora o come parla; lo scrive nel proprio diario di crescita. I cambiamenti valgono dalla sessione successiva.',
+      every: 'Ogni', everyDescription: 'Ripensa a sé dopo questi giorni.',
+      days: 'giorni',
+    },
   },
 
   failure: {

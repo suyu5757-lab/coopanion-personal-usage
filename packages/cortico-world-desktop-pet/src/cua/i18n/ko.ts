@@ -28,6 +28,7 @@ const ko: Translation<CuaText> = {
   },
 
   config: {
+    backgroundOnly: {"title": "백그라운드 창만 조작", "description": "입력 전에 Cua Driver 창을 선택해야 합니다. 전체 화면 입력과 전경 포커스를 거부하고 드라이버 오류 시 중지합니다."},
     group: '컴퓨터 사용',
     enabled: { title: '컴퓨터 사용 켜기' },
     control: { title: '마우스와 키보드 허용', description: '끄면 스크린샷과 창 목록만 쓸 수 있습니다.' },

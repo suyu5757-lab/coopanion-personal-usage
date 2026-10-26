@@ -25,6 +25,12 @@ const en: CoreText = {
       sound: 'Browser sound', soundDescription: 'Muted by default. With this on, the videos she watches play aloud.',
       actions: 'Allow likes, saves, danmaku and comments', actionsDescription: 'Off: she can only look, not interact. Sign in and solve CAPTCHAs in her browser window yourself.',
     },
+    growth: {
+      title: 'Growing on her own',
+      description: 'Every so often, during a quiet moment, she looks back over recent experience and may change how she is, how she works or how she talks, and writes it in her own growth log. Changes take effect in the next session.',
+      every: 'Every', everyDescription: 'Review herself after this many days.',
+      days: 'days',
+    },
   },
 
   /** What the pet's bubble says after several model requests in a row failed. */

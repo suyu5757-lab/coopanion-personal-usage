@@ -20,6 +20,12 @@ const ja: Translation<CoreText> = {
       sound: 'ブラウザの音', soundDescription: '既定はミュートです。オンにすると、見ている動画の音が出ます。',
       actions: 'いいね・保存・弾幕・コメントを許可', actionsDescription: 'オフにすると閲覧だけになります。ログインと認証コードはブラウザウィンドウで本人が行ってください。',
     },
+    growth: {
+      title: '自分で育つ',
+      description: 'しばらくたつと、静かな時間に最近の出来事を振り返り、性格や仕事のやり方、話し方を変えることがあります。変わったことは自分の成長ログに残します。次のセッションから反映されます。',
+      every: '間隔', everyDescription: 'この日数ごとに一度振り返ります。',
+      days: '日',
+    },
   },
 
   failure: {

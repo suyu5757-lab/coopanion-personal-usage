@@ -92,11 +92,11 @@ export const petToolDecls = (language: Language = 'zh'): Array<Omit<ToolDef, 'ha
   {
     name: 'pet_act',
     tags: ['act'],
-    description: 'Play a sequence of expressions or motions without speaking (the current figure\'s vocabulary is in the environment section). Returns at once; words marked as held until the next action stay on.',
+    description: 'Play one expression or motion without speaking (the current figure\'s vocabulary is in the environment section). A deliberate two-part beat, such as standing up and then stretching, may use two; do not chain unrelated motions. Returns at once; words marked as held until the next action stay on.',
     parameters: {
       type: 'object',
       properties: {
-        actions: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 6, description: 'Expression or motion words, played in order.' },
+        actions: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 6, description: 'Expression or motion words, played in order; keep them to what belongs together.' },
       },
       required: ['actions'],
     },

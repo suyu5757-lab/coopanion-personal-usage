@@ -75,7 +75,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
     },
     {
       name: 'memory_reflect',
-      description: 'Reason over your long-term memory to answer a question about the person, your shared history or your relationship. This is slow; use it when the person explicitly asks what you remember or why something matters, not for ordinary replies.',
+      description: 'Reason over your long-term memory to answer a question about the person, your shared history or your relationship. This is slow; use it when the person explicitly asks what you remember or why something matters, or when a self-review needs the actual events, not for ordinary replies.',
       tags: ['read'],
       barrierAfter: true,
       parameters: {

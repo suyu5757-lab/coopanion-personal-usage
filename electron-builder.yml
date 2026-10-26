@@ -65,6 +65,7 @@ mac:
     LSUIElement: true
     # English for every language: electron-builder has no option for per-language InfoPlist.strings
     NSMicrophoneUsageDescription: Coo listens to you through the microphone. Speech is recognized on this Mac; recordings are not uploaded.
+    NSAudioCaptureUsageDescription: Coo listens to video audio in her own browser. Speech is recognized on this Mac; recordings are not uploaded.
     NSAppleEventsUsageDescription: While using the computer for you, Coo uses this to bring the app you name to the front.
 dmg:
   writeUpdateInfo: false

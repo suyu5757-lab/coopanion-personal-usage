@@ -20,6 +20,12 @@ const de: Translation<CoreText> = {
       sound: 'Browser-Ton', soundDescription: 'Standardmäßig stumm. Eingeschaltet hört man die Videos, die sie ansieht.',
       actions: 'Likes, Favoriten, Danmaku und Kommentare erlauben', actionsDescription: 'Aus: Sie darf nur zusehen. Anmeldung und Codes bitte selbst in ihrem Browserfenster eingeben.',
     },
+    growth: {
+      title: 'Selbst wachsen',
+      description: 'Von Zeit zu Zeit blickt sie in einer ruhigen Minute auf die letzten Erfahrungen zurück und kann ändern, wie sie ist, arbeitet oder spricht; sie schreibt es in ihr eigenes Wachstumsprotokoll. Änderungen gelten ab der nächsten Sitzung.',
+      every: 'Alle', everyDescription: 'Nach so vielen Tagen blickt sie auf sich zurück.',
+      days: 'Tage',
+    },
   },
 
   failure: {
