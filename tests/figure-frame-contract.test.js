@@ -1,21 +1,32 @@
 // The figure frame (web/figure-frame.js) running the frozen api 2 pack (tests/fixtures/api2-pack in the
 // desktop-pet package) the way the pet page drives it: a change to the frame or the kit that breaks this
 // breaks the packs people have published (the package README, 形象包兼容承诺).
-import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { cpSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { afterEach, describe, expect, it } from 'vitest';
 import { JSDOM } from 'jsdom';
 
 const PKG = new URL('../packages/cortico-world-desktop-pet/', import.meta.url);
-const PACK = new URL('tests/fixtures/api2-pack/', PKG);
+const FIXTURE = new URL('tests/fixtures/api2-pack/', PKG);
+const tempDirs = [];
+afterEach(() => { for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('figure frame, api 2', () => {
   it('runs a pack made for it: ready with its words, frames, its own gesture, a scheme, a walk, a move it does not make', async () => {
+    // the checkout path may contain spaces; copy the fixture where a file URL has none
+    const temp = mkdtempSync(join(tmpdir(), 'figure-pack-'));
+    tempDirs.push(temp);
+    const packDir = join(temp, 'pack');
+    cpSync(FIXTURE, packDir, { recursive: true });
+    const PACK = new URL('.', pathToFileURL(join(packDir, 'figure.js')));
     const frame = new JSDOM('<!doctype html><div id="root"></div>', { url: 'http://127.0.0.1/figure-frame' }).window;
     const page = new JSDOM('<!doctype html>', { url: 'http://127.0.0.1/pet' }).window;
     const out = [];
     page.postMessage = (m) => out.push(m);
     Object.assign(globalThis, { document: frame.document, parent: page, addEventListener: frame.addEventListener.bind(frame) });
-    await import(new URL('web/figure-frame.js', PKG).href);
+    await import('../packages/cortico-world-desktop-pet/web/figure-frame.js');
     const send = (data) => frame.dispatchEvent(new frame.MessageEvent('message', { data, source: page }));
     const next = async (t) => { await expect.poll(() => out.some((m) => m.t === t || m.t === 'error')).toBe(true); return out.find((m) => m.t === t) ?? out.find((m) => m.t === 'error'); };
     const ticks = (n) => { const got = []; for (let i = 0; i < n; i++) { out.length = 0; send({ t: 'tick', dt: 1 / 60 }); const err = out.find((m) => m.t === 'error'); if (err) throw new Error(err.message); got.push(...out.filter((m) => m.t === 'frame')); } return got; };
