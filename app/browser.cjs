@@ -2,7 +2,8 @@
  * Coo's browser window: one persistent, muted-by-default Chromium window that the browser World drives
  * through `{ type: 'companion:browser' }` messages relayed by core-host.cjs. The page script is
  * `build/browser-agent.js` (app/browser-agent/entry.ts, built by scripts/stage.ts); it is injected into the
- * page after every full load and exposes only reading, clicking, typing, scrolling and video play/pause.
+ * page after every full load and exposes only reading, clicking, pointer positions, input preparation, scrolling and
+ * video play/pause. The host types through Chromium so page editors receive real text input.
  *
  * The window has its own Chromium profile (`persist:coo-browser`), so signing in on Bilibili or Douyin does
  * not touch the person's browser. It is shown without focus, denies camera, microphone, location and
@@ -281,14 +282,37 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
     if (op === 'element') { await ensureAgent(); return agentCall('element', [message.index]); }
     if (op === 'click') {
       await ensureAgent();
+      if (typeof message.text === 'string' && message.text.trim()) {
+        const point = await agentCall('textCenter', [message.text.trim()]);
+        if (!point || typeof point.x !== 'number' || typeof point.y !== 'number') throw new Error(`no visible element with text ${message.text.trim()}`);
+        const x = Math.round(point.x), y = Math.round(point.y);
+        // Some controls only respond to a real click, so this path moves the pointer and clicks at the element's center.
+        win.webContents.sendInputEvent({ type: 'mouseMove', x, y });
+        await sleep(200);
+        win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+        win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+        await sleep(250);
+        return { answer: { success: true, message: `clicked ${message.text.trim()}` }, state: await settle() };
+      }
       const answer = await agentCall('click', [message.index]);
       return { answer, state: await settle() };
     }
     if (op === 'input') {
       await ensureAgent();
-      const answer = await agentCall('input', [message.index, message.text]);
+      if (!await agentCall('prepareInput', [message.index])) throw new Error(`element ${message.index} is not a text box`);
+      // Editors keep their own state; only real text insertion updates it.
+      win.webContents.insertText(String(message.text ?? ''));
       await sleep(150);
-      return { answer, state: await settle() };
+      return { state: await settle() };
+    }
+    if (op === 'hover') {
+      await ensureAgent();
+      const point = await agentCall('center', [message.index]);
+      if (!point || typeof point.x !== 'number' || typeof point.y !== 'number') throw new Error(`no element at index ${message.index}`);
+      // A real pointer move is what turns CSS :hover on; the page's synthetic events do not.
+      win.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(point.x), y: Math.round(point.y) });
+      await sleep(250);
+      return { state: await settle() };
     }
     if (op === 'scroll') {
       await ensureAgent();
