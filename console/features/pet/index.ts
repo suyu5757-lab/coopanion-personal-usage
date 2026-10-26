@@ -44,7 +44,7 @@ const GROUP = 'world:desktop-pet';
 const SOUND_GROUP = 'world:desktop-pet:sound';
 const STATS_GROUP = 'companion';
 const STATS_KEY = 'companion.telemetry';
-const STATS_DOC = 'https://github.com/Pal-AI-Lab/Coopanion/blob/main/docs/TELEMETRY.md';
+const STATS_DOC = 'https://github.com/suyu5757-lab/coopanion-personal-usage/blob/main/docs/TELEMETRY.md';
 /** Whether the Chat page shows its context ring (features/chat/context.ts), in the `companion` group; off by default. */
 const RING_KEY = 'companion.contextRing';
 /** The app language: a key of the `companion` group, its choices from the Core. */
@@ -86,6 +86,7 @@ const KEYS = {
   selfTime: 'companion.selfTime.enabled',
   selfTimeAfter: 'companion.selfTime.afterMinutes',
   selfTimeSession: 'companion.selfTime.sessionMinutes',
+  selfTimeUnlimited: 'companion.selfTime.sessionUnlimited',
   selfTimeSound: 'companion.selfTime.sound',
   selfTimeActions: 'companion.selfTime.actions',
 } as const;
@@ -179,8 +180,12 @@ async function mount(ctx: PageContext): Promise<void> {
     return { input, box };
   };
   // 20 minutes is SELF_TIME_DEFAULTS in core/browser/config.ts, which the page cannot import from browser code
-  const selfTimeAfter = minutesBox(5, 240, KEYS.selfTimeAfter, 20);
+  const selfTimeAfter = minutesBox(1, 240, KEYS.selfTimeAfter, 20);
   const selfTimeSession = minutesBox(5, 60, KEYS.selfTimeSession, 20);
+  const selfTimeUnlimited = ui.checkbox(S.selfTimeUnlimited, {
+    onChange: (on) => { renderSelfTime(); void save(KEYS.selfTimeUnlimited, on, STATS_GROUP, behaviorMsg); },
+  });
+  selfTimeSession.box.append(selfTimeUnlimited.el);
   const selfTimeSound = ui.checkbox(S.selfTimeSound, { onChange: (on) => void save(KEYS.selfTimeSound, on, STATS_GROUP, behaviorMsg) });
   const selfTimeActions = ui.checkbox(S.selfTimeActions, { onChange: (on) => void save(KEYS.selfTimeActions, on, STATS_GROUP, behaviorMsg) });
   selfTimeActions.setChecked(true);
@@ -428,7 +433,8 @@ async function mount(ctx: PageContext): Promise<void> {
     const on = selfTime.checked;
     for (const r of [selfTimeAfterRow, selfTimeSessionRow, selfTimeSoundRow, selfTimeActionsRow]) r.hidden = !on;
     selfTimeAfter.input.disabled = !on;
-    selfTimeSession.input.disabled = !on;
+    selfTimeUnlimited.input.disabled = !on;
+    selfTimeSession.input.disabled = !on || selfTimeUnlimited.checked;
   };
   behavior.body.append(
     row(S.roam, roam.el),
@@ -654,10 +660,12 @@ async function mount(ctx: PageContext): Promise<void> {
     const active = document.activeElement;
     if (typeof statsValues[STATS_KEY] === 'boolean') stats.setChecked(statsValues[STATS_KEY] as boolean);
     ring.setChecked(statsValues[RING_KEY] === true);
-    if (typeof statsValues[KEYS.selfTime] === 'boolean') { selfTime.setChecked(statsValues[KEYS.selfTime] as boolean); renderSelfTime(); }
+    if (typeof statsValues[KEYS.selfTime] === 'boolean') selfTime.setChecked(statsValues[KEYS.selfTime] as boolean);
+    selfTimeUnlimited.setChecked(statsValues[KEYS.selfTimeUnlimited] === true);
+    renderSelfTime();
     // 0 is the config API's answer for an unset integer; the field's 20 is the real default
     const selfTimeAfterValue = statsValues[KEYS.selfTimeAfter];
-    if (typeof selfTimeAfterValue === 'number' && selfTimeAfterValue >= 5 && active !== selfTimeAfter.input) {
+    if (typeof selfTimeAfterValue === 'number' && selfTimeAfterValue >= 1 && active !== selfTimeAfter.input) {
       selfTimeAfter.input.value = selfTimeAfter.input.dataset.saved = String(selfTimeAfterValue);
     }
     const selfTimeSessionValue = statsValues[KEYS.selfTimeSession];
