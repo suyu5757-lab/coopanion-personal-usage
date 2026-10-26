@@ -7,8 +7,13 @@
  * A screenshot shows one display, scaled to fit `screenshot.maxWidth`×`maxHeight`; tool coordinates
  * are pixels of the latest screenshot and are mapped back to physical pixels of its display here.
  * An input aimed at an arrangement of displays that has changed since that screenshot is refused
- * by the engine. Input tools first wait for the user to leave mouse and keyboard alone
- * (`userIdleMs`), up to `maxYieldWaitMs`, and fail without acting if the user keeps going.
+ * by the engine. Display input first waits for the user to leave mouse and keyboard alone
+ * (`userIdleMs`), up to `maxYieldWaitMs`, and fails without acting if the user keeps going.
+ *
+ * With Cua Driver installed, `pet_cua_window` selects one window for background work: captures and
+ * input go to that window, the person's pointer and focus stay put, and the idle wait does not apply.
+ * The driver's daemon owns its own Accessibility and Screen Recording grants and draws the agent
+ * cursor; a crash there fails the call instead of taking down this process.
  *
  * `permission` sets when the person is asked first (config.ts, PERMISSION_LEVELS): at most once
  * a turn, before the first call that reads the screen or before the first input, or once for
@@ -34,6 +39,7 @@ import { childExecArgv } from 'cortico/extensions/runtime.ts';
 import type { CuaConfig, PermissionLevel } from './config.ts';
 import { cuaText, type CuaText } from './i18n/index.ts';
 import { CUA_TOOL_DECLS } from './tools.ts';
+import { CuaDriver, driverKeyChords, DriverFailure, type CuaDriverLike, type DriverAction, type DriverCapture } from './driver.ts';
 import { fit } from './engine/image.ts';
 import { parseKeys } from './engine/keys.ts';
 import { MODEL_TEXT, type ModelLanguage, type ModelText } from './model-text.ts';
@@ -63,6 +69,8 @@ export interface CuaOptions {
   modelLanguage?: () => ModelLanguage;
   /** The app language: the permission question and the system dialog's words. Read at each use; `zh` when absent. */
   language?: () => Language;
+  /** The background window driver; tests pass a fake. Default: Cua Driver through the installed CLI. */
+  driver?: () => CuaDriverLike;
 }
 
 /** The person did not allow this turn's computer use. */
@@ -83,6 +91,23 @@ interface View extends Target {
 
 /** The display part of an engine result. */
 const screenOf = (r: ScreenInfo): ScreenInfo => ({ displays: r.displays, layout: r.layout, cursor: r.cursor, foreground: r.foreground, foregroundDisplay: r.foregroundDisplay });
+
+/** A window selected for background work; its capture is the coordinate frame of later inputs. */
+interface WindowTarget {
+  handle: string;
+  pid: number;
+  windowId: number;
+  title: string;
+  captureId: string;
+  width: number;
+  height: number;
+}
+
+/** Whether an error says the target window disappeared. */
+const windowGone = (err: unknown) => err instanceof DriverFailure && /window_id_not_found|window_owner_pid_mismatch|not found/i.test(`${err.code} ${err.message}`);
+
+/** Whether an error says the capture a pixel action was aimed at is no longer the current one. */
+const captureStale = (err: unknown) => err instanceof DriverFailure && /capture_not_found|capture_expired|stale.*capture|capture.*stale/i.test(`${err.code} ${err.message}`);
 
 /** `p`'s value, or null when `signal` aborts first. */
 function untilAborted<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T | null> {
@@ -120,8 +145,24 @@ export class Cua {
   private grantedUntil = 0;
   /** The screen size asked of the engine, once per engine start. */
   private screenAsked: Promise<void> | null = null;
+  /** The background driver, created on first use. */
+  private driverClient: CuaDriverLike | null = null;
+  /** The window background actions act on; null means the whole screen. */
+  private target: WindowTarget | null = null;
 
   constructor(private readonly opts: CuaOptions) {}
+
+  /** The background window driver. */
+  private get driver(): CuaDriverLike {
+    return this.driverClient ??= this.opts.driver?.() ?? new CuaDriver('coo');
+  }
+
+  /** Why a window cannot be selected for background work; null when it can. */
+  private backgroundReason(): string | null {
+    if (process.platform !== 'darwin') return this.t.backgroundUnsupported;
+    if (!this.driver.available()) return this.t.backgroundMissing;
+    return null;
+  }
 
   private get cfg(): CuaConfig {
     return this.opts.cfg();
@@ -169,12 +210,14 @@ export class Cua {
   }
 
   async stop(): Promise<void> {
+    this.target = null;
     await this.endEngine(this.t.worldStopped);
     this.host = null;
   }
 
   /** Computer use was switched off: the engine process ends, and the next call starts another. */
   switchedOff(): Promise<void> {
+    this.target = null;
     return this.endEngine(this.t.switchedOff);
   }
 
@@ -326,6 +369,262 @@ export class Cua {
     return t.cursorAt(`(${Math.round(c.x * v.scale)}, ${Math.round(c.y * v.scale)})`);
   }
 
+  /* ---------- background windows ---------- */
+
+  /** The environment prompt's background section: available, or why not. */
+  private backgroundPrompt(): string {
+    if (process.platform !== 'darwin') return this.t.backgroundUnsupported;
+    if (!this.driver.available()) return this.t.backgroundMissing;
+    if (!this.cfg.control) return this.t.backgroundViewOnly;
+    return this.t.backgroundAvailable;
+  }
+
+  /** The options for one driver capture. */
+  private captureOptions(screenshot: boolean, signal?: AbortSignal) {
+    return { screenshot, maxDimension: Math.max(this.cfg.screenshot.maxWidth, this.cfg.screenshot.maxHeight), quality: this.cfg.screenshot.quality, signal };
+  }
+
+  /** `pet_cua_window`: capture a window and make it the target of later actions. */
+  private async window(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
+    const reason = this.backgroundReason();
+    if (reason) return { text: this.t.notRun('pet_cua_window', reason), failed: true };
+    const key = typeof args.window === 'string' ? args.window.trim() : '';
+    if (!key) return { text: this.t.notRun('pet_cua_window', this.t.focusEmpty), failed: true };
+    let handle = key.toLowerCase();
+    let title = '';
+    if (!/^\d+:\d+$/.test(handle)) {
+      const list = await this.listWindows(signal);
+      const hit = list.find((w) => w.handle === handle) ?? list.find((w) => w.title.includes(key)) ?? list.find((w) => w.title.toLowerCase().includes(handle));
+      if (!hit) return { text: this.t.notRun('pet_cua_window', this.t.windowMissing(key)), failed: true };
+      handle = hit.handle;
+      title = hit.title;
+    }
+    const [pid, windowId] = handle.split(':').map(Number);
+    if (!Number.isInteger(pid) || !Number.isInteger(windowId) || pid <= 0 || windowId <= 0) {
+      return { text: this.t.notRun('pet_cua_window', this.t.windowMissing(key)), failed: true };
+    }
+    await this.permit('see', signal);
+    try {
+      const cap = await this.driver.capture(pid, windowId, this.captureOptions(true, signal));
+      this.target = { handle, pid, windowId, title: title || cap.title || handle, captureId: cap.captureId, width: cap.width, height: cap.height };
+      return this.windowOutcome('', cap);
+    } catch (err) {
+      return this.driverOutcome('pet_cua_window', err);
+    }
+  }
+
+  /** A fresh capture of the current target, updating its coordinates and capture id. */
+  private async refreshWindow(screenshot: boolean, signal?: AbortSignal) {
+    const target = this.target!;
+    const cap = await this.driver.capture(target.pid, target.windowId, this.captureOptions(screenshot, signal));
+    this.target = { ...target, title: target.title || cap.title, captureId: cap.captureId, width: cap.width, height: cap.height };
+    return cap;
+  }
+
+  /** The image and text of a window capture. */
+  private windowOutcome(lead: string, cap: DriverCapture): ToolOutcome {
+    const t = this.t, target = this.target!;
+    const seen = this.host?.modelFacts.accepts('image/jpeg') ?? true;
+    return {
+      text: t.windowShot(lead, target.title || cap.title, target.handle, cap.width, cap.height, seen),
+      blobs: [{ bytes: cap.jpeg, mime: 'image/jpeg', name: 'window.jpg', fallbackText: t.windowShotFallback(cap.width, cap.height) }],
+    };
+  }
+
+  /** The current window's screenshot, falling back to the whole screen when it disappeared. */
+  private async windowScreenshot(lead: string, signal?: AbortSignal): Promise<ToolOutcome> {
+    await this.permit('see', signal);
+    try {
+      return this.windowOutcome(lead, await this.refreshWindow(true, signal));
+    } catch (err) {
+      if (windowGone(err)) {
+        this.target = null;
+        return this.screenshot(`${lead}${this.t.windowGone((err as Error).message)}\n`, signal);
+      }
+      return this.driverOutcome('pet_cua_screenshot', err);
+    }
+  }
+
+  /** The screenshot the current mode would show: the target window, or the whole display. */
+  private look(lead: string, signal?: AbortSignal): Promise<ToolOutcome> {
+    return this.target ? this.windowScreenshot(lead, signal) : this.screenshot(lead, signal);
+  }
+
+  /** A screenshot-pixel point checked against the current window. */
+  private targetPoint(x: unknown, y: unknown): { x: number; y: number } | string {
+    if (typeof x !== 'number' || typeof y !== 'number' || !Number.isFinite(x) || !Number.isFinite(y)) return this.t.notNumbers;
+    const width = this.target?.width ?? 0, height = this.target?.height ?? 0;
+    if (x < 0 || y < 0 || x >= width || y >= height) return this.t.offShot(x, y, width - 1, height - 1);
+    return { x: Math.round(x), y: Math.round(y) };
+  }
+
+  /** Runs a pixel action once more after refreshing the capture it was aimed at. */
+  private async withCaptureRetry<T>(act: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    try {
+      return await act();
+    } catch (err) {
+      if (!captureStale(err)) throw err;
+      await this.refreshWindow(false, signal);
+      return act();
+    }
+  }
+
+  /** Shared tail of a background action: the receipt, then a fresh window screenshot. */
+  private async afterWindow(tool: string, done: string, args: Args, signal: AbortSignal | undefined, action?: DriverAction): Promise<ToolOutcome> {
+    const t = this.t;
+    const note = action && action.effect !== 'confirmed' ? t.windowUnverified : '';
+    const line = `${done}${note}`;
+    const target = this.target!;
+    const want = typeof args.screenshot === 'boolean' ? args.screenshot : this.cfg.screenshot.afterAction;
+    if (!want) return { text: `${line}\n${t.windowCurrent(target.title, target.handle)}` };
+    await pause(this.cfg.screenshot.settleMs, signal);
+    if (signal?.aborted) return { text: `${line}${t.noShotInterrupted}` };
+    try {
+      return this.windowOutcome(`${line}\n`, await this.refreshWindow(true, signal));
+    } catch (err) {
+      if (err instanceof DriverFailure && err.code === 'aborted') return { text: `${line}${t.noShotInterrupted}` };
+      if (windowGone(err)) {
+        this.target = null;
+        return { text: `${line}\n${t.windowGone((err as Error).message)}`, failed: true };
+      }
+      return this.driverOutcome(tool, err);
+    }
+  }
+
+  /** A driver failure, worded for the model; clears a target whose window is gone. */
+  private driverOutcome(tool: string, err: unknown): ToolOutcome {
+    if (err instanceof DriverFailure) {
+      if (err.code === 'not_installed') return { text: this.t.notRun(tool, this.t.backgroundMissing), failed: true };
+      if (err.code === 'aborted') return { text: this.t.notRun(tool, this.t.interruptedBeforeAct), failed: true };
+      if (windowGone(err)) this.target = null;
+      return { text: this.t.failed(tool, windowGone(err) ? this.t.windowGone(err.message) : this.t.driverFailed(err.message)), failed: true };
+    }
+    return { text: this.t.failed(tool, (err as Error).message), failed: true };
+  }
+
+  private async backgroundClick(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
+    const p = this.targetPoint(args.x, args.y);
+    if (typeof p === 'string') return { text: this.t.notRun('pet_cua_click', p), failed: true };
+    const button = (args.button === 'right' || args.button === 'middle' ? args.button : 'left') as Button;
+    const count = args.clicks === 2 || args.clicks === 3 ? args.clicks : 1;
+    await this.permit('act', signal);
+    try {
+      const action = await this.withCaptureRetry(() => this.driver.click(this.target!.pid, this.target!.windowId, p.x, p.y, this.target!.captureId, { button, count, signal }), signal);
+      return this.afterWindow('pet_cua_click', this.t.clicked(args.x, args.y, button, count), args, signal, action);
+    } catch (err) {
+      return this.driverOutcome('pet_cua_click', err);
+    }
+  }
+
+  private async backgroundMove(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
+    const p = this.targetPoint(args.x, args.y);
+    if (typeof p === 'string') return { text: this.t.notRun('pet_cua_move', p), failed: true };
+    await this.permit('act', signal);
+    try {
+      const action = await this.driver.move(this.target!.pid, this.target!.windowId, p.x, p.y, { signal });
+      return this.afterWindow('pet_cua_move', this.t.movedWindow(args.x, args.y), args, signal, action);
+    } catch (err) {
+      return this.driverOutcome('pet_cua_move', err);
+    }
+  }
+
+  private async backgroundDrag(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
+    const from = Array.isArray(args.from) ? args.from : [];
+    const to = Array.isArray(args.to) ? args.to : [];
+    const a = this.targetPoint(from[0], from[1]);
+    const b = this.targetPoint(to[0], to[1]);
+    if (typeof a === 'string' || typeof b === 'string') {
+      return { text: this.t.notRun('pet_cua_drag', typeof a === 'string' ? this.t.dragStart(a) : this.t.dragEnd(b as string)), failed: true };
+    }
+    await this.permit('act', signal);
+    try {
+      const action = await this.driver.drag(this.target!.pid, this.target!.windowId, [a.x, a.y], [b.x, b.y], { signal });
+      return this.afterWindow('pet_cua_drag', this.t.dragged(from, to), args, signal, action);
+    } catch (err) {
+      return this.driverOutcome('pet_cua_drag', err);
+    }
+  }
+
+  private async backgroundScroll(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
+    const p = this.targetPoint(args.x, args.y);
+    if (typeof p === 'string') return { text: this.t.notRun('pet_cua_scroll', p), failed: true };
+    const clampN = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? Math.max(-30, Math.min(30, Math.round(v))) : 0);
+    const down = clampN(args.down), right = clampN(args.right);
+    if (!down && !right) return { text: this.t.notRun('pet_cua_scroll', this.t.scrollNone), failed: true };
+    await this.permit('act', signal);
+    try {
+      const action = await this.driver.scroll(this.target!.pid, this.target!.windowId, p.x, p.y, down, right, { signal });
+      return this.afterWindow('pet_cua_scroll', this.t.scrolled(args.x, args.y, down, right), args, signal, action);
+    } catch (err) {
+      return this.driverOutcome('pet_cua_scroll', err);
+    }
+  }
+
+  private async backgroundType(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
+    const text = typeof args.text === 'string' ? args.text : '';
+    if (!text) return { text: this.t.notRun('pet_cua_type', this.t.typeEmpty), failed: true };
+    await this.permit('act', signal);
+    const t = this.t, normalized = text.replace(/\r\n/g, '\n'), total = [...normalized].length;
+    let typed = 0;
+    const lines = normalized.split('\n');
+    try {
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i]!;
+        if (line) {
+          await this.driver.type(this.target!.pid, this.target!.windowId, line, { signal });
+          typed += [...line].length;
+        }
+        if (i < lines.length - 1) {
+          await this.driver.key(this.target!.pid, this.target!.windowId, [{ modifiers: [], key: 'return' }], { signal });
+          typed += 1;
+        }
+      }
+      return this.afterWindow('pet_cua_type', t.typed(total), args, signal);
+    } catch (err) {
+      if (err instanceof DriverFailure) {
+        if (windowGone(err)) {
+          this.target = null;
+          return { text: t.failed('pet_cua_type', t.windowGone(err.message)), failed: true };
+        }
+        return { text: t.failed('pet_cua_type', t.typedDriver(typed, total, err.message)), failed: true };
+      }
+      return this.driverOutcome('pet_cua_type', err);
+    }
+  }
+
+  private async backgroundKey(spec: string, args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
+    const chords = driverKeyChords(spec);
+    if ('error' in chords) {
+      const why = chords.error === 'oneKey' ? this.t.keyOneKey : chords.error === 'unsupported' ? this.t.keyUnsupported(chords.key) : this.t.keyNone;
+      return { text: this.t.notRun('pet_cua_key', this.t.keyBad(why)), failed: true };
+    }
+    await this.permit('act', signal);
+    try {
+      const action = await this.driver.key(this.target!.pid, this.target!.windowId, chords, { signal });
+      return this.afterWindow('pet_cua_key', this.t.pressed(spec.trim()), args, signal, action);
+    } catch (err) {
+      return this.driverOutcome('pet_cua_key', err);
+    }
+  }
+
+  private async windowZoom(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
+    const t = this.t, target = this.target!;
+    const { x, y, width, height } = args;
+    const ok = [x, y, width, height].every((n) => typeof n === 'number' && Number.isFinite(n));
+    if (!ok || (x as number) < 0 || (y as number) < 0 || (x as number) >= target.width || (y as number) >= target.height || (width as number) < 1 || (height as number) < 1) {
+      return { text: t.notRun('pet_cua_zoom', t.zoomBad), failed: true };
+    }
+    const rx = Math.min(target.width - 1, Math.round(x as number)), ry = Math.min(target.height - 1, Math.round(y as number));
+    const rw = Math.min(target.width - rx, Math.round(width as number)), rh = Math.min(target.height - ry, Math.round(height as number));
+    await this.permit('see', signal);
+    try {
+      const z = await this.driver.zoom(target.pid, target.windowId, rx, ry, rw, rh, { signal });
+      return { text: t.zoomed(z.width, z.height, rx, ry, rw, rh), blobs: [{ bytes: z.jpeg, mime: 'image/jpeg', name: 'zoom.jpg', fallbackText: t.zoomFallback(z.width, z.height) }] };
+    } catch (err) {
+      return this.driverOutcome('pet_cua_zoom', err);
+    }
+  }
+
   /* ---------- tools ---------- */
 
   tools(): ToolDef[] {
@@ -339,6 +638,7 @@ export class Cua {
       pet_cua_type: (a, s) => this.type(a, s),
       pet_cua_key: (a, s) => this.key(a, s),
       pet_cua_windows: (_, s) => this.windows(s),
+      pet_cua_window: (a, s) => this.window(a, s),
       pet_cua_focus: (a, s) => this.focus(a, s),
       pet_cua_wait: (a, s) => this.wait(a, s),
     };
@@ -370,9 +670,10 @@ export class Cua {
       if (typeof n !== 'number' || !Number.isInteger(n) || n < 1 || (total !== undefined && n > total)) {
         return { text: this.t.notRun('pet_cua_screenshot', this.t.displayBad(n, total ?? 1)), failed: true };
       }
+      this.target = null;
       return this.screenshot('', signal, n);
     }
-    return this.screenshot('', signal);
+    return this.look('', signal);
   }
 
   /**
@@ -397,6 +698,7 @@ export class Cua {
 
   /** `pet_cua_zoom`: a region of the latest screenshot, captured again at full resolution. */
   private async zoom(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
+    if (this.target) return this.windowZoom(args, signal);
     const t = this.t, v = this.view;
     if (!v) return { text: t.notRun('pet_cua_zoom', t.zoomNoShot), failed: true };
     const { x, y, width, height } = args;
@@ -450,6 +752,7 @@ export class Cua {
   private async click(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
     const refused = this.refuseControl('pet_cua_click');
     if (refused) return refused;
+    if (this.target) return this.backgroundClick(args, signal);
     const p = await this.toScreen(args.x, args.y);
     if (typeof p === 'string') return { text: this.t.notRun('pet_cua_click', p), failed: true };
     const button = (args.button === 'right' || args.button === 'middle' ? args.button : 'left') as Button;
@@ -461,6 +764,7 @@ export class Cua {
   private async move(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
     const refused = this.refuseControl('pet_cua_move');
     if (refused) return refused;
+    if (this.target) return this.backgroundMove(args, signal);
     const p = await this.toScreen(args.x, args.y);
     if (typeof p === 'string') return { text: this.t.notRun('pet_cua_move', p), failed: true };
     const res = await this.call<InputResult>({ op: 'move', ...p, yield: this.yieldCfg }, signal);
@@ -470,6 +774,7 @@ export class Cua {
   private async drag(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
     const refused = this.refuseControl('pet_cua_drag');
     if (refused) return refused;
+    if (this.target) return this.backgroundDrag(args, signal);
     const from = Array.isArray(args.from) ? args.from : [];
     const to = Array.isArray(args.to) ? args.to : [];
     const a = await this.toScreen(from[0], from[1]);
@@ -482,6 +787,7 @@ export class Cua {
   private async scroll(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
     const refused = this.refuseControl('pet_cua_scroll');
     if (refused) return refused;
+    if (this.target) return this.backgroundScroll(args, signal);
     const p = await this.toScreen(args.x, args.y);
     if (typeof p === 'string') return { text: this.t.notRun('pet_cua_scroll', p), failed: true };
     const clampN = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? Math.max(-30, Math.min(30, Math.round(v))) : 0);
@@ -496,6 +802,7 @@ export class Cua {
     if (refused) return refused;
     const text = typeof args.text === 'string' ? args.text : '';
     if (!text) return { text: this.t.notRun('pet_cua_type', this.t.typeEmpty), failed: true };
+    if (this.target) return this.backgroundType(args, signal);
     const res = await this.call<TypeResult>({ op: 'type', text, chunkDelayMs: this.cfg.typeChunkDelayMs, yield: this.yieldCfg }, signal);
     const total = [...text].length;
     const done = res.stoppedBy === 'cancel' || res.stoppedBy === 'user' ? this.t.typedPart(res.typed, total, res.stoppedBy) : this.t.typed(total);
@@ -508,6 +815,7 @@ export class Cua {
     const spec = typeof args.keys === 'string' ? args.keys : '';
     const parsed = parseKeys(spec, this.language);
     if ('error' in parsed) return { text: this.t.notRun('pet_cua_key', this.t.keyBad(parsed.error)), failed: true };
+    if (this.target) return this.backgroundKey(spec, args, signal);
     const res = await this.call<InputResult>({ op: 'key', chords: parsed.chords, yield: this.yieldCfg }, signal);
     return this.after('pet_cua_key', res, signal, this.t.pressed(spec.trim()), args);
   }
@@ -527,7 +835,8 @@ export class Cua {
         : `(${Math.round(r.x * s.scale)}, ${Math.round(r.y * s.scale)}) ${Math.round(r.width * s.scale)}×${Math.round(r.height * s.scale)}`;
       return t.windowLine(w.handle, w.foreground, w.title, where);
     });
-    return { text: t.windows(list.length, lines) };
+    const current = this.target ? `${t.windowCurrent(this.target.title, this.target.handle)}\n` : '';
+    return { text: `${current}${t.windows(list.length, lines)}` };
   }
 
   private async focus(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
@@ -535,16 +844,19 @@ export class Cua {
     if (refused) return refused;
     const key = typeof args.window === 'string' ? args.window.trim() : '';
     if (!key) return { text: this.t.notRun('pet_cua_focus', this.t.focusEmpty), failed: true };
+    const left = this.target ? this.t.windowLeft : '';
+    this.target = null;
     const list = await this.listWindows(signal);
     const hit = list.find((w) => w.handle === key.toLowerCase()) ?? list.find((w) => w.title.includes(key)) ?? list.find((w) => w.title.toLowerCase().includes(key.toLowerCase()));
-    if (!hit) return { text: this.t.notRun('pet_cua_focus', this.t.focusMissing(key)), failed: true };
+    if (!hit) return { text: this.t.notRun('pet_cua_focus', `${left ? `${left} ` : ''}${this.t.focusMissing(key)}`), failed: true };
     const res = await this.call<InputResult & { focused: boolean }>({ op: 'focus', handle: hit.handle, yield: this.yieldCfg }, signal);
     const ok = res.focused || res.foreground === hit.title;
     // a window on another display is what the screenshot after focusing should show
     const elsewhere = ok && hit.display !== null && hit.display !== this.shotSize().display ? hit.display : undefined;
     const done = ok ? this.t.focused(hit.title) : this.t.focusRefused(hit.title, res.foreground);
+    const line = left ? `${left} ${done}` : done;
     const shows = typeof args.screenshot === 'boolean' ? args.screenshot : this.cfg.screenshot.afterAction;
-    return this.after('pet_cua_focus', res, signal, elsewhere !== undefined && !shows ? `${done}${this.t.focusedElsewhere(elsewhere)}` : done, args, elsewhere);
+    return this.after('pet_cua_focus', res, signal, elsewhere !== undefined && !shows ? `${line}${this.t.focusedElsewhere(elsewhere)}` : line, args, elsewhere);
   }
 
   /** Waiting asks nobody; the screenshot after it is taken only when looking needs no new question. */
@@ -556,7 +868,7 @@ export class Cua {
     const look = await this.mayLook(signal);
     if (signal?.aborted) return { text: `${t.waited(seconds)}${t.noShotInterrupted}` };
     if (!look) return { text: t.waitNoLook(seconds) };
-    return this.screenshot(`${t.waited(seconds)}\n`);
+    return this.look(`${t.waited(seconds)}\n`, signal);
   }
 
   /** Looking at the screen now would not ask the person: the level lets it, or this turn's answer was yes. */
@@ -580,6 +892,7 @@ export class Cua {
       'cua.control': t.control(this.cfg.control),
       'cua.idle': String(Math.round(this.cfg.userIdleMs / 100) / 10),
       'cua.permission': t.permission(this.level, this.cfg.grantMinutes),
+      'cua.background': this.backgroundPrompt(),
     };
     return renderTemplate(readFileSync(this.envPromptFile(), 'utf8'), vars).trim();
   }

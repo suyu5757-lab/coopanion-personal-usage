@@ -136,6 +136,8 @@ class CoreHost extends EventEmitter {
         this.emit('releases');
       } else if (msg?.type === 'companion:browse' && typeof msg.url === 'string') {
         this.emit('browse', msg.url);
+      } else if (msg?.type === 'companion:browser' && typeof msg.id === 'number') {
+        this.emit('browser', msg);
       }
     });
     const exited = (code, signal, startFailed) => {

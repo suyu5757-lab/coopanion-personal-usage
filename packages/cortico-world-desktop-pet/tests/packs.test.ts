@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { BUILTIN_PACKS, figurePacks, lookOf, lookPatch, readManifest, scanPacks } from '../src/packs.ts';
+import { vocabId } from '../src/script.ts';
 
 function pack(manifest: Record<string, unknown>, files: string[] = []): string {
   const dir = mkdtempSync(join(tmpdir(), 'pack-'));
@@ -19,6 +20,28 @@ describe('figure packs', () => {
     const { packs, problems } = figurePacks([]);
     expect(problems).toEqual([]);
     expect(packs.map((p) => p.id)).toEqual(['coo', 'whale']);
+  });
+
+  it('gives the whale a tail whip by every name she answers to', () => {
+    const whale = figurePacks([]).packs.find((p) => p.id === 'whale')!;
+    expect(vocabId('甩尾巴', whale.manifest.vocab)).toBe('tail-whip');
+    expect(vocabId('甩尾', whale.manifest.vocab)).toBe('tail-whip');
+    expect(vocabId('抽尾巴', whale.manifest.vocab)).toBe('tail-whip');
+    expect(vocabId('whip', whale.manifest.vocab)).toBe('tail-whip');
+  });
+
+  it('offers the whale\'s fourteen expressive motions to the bot', () => {
+    const whale = figurePacks([]).packs.find((p) => p.id === 'whale')!;
+    const names = [
+      ['peek', '捂脸偷看'], ['spout', '喷水'], ['hug-tail', '抱尾巴'], ['swim', '游泳'],
+      ['shake-off', '抖水'], ['bubbles', '吹泡泡'], ['float', '飘浮'], ['sulk', '蹲着画圈'],
+      ['knock', '敲屏幕'], ['peek-out', '探头'], ['stretch', '伸懒腰'], ['play-dead', '装死'],
+      ['tail-clap', '拍尾鼓掌'], ['sneeze', '打喷嚏'],
+    ];
+    for (const [id, name] of names) {
+      expect(whale.manifest.vocab.find((w) => w.id === id)?.kind).toBe('motion');
+      expect(vocabId(name, whale.manifest.vocab)).toBe(id);
+    }
   });
 
   it('refuses a pack whose files lie outside it', () => {

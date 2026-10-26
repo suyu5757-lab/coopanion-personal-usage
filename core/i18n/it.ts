@@ -10,6 +10,16 @@ const it: Translation<CoreText> = {
     contextRing: { title: 'Anello del contesto', description: 'Mostra nella casella di testo della pagina Chat un anello con quanto manca al riordino della conversazione precedente.' },
     roundsSoft: { title: 'Promemoria di chiusura', suffix: 'richieste', description: 'Dopo questo numero di richieste al modello in un risveglio, Coo riceve un invito a finire ciò che sta facendo e chiudere il turno.' },
     roundsHard: { title: 'Richieste per risveglio', suffix: 'richieste', description: 'Il massimo di richieste al modello in un risveglio; raggiunto il limite, il turno finisce.' },
+    selfTime: {
+      title: 'Tempo per sé',
+      description: "Dopo un po' senza conversazione può aprire il proprio browser e guardarsi intorno. Finestra e accessi sono separati.",
+      after: 'Dopo il silenzio', afterDescription: 'Riceve tempo per sé dopo questo periodo senza conversazione.',
+      session: 'Al massimo', sessionDescription: 'Un tempo per sé dura al massimo così; alla fine il browser si chiude. Con «Senza limite» non si chiude per tempo.',
+      unlimited: 'Senza limite', unlimitedDescription: 'Attivo: un tempo per sé non finisce col tempo, ma quando lei chiude il browser.',
+      minutes: 'min',
+      sound: 'Audio del browser', soundDescription: 'Muto per impostazione predefinita. Attivo, i video che guarda si sentono.',
+      actions: 'Consenti like, salvataggi, danmaku e commenti', actionsDescription: 'Disattivato, può solo guardare. Accedi e inserisci i codici nella sua finestra tu stesso.',
+    },
   },
 
   failure: {
@@ -33,7 +43,7 @@ const it: Translation<CoreText> = {
 
   status: {
     read: 'Legge', browse: 'Sfoglia', memory: 'memoria', find: 'Trova', search: 'Cerca', write: 'Scrive', edit: 'Modifica', append: 'Aggiunge a',
-    delete: 'Elimina', save: 'Salva', screen: 'Guarda lo schermo', windows: 'Guarda le finestre aperte', rightClick: 'Fa clic destro', doubleClick: 'Fa doppio clic', click: 'Fa clic',
+    delete: 'Elimina', save: 'Salva', screen: 'Guarda lo schermo', web: 'Su una pagina web', windows: 'Guarda le finestre aperte', rightClick: 'Fa clic destro', doubleClick: 'Fa doppio clic', click: 'Fa clic',
     move: 'Muove il mouse', drag: 'Trascina', scroll: 'Scorre', focus: 'Cambia finestra', type: 'Digita', key: 'Preme', wait: 'Aspetta',
     alarmSet: 'Imposta una sveglia', alarmList: 'Controlla le sveglie', alarmCancel: 'Annulla una sveglia',
     quoted: (text: string) => `«${text}»`,

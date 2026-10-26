@@ -11,8 +11,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Pal-AI-Lab/Coopanion/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/Pal-AI-Lab/Coopanion?color=00a870"></a>
-  <a href="https://github.com/Pal-AI-Lab/Coopanion/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Pal-AI-Lab/Coopanion/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/suyu5757-lab/coopanion-personal-usage/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/suyu5757-lab/coopanion-personal-usage?color=00a870"></a>
+  <a href="https://github.com/suyu5757-lab/coopanion-personal-usage/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/suyu5757-lab/coopanion-personal-usage/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Windows 10 / 11" src="https://img.shields.io/badge/Windows-10%20%2F%2011-1f6feb">
   <img alt="macOS 13+" src="https://img.shields.io/badge/macOS-13%2B-1f6feb">
   <img alt="Linux x64" src="https://img.shields.io/badge/Linux-x64-1f6feb">
@@ -25,7 +25,7 @@
   <a href="#getting-started">Getting Started</a> ｜
   <a href="#everyday-use">Everyday Use</a> ｜
   <a href="#faq">FAQ</a> ｜
-  <a href="https://github.com/Pal-AI-Lab/Coopanion/releases">Changelog</a> ｜
+  <a href="https://github.com/suyu5757-lab/coopanion-personal-usage/releases">Changelog</a> ｜
   <a href="docs/DEVELOPMENT.md">Development</a>
 </p>
 
@@ -43,12 +43,13 @@ Coopanion is a desktop pet. **Coo** lives on the bottom edge of your screen: it 
 - **Chat**: hold the talk key and speak, or type; Coo answers in a bubble. Speech is recognized on your machine with FunASR or Whisper, picked by the app language.
 - **Memory**: Coo remembers what you talked about, and knows when you poke it or pat its head. What it knows about you goes in `PARTNER.md` in its workspace, which its prompt includes whole. Every change to the workspace is kept as a version; the Memory page in the advanced mode shows the history. The Windows build carries git; on macOS and Linux git has to be installed.
 - **Computer use**: clicking buttons, typing, switching windows. Coo asks before it acts.
+- **Time of her own**: when you are not chatting, she may open her own browser window and look around Bilibili, Douyin or elsewhere, and note down what she found. Off by default; turn it on in Habits.
 - **Activity bubbles**: see when Coo is thinking and what it is working on, with a different animated icon for reading, searching, writing and using the computer. File names appear; the bubble lets clicks through. On by default; turn it off in Habits.
-- **Figures**: Coo, or the **DeepSeek Chan**, a fully animated whale girl with eight vendor color schemes and three outfits (a maid dress, a winter outfit and a crew uniform). Other figure packs are imported on the Dress up page from a zip or a folder; packs written for figure API 2 keep loading in later versions (see the [figure pack compatibility promise](packages/cortico-world-desktop-pet/README.md#形象包兼容承诺)).
+- **Figures**: Coo, or the **DeepSeek Chan**, a fully animated whale girl with eight vendor color schemes and five outfits (a maid dress, a winter outfit, a crew uniform, workwear and a nightgown). Other figure packs are imported on the Dress up page from a zip or a folder; packs written for figure API 2 keep loading in later versions (see the [figure pack compatibility promise](packages/cortico-world-desktop-pet/README.md#形象包兼容承诺)).
 - **Dress up**: Coo's colors (five of them after Cultist Simulator's principles: Lantern, Grail, Forge, Heart, Winter), hats, earrings, glasses and neckwear, plus its size and how often it walks.
 - **Extensions**: install Worlds such as a QQ bot, a drawing room and small games from the Extensions page.
 
-What changed in each version is in [Releases](https://github.com/Pal-AI-Lab/Coopanion/releases).
+What changed in each version is in [Releases](https://github.com/suyu5757-lab/coopanion-personal-usage/releases).
 
 ## Install
 
@@ -62,7 +63,7 @@ You also need an API key from one model service, which bills you for usage (see 
 
 ### Windows: installer
 
-1. Open the [latest release](https://github.com/Pal-AI-Lab/Coopanion/releases/latest) and download `Coopanion-Setup-<version>.exe`.
+1. Open the [latest release](https://github.com/suyu5757-lab/coopanion-personal-usage/releases/latest) and download `Coopanion-Setup-<version>.exe`.
 2. Run it; its pages follow the system language. The installer is not code-signed, so Windows may show "Windows protected your PC": click **More info** → **Run anyway**.
 3. Pick a folder (default `C:\Users\<you>\Coopanion`) and install. Coopanion starts when done, and a desktop icon is added.
 
@@ -74,7 +75,7 @@ You also need an API key from one model service, which bills you for usage (see 
 Open PowerShell, paste this line and press Enter:
 
 ```powershell
-irm https://raw.githubusercontent.com/Pal-AI-Lab/Coopanion/main/installer/install.ps1 | iex
+irm https://raw.githubusercontent.com/suyu5757-lab/coopanion-personal-usage/main/installer/install.ps1 | iex
 ```
 
 It downloads the latest installer, runs it, and deletes the download afterwards.
@@ -87,7 +88,7 @@ Coopanion to your antivirus's allowed list first.
 
 To run Coopanion without installing it, from a removable drive, or as several pets at once, use the portable version:
 
-1. Download `Coopanion-<version>-win-x64-portable.zip` from the [latest release](https://github.com/Pal-AI-Lab/Coopanion/releases/latest) and unpack it into any folder.
+1. Download `Coopanion-<version>-win-x64-portable.zip` from the [latest release](https://github.com/suyu5757-lab/coopanion-personal-usage/releases/latest) and unpack it into any folder.
 2. Run `Coopanion.exe` in that folder.
 
 The portable version keeps its data in the folder's `data` and writes nothing else to the system, apart from the login item when you turn on Start at login. A copy of the whole folder is another pet with its own memory and settings. Up to 5 can run at once (installed and portable together); one more says that the ports are all taken.
@@ -96,7 +97,7 @@ The portable version does not update itself; the settings window shows a downloa
 
 ### macOS
 
-1. Open the [latest release](https://github.com/Pal-AI-Lab/Coopanion/releases/latest). On Apple silicon download `Coopanion-<version>-mac-arm64.dmg`; on Intel download `…-mac-x64.dmg`.
+1. Open the [latest release](https://github.com/suyu5757-lab/coopanion-personal-usage/releases/latest). On Apple silicon download `Coopanion-<version>-mac-arm64.dmg`; on Intel download `…-mac-x64.dmg`.
    Not sure which you have: Apple menu → About This Mac. If "Chip" says Apple M-something, it is Apple silicon.
 2. Open the dmg and drag Coopanion into Applications.
 3. The app has no Apple developer signature, so macOS blocks the first open. Open it once and click Done on the warning, then go to System Settings → Privacy & Security, click **Open Anyway** at the bottom and confirm with your password. It opens normally after that.
@@ -107,7 +108,7 @@ The portable version does not update itself; the settings window shows a downloa
 
 ### Linux
 
-1. Open the [latest release](https://github.com/Pal-AI-Lab/Coopanion/releases/latest) and download `Coopanion-<version>-linux-x64.deb` (Debian / Ubuntu) or `Coopanion-<version>-linux-x64.AppImage` (other distributions).
+1. Open the [latest release](https://github.com/suyu5757-lab/coopanion-personal-usage/releases/latest) and download `Coopanion-<version>-linux-x64.deb` (Debian / Ubuntu) or `Coopanion-<version>-linux-x64.AppImage` (other distributions).
 2. deb: `sudo apt install ./Coopanion-<version>-linux-x64.deb`, then open Coopanion from the app menu.
    AppImage: `chmod +x Coopanion-*.AppImage` and run it. Ubuntu 22.04 and later need `libfuse2` first (`sudo apt install libfuse2t64`).
 3. The pet is a transparent always-on-top window, so the desktop needs compositing (on by default in GNOME and KDE). Under Wayland it runs through XWayland.
@@ -198,12 +199,18 @@ Ask Coo to set an alarm at a local time or after a number of minutes. Daily alar
 ### Playing with Coo
 
 - **Click** to poke it, **move back and forth over its head** to pat it, **press and drag** to pick it up; let go mid-swing to throw it. By default a poke makes Coo respond, and pats and pick-ups are passed on the next time it wakes. **Response mode** in Habits changes this: Quiet keeps every touch until you next talk to Coo, Eager responds to every touch, Custom… picks the touches that get a response right away.
-- **Expressions and motions**: Coo pairs what it says with a face and a motion. Faces: happy, wink, love, shy, surprised, angry, sad, sleepy, thinking, smug, pout, worried, determined, flustered, scared, excited (starry eyes), crying, confused. Motions include nod, shake, look around, turn, spin, jump, sit, sleep, wave, bow, shiver, flap, dance. As the DeepSeek Whale, a nod really dips the head and a shake turns the face, a wave raises the arm nearer you, and a bow tips the upper body forward.
+- **Expressions and motions**: Coo pairs what it says with a face and a motion. Faces: happy, wink, love, shy, surprised, angry, sad, sleepy, thinking, smug, pout, worried, determined, flustered, scared, excited (starry eyes), crying, confused. Motions include nod, shake, look around, turn, spin, jump, sit, sleep, wave, bow, shiver, flap, tail whip, dance. As the DeepSeek Whale, a nod really dips the head and a shake turns the face, a wave raises the arm nearer you, a bow tips the upper body forward, and a tail whip raises the fluke high and slams it down with a splash. She also has fourteen motions of her own: peek from behind a hand, spout, hug her tail, swim, shake dry, blow bubbles, float, sulk while drawing circles, knock on the screen, peek out, stretch, play dead, clap with her tail and sneeze.
 - **Right-click** for the menu: pause / resume, settings, quit, plus typing, voice input, night mode, sounds, hide and dress up.
 - **Hover buttons**: the buttons beside Coo while the pointer rests on it. Typing and voice by default; pick up to six in Habits.
 - **Remember where Coo stands**: turn it on in Habits and Coo returns to the same spot across the screen on the next start.
 - **OBS overlay**: turn on Export OBS overlay under Habits › Other, then add a Browser source in OBS with the address shown and your screen's resolution as its size. A Browser source draws 30 frames a second unless its custom frame rate is set; set it to 60 to see the pet at 60. Coo and its bubbles sit where they are on screen, on a transparent background.
 - **Several displays**: Coo starts on the main display. Carry it to another display and let go to move it there. If that display is unplugged, Coo returns to the main one.
+
+### Time of her own
+
+Turn on **Time of her own** under Behavior on the Habits page. After a stretch without a chat (20 minutes by default, at least 1 minute) she gets time of her own, 20 minutes by default; the browser closes when it ends. Turn on **No limit** next to **At most** and it stays open until she closes it. She has her own browser window with its own logins: the first time Bilibili or Douyin needs a sign-in, she asks in a bubble, and you sign in or scan the code in that window; passwords and verification codes are yours to enter. The window is muted by default; **Browser sound** in the same section turns its sound on.
+
+She can open pages, search, play videos, scroll and read comments; with **Allow likes, saves, danmaku and comments** on, she can also like, save, follow, send danmaku and comment. She never buys, recharges, tips, spends coins, opens a paid membership, sends private messages or changes the account, and she does not download files or fill in personal details. She only browses while you are not chatting; when you speak, she stops and answers.
 
 ### Letting Coo use your computer
 
@@ -217,7 +224,8 @@ Once it is on, Coo looks at the screen without asking, and asks before it first 
   - `ask-once` (default): looking is not asked; ask once before acting, then not again for the time set in **A yes lasts** (30 minutes by default);
   - `never-ask`: never ask.
 - With several displays, Coo looks at one at a time and moves to another when it needs to.
-- When you touch the mouse or keyboard, Coo stops and waits for you.
+- When you touch the mouse or keyboard, whole-screen input stops and waits for you.
+- With [Cua Driver](https://github.com/trycua/cua) installed and allowed Accessibility and Screen Recording, Coo can also work on one window in the background: it captures that window and clicks or types in it without moving your pointer or taking focus, so you can keep using the computer. Background window input does not wait for you to stop.
 - Logins, passwords and payments are left to you.
 - One wake makes at most 40 model requests; at the limit the turn ends and you can tell Coo to continue. The limit is on the Cormini page in advanced mode and applies after a restart.
 
@@ -242,7 +250,7 @@ Click the tray icon, or right-click Coo and click the gear. The window opens in 
 | Page          | What is there                                                                                                    |
 | ------------- | ---------------------------------------------------------------------------------------------------------------- |
 | Start         | Connect a model (the connected one and the other model services in one place), show or hide the pet on the desktop, preview the pet, pick the interface colors or edit their palette, rerun the guide. The bottom left says Running / Paused, beside pause / resume and shut down. |
-| Habits        | In sections: General (app language, your name, Coo's name, anonymous usage statistics), Behavior (walking, how Coo responds, what Coo may change by itself, hover buttons, double-click to type, typing key, status bubble, input bubbles), Display (size, bubble size, text size, bubble speed, frame rate, hide in full screen on Windows, remember position), Sounds (each kind can be turned off), Speech (bubbles read out syllable by syllable in place of the typing babble; pitch and speed by step or custom), Computer use (on/off, mouse and keyboard, when to ask you, how long a yes lasts), Other (OBS overlay, the context ring on the Chat page, off by default) |
+| Habits        | In sections: General (app language, your name, Coo's name, anonymous usage statistics), Behavior (walking, how Coo responds, what Coo may change by itself, time of her own, hover buttons, double-click to type, typing key, status bubble, input bubbles), Display (size, bubble size, text size, bubble speed, frame rate, hide in full screen on Windows, remember position), Sounds (each kind can be turned off), Speech (bubbles read out syllable by syllable in place of the typing babble; pitch and speed by step or custom), Computer use (on/off, mouse and keyboard, when to ask you, how long a yes lasts), Other (OBS overlay, the context ring on the Chat page, off by default) |
 | Dress up      | Figure (Coo, the DeepSeek Whale or an installed figure pack), colors and accessories; changes apply at once. **Import** at the end of the figure row installs packs from a zip or a folder (up to 128 MB at a time); dropping one on the page works too. Replacing an existing pack requires confirmation. An imported pack can be uninstalled: hover its tile, click the delete button in the corner and confirm; the whole pack is deleted, and the pet wearing it changes back to Coo |
 | Voice input   | On/off, recognizer, model download, talk key, microphone, listening mode                                          |
 | System prompt | Coo's system prompt; the persona is the CONSTITUTION section. The sections form one document; all but CONSTITUTION start folded, and folds last until the app quits. Template variables can be inserted and previewed with their current values; in the advanced mode a World's section links to that World's configuration. Ctrl+S saves to file and **Revert all edits** returns to the last save; **Apply now** saves and updates the current conversation's prompt, keeping its messages; **Clear conversation and restart** saves and clears the current conversation, keeping Memory and persona; **Full prompt preview** unfolds the whole prompt as assembled from the current files |
@@ -357,13 +365,13 @@ With Intel graphics (Mesa's iris driver), fast clear leaves old frames in the tr
 <details>
 <summary><b>What is it thinking?</b></summary>
 
-The Chat page has the full record. If something goes wrong, click **Export diagnostics** there and attach the file to an [issue](https://github.com/Pal-AI-Lab/Coopanion/issues).
+The Chat page has the full record. If something goes wrong, click **Export diagnostics** there and attach the file to an [issue](https://github.com/suyu5757-lab/coopanion-personal-usage/issues).
 
 </details>
 
 ## Feedback and contributing
 
-- Report problems and ideas in [Issues](https://github.com/Pal-AI-Lab/Coopanion/issues) with your OS version, Coopanion version and steps to reproduce.
+- Report problems and ideas in [Issues](https://github.com/suyu5757-lab/coopanion-personal-usage/issues) with your OS version, Coopanion version and steps to reproduce.
 - To build from source or change the code, see the [development guide](docs/DEVELOPMENT.md).
 
 ## Acknowledgements

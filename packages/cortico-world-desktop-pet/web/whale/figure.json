@@ -17,8 +17,8 @@
     "ru": "DeepSeek-тян"
   },
   "about": {
-    "zh": "一个 Q 版鲸鱼娘,二头身,侧身朝右站;蓝色长发、头顶一根呆毛,头两侧各一只鲸鱼鳍,身后一条鲸鱼尾巴;服装是括号里选的那套:女仆装是女仆裙和印着配色对应厂商标志的围裙,冬装是戴鲸鱼兜帽、围条纹围巾的斗篷,店员装是扎单马尾、戴红色遮阳帽和耳麦、穿条纹衬衫和红裙的快餐店员制服",
-    "en": "a chibi whale girl, two heads tall, standing three-quarters on facing right; long blue hair with an ahoge, a whale fin on each side of the head, and a whale tail behind; she wears the outfit picked in brackets: the maid dress is a maid dress with an apron printed with the logo of the colour scheme's vendor, the winter outfit a cape with a whale hood and a striped scarf, and the crew uniform a fast-food crew uniform with a single ponytail, a red visor and headset, a striped shirt and a red skirt"
+    "zh": "一个 Q 版鲸鱼娘,二头身,侧身朝右站;蓝色长发、头顶一根呆毛,头两侧各一只鲸鱼鳍,身后一条鲸鱼尾巴;服装是括号里选的那套:女仆装是女仆裙和印着配色对应厂商标志的围裙,冬装是戴鲸鱼兜帽、围条纹围巾的斗篷,店员装是扎单马尾、戴红色遮阳帽和耳麦、穿条纹衬衫和红裙的快餐店员制服,睡裙是淡蓝水手领睡裙配奶白荷叶边、印小鲸鱼的围裙前襟和蓝色蝴蝶结,头发编成两条麻花辫,睡觉时身下出现贝壳床、月亮抱枕、被子和床头灯,工装是扎高马尾、穿小领口无袖深蓝背心和浅灰蓝工装裙,背心袖口是三片鲸鳍形翻边,腰侧挂一只小鲸鱼挂件,后腰留尾巴开口",
+    "en": "a chibi whale girl, two heads tall, standing three-quarters on facing right; long blue hair with an ahoge, a whale fin on each side of the head, and a whale tail behind; she wears the outfit picked in brackets: the maid dress is a maid dress with an apron printed with the logo of the colour scheme's vendor, the winter outfit a cape with a whale hood and a striped scarf, and the crew uniform a fast-food crew uniform with a single ponytail, a red visor and headset, a striped shirt and a red skirt; the nightgown a pale blue sailor-collar nightdress with cream ruffles, a whale-print bib and a blue bow, her hair in twin braids, and a shell bed with a moon cushion, a blanket and a bedside lamp when she sleeps in it; the workwear is a small-collared sleeveless indigo work vest with three whale-fin flounces at each armhole, worn with a light grey-blue utility skirt with a tail opening at the lower back and a small whale charm at the hip, and a high ponytail"
   },
   "author": "Pal-AI-Lab",
   "credits": [
@@ -192,6 +192,40 @@
             "pt-BR": "Uniforme de atendente",
             "it": "Divisa da commessa",
             "ru": "Форма сотрудницы"
+          }
+        },
+        {
+          "id": "night",
+          "thumb": "thumbs/night.png",
+          "name": {
+            "zh": "睡裙",
+            "zh-Hant": "睡裙",
+            "en": "Nightgown",
+            "ja": "ナイトガウン",
+            "ko": "잠옷",
+            "fr": "Chemise de nuit",
+            "de": "Nachthemd",
+            "es-419": "Camisón",
+            "pt-BR": "Camisola",
+            "it": "Camicia da notte",
+            "ru": "Ночная рубашка"
+          }
+        },
+        {
+          "id": "work",
+          "thumb": "thumbs/work.png",
+          "name": {
+            "zh": "工装",
+            "zh-Hant": "工裝",
+            "en": "Workwear",
+            "ja": "ワークウェア",
+            "ko": "워크웨어",
+            "fr": "Tenue de travail",
+            "de": "Arbeitskleidung",
+            "es-419": "Ropa de trabajo",
+            "pt-BR": "Roupa de trabalho",
+            "it": "Abbigliamento da lavoro",
+            "ru": "Рабочая одежда"
           }
         }
       ]
@@ -973,6 +1007,297 @@
         "en": "bounces happily, fins, tail and ahoge all flapping"
       },
       "seconds": 1.5
+    },
+    {
+      "id": "tail-whip",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "甩尾巴",
+          "甩尾",
+          "抽尾巴"
+        ],
+        "en": [
+          "whip",
+          "lash"
+        ]
+      },
+      "about": {
+        "zh": "把尾巴高高扬起,再用力甩到地上,尾鳍拍出一片水花",
+        "en": "raises the tail high, then slams it down hard, the fluke throwing up a splash"
+      },
+      "seconds": 1.3
+    },
+    {
+      "id": "peek",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "捂脸偷看",
+          "偷看",
+          "捂脸"
+        ],
+        "en": [
+          "peep"
+        ]
+      },
+      "about": {
+        "zh": "捂住脸,再挪开手从指缝里偷看",
+        "en": "covers her face, then peeks out from behind her hand"
+      },
+      "seconds": 2.2
+    },
+    {
+      "id": "spout",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "喷水",
+          "喷水柱"
+        ],
+        "en": [
+          "spray"
+        ]
+      },
+      "about": {
+        "zh": "仰起头,从头顶喷出一道高高的水柱",
+        "en": "tilts her head back and spouts a tall plume of water"
+      },
+      "seconds": 1.8
+    },
+    {
+      "id": "hug-tail",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "抱尾巴",
+          "抱尾"
+        ],
+        "en": [
+          "hug"
+        ]
+      },
+      "about": {
+        "zh": "把尾巴卷到身前,两只手抱住尾鳍",
+        "en": "curls her tail around in front and hugs the fluke"
+      },
+      "seconds": 2.4
+    },
+    {
+      "id": "swim",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "游泳",
+          "游"
+        ],
+        "en": [
+          "swimming"
+        ]
+      },
+      "about": {
+        "zh": "身体前倾,手脚划水,尾巴摆动,身边冒水泡",
+        "en": "leans into a swim, paddles and kicks, tail sweeping, bubbles rising"
+      },
+      "seconds": 2.8
+    },
+    {
+      "id": "shake-off",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "抖水",
+          "甩水"
+        ],
+        "en": [
+          "dry"
+        ]
+      },
+      "about": {
+        "zh": "像刚出水一样全身抖一抖,把水珠甩开",
+        "en": "shakes herself all over like a wet dog, flinging off droplets"
+      },
+      "seconds": 1.8
+    },
+    {
+      "id": "bubbles",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "吹泡泡",
+          "泡泡"
+        ],
+        "en": [
+          "bubble"
+        ]
+      },
+      "about": {
+        "zh": "鼓起腮帮子,从嘴里吹出一串泡泡",
+        "en": "puffs her cheeks and blows a stream of bubbles"
+      },
+      "seconds": 2.6
+    },
+    {
+      "id": "float",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "飘浮",
+          "漂浮"
+        ],
+        "en": [
+          "hover"
+        ]
+      },
+      "about": {
+        "zh": "轻轻浮离地面,张开手臂慢慢晃",
+        "en": "lifts off the floor, arms out, drifting gently"
+      },
+      "seconds": 3
+    },
+    {
+      "id": "sulk",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "蹲着画圈",
+          "画圈圈",
+          "生闷气"
+        ],
+        "en": [
+          "mope"
+        ]
+      },
+      "about": {
+        "zh": "蹲下来嘟着嘴,用手指在地上画圈",
+        "en": "squats with a pout and draws circles with one finger"
+      },
+      "seconds": 3
+    },
+    {
+      "id": "knock",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "敲屏幕",
+          "敲敲"
+        ],
+        "en": [
+          "tap"
+        ]
+      },
+      "about": {
+        "zh": "抬起手在屏幕前敲两下,敲出两圈波纹",
+        "en": "raises a hand and taps twice on the screen, leaving two ripples"
+      },
+      "seconds": 1.8
+    },
+    {
+      "id": "peek-out",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "探头",
+          "探出头"
+        ],
+        "en": [
+          "peer"
+        ]
+      },
+      "about": {
+        "zh": "从旁边探出半个身子和脑袋张望",
+        "en": "leans out from the side to take a look"
+      },
+      "seconds": 1.8
+    },
+    {
+      "id": "stretch",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "伸懒腰",
+          "伸展"
+        ],
+        "en": [
+          "stretching"
+        ]
+      },
+      "about": {
+        "zh": "闭着眼把两只手臂向两边伸开,把身体拉长",
+        "en": "shuts her eyes, stretches both arms out and makes herself taller"
+      },
+      "seconds": 2.4
+    },
+    {
+      "id": "play-dead",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "装死",
+          "躺平"
+        ],
+        "en": [
+          "dead"
+        ]
+      },
+      "about": {
+        "zh": "往后一倒躺在地上,眼睛转圈装死",
+        "en": "flops onto her back and plays dead with spinning eyes"
+      },
+      "seconds": 2.8
+    },
+    {
+      "id": "tail-clap",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "拍尾鼓掌",
+          "尾巴鼓掌"
+        ],
+        "en": [
+          "clap"
+        ]
+      },
+      "about": {
+        "zh": "用尾鳍在地上连拍两下,像在鼓掌",
+        "en": "slaps the fluke on the floor twice as if applauding"
+      },
+      "seconds": 1.6
+    },
+    {
+      "id": "sneeze",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "打喷嚏",
+          "喷嚏"
+        ],
+        "en": [
+          "achoo"
+        ]
+      },
+      "about": {
+        "zh": "皱起脸憋一下,再猛地打出喷嚏,喷出小水珠",
+        "en": "scrunches up, then sneezes hard with a spray of droplets"
+      },
+      "seconds": 1.6
+    },
+    {
+      "id": "change",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "换装"
+        ],
+        "en": [
+          "outfit"
+        ]
+      },
+      "about": {
+        "zh": "换装时围着她冒一圈泡泡,换好再散开",
+        "en": "a ring of soap bubbles while the outfit changes, clearing when it is done"
+      },
+      "seconds": 1.4
     },
     {
       "id": "dance",

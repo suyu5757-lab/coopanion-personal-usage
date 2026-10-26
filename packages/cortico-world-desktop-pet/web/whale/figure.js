@@ -26,6 +26,9 @@ const SVGNS = 'http://www.w3.org/2000/svg';
 const FACE = { x: 520, y: 578, w: 390, h: 252 };
 // the head's parallax warps act over this rect (rig units); the long hair below it stays put
 const HEAD = [30, 12, 215, 168];
+// the fluke's outer tip in rig units, where a tail whip throws its splash
+const TAIL_TIP = [24.3, 192.7];
+const DROP = 'M0 -9C4 -3 6 0 6 3.5A6 6 0 0 1 -6 3.5C-6 0 -4 -3 0 -9Z';
 
 /**
  * A leg's warp: from 14 units below the hip pivot down it turns about the pivot by `a` degrees as a rigid
@@ -39,6 +42,219 @@ function hinge([px, py], a, ty) {
     const w = smooth(py - 6, py + 14, y), lx = x - px, ly = y - py;
     return [(lx * c - ly * s - lx) * w, ((lx * s + ly * c - ly) + ty) * w];
   };
+}
+
+/**
+ * The tail's angle through a whip, in degrees: up for the wind-up, down hard, then a few smaller
+ * swings. `k` is the gesture's progress, 0 to 1.
+ */
+function whipAngle(k) {
+  if (k < .28) return 34 * smooth(0, .28, k);
+  if (k < .42) return lerp(34, -58, smooth(.28, .42, k));
+  const u = (k - .42) / .58;
+  return -58 * Math.exp(-4.2 * u) * Math.cos(u * Math.PI * 2.2);
+}
+
+const ACTION_KINDS = new Set([
+  'peek', 'spout', 'hug-tail', 'swim', 'shake-off', 'bubbles', 'float', 'sulk',
+  'knock', 'peek-out', 'stretch', 'play-dead', 'tail-clap', 'sneeze',
+]);
+
+/** A short pulse used by the tap-like actions: 1 at `at`, 0 outside `at ± w`. */
+function tapPulse(k, at, w) {
+  const u = (k - at) / w;
+  return Math.abs(u) < 1 ? Math.cos(Math.PI * u / 2) ** 2 : 0;
+}
+
+/**
+ * What each of the whale's own motions adds to the rig: arm overrides in degrees, the rest as offsets.
+ * The kit runs the gesture's clock; the figure only has to shape it.
+ */
+function actionPose(kind, k, t) {
+  const env = (a, b, c = b, d = 1) => smooth(0, a, k) * (1 - smooth(c, d, k));
+  const o = {};
+  switch (kind) {
+    case 'peek': {
+      const cover = env(.05, .16, .78, .94), peer = smooth(.38, .52, k) * (1 - smooth(.62, .76, k));
+      o.armN = 4 + 181 * cover - 30 * peer;
+      o.armF = -2 - 6 * cover;
+      o.armNTx = 24 * cover;
+      o.z = { arm_near: 14.2 };
+      o.neckA = 5 * cover - 2 * peer;
+      o.bodyA = -2 * cover;
+      o.bodyTy = 2 * cover;
+      break;
+    }
+    case 'spout': {
+      const e = env(.1, .22, .7, .92);
+      o.bodyA = -5 * e;
+      o.bodyTy = -2 * e;
+      o.neckA = -12 * e;
+      o.angleY = -.55 * e;
+      o.armN = 4 + 25 * e;
+      o.armF = -2 - 12 * e;
+      o.tail = 18 * e + 4 * Math.sin(t * 8) * e;
+      o.fin = 10 * e;
+      break;
+    }
+    case 'hug-tail': {
+      const e = env(.08, .22, .8, .96);
+      o.tail = 30 * e;
+      o.armN = 4 + 78 * e;
+      o.armF = -2 + 112 * e;
+      o.z = { tail: 7.1, arm_near: 7.25, arm_far: 7.3 };
+      o.waistA = 4 * e;
+      o.bodyA = 3 * e;
+      o.neckA = 6 * e;
+      o.fin = 8 * e;
+      break;
+    }
+    case 'bubbles': {
+      const e = env(.08, .2, .72, .94);
+      o.talk = .7 * smooth(.12, .3, k) * (1 - smooth(.7, .9, k));
+      o.neckA = 5 * e;
+      o.angleY = .18 * e;
+      o.bodyA = 2 * e;
+      o.bodyTy = e;
+      o.armN = 4 + 8 * e;
+      o.armF = -2 - 6 * e;
+      o.tail = 4 * Math.sin(t * 3) * e;
+      break;
+    }
+    case 'knock': {
+      const e = env(.06, .14, .78, .96);
+      o.armF = -2 - 130 * e;
+      o.armFTx = 4 * e;
+      o.z = { arm_far: 14.2 };
+      o.neckA = 4 * e;
+      o.angleY = .1 * e;
+      o.bodyA = 2 * e;
+      o.bodyTx = 4 * e;
+      break;
+    }
+    case 'stretch': {
+      const e = env(.1, .25, .72, .94);
+      o.armN = 4 + 75 * e;
+      o.armF = -2 - 73 * e;
+      o.z = { arm_near: 13.8, arm_far: 13.7 };
+      o.bodyTy = -9 * e;
+      o.bodySq = -.08 * e;
+      o.neckA = -12 * e;
+      o.angleY = -.5 * e;
+      o.eyeClose = .75 * e;
+      o.talk = .4 * e;
+      o.tail = 10 * e;
+      o.fin = 10 * e;
+      o.ahoge = -10 * e;
+      break;
+    }
+    case 'sneeze': {
+      const wind = smooth(0, .12, k) * (1 - smooth(.36, .46, k));
+      const pop = smooth(.42, .48, k) * (1 - smooth(.7, .9, k));
+      o.neckA = -7 * wind + 9 * pop;
+      o.angleY = -.45 * wind + .35 * pop;
+      o.bodyA = -2 * wind + 2.5 * pop;
+      o.bodySq = .025 * pop;
+      o.armN = 4 + 8 * wind - 4 * pop;
+      o.armF = -2 - 6 * wind + 4 * pop;
+      o.eyeClose = Math.max(.7 * wind, pop);
+      o.talk = .65 * pop;
+      break;
+    }
+    case 'swim': {
+      const e = env(.08, .2, .8, .96), paddle = Math.sin(t * 7);
+      o.bodyA = 16 * e + 2 * Math.sin(t * 2.3) * e;
+      o.bodyTy = -16 * e + 2 * Math.sin(t * 3.1) * e;
+      o.bodyTx = -26 * e;
+      o.armN = 4 + 80 * e + 35 * paddle * e;
+      o.armF = -2 - 45 * e - 35 * paddle * e;
+      o.legN = 16 * Math.sin(t * 7 + 1) * e;
+      o.legF = 16 * Math.sin(t * 7) * e;
+      o.tail = 24 * Math.sin(t * 4) * e;
+      o.fin = 8 * Math.sin(t * 5) * e;
+      o.angleY = -.15 * e;
+      break;
+    }
+    case 'shake-off': {
+      const e = env(.05, .1, .8, .95), q = Math.sin(t * 38);
+      o.bodyA = 6 * q * e;
+      o.bodySq = .015 * Math.sin(t * 70) * e;
+      o.waistA = 3 * Math.sin(t * 41) * e;
+      o.neckA = 5 * Math.sin(t * 45 + 1) * e;
+      o.armN = 4 + 55 * e;
+      o.armF = -2 - 48 * e;
+      o.tail = 14 * Math.sin(t * 35) * e;
+      o.fin = 10 * Math.sin(t * 33) * e;
+      break;
+    }
+    case 'float': {
+      const e = env(.1, .28, .78, .96);
+      o.bodyTy = -30 * e + 2 * Math.sin(t * 2) * e;
+      o.bodyA = 4 * Math.sin(t * 1.2) * e;
+      o.bodyTx = 3 * Math.sin(t * .8) * e;
+      o.armN = 4 + 80 * e;
+      o.armF = -2 - 76 * e;
+      o.legN = -8 * e;
+      o.legF = 8 * e;
+      o.tail = 16 * e + 4 * Math.sin(t * 1.5) * e;
+      o.fin = 10 * e;
+      o.angleY = -.1 * e;
+      break;
+    }
+    case 'sulk': {
+      const e = env(.08, .2, .8, .96);
+      o.bodyTy = 16 * e;
+      o.bodySq = .05 * e;
+      o.bodyA = -3 * e;
+      o.legN = -12 * e;
+      o.legF = 12 * e;
+      o.legTyN = -16 * e;
+      o.legTyF = -16 * e;
+      o.armN = 4 - 18 * e;
+      o.armF = -2 - 8 * e;
+      o.neckA = 4 * e;
+      o.angleY = .28 * e;
+      o.tail = -6 * e;
+      break;
+    }
+    case 'peek-out': {
+      const e = env(.06, .18, .72, .92);
+      o.bodyTx = 14 * e;
+      o.bodyA = -5 * e;
+      o.bodyTy = -e;
+      o.neckA = 7 * e;
+      o.neckTx = 18 * e;
+      o.neckTy = -2 * e;
+      o.angleX = .6 * e;
+      o.angleY = -.1 * e;
+      o.armN = 4 + 16 * e;
+      o.armF = -2 - 8 * e;
+      o.tail = 8 * e;
+      break;
+    }
+    case 'play-dead': {
+      const e = smooth(0, .2, k) * (1 - smooth(.8, 1, k));
+      o.bodyA = -78 * e;
+      o.bodyTx = 66 * e;
+      o.neckA = 5 * e;
+      o.armN = 4 + 75 * e;
+      o.armF = -2 - 60 * e;
+      o.tail = -10 * e;
+      o.angleY = .1 * e;
+      break;
+    }
+    case 'tail-clap': {
+      const e = env(.06, .16, .8, .96), hit = tapPulse(k, .4, .1) + tapPulse(k, .6, .1);
+      o.tail = 24 * e - 82 * hit;
+      o.bodySq = .02 * hit;
+      o.neckA = -3 * e + 2 * hit;
+      o.armN = 4 + 20 * e;
+      o.armF = -2 - 16 * e;
+      o.fin = 8 * e;
+      break;
+    }
+  }
+  return o;
 }
 
 /* ---------- springs ---------- */
@@ -457,8 +673,12 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
     ahoge: spring(140, 6, 38), head: spring(70, 10, 16), armN: spring(60, 9, 125), armF: spring(60, 9, 95),
   };
   let lastT = null, prevTilt = 0, prevYaw = 0, prevLow = 0, headTilt = 0, fx = '';
+  // a tail whip's wind-up tip, the splash's start and origin, and this frame's fluke tip
+  let whipStart = null, splashAt = -1, splashAtP = null, whipTip = null;
   // the angle each hanging piece's root was last turned to (see the pendulums)
   let rootWas = {};
+  // a jump's take-off and landing, and the mirror of a turn, kick the belt charm (see the pendulums)
+  let charmJump = 0, charmTurn = 0, wasAir = false, faceVisWas = 1;
   // the kit tips Coo's whole round body to listen, nod, doze or wobble; she keeps her feet on the floor and
   // moves her head instead. Only flight, dragging and the jump's crouch and landing tip the whole group,
   // running keeps half its lean. The shares ease between modes so the group never snaps.
@@ -559,13 +779,24 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
     const bow = g?.kind === 'bow' ? env(.25, .7) : 0;        // the upper body tips forward about the waist
     const shiver = g?.kind === 'shiver' ? env(.08, .85) : 0; // arms hugged in, trembling, fins down
     const flap = g?.kind === 'flap' ? env(.05, .75) : 0;     // fins, tail, ahoge and arms all flutter
+    const whip = g?.kind === 'tail-whip' ? g.k : -1;         // her own hard tail lash
+    const change = g?.kind === 'change' ? g.k : -1;         // the dress change's bubble veil
+    const action = g && ACTION_KINDS.has(g.kind) ? { kind: g.kind, k: g.k } : null;
+    const ap = action ? actionPose(action.kind, action.k, t) : null;
+    const whipA = whip < 0 ? 0 : whipAngle(whip);
+    const whipAmp = whip < 0 ? 0 : smooth(.1, .28, whip) * (1 - smooth(.55, 1, whip));
+    // the wind-up pulls the tail out past her hair, and the strike settles the whole body for a moment
+    const wind = whip < 0 ? 0 : smooth(0, .26, whip) * (1 - smooth(.26, .38, whip));
+    const whipHit = whip < 0 ? 0 : smooth(.37, .42, whip) * (1 - smooth(.42, .62, whip));
     const gNeck = nod * 7 + shake * 2.5 + bow * 10 + wave * 4, gYaw = shake * 1.1;
     const headA = headTilt + gNeck;
     const tiltVel = (headA - prevTilt) / Math.max(dt, 1e-3); prevTilt = headA;
     const yawVel = (gYaw - prevYaw) / Math.max(dt, 1e-3); prevYaw = gYaw;
-    const angleX = clamp(clamp(o.look[0] / 5, -1, 1) * .9 + gYaw, -1.4, 1.4);
+    let angleX = clamp(clamp(o.look[0] / 5, -1, 1) * .9 + gYaw, -1.4, 1.4);
     // angleY + pitches the face down (the features slide down, more crown shows), as a gaze down (look[1] +) does
-    const angleY = clamp(clamp(o.look[1] / 4, -1, 1) * .7 + (mode === 'sleep' ? .8 : 0) + (HEAD_PITCH[face] || 0) + nod * .9 + bow * .5, -1.4, 1.4);
+    let angleY = clamp(clamp(o.look[1] / 4, -1, 1) * .7 + (mode === 'sleep' ? .8 : 0) + (HEAD_PITCH[face] || 0) + nod * .9 + bow * .5, -1.4, 1.4);
+    angleX = clamp(angleX + (ap?.angleX || 0), -1.4, 1.4);
+    angleY = clamp(angleY + (ap?.angleY || 0), -1.4, 1.4);
 
     /* springs */
     const sway = clamp(o.swing / 26, -1.6, 1.6);
@@ -580,11 +811,14 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
     wagAmp = lerp(wagAmp, wg, ease(3, dt));
     tailMood = lerp(tailMood, mode === 'sleep' || face === 'sad' || face === 'cry' || face === 'scared' ? -1 : 0, ease(3, dt));
     // fast flutters go on after the springs, which would smooth them away
-    const fins = sp.fins.step(finMood * 14 + sway * 10, dt) + (face === 'angry' ? 2.5 * Math.sin(t * 40) : 0) + flap * 13 * Math.sin(t * 26);
+    const fins = sp.fins.step(finMood * 14 + sway * 10, dt) + (face === 'angry' ? 2.5 * Math.sin(t * 40) : 0) + flap * 13 * Math.sin(t * 26)
+      + (whip < 0 ? 0 : 12 * Math.sin(Math.PI * clamp((whip - .28) / .3, 0, 1)) * (1 - smooth(.62, 1, whip)))
+      + (ap?.fin || 0);
     const ahoge = sp.ahoge.step(-tiltVel * .12 - yawVel * .5 + sway * 18 + (face === 'surprised' ? -16 : 0) + (face === 'confused' ? 20 : 0) + (mode === 'sleep' ? 22 : 0) - hairY * 12, dt)
-      + flap * 12 * Math.sin(t * 19);
+      + flap * 12 * Math.sin(t * 19) + (ap?.ahoge || 0);
     const tail = sp.tail.step(sway * 14 + tailMood * 12, dt) + wagAmp * 13 * Math.sin(t * (4 + 5 * wagAmp)) + Math.sin(t * 1.3) * 3
       + flap * 14 * Math.sin(t * 17);
+    const tailA = tail + whipA + (ap?.tail || 0);
 
     /* legs: the kit hands hip→foot segments sized for Coo; keep their angle (forward = foot to the right) */
     const legA = o.legs.map(l => -Math.atan2(l[2] - l[0], Math.max(4, l[3] - l[1])) * 180 / Math.PI);
@@ -610,6 +844,8 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
     if (runK > .001) { aN = lerp(aN, 38, runK); aF = lerp(aF, 32, runK); }
     if (wave) aN = lerp(aN, 108, wave);
     if (shiver) { aN = lerp(aN, -10, shiver); aF = lerp(aF, 8, shiver); }
+    if (ap?.armN != null) { aN = ap.armN; swing = 0; }
+    if (ap?.armF != null) { aF = ap.armF; swing = 0; }
     // each arm swings against the leg on its side. The swing goes on after the arm springs, which settle at about
     // 1.2 Hz: the walk's 2.1 Hz stride would come out of them about 120° late, each arm moving with its own leg.
     swingK = lerp(swingK, swing, ease(8, dt));
@@ -619,8 +855,15 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
 
     /* deformer states */
     // the kit sinks the hips 29 when seated; the sitting drawing's lowest point is 19.4 above the soles
-    st.body = { a: -sway * 1.2 + (held ? o.swing * .15 : 0), ty: low - 9.6 * sitK, sx: (1 + .006 * breath + .04 * plop) * (1 - .03 * shiver), sy: 1 - .012 * breath - .06 * plop };
-    st.waist = { a: bow * 20 };
+    const bodySq = ap?.bodySq || 0;
+    st.body = {
+      a: -sway * 1.2 + (held ? o.swing * .15 : 0) + 3 * whipHit + (ap?.bodyA || 0),
+      tx: ap?.bodyTx || 0,
+      ty: low - 9.6 * sitK + 3 * whipHit + (ap?.bodyTy || 0),
+      sx: (1 + .006 * breath + .04 * plop + .04 * whipHit) * (1 - .03 * shiver) * (1 + bodySq),
+      sy: (1 - .012 * breath - .06 * plop - .04 * whipHit) * (1 - bodySq),
+    };
+    st.waist = { a: bow * 20 + (ap?.waistA || 0), tx: ap?.waistTx || 0, ty: ap?.waistTy || 0 };
     st.skirt = {
       fn: (u, v) => {
         const k = v * v;
@@ -633,19 +876,25 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
     st.alpha.skirt = st.alpha.waist_bow_front = 1 - sitIn;
     st.alpha.leg_back = st.alpha.leg_front = 1 - smooth(.42, .52, sitK);
     st.alpha.skirt_sit = st.alpha.waist_bow_sit_front = sitIn;
-    st.armNear = { a: armN };
-    st.armFar = { a: armF };
+    const bed = outfit === 'night' ? (mode === 'sleep' ? sitIn : 0) : 0;
+    st.alpha.bed_shell = st.alpha.bed_blanket = st.alpha.bed_lamp = bed;
+    st.armNear = { a: armN, tx: ap?.armNTx || 0, ty: ap?.armNTy || 0 };
+    st.armFar = { a: armF, tx: ap?.armFTx || 0, ty: ap?.armFTy || 0 };
     // the far arm's cuff layer sits over the bodice; swept back, the arm is behind her and so is the cuff
     st.alpha.arm_far_end_front = 1 - smooth(12, 30, armF);
     // she is turned toward us, so a foot behind its hip is also farther away: it rides a little higher,
     // which reads as the heel coming up at the push-off
     const behind = o.legs.map(l => Math.max(0, l[0] - l[2]) * .3 * walkK);
-    st.legBack = { fn: hinge(L.PV.legBack, lerp(legA[0], -55, sitK), (-lift[0] * .9 - behind[0]) * (1 - sitK)) };
-    st.legFront = { fn: hinge(L.PV.legFront, lerp(legA[1], -60, sitK), (-lift[1] * .9 - behind[1]) * (1 - sitK)) };
-    st.tail = { a: tail - 10 * sitK };
-    st.tailBend = { fn: u => [0, -tail * .5 * u * u] };
+    st.legBack = { fn: hinge(L.PV.legBack, ap?.legN ?? lerp(legA[0], -55, sitK), (-lift[0] * .9 - behind[0]) * (1 - sitK) + (ap?.legTyN || 0)) };
+    st.legFront = { fn: hinge(L.PV.legFront, ap?.legF ?? lerp(legA[1], -60, sitK), (-lift[1] * .9 - behind[1]) * (1 - sitK) + (ap?.legTyF || 0)) };
+    st.tail = { a: tailA - 10 * sitK, tx: -14 * wind, ty: -4 * wind };
+    st.tailBend = { fn: u => [0, -tailA * .5 * (1 - .7 * whipAmp) * u * u] };
     // the head stays up while she leans forward for the ninja run
-    st.neck = { a: headA + clamp(bend * .8, -10, 12) - runK * 12, ty: (mode === 'sleep' ? 2.5 : 0) + breath * .35 };
+    st.neck = {
+      a: headA + clamp(bend * .8, -10, 12) - runK * 12 + (ap?.neckA || 0),
+      tx: ap?.neckTx || 0,
+      ty: (mode === 'sleep' ? 2.5 : 0) + breath * .35 + (ap?.neckTy || 0),
+    };
     const parallax = (k, ky) => (u, v) => [angleX * k * bump(u) * (.4 + .6 * bump(v)), angleY * ky * bump(v) * (.4 + .6 * bump(u))];
     st.headFront = { fn: parallax(4.2, 2.8) };
     // the eyes and mouth move with the face: the eyes' outline is shared between the two layers
@@ -700,12 +949,17 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
     st.ahoge = { a: ahoge * .5 + Math.sin(t * 2.1) * 2 };
     st.finNear = { a: fins + Math.sin(t * 1.4) * 1.5 };
     st.finFar = { a: -fins * .8 - Math.sin(t * 1.4) * 1.2 };
-    // what hangs off her (the pompoms on the hood ties, the scarf ends) is a pendulum: it hangs down whichever way
-    // its root and the whole of her are turned, and the motion that flings her hair flings it, so it trails, swings
-    // back and settles over a few swings. A quick turn of its root (a nod, a landing) kicks it, and so does each
-    // step; one hung from the head also swings as the face turns (a shake, a look round), and idly sways a little.
-    // `gain` is how freely it swings: 1 for a pompom on a string, less for cloth, which hangs only partly
+    // what hangs off her (the pompoms on the hood ties, the scarf ends, the belt charm) is a pendulum: it hangs
+    // down whichever way its root and the whole of her are turned, and the motion that flings her hair flings it,
+    // so it trails, swings back and settles over a few swings. A quick turn of its root (a nod, a landing) kicks
+    // it, and so does each step; one hung from the head also swings as the face turns (a shake, a look round), and
+    // idly sways a little. `gain` is how freely it swings: 1 for a pompom on a string, less for cloth, which hangs
+    // only partly. A `fling` piece is also kicked by a jump's take-off and landing and by the mirror of a turn.
     const faceTurn = (angleX - (rootWas.face ?? angleX)) / Math.max(dt, 1e-3); rootWas.face = angleX;
+    if (airborne !== wasAir) { charmJump = airborne ? -18 : 13; wasAir = airborne; }
+    charmJump *= Math.exp(-7 * dt);
+    const faceVisV = ((o.facing ?? 1) - faceVisWas) / Math.max(dt, 1e-3); faceVisWas = o.facing ?? 1;
+    charmTurn = clamp(-faceVisV * 1.1, -22, 22);
     for (const [k, d] of Object.entries(L.swings)) {
       let root = (o.groupRot || 0) * facing, onHead = false;
       for (let p = d.parent; p; p = L.deformers[p].parent) {
@@ -714,13 +968,18 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
       }
       const kick = (root - (rootWas[k] ?? root)) / Math.max(dt, 1e-3); rootWas[k] = root;
       // a short string: it takes a good many degrees before the swing shows
-      const pend = sp[`pend_${k}`] ||= spring(28, 1.8, 55), ph = d.pivot[0] * .05;
-      const a = pend.step((-sway * 34 - kick * .15 + (onHead ? faceTurn * 8 : 0) + walkK * (legA[0] - legA[1]) * .3) * d.gain, dt);
+      const pend = sp[`pend_${k}`] ||= d.fling ? spring(45, 2, 60) : spring(28, 1.8, 55), ph = d.pivot[0] * .05;
+      const fling = d.fling ? charmJump + charmTurn : 0;
+      const a = pend.step((-sway * 34 - kick * .15 + fling + (onHead ? faceTurn * 8 : 0) + walkK * (legA[0] - legA[1]) * .3) * d.gain, dt);
       const idle = onHead ? Math.sin(t * 1.7 + ph) * 6 + Math.sin(t * 2.9 + ph * 1.3) * 2.5 : Math.sin(t * 1.7 + ph) * 2;
       st[k] = { a: a + idle * d.gain - root * Math.min(1, d.gain) };
     }
 
-    paintFace(fc, face, o, t);
+    st.z = ap?.z || {};
+    const faceO = { ...o };
+    if (ap?.eyeClose) faceO.eyeClose = Math.max(faceO.eyeClose || 0, ap.eyeClose);
+    if (ap?.talk) faceO.talk = Math.max(faceO.talk || 0, ap.talk);
+    paintFace(fc, face, faceO, t);
     rig.upload('faceFx', faceCv);
     st.mix = 0;
     if (fade) {
@@ -728,19 +987,35 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
       st.mix = smooth(0, 1, (t - fade.t0) / fade.dur);
       const own = img;
       img = fade.set.img; fg = fg2;
-      paintFace(fc, face, o, t);
+      paintFace(fc, face, faceO, t);
       img = own; fg = fg1;
       rig.upload('faceFx@mix', faceCv2);
+    }
+    // the fluke's tip this frame, and the fixed points a whip's trail and splash are drawn from
+    whipTip = rig.point('tailBend', st, TAIL_TIP[0], TAIL_TIP[1]);
+    if (whip >= 0) {
+      if (whip < .28) { whipStart = null; splashAt = -1; splashAtP = null; }
+      const atTail = (angle, tx = 0, ty = 0) => {
+        const pose = { ...st, tail: { a: angle - 10 * sitK, tx, ty }, tailBend: { fn: u => [0, -angle * .5 * .3 * u * u] } };
+        return rig.point('tailBend', pose, TAIL_TIP[0], TAIL_TIP[1]);
+      };
+      if (whip >= .28 && !whipStart) whipStart = atTail(34, -14, -4);
+      if (whip >= .42 && splashAt < 0) {
+        const p = atTail(-58);
+        splashAtP = [p[0], Math.min(p[1], 256)];
+        splashAt = t;
+        opts.host?.sound?.('splash', 'move');
+      }
     }
     rig.render(st);
     if (opts.raster) { fo.setAttribute('href', canvas.toDataURL('image/png')); decoded = fo.decode ? fo.decode().catch(() => {}) : null; }
     if (fade && st.mix >= 1) endFade();
-    drawFx(fc, t);
+    drawFx(fc, t, whip, change, action);
   }
 
   /* ---------- effects over the figure (SVG, like the built-in figure's) ---------- */
   const at = (x, y) => rig.point('neck', st, x, y);
-  function drawFx(fc, t) {
+  function drawFx(fc, t, whip, change, action) {
     let s = '';
     const ac = accent();
     const top = at(124, 34), side = at(204, 52);
@@ -778,6 +1053,217 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
       const c = at(206, 36), k = 1 + .06 * Math.sin(t * 3);
       s += `<g transform="translate(${f1(c[0])} ${f1(c[1])}) scale(${f1(k)})"><path fill="none" stroke="#252049" stroke-width="7" stroke-linecap="round" stroke-linejoin="round" d="M-8 -9Q-8 -19 0 -19Q9 -19 9 -11Q9 -4 0 -1V4"/><circle fill="#252049" cx="0" cy="14" r="4.5"/></g>`;
     }
+    // the fluke's trail through the strike, then the splash it throws at the floor
+    if (whip >= .28 && whipStart && whipTip) {
+      const arc = whip < .42 ? smooth(.28, .42, whip) : 1 - smooth(.42, .68, whip);
+      if (arc > 0) {
+        const [px, py] = L.PV.tail, [sx, sy] = whipStart, [ex, ey] = whip < .42 ? whipTip : (splashAtP ?? whipTip);
+        const r0 = Math.hypot(sx - px, sy - py), r1 = Math.hypot(ex - px, ey - py);
+        const a0 = Math.atan2(sy - py, sx - px), a1 = Math.atan2(ey - py, ex - px);
+        let da = a1 - a0;
+        while (da > Math.PI) da -= Math.PI * 2;
+        while (da < -Math.PI) da += Math.PI * 2;
+        const pts = [];
+        for (let i = 0; i <= 12; i++) {
+          const u = i / 12, a = a0 + da * u, r = lerp(r0, r1, u);
+          pts.push(`${f1(px + r * Math.cos(a))} ${f1(py + r * Math.sin(a))}`);
+        }
+        const d = `M${pts.join('L')}`;
+        s += `<path fill="none" stroke="#8fd0ff" stroke-width="8" stroke-linecap="round" opacity="${f1(.22 * arc)}" d="${d}"/>`;
+        s += `<path fill="none" stroke="#eaf9ff" stroke-width="3.2" stroke-linecap="round" opacity="${f1(.8 * arc)}" d="${d}"/>`;
+      }
+    }
+    const splashAge = splashAt >= 0 ? t - splashAt : Infinity;
+    if (splashAge >= 0 && splashAge < .55 && splashAtP) {
+      const [ox, oy] = splashAtP, k = clamp(splashAge / .55, 0, 1), fade = 1 - smooth(.7, 1, k);
+      s += `<ellipse cx="${f1(ox)}" cy="${f1(oy)}" rx="${f1(7 + 24 * k)}" ry="${f1(2 + 7 * k)}" fill="none" stroke="#9fdcff" stroke-width="2.4" opacity="${f1(.55 * (1 - smooth(.1, .7, k)))}"/>`;
+      s += `<ellipse cx="${f1(ox)}" cy="${f1(oy)}" rx="${f1(5 + 28 * k)}" ry="${f1(1.2 + 8 * k)}" fill="#eaf9ff" opacity="${f1(.6 * (1 - smooth(0, .25, k)))}"/>`;
+      for (let i = 0; i < 9; i++) {
+        const a = -Math.PI / 2 + (i - 4) * .23, r0 = 5 + 5 * k, r1 = 16 + 46 * k;
+        const x0 = ox + r0 * Math.cos(a), y0 = oy + r0 * Math.sin(a);
+        const x1 = ox + r1 * Math.cos(a), y1 = oy + r1 * Math.sin(a);
+        const cx = ox + (r0 + (r1 - r0) * .45) * Math.cos(a + .35), cy = oy + (r0 + (r1 - r0) * .45) * Math.sin(a + .35);
+        s += `<path fill="none" stroke="#e8f8ff" stroke-width="2.6" stroke-linecap="round" opacity="${f1(.9 * fade)}" d="M${f1(x0)} ${f1(y0)}Q${f1(cx)} ${f1(cy)} ${f1(x1)} ${f1(y1)}"/>`;
+      }
+      for (let i = 0; i < 11; i++) {
+        const a = -Math.PI / 2 + (i - 5) * .26, v = 90 + (i % 3) * 36;
+        const x = ox + Math.cos(a) * v * splashAge, y = oy + Math.sin(a) * v * splashAge + 170 * splashAge * splashAge;
+        const r = (5.4 - 3 * k) * (1 - .16 * (i % 2)), o = (1 - smooth(.55, 1, k)) * (.95 - .05 * (i % 3));
+        s += `<circle cx="${f1(x)}" cy="${f1(y)}" r="${f1(r)}" fill="#bfe9ff" opacity="${f1(o)}"/>`;
+        s += `<circle cx="${f1(x - r * .3)}" cy="${f1(y - r * .35)}" r="${f1(r * .38)}" fill="#fff" opacity="${f1(o)}"/>`;
+      }
+    }
+    if (change >= 0) {
+      // a soap-bubble veil around her while the dress changes; the outfit swap happens under it
+      const fade = smooth(0, .12, change) * (1 - smooth(.8, 1, change));
+      for (let i = 0; i < 14; i++) {
+        const a = i * 2.399 + change * 2.1;
+        const lift = smooth(0, 1, change);
+        const cx = 128 + Math.cos(a) * (28 + 40 * Math.sin(Math.PI * Math.min(1, change * 1.25)));
+        const cy = 142 + Math.sin(a) * (26 + 34 * lift) - 22 * lift;
+        const r = 3.2 + 7.5 * Math.abs(Math.sin(i * 1.73 + change * 4.2));
+        const o = fade * (.45 + .45 * Math.abs(Math.sin(i * 2.4 + change * 5)));
+        s += `<circle cx="${f1(cx)}" cy="${f1(cy)}" r="${f1(r)}" fill="#f4fbff" stroke="${ac}" stroke-width=".85" opacity="${f1(o)}"/>`;
+        s += `<circle cx="${f1(cx - r * .3)}" cy="${f1(cy - r * .3)}" r="${f1(r * .22)}" fill="#ffffff" opacity="${f1(o * .9)}"/>`;
+      }
+    }
+
+    const ak = action?.kind, q = action?.k ?? 0;
+    const faceAt = (x, y) => rig.point('headFeat', st, U(x), V(y));
+    const handAt = (side) => rig.point(side === 'near' ? 'armNear' : 'armFar', st, side === 'near' ? 98 : 161, side === 'near' ? 204 : 201);
+    const fluke = () => rig.point('tailBend', st, TAIL_TIP[0], TAIL_TIP[1]);
+    const star = (x, y, r, o) => `<path fill="#fff" stroke="${ac}" stroke-width=".8" opacity="${f1(o)}" transform="translate(${f1(x)} ${f1(y)}) scale(${f1(r / 7)})" d="M0 -7L2 -2L7 -2L3 1L4.5 6.5L0 3.3L-4.5 6.5L-3 1L-7 -2L-2 -2Z"/>`;
+    if (ak === 'spout') {
+      const e = smooth(.12, .24, q) * (1 - smooth(.68, .9, q));
+      if (e > .01) {
+        const [hx, hy] = rig.point('headFront', st, 128, 58), topY = hy - 58 - 6 * Math.sin(q * Math.PI);
+        const column = `M${f1(hx)} ${f1(hy)}Q${f1(hx - 5)} ${f1(hy - 34)} ${f1(hx + 3)} ${f1(topY)}`;
+        s += `<path fill="none" stroke="#5ab9ff" stroke-width="17" stroke-linecap="round" opacity="${f1(.22 * e)}" d="${column}"/>`;
+        s += `<path fill="none" stroke="#8fd0ff" stroke-width="9" stroke-linecap="round" opacity="${f1(.5 * e)}" d="${column}"/>`;
+        s += `<path fill="none" stroke="#f4fbff" stroke-width="3.2" stroke-linecap="round" opacity="${f1(.95 * e)}" d="${column}"/>`;
+        for (let i = 0; i < 12; i++) {
+          const age = (q * 2.4 + i / 12) % 1, a = -Math.PI / 2 + (i - 5.5) * .14, d = 22 + 62 * age;
+          const x = hx + 3 + Math.cos(a) * d, y = topY + Math.sin(a) * d * .8 + 50 * age * age, o = e * (1 - age);
+          s += `<circle cx="${f1(x)}" cy="${f1(y)}" r="${f1(3.6 - 1.6 * age)}" fill="#dff5ff" opacity="${f1(o)}"/>`;
+          if (i % 3 === 0) s += `<circle cx="${f1(x - 1)}" cy="${f1(y - 1)}" r="${f1(1.2 - .4 * age)}" fill="#fff" opacity="${f1(o)}"/>`;
+        }
+        s += `<ellipse cx="${f1(hx + 3)}" cy="${f1(topY)}" rx="${f1(9 + 4 * Math.sin(q * 9))}" ry="${f1(4 + 2 * Math.cos(q * 9))}" fill="#eaf9ff" opacity="${f1(.8 * e)}"/>`;
+      }
+    }
+    if (ak === 'bubbles') {
+      const e = smooth(0, .12, q) * (1 - smooth(.82, 1, q)), [mx, my] = faceAt(766, 772);
+      if (e > .01) {
+        for (let i = 0; i < 11; i++) {
+          const p = (q * 1.7 + i / 11) % 1, x = mx + 10 + 50 * p + 3 * Math.sin(t * 2 + i), y = my - 2 - 70 * p + 2 * Math.sin(t * 3 + i);
+          const r = (3 + 7 * (1 - p)) * e, o = e * (1 - p);
+          s += `<circle cx="${f1(x)}" cy="${f1(y)}" r="${f1(r)}" fill="#eaf9ff" stroke="${ac}" stroke-width="1" opacity="${f1(o * .85)}"/>`;
+          s += `<circle cx="${f1(x - r * .3)}" cy="${f1(y - r * .3)}" r="${f1(r * .24)}" fill="#ffffff" opacity="${f1(o * .95)}"/>`;
+        }
+      }
+    }
+    if (ak === 'shake-off') {
+      const e = smooth(.02, .1, q) * (1 - smooth(.78, .96, q));
+      if (e > .01) {
+        const spread = 56 + 58 * smooth(0, .75, q);
+        for (let i = 0; i < 18; i++) {
+          const a = i * 2.399, x = 128 + Math.cos(a) * spread * (.8 + .2 * Math.sin(i * 2.1));
+          const y = 172 + Math.sin(a) * spread * .55, o = e * (.8 - .45 * q);
+          if (y < 142) continue;
+          const r = 1.8 + 1.4 * (i % 3);
+          s += `<circle cx="${f1(x)}" cy="${f1(y)}" r="${f1(r)}" fill="#bfe9ff" opacity="${f1(o)}"/>`;
+          s += `<circle cx="${f1(x - r * .35)}" cy="${f1(y - r * .35)}" r="${f1(r * .35)}" fill="#fff" opacity="${f1(o)}"/>`;
+        }
+      }
+    }
+    if (ak === 'swim') {
+      const e = smooth(.06, .2, q) * (1 - smooth(.78, .95, q));
+      if (e > .01) {
+        for (let i = 0; i < 7; i++) {
+          const p = (q * 1.4 + i / 7) % 1, x = 110 + Math.sin(i * 2.2) * 28 + 8 * Math.sin(t + i);
+          const y = 205 - 72 * p + 4 * Math.sin(t * 2 + i), r = 2.2 + 4.5 * (1 - p), o = e * (1 - p);
+          s += `<circle cx="${f1(x)}" cy="${f1(y)}" r="${f1(r)}" fill="#eaf9ff" stroke="${ac}" stroke-width=".8" opacity="${f1(o * .8)}"/>`;
+        }
+        const [wx, wy] = rig.point('body', st, 72, 218);
+        s += `<path fill="none" stroke="#bfe9ff" stroke-width="2.6" stroke-linecap="round" opacity="${f1(.55 * e)}" d="M${f1(wx - 24)} ${f1(wy)}Q${f1(wx - 35)} ${f1(wy - 8)} ${f1(wx - 47)} ${f1(wy + 1)}"/>`;
+        s += `<path fill="none" stroke="#eaf9ff" stroke-width="1.6" stroke-linecap="round" opacity="${f1(.7 * e)}" d="M${f1(wx - 20)} ${f1(wy + 8)}Q${f1(wx - 31)} ${f1(wy + 1)} ${f1(wx - 42)} ${f1(wy + 9)}"/>`;
+      }
+    }
+    if (ak === 'float') {
+      const e = smooth(.08, .28, q) * (1 - smooth(.78, .96, q));
+      if (e > .01) {
+        for (let i = 0; i < 5; i++) {
+          const a = t * .9 + i * 1.7, x = 128 + Math.cos(a) * (42 + 6 * Math.sin(i)), y = 132 + Math.sin(a) * (52 + 5 * Math.cos(i * 1.3));
+          s += star(x, y, 2.8 + 1.6 * (i % 2), e * (.45 + .35 * Math.abs(Math.sin(a))));
+        }
+      }
+    }
+    if (ak === 'sulk') {
+      const e = smooth(.12, .25, q) * (1 - smooth(.82, .96, q));
+      if (e > .01) {
+        const [hx, hy] = handAt('near'), cx = hx - 14, cy = hy + 16 + 2 * Math.sin(t * 3);
+        let d = '';
+        for (let i = 0; i <= 28; i++) {
+          const a = i * .62 + t * 2, r = 1.5 + i * .72, x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r * .72;
+          d += `${i ? 'L' : 'M'}${f1(x)} ${f1(y)}`;
+        }
+        s += `<path fill="none" stroke="#4a6aa8" stroke-width="2.6" stroke-linecap="round" opacity="${f1(.8 * e)}" d="${d}"/>`;
+        s += `<circle cx="${f1(cx)}" cy="${f1(cy)}" r="2.2" fill="#4a6aa8" opacity="${f1(.7 * e)}"/>`;
+      }
+    }
+    if (ak === 'knock') {
+      const e = smooth(.04, .12, q) * (1 - smooth(.82, .96, q)), [hx, hy] = handAt('far');
+      for (const atK of [.28, .56]) {
+        const u = (q - atK) / .24;
+        if (u >= 0 && u <= 1) {
+          const r = 10 + 30 * u, o = e * .95 * (1 - u);
+          s += `<ellipse cx="${f1(hx)}" cy="${f1(hy)}" rx="${f1(r)}" ry="${f1(r * .92)}" fill="none" stroke="${ac}" stroke-width="5" opacity="${f1(o * .45)}"/>`;
+          s += `<ellipse cx="${f1(hx)}" cy="${f1(hy)}" rx="${f1(r)}" ry="${f1(r * .92)}" fill="none" stroke="#fff" stroke-width="2.6" opacity="${f1(o)}"/>`;
+          for (let i = 0; i < 6; i++) {
+            const a = i * Math.PI / 3;
+            s += `<path fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" opacity="${f1(o)}" d="M${f1(hx + Math.cos(a) * (r + 5))} ${f1(hy + Math.sin(a) * (r + 5))}L${f1(hx + Math.cos(a) * (r + 12))} ${f1(hy + Math.sin(a) * (r + 12))}"/>`;
+          }
+          if (u < .3) s += star(hx, hy, 7 + 14 * (1 - u / .3), .9 * (1 - u / .3));
+        }
+      }
+    }
+    if (ak === 'peek-out') {
+      const e = smooth(.08, .25, q) * (1 - smooth(.7, .92, q));
+      if (e > .01) {
+        const [hx, hy] = rig.point('headFront', st, 205, 94);
+        for (let i = 0; i < 3; i++) {
+          const o = e * (.55 + .2 * Math.sin(t * 8 + i));
+          s += `<path fill="none" stroke="${ac}" stroke-width="2.6" stroke-linecap="round" opacity="${f1(o)}" d="M${f1(hx + 6 + i * 5)} ${f1(hy - 8 + i * 7)}h12"/>`;
+        }
+      }
+    }
+    if (ak === 'stretch') {
+      const e = smooth(.1, .3, q) * (1 - smooth(.7, .92, q));
+      if (e > .01) {
+        for (let i = 0; i < 4; i++) {
+          const a = t * .8 + i * 1.6, x = 128 + Math.cos(a) * (34 + 5 * i), y = 92 + Math.sin(a) * 22;
+          s += star(x, y, 2.5 + 1.4 * (i % 2), e * .55);
+        }
+      }
+    }
+    if (ak === 'play-dead') {
+      const e = smooth(.02, .12, q) * (1 - smooth(.78, .96, q));
+      const p = smooth(.16, .24, q) * (1 - smooth(.32, .52, q));
+      if (p > .01) {
+        s += `<ellipse cx="194" cy="252" rx="${f1(12 + 26 * p)}" ry="${f1(3 + 5 * p)}" fill="none" stroke="#bfe9ff" stroke-width="2" opacity="${f1(.5 * e * (1 - p))}"/>`;
+        for (let i = 0; i < 5; i++) {
+          const x = 180 + i * 9, y = 246 - 5 * Math.sin(i * 1.7) - 10 * p;
+          s += `<circle cx="${f1(x)}" cy="${f1(y)}" r="${f1(2 + 2 * p)}" fill="#d8e2f2" opacity="${f1(.45 * e * (1 - p))}"/>`;
+        }
+      }
+    }
+    if (ak === 'tail-clap') {
+      for (const atK of [.4, .6]) {
+        const u = (q - atK) / .16;
+        if (u >= 0 && u <= 1) {
+          const [tx, ty] = fluke(), y = Math.min(ty, 254), o = .9 * (1 - u);
+          s += `<ellipse cx="${f1(tx)}" cy="${f1(y)}" rx="${f1(8 + 22 * u)}" ry="${f1(2.5 + 6 * u)}" fill="none" stroke="#bfe9ff" stroke-width="2.4" opacity="${f1(o)}"/>`;
+          for (let i = 0; i < 5; i++) {
+            const a = -Math.PI / 2 + (i - 2) * .28, d = 10 + 34 * u;
+            s += `<circle cx="${f1(tx + Math.cos(a) * d)}" cy="${f1(y + Math.sin(a) * d)}" r="${f1(2.5 - 1.2 * u)}" fill="#eaf9ff" opacity="${f1(o)}"/>`;
+          }
+        }
+      }
+    }
+    if (ak === 'sneeze') {
+      const u = (q - .43) / .52;
+      if (u > 0 && u < 1) {
+        const [mx, my] = faceAt(766, 772);
+        s += `<ellipse cx="${f1(mx + 8 + 20 * u)}" cy="${f1(my + 2)}" rx="${f1(7 + 16 * u)}" ry="${f1(5 + 13 * u)}" fill="#eaf9ff" opacity="${f1(.7 * (1 - u))}"/>`;
+        for (let i = 0; i < 14; i++) {
+          const a = -.3 + i * .045, d = 12 + 90 * u, x = mx + Math.cos(a) * d, y = my + Math.sin(a) * d * .35 + 20 * u * u;
+          s += `<circle cx="${f1(x)}" cy="${f1(y)}" r="${f1(2.2 + 1.7 * (i % 3))}" fill="#bfe9ff" opacity="${f1(.9 * (1 - u))}"/>`;
+          s += `<circle cx="${f1(x - .8)}" cy="${f1(y - .8)}" r="${f1(.9 + .5 * (i % 2))}" fill="#fff" opacity="${f1(.9 * (1 - u))}"/>`;
+        }
+        for (let i = 0; i < 3; i++) {
+          s += `<path fill="none" stroke="#eaf9ff" stroke-width="2.6" stroke-linecap="round" opacity="${f1(.75 * (1 - u))}" d="M${f1(mx + 8)} ${f1(my - 10 + i * 7)}Q${f1(mx + 34 + i * 5)} ${f1(my - 14 + i * 7)} ${f1(mx + 58 + i * 6)} ${f1(my - 4 + i * 7)}"/>`;
+        }
+      }
+    }
     if (fx !== s) { fxG.innerHTML = s; fx = s; }
   }
 
@@ -785,7 +1271,7 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
     draw,
     groupTilt,
     /** The gestures she draws herself, from the frame's `gesture` (the kit leaves them off the body). */
-    gestures: ['nod', 'shake', 'wave', 'bow'],
+    gestures: ['nod', 'shake', 'wave', 'bow', 'tail-whip', 'change', ...ACTION_KINDS],
     setScheme,
     /** Forgets the motion state (springs, clocks), for callers that replay a timeline from its start. */
     /**
@@ -814,6 +1300,8 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
       endFade();
       for (const k in sp) { sp[k].x = 0; sp[k].v = 0; }
       lastT = null; rootWas = {}; prevTilt = 0; prevYaw = 0; prevLow = 0; headTilt = 0; wTilt = 0; wLean = 0; finMood = 0; tailMood = 0; wagAmp = 0; sitK = 0; walkK = 0; runK = 0; swingK = 0;
+      whipStart = null; splashAt = -1; splashAtP = null; whipTip = null;
+      charmJump = 0; charmTurn = 0; wasAir = false; faceVisWas = 1;
     },
     /** Loads every scheme's and outfit's textures, so later switches are immediate. */
     preload: () => Promise.all(SCHEMES.flatMap(sc => OUTFITS.map(of => loadScheme(sc.id, of.id)))),
@@ -831,7 +1319,30 @@ export async function createWhaleFigure(base = new URL('./', import.meta.url), o
   };
 }
 
+/** The whale's own words, beyond the kit's: the kit hands each to her figure as `frame.gesture`. */
+export const WHALE_WORDS = {
+  'tail-whip': { motion: { seconds: 1.3, sound: 'swish' } },
+  'change': { motion: { seconds: 1.4 } },
+  'peek': { motion: { seconds: 2.2, face: 'shy', sound: 'shy' } },
+  'spout': { motion: { seconds: 1.8, face: 'surprised', sound: 'splash' } },
+  'hug-tail': { motion: { seconds: 2.4, face: 'love', sound: 'purr' } },
+  'swim': { motion: { seconds: 2.8, face: 'happy', sound: 'splash' } },
+  'shake-off': { motion: { seconds: 1.8, face: 'flustered', sound: 'shake' } },
+  'bubbles': { motion: { seconds: 2.6, face: 'happy', sound: 'blub' } },
+  'float': { motion: { seconds: 3, face: 'content', sound: 'swish' } },
+  'sulk': { motion: { seconds: 3, face: 'pout', sound: 'hmm' } },
+  'knock': { motion: { seconds: 1.8, face: 'neutral', sound: 'tick' } },
+  'peek-out': { motion: { seconds: 1.8, face: 'surprised', sound: 'look' } },
+  'stretch': { motion: { seconds: 2.4, face: 'sleepy', sound: 'yawn' } },
+  'play-dead': { motion: { seconds: 2.8, face: 'dizzy', sound: 'land' } },
+  'tail-clap': { motion: { seconds: 1.6, face: 'happy', sound: 'splash' } },
+  'sneeze': { motion: { seconds: 1.6, face: 'surprised', sound: 'surprised' } },
+};
+
 /** The whale pack's entry (figure.json): her body for the figure frame, the kit's body drawn by her figure. */
 export async function createWhaleBody(base, opts) {
-  return opts.kit.createBody(opts.host, { figure: await createWhaleFigure(base, opts) });
+  return opts.kit.createBody(opts.host, {
+    figure: await createWhaleFigure(base, opts),
+    words: WHALE_WORDS,
+  });
 }

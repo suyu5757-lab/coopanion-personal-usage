@@ -115,6 +115,8 @@ cpSync(join(ROOT, 'docs', 'releases'), join(OUT, 'docs', 'releases'), { recursiv
 cpSync(join(ROOT, 'build', 'cortico'), join(OUT, 'build', 'cortico'), { recursive: true, filter: (src) => !src.endsWith('.map') && skip(join(ROOT, 'build', 'cortico'))(src) });
 // the settings window (app/main.cjs serves it)
 cpSync(join(ROOT, 'build', 'console'), join(OUT, 'build', 'console'), { recursive: true, filter: (src) => !src.endsWith('.map') });
+// the page script of Coo's browser window (scripts/stage.ts builds it)
+cpSync(join(ROOT, 'build', 'browser-agent.js'), join(OUT, 'build', 'browser-agent.js'));
 // the coopanion World's panel bundle (core/companion.ts registers it)
 cpSync(join(ROOT, 'build', 'panels'), join(OUT, 'build', 'panels'), { recursive: true, filter: (src) => !src.endsWith('.map') });
 writeFileSync(join(OUT, 'package.json'), JSON.stringify({

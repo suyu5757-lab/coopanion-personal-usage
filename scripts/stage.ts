@@ -10,7 +10,9 @@
  * 2. the desktop pet World's panel bundle, which the settings window loads the same way;
  * 3. `build/panels/coopanion/`: the coopanion World's panel bundle (`core/webui/client.ts`), loaded the same way;
  * 4. `build/console/`: the settings window (`console/index.ts`, `console/index.html`), which the
- *    Electron main process serves under `/coopanion/` on Core's origin.
+ *    Electron main process serves under `/coopanion/` on Core's origin;
+ * 5. `build/browser-agent.js`: the page script of Coo's browser window (`app/browser-agent/entry.ts`),
+ *    which `app/browser.cjs` injects after each page load.
  *
  * Run: `pnpm run build:cortico`. Idempotent; the previous output is replaced.
  */
@@ -77,6 +79,21 @@ const panel = spawnSync(process.execPath, [join(pet, 'scripts', 'build-webui.mjs
 if (panel.status !== 0) process.exit(panel.status ?? 1);
 
 const esbuild = await import('esbuild');
+
+// Coo's browser page script, injected by app/browser.cjs after each page load
+const BROWSER_AGENT_OUT = join(ROOT, 'build', 'browser-agent.js');
+await esbuild.build({
+  entryPoints: [join(ROOT, 'app', 'browser-agent', 'entry.ts')],
+  outfile: BROWSER_AGENT_OUT,
+  bundle: true,
+  format: 'iife',
+  target: 'es2022',
+  platform: 'browser',
+  minify: true,
+  legalComments: 'inline',
+  logLevel: 'warning',
+});
+
 const PANELS_OUT = join(ROOT, 'build', 'panels', 'coopanion');
 rmSync(PANELS_OUT, { recursive: true, force: true });
 await esbuild.build({

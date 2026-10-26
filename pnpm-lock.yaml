@@ -45,6 +45,9 @@ importers:
       '@codemirror/view':
         specifier: ^6.43.12
         version: 6.43.12
+      '@page-agent/page-controller':
+        specifier: 1.12.4
+        version: 1.12.4
       '@tailwindcss/cli':
         specifier: ^4.3.3
         version: 4.3.3
@@ -732,6 +735,9 @@ packages:
     resolution: {integrity: sha512-X5XaVWZIBCT7HHZGm5I7ZQXDwLG+bGXuSrMQAW+7Zvl87h1kmc1ZB1VSRJcpUfoUrGQp4Fkoxm5kZ+Ms+aW+eA==}
     engines: {node: '>= 20.19.0'}
 
+  '@page-agent/page-controller@1.12.4':
+    resolution: {integrity: sha512-I8se6/QMhg1wMZp52fkX37xbv/lkUnBihtadcoZKOQ9xvL562/sd141mu5ANPGvaCosPlXxJQ3HGIwA2VM4bwQ==}
+
   '@parcel/watcher-android-arm64@2.5.1':
     resolution: {integrity: sha512-KF8+j9nNbUN8vzOFDpRMsaKBHZ/mcjEjMToVMJOhTozkDonQFFrRcfdLWn6yWKCmJKmdVxSgHiYvTCef4/qcBA==}
     engines: {node: '>= 10.0.0'}
@@ -1201,6 +1207,9 @@ packages:
   agent-base@7.1.4:
     resolution: {integrity: sha512-MnA+YT8fwfJPgBx3m60MNqakm30XOkyIoH1y6huTQvC0PwZG7ki8NacLBcrPbNoo8vEZy7Jpuk7+jMO+CUovTQ==}
     engines: {node: '>= 14'}
+
+  ai-motion@0.4.8:
+    resolution: {integrity: sha512-9nQVjf8lrYQWSW0sZdb9bES4x8Ei1w9C0S62po2KvRbMjslmjm0WMeszyW771SEauDnu4YGWqurLZ/gCkCTosQ==}
 
   ajv@8.20.0:
     resolution: {integrity: sha512-Thbli+OlOj+iMPYFBVBfJ3OmCAnaSyNn4M1vz9T6Gka5Jt9ba/HIR56joy65tY6kx/FCF5VXNB819Y7/GUrBGA==}
@@ -3360,6 +3369,10 @@ snapshots:
 
   '@noble/hashes@2.4.0': {}
 
+  '@page-agent/page-controller@1.12.4':
+    dependencies:
+      ai-motion: 0.4.8
+
   '@parcel/watcher-android-arm64@2.5.1':
     optional: true
 
@@ -3747,6 +3760,8 @@ snapshots:
       negotiator: 0.6.3
 
   agent-base@7.1.4: {}
+
+  ai-motion@0.4.8: {}
 
   ajv@8.20.0:
     dependencies:

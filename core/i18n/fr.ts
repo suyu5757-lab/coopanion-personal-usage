@@ -10,6 +10,16 @@ const fr: Translation<CoreText> = {
     contextRing: { title: 'Anneau de contexte', description: 'Affiche dans la zone de saisie de la page Discussion un anneau indiquant combien il reste avant la mise en ordre de la conversation précédente.' },
     roundsSoft: { title: 'Rappel de conclusion', suffix: 'requêtes', description: "Après ce nombre de requêtes au modèle dans un même réveil, un rappel demande à Coo de conclure ce qui est en cours et de terminer le tour." },
     roundsHard: { title: 'Requêtes par réveil', suffix: 'requêtes', description: 'Le maximum de requêtes au modèle dans un même réveil ; le tour se termine quand il est atteint.' },
+    selfTime: {
+      title: "Un temps à elle",
+      description: "Après un moment sans conversation, elle peut ouvrir son propre navigateur et regarder. La fenêtre et ses connexions sont séparées.",
+      after: "Après le calme", afterDescription: "Elle obtient un temps à elle après ce délai sans conversation.",
+      session: "Au plus", sessionDescription: "Un temps à elle dure au plus ce délai ; le navigateur se ferme à la fin. Avec « Sans limite », il ne se ferme pas après ce délai.",
+      unlimited: "Sans limite", unlimitedDescription: "Activé : un temps à elle ne se termine pas après un délai, mais quand elle ferme le navigateur.",
+      minutes: "min",
+      sound: "Son du navigateur", soundDescription: "Muet par défaut. Activé, les vidéos qu'elle regarde sont audibles.",
+      actions: "Autoriser likes, favoris, danmaku et commentaires", actionsDescription: "Désactivé, elle ne peut que regarder. Connectez-vous et saisissez les codes dans sa fenêtre vous-même.",
+    },
   },
 
   failure: {
@@ -33,7 +43,7 @@ const fr: Translation<CoreText> = {
 
   status: {
     read: 'Lit', browse: 'Parcourt', memory: 'mémoire', find: 'Cherche', search: 'Recherche', write: 'Écrit', edit: 'Modifie', append: 'Complète',
-    delete: 'Supprime', save: 'Enregistre', screen: "Regarde l'écran", windows: 'Regarde les fenêtres ouvertes', rightClick: 'Fait un clic droit', doubleClick: 'Double-clique', click: 'Clique',
+    delete: 'Supprime', save: 'Enregistre', screen: "Regarde l'écran", web: "Sur une page web", windows: 'Regarde les fenêtres ouvertes', rightClick: 'Fait un clic droit', doubleClick: 'Double-clique', click: 'Clique',
     move: 'Déplace la souris', drag: 'Fait glisser', scroll: 'Fait défiler', focus: 'Change de fenêtre', type: 'Tape', key: 'Appuie sur', wait: 'Attend',
     alarmSet: 'Règle une alarme', alarmList: 'Consulte les alarmes', alarmCancel: 'Annule une alarme',
     quoted: (text: string) => `« ${text} »`,

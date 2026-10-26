@@ -1,0 +1,8 @@
+Coo's browser page script bundles these MIT-licensed works:
+
+- @page-agent/page-controller 1.12.4, Copyright (c) 2026 SimonLuvRamen and Alibaba Group Holding Limited.
+  License: LICENSE.
+- ai-motion 0.4.8, Copyright (c) 2025 Simon <gaomeng1900@gmail.com>. License: LICENSE-ai-motion.
+
+Parts of @page-agent/page-controller are derived from browser-use,
+Copyright (c) 2024 Gregor Zunic, also under the MIT License.

@@ -3,8 +3,9 @@
  *
  * Two modes share this executable:
  * - the app: tray icon, the settings window (Coopanion's own front end, `build/console`, served under
- *   `/coopanion/` on the Core child's console origin in a session of its own, see serveWindow), and
- *   the Core child process (`core-host.cjs`). A start shows the pet and the tray icon only; the settings window opens from the tray, the pet's menu, or when the pet asks for
+ *   `/coopanion/` on the Core child's console origin in a session of its own, see serveWindow), the
+ *   Core child process (`core-host.cjs`), and Coo's own browser window (`browser.cjs`, opened by the
+ *   browser World with its own persistent profile). A start shows the pet and the tray icon only; the settings window opens from the tray, the pet's menu, or when the pet asks for
  *   a missing model key (`core/companion.ts`). Closing the settings window ends its renderer, unless a page holds unsaved
  *   edits, which keeps it hidden; it opens again at the route it last showed. Starting the app again while it runs brings the pet back, or starts the
  *   Core again when it stopped retrying (`failed`);
@@ -218,6 +219,7 @@ if (located) {
 }
 
 const { CoreHost } = require('./core-host.cjs');
+const { createBrowserHost } = require('./browser.cjs');
 const { configuredLanguage, systemLanguage, textOf } = require('./i18n/index.cjs');
 const { RELEASES_URL, canUpdate, startUpdater } = require('./updater.cjs');
 /** Steam updates its build, and the portable one is updated by hand: only the others run the updater. */
@@ -278,6 +280,15 @@ const core = new CoreHost({
     COOPANION_CHANNEL: STEAM ? 'steam' : 'github',
   },
 });
+
+// Coo's own browser window: the browser World drives it through the Core child (core/browser)
+const browser = createBrowserHost({
+  appRoot: APP_ROOT,
+  icon: WINDOW_ICON,
+  log: console,
+  send: (msg) => core.send(msg),
+});
+core.on('browser', (msg) => void browser.handle(msg));
 
 let settings = null;
 /** The route the settings window showed when it was last closed, where it opens next unless asked for another. */
@@ -392,7 +403,7 @@ function forward(request, url, origin) {
 }
 
 /** The only remote address the settings page asks: the latest Coopanion release, for the hint under the wordmark. */
-const RELEASE_CHECK = 'https://api.github.com/repos/Pal-AI-Lab/Coopanion/releases/latest';
+const RELEASE_CHECK = 'https://api.github.com/repos/suyu5757-lab/coopanion-personal-usage/releases/latest';
 /** Images of the extension market: package icons and screenshots of the official index, and GitHub avatars. */
 const MARKET_IMAGES = ['https://raw.githubusercontent.com/Pal-AI-Lab/cortico-extensions/', 'https://avatars.githubusercontent.com/'];
 const isLocal = (url) => /^(https?|wss?):\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?\//.test(url);
@@ -621,6 +632,7 @@ app.on('before-quit', (e) => {
   e.preventDefault();
   tray?.destroy();
   tray = null;
+  browser.close();
   void core.stop().finally(() => {
     // a downloaded update installs now; its quit comes back here with quitting set and goes through
     if (updater?.installOnQuit(restartAfterUpdate)) setTimeout(() => app.exit(0), 10_000);

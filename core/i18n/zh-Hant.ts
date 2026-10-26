@@ -10,6 +10,16 @@ const zhHant: Translation<CoreText> = {
     contextRing: { title: '上下文圓環', description: '在對話頁輸入框顯示一個圓環，表示離整理之前的對話還有多遠。' },
     roundsSoft: { title: '收尾提醒', suffix: '次', description: '單次喚醒請求模型達到此次數時，提醒 Coo 完成目前任務後結束本輪。' },
     roundsHard: { title: '單次喚醒上限', suffix: '次', description: '單次喚醒最多請求模型的次數，達到後結束本輪。' },
+    selfTime: {
+      title: '自己的時間',
+      description: '沒聊天一段時間後，她可以自己打開瀏覽器逛逛、看看影片。瀏覽器視窗和登入狀態都是她自己的。',
+      after: '安靜多久後', afterDescription: '這段時間沒有聊天後，她會得到一段自己的時間。',
+      session: '每次最多', sessionDescription: '一段自己的時間最多持續這麼久，到時瀏覽器自動關上；打開「不限」時不按時間關閉。',
+      unlimited: '不限', unlimitedDescription: '打開後，一段自己的時間不會按時長自動結束，她關上瀏覽器才結束。',
+      minutes: '分鐘',
+      sound: '瀏覽器聲音', soundDescription: '預設靜音。打開後，她看的影片會外放。',
+      actions: '允許按讚、收藏、發送彈幕和評論', actionsDescription: '關閉後她只能看網頁和影片，不能互動。登入和驗證碼請在她的瀏覽器視窗裡自己完成。',
+    },
   },
 
   failure: {
@@ -33,7 +43,7 @@ const zhHant: Translation<CoreText> = {
 
   status: {
     read: '在查看', browse: '在翻閱', memory: '記憶', find: '在尋找', search: '在搜尋', write: '在寫入', edit: '在修改', append: '在附加',
-    delete: '在刪除', save: '在儲存', screen: '在查看螢幕', windows: '在查看開啟的視窗', rightClick: '在按右鍵', doubleClick: '在點兩下', click: '在點選',
+    delete: '在刪除', save: '在儲存', screen: '在查看螢幕', web: '在看網頁', windows: '在查看開啟的視窗', rightClick: '在按右鍵', doubleClick: '在點兩下', click: '在點選',
     move: '在移動滑鼠', drag: '在拖曳', scroll: '在捲動', focus: '在切換視窗', type: '在打字', key: '在按鍵', wait: '在等待',
     alarmSet: '在設定鬧鐘', alarmList: '在查看鬧鐘', alarmCancel: '在取消鬧鐘',
     quoted: (text: string) => `「${text}」`,

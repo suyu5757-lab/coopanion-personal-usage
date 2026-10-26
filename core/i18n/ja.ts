@@ -10,6 +10,16 @@ const ja: Translation<CoreText> = {
     contextRing: { title: 'コンテキストリング', description: 'チャットページの入力欄に、以前の会話を整理するまでの残りを円で表示します。' },
     roundsSoft: { title: 'まとめのリマインド', suffix: '回', description: '1 回のウェイクでモデルへのリクエストがこの回数に達すると、今の作業を片付けてターンを終えるよう Coo に促します。' },
     roundsHard: { title: '1 回のウェイクのリクエスト上限', suffix: '回', description: '1 回のウェイクでモデルにリクエストできる最大回数です。達するとターンが終わります。' },
+    selfTime: {
+      title: '自分の時間',
+      description: 'しばらく会話がないと、自分でブラウザを開いて動画などを見に行けます。ウィンドウとログインは彼女専用です。',
+      after: '静かな時間', afterDescription: 'この時間だけ会話がないと、自分の時間が始まります。',
+      session: '1 回の上限', sessionDescription: '自分の時間は最長これだけ続き、終わるとブラウザが閉じます。「無制限」をオンにすると時間では閉じません。',
+      unlimited: '無制限', unlimitedDescription: 'オンにすると、自分の時間は時間では終わらず、彼女がブラウザを閉じたときに終わります。',
+      minutes: '分',
+      sound: 'ブラウザの音', soundDescription: '既定はミュートです。オンにすると、見ている動画の音が出ます。',
+      actions: 'いいね・保存・弾幕・コメントを許可', actionsDescription: 'オフにすると閲覧だけになります。ログインと認証コードはブラウザウィンドウで本人が行ってください。',
+    },
   },
 
   failure: {
@@ -33,7 +43,7 @@ const ja: Translation<CoreText> = {
 
   status: {
     read: '読み取り中', browse: '閲覧中', memory: '記憶', find: '探索中', search: '検索中', write: '書き込み中', edit: '編集中', append: '追記中',
-    delete: '削除中', save: '保存中', screen: '画面を確認中', windows: '開いているウィンドウを確認中', rightClick: '右クリック中', doubleClick: 'ダブルクリック中', click: 'クリック中',
+    delete: '削除中', save: '保存中', screen: '画面を確認中', web: 'ページ閲覧中', windows: '開いているウィンドウを確認中', rightClick: '右クリック中', doubleClick: 'ダブルクリック中', click: 'クリック中',
     move: 'マウスを移動中', drag: 'ドラッグ中', scroll: 'スクロール中', focus: 'ウィンドウを切り替え中', type: '入力中', key: 'キー入力中', wait: '待機中',
     alarmSet: 'アラームを設定中', alarmList: 'アラームを確認中', alarmCancel: 'アラームを取り消し中',
     quoted: (text: string) => `「${text}」`,

@@ -15,6 +15,16 @@ const en: CoreText = {
     contextRing: { title: 'Context ring', description: "Shows a ring in the Chat page's input box with how far the conversation is from being tidied up." },
     roundsSoft: { title: 'Wrap-up reminder', suffix: 'requests', description: 'After this many model requests in one wake-up, Coo is reminded to finish the current task and end the turn.' },
     roundsHard: { title: 'Requests per wake-up', suffix: 'requests', description: 'The most model requests in one wake-up; the turn ends when it is reached.' },
+    selfTime: {
+      title: 'Time of her own',
+      description: 'After a while without a chat, she may open her own browser and look around. The window and its logins are separate.',
+      after: 'After quiet', afterDescription: 'She gets time of her own after this long without a chat.',
+      session: 'At most', sessionDescription: 'One stretch lasts at most this long; the browser closes when it ends. With No limit on, it does not close on time.',
+      unlimited: 'No limit', unlimitedDescription: 'On: a stretch does not end on time; it ends when she closes the browser.',
+      minutes: 'min',
+      sound: 'Browser sound', soundDescription: 'Muted by default. With this on, the videos she watches play aloud.',
+      actions: 'Allow likes, saves, danmaku and comments', actionsDescription: 'Off: she can only look, not interact. Sign in and solve CAPTCHAs in her browser window yourself.',
+    },
   },
 
   /** What the pet's bubble says after several model requests in a row failed. */
@@ -42,7 +52,7 @@ const en: CoreText = {
   /** The status bubble: the tool Coo is using. */
   status: {
     read: 'Reading', browse: 'Browsing', memory: 'memory', find: 'Looking for', search: 'Searching', write: 'Writing', edit: 'Editing', append: 'Adding to',
-    delete: 'Deleting', save: 'Saving', screen: 'Looking at the screen', windows: 'Looking at the open windows', rightClick: 'Right-clicking', doubleClick: 'Double-clicking', click: 'Clicking',
+    delete: 'Deleting', save: 'Saving', screen: 'Looking at the screen', web: 'On a web page', windows: 'Looking at the open windows', rightClick: 'Right-clicking', doubleClick: 'Double-clicking', click: 'Clicking',
     move: 'Moving the mouse', drag: 'Dragging', scroll: 'Scrolling', focus: 'Switching windows', type: 'Typing', key: 'Pressing', wait: 'Waiting',
     alarmSet: 'Setting an alarm', alarmList: 'Checking alarms', alarmCancel: 'Cancelling an alarm',
     /** The words being searched for. */

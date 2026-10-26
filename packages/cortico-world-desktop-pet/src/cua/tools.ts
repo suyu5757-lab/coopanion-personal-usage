@@ -25,7 +25,7 @@ export const CUA_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'pet_cua_screenshot',
     tags: ['read', 'snapshot'],
-    description: 'Capture one display. Returns the scaled image (with the mouse pointer drawn on it), its size and the display\'s, the other displays, the pointer position and the title of the foreground window. Later coordinates are pixels of this screenshot.',
+    description: 'Capture one display, or the window selected with pet_cua_window. Returns the scaled image, its size and where it came from; later coordinates are pixels of this screenshot. Passing `display` leaves a window target and captures that display.',
     parameters: {
       type: 'object',
       properties: { display: { type: 'integer', minimum: 1, description: 'Display number, 1 = leftmost; omitted: the display looked at last, at first the one holding the foreground window' } },
@@ -49,7 +49,7 @@ export const CUA_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'pet_cua_click',
     tags: ['act'],
-    description: 'Move the mouse to (x, y) and click.',
+    description: 'Click at (x, y). Without a window target this moves the mouse; after pet_cua_window it clicks inside that window in the background, without moving the person\'s pointer or changing the foreground app.',
     parameters: {
       type: 'object',
       properties: {
@@ -64,13 +64,13 @@ export const CUA_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'pet_cua_move',
     tags: ['act'],
-    description: 'Only move the mouse to (x, y), without clicking; for hovering to bring up a tooltip or a menu.',
+    description: 'Only move the pointer to (x, y), without clicking; for hovering to bring up a tooltip or a menu. After pet_cua_window this moves only the agent cursor; most apps do not show hover in the background.',
     parameters: { type: 'object', properties: { ...xy, screenshot: shot }, required: ['x', 'y'] },
   },
   {
     name: 'pet_cua_drag',
     tags: ['act'],
-    description: 'Hold the left button down, drag from `from` to `to`, and release. Both points are on the display of the latest screenshot.',
+    description: 'Hold the left button down, drag from `from` to `to`, and release. Both points are in pixels of the latest screenshot; after pet_cua_window the drag runs inside that window in the background.',
     parameters: {
       type: 'object',
       properties: {
@@ -84,7 +84,7 @@ export const CUA_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'pet_cua_scroll',
     tags: ['act'],
-    description: 'Move the mouse to (x, y) and turn the wheel. Positive down scrolls down, negative up; positive right scrolls right. Units are wheel notches.',
+    description: 'Scroll at (x, y). Positive down scrolls down, negative up; positive right scrolls right. Units are wheel notches. After pet_cua_window this scrolls inside that window in the background.',
     parameters: {
       type: 'object',
       properties: {
@@ -99,25 +99,31 @@ export const CUA_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'pet_cua_type',
     tags: ['act'],
-    description: 'Type text at the current input focus (any language, whatever state the input method is in); \\n presses Enter once. Click where the text goes first.',
+    description: 'Type text at the current input focus (any language, whatever state the input method is in); \\n presses Enter once. Click where the text goes first. After pet_cua_window the text goes to that window without raising it.',
     parameters: { type: 'object', properties: { text: { type: 'string', maxLength: 2000 }, screenshot: shot }, required: ['text'] },
   },
   {
     name: 'pet_cua_key',
     tags: ['act'],
-    description: 'Press a key or a key combination. Join keys pressed together with +, and separate keys pressed one after another with spaces: "ctrl+s", "alt+f4", "ctrl+a delete", "enter", "win".',
+    description: 'Press a key or a key combination. Join keys pressed together with +, and separate keys pressed one after another with spaces: "ctrl+s", "alt+f4", "ctrl+a delete", "enter", "win". After pet_cua_window the keys go to that window without raising it.',
     parameters: { type: 'object', properties: { keys: { type: 'string' }, screenshot: shot }, required: ['keys'] },
   },
   {
     name: 'pet_cua_windows',
     tags: ['read'],
-    description: 'List the visible top-level windows: title, which display each is on (with its position in screenshot coordinates when that is the display of the latest screenshot), whether minimized, and which one is in the foreground.',
+    description: 'List the visible top-level windows: title, which display each is on (with its position in screenshot coordinates when that is the display of the latest screenshot), whether minimized, and which one is in the foreground. Pass a handle to pet_cua_window to work in it in the background.',
     parameters: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'pet_cua_window',
+    tags: ['read', 'snapshot'],
+    description: 'Work on one window in the background: capture it and make later pet_cua_* coordinates refer to its screenshot. The window is not raised; the person\'s pointer and keyboard focus stay where they are. window is a handle from pet_cua_windows, or part of its title. Requires Cua Driver. To leave the window, pass a display to pet_cua_screenshot or call pet_cua_focus.',
+    parameters: { type: 'object', properties: { window: { type: 'string' } }, required: ['window'] },
   },
   {
     name: 'pet_cua_focus',
     tags: ['act'],
-    description: 'Bring a window to the foreground (restoring it first if minimized). window is a handle from pet_cua_windows, or part of its title.',
+    description: 'Bring a window to the foreground (restoring it first if minimized) and leave any background window target. window is a handle from pet_cua_windows, or part of its title.',
     parameters: { type: 'object', properties: { window: { type: 'string' }, screenshot: shot }, required: ['window'] },
   },
   {

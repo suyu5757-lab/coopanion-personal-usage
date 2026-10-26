@@ -10,6 +10,16 @@ const ko: Translation<CoreText> = {
     contextRing: { title: '컨텍스트 링', description: '대화 페이지 입력란에 이전 대화를 정리하기까지 얼마나 남았는지 원으로 표시합니다.' },
     roundsSoft: { title: '마무리 알림', suffix: '회', description: '한 번 깨어난 동안 모델 요청이 이만큼 쌓이면 Coo에게 하던 일을 마치고 턴을 끝내라고 알립니다.' },
     roundsHard: { title: '한 번 깨어날 때 요청 한도', suffix: '회', description: '한 번 깨어난 동안 보낼 수 있는 최대 모델 요청 수이며, 도달하면 턴이 끝납니다.' },
+    selfTime: {
+      title: '자기만의 시간',
+      description: '한동안 대화가 없으면 스스로 브라우저를 열어 둘러보고 영상을 볼 수 있습니다. 창과 로그인은 따로입니다.',
+      after: '조용한 시간', afterDescription: '이만큼 대화가 없으면 자기만의 시간이 시작됩니다.',
+      session: '한 번에 최대', sessionDescription: '자기만의 시간은 최대 이만큼 이어지고, 끝나면 브라우저가 닫힙니다. "제한 없음"을 켜면 시간으로 닫히지 않습니다.',
+      unlimited: '제한 없음', unlimitedDescription: '켜면 자기만의 시간은 시간으로 끝나지 않고, 그녀가 브라우저를 닫을 때 끝납니다.',
+      minutes: '분',
+      sound: '브라우저 소리', soundDescription: '기본은 음소거입니다. 켜면 보는 영상의 소리가 납니다.',
+      actions: '좋아요·저장·탄막·댓글 허용', actionsDescription: '끄면 보기만 할 수 있습니다. 로그인과 인증 코드는 브라우저 창에서 직접 해 주세요.',
+    },
   },
 
   failure: {
@@ -33,7 +43,7 @@ const ko: Translation<CoreText> = {
 
   status: {
     read: '읽는 중', browse: '둘러보는 중', memory: '기억', find: '찾는 중', search: '검색 중', write: '쓰는 중', edit: '고치는 중', append: '덧붙이는 중',
-    delete: '삭제 중', save: '저장 중', screen: '화면 보는 중', windows: '열린 창 보는 중', rightClick: '오른쪽 클릭 중', doubleClick: '더블클릭 중', click: '클릭 중',
+    delete: '삭제 중', save: '저장 중', screen: '화면 보는 중', web: '웹페이지 보는 중', windows: '열린 창 보는 중', rightClick: '오른쪽 클릭 중', doubleClick: '더블클릭 중', click: '클릭 중',
     move: '마우스 옮기는 중', drag: '드래그 중', scroll: '스크롤 중', focus: '창 전환 중', type: '입력 중', key: '키 누르는 중', wait: '기다리는 중',
     alarmSet: '알람 맞추는 중', alarmList: '알람 확인 중', alarmCancel: '알람 취소 중',
     quoted: (text: string) => `"${text}"`,

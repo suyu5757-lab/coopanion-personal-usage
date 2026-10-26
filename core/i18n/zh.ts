@@ -12,6 +12,16 @@ export default {
     contextRing: { title: '上下文圆环', description: '在对话页输入框显示一个圆环，表示离整理之前的对话还有多远。' },
     roundsSoft: { title: '收尾提醒', suffix: '次', description: '单次唤醒请求模型达到此次数时，提醒 Coo 完成当前任务后结束本轮。' },
     roundsHard: { title: '单次唤醒上限', suffix: '次', description: '单次唤醒最多请求模型的次数，达到后结束本轮。' },
+    selfTime: {
+      title: '自己的时间',
+      description: '没聊天一段时间后,她可以自己打开浏览器逛逛、看看视频。浏览器窗口和登录状态都是她自己的。',
+      after: '安静多久后', afterDescription: '这段时间没有聊天后,她会得到一段自己的时间。',
+      session: '每次最多', sessionDescription: '一段自己的时间最多持续这么久,到时浏览器自动关上;打开「不限」时不按时间关闭。',
+      unlimited: '不限', unlimitedDescription: '打开后,一段自己的时间不会按时长自动结束,她关上浏览器才结束。',
+      minutes: '分钟',
+      sound: '浏览器声音', soundDescription: '默认静音。打开后,她看的视频会外放。',
+      actions: '允许点赞、收藏、发送弹幕和评论', actionsDescription: '关闭后她只能看网页和视频,不能互动。登录和验证码请在她的浏览器窗口里自己完成。',
+    },
   },
 
   /** 连续几次请求模型失败后,桌宠气泡里的说明 */
@@ -41,7 +51,7 @@ export default {
   /** 状态气泡:Coo 正在用的工具 */
   status: {
     read: '在查看', browse: '在翻阅', memory: '记忆', find: '在查找', search: '在搜索', write: '在写入', edit: '在修改', append: '在追加',
-    delete: '在删除', save: '在保存', screen: '在查看屏幕', windows: '在查看打开的窗口', rightClick: '在右击', doubleClick: '在双击', click: '在点击',
+    delete: '在删除', save: '在保存', screen: '在查看屏幕', web: '在看网页', windows: '在查看打开的窗口', rightClick: '在右击', doubleClick: '在双击', click: '在点击',
     move: '在移动鼠标', drag: '在拖动', scroll: '在滚动', focus: '在切换窗口', type: '在打字', key: '在按键', wait: '在等待',
     alarmSet: '在设定闹钟', alarmList: '在查看闹钟', alarmCancel: '在取消闹钟',
     /** 在搜的关键词 */

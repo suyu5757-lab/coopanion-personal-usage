@@ -347,7 +347,7 @@ Coopanion 在 Linux 上固定跑在 X11 上;Wayland 会话里经 XWayland 只看
 ## 电脑操作
 
 `worlds.desktop-pet.cua.enabled` 开着时(默认关),bot 还看得见这台电脑(Windows、macOS 或 Linux)的屏幕,接了几块显示器都能看、能操作,能移动和点击鼠标、滚动、打字、按组合键、
-列出和切换窗口;使用者一动鼠标键盘,操作就让位。代码在 `src/cua/`;关着时没有这些工具,环境提示词的 `{{pet.cua}}` 只说明功能存在、在应用设置里打开;内嵌应用给了 `controls.openCuaSettings` 时,
+列出和切换窗口;整屏操作在使用者一动鼠标键盘时就让位,后台窗口操作不会碰使用者的鼠标和焦点。代码在 `src/cua/`;关着时没有这些工具,环境提示词的 `{{pet.cua}}` 只说明功能存在、在应用设置里打开;内嵌应用给了 `controls.openCuaSettings` 时,
 bot 还有 `pet_cua_open_settings`,在使用者同意后把设置窗口打开到这个开关。
 开关和下面的配置都是热更新,下一轮起生效;内嵌应用要在开关改动后重载 session 前缀,工具表才跟着变。
 
@@ -359,7 +359,7 @@ bot 还有 `pet_cua_open_settings`,在使用者同意后把设置窗口打开到
 
 | 工具 | 作用 |
 |---|---|
-| `pet_cua_screenshot(display)` | 截一块显示器:不带 `display` 时截上次看的那块,第一次截前台窗口所在的那块;回执带截图与显示器尺寸、其他显示器、指针位置、前台窗口标题 |
+| `pet_cua_screenshot(display)` | 截一块显示器:不带 `display` 时截上次看的那块,第一次截前台窗口所在的那块;选中后台窗口后截那个窗口;回执带截图与尺寸、来源 |
 | `pet_cua_zoom(x, y, width, height)` | 按原始分辨率重截最近一张截图里的一块,读缩小后看不清的小字;只用来看 |
 | `pet_cua_click(x, y, button, clicks)` | 左/右/中键,单击、双击、三击 |
 | `pet_cua_move(x, y)` | 只移动,用于悬停 |
@@ -368,11 +368,22 @@ bot 还有 `pet_cua_open_settings`,在使用者同意后把设置窗口打开到
 | `pet_cua_type(text)` | 按 Unicode 字符打字,与键盘布局和输入法状态无关;`\n` 按回车 |
 | `pet_cua_key(keys)` | `"ctrl+s"`、`"alt+f4"`、`"ctrl+a delete"`:`+` 同时按,空格分先后 |
 | `pet_cua_windows` | 可见顶层窗口的标题、在哪块显示器(在最近一张截图那块上的给出截图坐标)、是否最小化、前台 |
-| `pet_cua_focus(window)` | 按句柄或标题片段切到前台,最小化的先还原;窗口在另一块显示器上时,附带的截图截那块 |
+| `pet_cua_window(window)` | 选中一个窗口做后台操作,截取它;之后坐标都用这张窗口截图的像素,窗口不抬到前台 |
+| `pet_cua_focus(window)` | 按句柄或标题片段切到前台,最小化的先还原;窗口在另一块显示器上时,附带的截图截那块;同时离开后台窗口 |
 | `pet_cua_wait(seconds)` | 等一会儿再截图 |
 
 操作类工具默认做完等 `cua.screenshot.settleMs`(500 ms)再附一张截图;参数 `screenshot: false` 可以省掉,这时等完同样的时间再读一次指针和前台窗口,
 没有窗口接收键盘输入时回执提醒先截图。
+
+### 后台操作一个窗口
+
+装了 [Cua Driver](https://github.com/trycua/cua)(`/Applications/CuaDriver.app`,命令行 `cua-driver`)并授权辅助功能与屏幕录制后,
+bot 可以把操作限定在一个窗口:`pet_cua_windows` 拿到句柄,`pet_cua_window(handle)` 选中并截取它;之后的截图、点击、拖动、滚动、打字、按键都作用于这个窗口,
+坐标是那张窗口截图的像素。窗口不会被抬到前台,使用者真实的鼠标、键盘焦点和前台应用都不变,所以可以和 bot 同时用电脑;这类操作也不等使用者停手。
+Cua Driver 自己画一个 agent 光标。要回到整块屏幕,用 `pet_cua_screenshot(display)` 或 `pet_cua_focus`。
+
+后台点击靠窗口级事件投递,只接受真实 HID 输入、需要前台焦点或系统拖放会话的窗口可能无效;这时回执会说明,可以改用 `pet_cua_focus` 把窗口带到前台。
+没有安装 Cua Driver 时 `pet_cua_window` 不可用,其余工具和以前一样。
 
 ### 什么时候先问
 

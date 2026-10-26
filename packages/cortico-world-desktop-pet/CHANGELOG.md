@@ -1,5 +1,9 @@
 ## Unreleased
 
+- Background window control through Cua Driver: `pet_cua_window` selects one window, and later screenshots and input act on it without moving the person's pointer or changing the foreground app. Requires Cua Driver with Accessibility and Screen Recording; whole-screen input still waits for the person to stop.
+- The whale has a nightgown outfit: a pale blue sailor-collar nightdress with cream ruffles, a whale-print bib, a blue bow and twin braids; when she sleeps in it, a shell bed with a moon cushion, a blanket and a bedside lamp appear around her.
+- The whale has a workwear outfit: a sleeveless indigo work vest with a small collar, two chest pockets and three whale-fin flounces at each armhole, over a light grey-blue utility skirt with a belt, two raised cargo pockets, a front slit, a crescent tail opening at the lower back and a short chain to the far pocket's snap; a small whale charm hangs from the belt and swings with her, and she wears a high ponytail, cream socks and navy shoes.
+- The whale has fourteen more motions of her own: `peek` (covers her face, then peeks), `spout`, `hug-tail`, `swim`, `shake-off`, `bubbles`, `float`, `sulk`, `knock`, `peek-out`, `stretch`, `play-dead`, `tail-clap` and `sneeze`; each has its own pose, face and effects, and the bot can use all of them through her vocabulary.
 - `HOST_ENV` and `HOST_MAIN` are internal to the window host and no longer exported. Embedding apps configure the command with `CORTICO_DESKTOP_PET_HOST`.
 - An app can lend the bot's name as `botName()` in `desktopPetDefinition`'s assembly; it is read at each use, so the menu header, the chat page (a `bot` frame) and computer use's question follow a rename without a World restart. Without it the World keeps the name it was mounted with. `DesktopPetWorldOptions.botName` and `CuaOptions.botName` are functions now.
 - `pet_walk_to` is now `pet_move_to`, with the same `to` and `run` and an optional `params`. A bot that names the old tool has to use the new name.
@@ -9,6 +13,7 @@
 - The pet window's socket (`host=window`) and the OBS overlay source (`role=overlay-source`) put that credential in the `/socket` query as `key`; a socket without it or with another one is answered 403.
 - Browser writes (every method but GET and HEAD) and the WebSocket are accepted only with the service's own HTTP origin, port included (`http://127.0.0.1:<port>` or `http://localhost:<port>`); any other Origin is answered 421. A client that sends no Origin is accepted.
 - `POST /api/figures/import/install` answers 409 with `{ conflicts: [id, …] }` when a chosen pack's id is installed or `figures/<id>/` exists, and then changes no file and keeps the staged import. The same request with the same `token` and `replace: [id, …]` naming every conflicting id replaces them. An install without conflicts takes no new field. Once an install passes these checks its token is spent.
+- The whale has a hard motion of her own, `tail-whip`: the fluke rises past her hair, snaps down to the floor with an arc trail, a splash, and a bright, bubbly landing sound.
 
 ## 0.2.0
 
