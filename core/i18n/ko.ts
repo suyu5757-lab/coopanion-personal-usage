@@ -14,10 +14,11 @@ const ko: Translation<CoreText> = {
       title: '자기만의 시간',
       description: '한동안 대화가 없으면 스스로 브라우저를 열어 둘러보고 영상을 볼 수 있습니다. 창과 로그인은 따로입니다.',
       after: '조용한 시간', afterDescription: '이만큼 대화가 없으면 자기만의 시간이 시작됩니다.',
-      session: '한 번에 최대', sessionDescription: '자기만의 시간은 최대 이만큼 이어지고, 끝나면 브라우저가 닫힙니다.',
+      session: '한 번에 최대', sessionDescription: '자기만의 시간은 최대 이만큼 이어지고, 끝나면 브라우저가 닫힙니다. "제한 없음"을 켜면 시간으로 닫히지 않습니다.',
+      unlimited: '제한 없음', unlimitedDescription: '켜면 자기만의 시간은 시간으로 끝나지 않고, 그녀가 브라우저를 닫을 때 끝납니다.',
       minutes: '분',
       sound: '브라우저 소리', soundDescription: '기본은 음소거입니다. 켜면 보는 영상의 소리가 납니다.',
-      actions: '좋아요·저장·탄막 허용', actionsDescription: '끄면 보기만 할 수 있습니다. 로그인과 인증 코드는 브라우저 창에서 직접 해 주세요.',
+      actions: '좋아요·저장·탄막·댓글 허용', actionsDescription: '끄면 보기만 할 수 있습니다. 로그인과 인증 코드는 브라우저 창에서 직접 해 주세요.',
     },
   },
 

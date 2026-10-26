@@ -16,10 +16,11 @@ export default {
       title: '自己的时间',
       description: '没聊天一段时间后,她可以自己打开浏览器逛逛、看看视频。浏览器窗口和登录状态都是她自己的。',
       after: '安静多久后', afterDescription: '这段时间没有聊天后,她会得到一段自己的时间。',
-      session: '每次最多', sessionDescription: '一段自己的时间最多持续这么久,到时浏览器自动关上。',
+      session: '每次最多', sessionDescription: '一段自己的时间最多持续这么久,到时浏览器自动关上;打开「不限」时不按时间关闭。',
+      unlimited: '不限', unlimitedDescription: '打开后,一段自己的时间不会按时长自动结束,她关上浏览器才结束。',
       minutes: '分钟',
       sound: '浏览器声音', soundDescription: '默认静音。打开后,她看的视频会外放。',
-      actions: '允许点赞、收藏和发弹幕', actionsDescription: '关闭后她只能看网页和视频,不能互动。登录和验证码请在她的浏览器窗口里自己完成。',
+      actions: '允许点赞、收藏、发送弹幕和评论', actionsDescription: '关闭后她只能看网页和视频,不能互动。登录和验证码请在她的浏览器窗口里自己完成。',
     },
   },
 

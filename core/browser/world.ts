@@ -167,7 +167,7 @@ export class BrowserWorld implements World {
         path: ENV_PROMPT_FILES[this.opts.modelLanguage()],
         role: 'envPrompt',
         vars: [
-          { name: 'browser.session', description: en ? 'Minutes one stretch may last.' : '一段自己的时间最多多少分钟。' },
+          { name: 'browser.session', description: en ? 'How long one stretch may last.' : '一段自己的时间有多长。' },
           { name: 'browser.actions', description: en ? 'What she may do besides look.' : '除了看,她还能做什么。' },
           { name: 'browser.audio', description: en ? 'Whether the window is muted.' : '窗口是否静音。' },
         ],
@@ -179,7 +179,9 @@ export class BrowserWorld implements World {
     const st = this.self;
     const en = this.opts.modelLanguage() === 'en';
     return {
-      'browser.session': String(st.sessionMinutes),
+      'browser.session': st.sessionUnlimited
+        ? (en ? 'has no time limit' : '不限时长')
+        : (en ? `lasts at most ${st.sessionMinutes} minutes` : `最多 ${st.sessionMinutes} 分钟`),
       'browser.actions': st.actions
         ? (en ? 'likes, favorites, follows, comments and danmaku are allowed' : '可以点赞、收藏、关注、评论和发弹幕')
         : (en ? 'read only: do not like, favorite, follow, comment or send danmaku' : '只允许看:不要点赞、收藏、关注、评论或发弹幕'),
@@ -195,6 +197,7 @@ export class BrowserWorld implements World {
       browser_text: (_args, ctx) => this.text(ctx),
       browser_find: (args, ctx) => this.find(args, ctx),
       browser_click: (args, ctx) => this.click(args, ctx),
+      browser_hover: (args, ctx) => this.hover(args, ctx),
       browser_type: (args, ctx) => this.type(args, ctx),
       browser_press: (args, ctx) => this.press(args, ctx),
       browser_scroll: (args, ctx) => this.scroll(args, ctx),
@@ -216,21 +219,24 @@ export class BrowserWorld implements World {
   /** Starts or continues a session; a reason the call cannot run, or null. */
   private begin(tool: string): ToolOutcome | null {
     const fresh = tool === 'browser_open' || tool === 'browser_search';
+    const st = this.self;
     if (this.ended && !fresh) return this.toast(this.t.timeUp, true);
     if (this.started === null) {
       if (!fresh) return this.toast(this.t.notOpen, true);
       this.ended = false;
       this.started = Date.now();
       this.calls = 0;
-      const minutes = this.self.sessionMinutes;
       if (this.timer) clearTimeout(this.timer);
-      this.timer = setTimeout(() => {
-        this.timer = null;
-        this.finish(true);
-      }, minutes * 60_000);
-      this.timer.unref?.();
+      this.timer = null;
+      if (!st.sessionUnlimited) {
+        this.timer = setTimeout(() => {
+          this.timer = null;
+          this.finish(true);
+        }, st.sessionMinutes * 60_000);
+        this.timer.unref?.();
+      }
     }
-    if (Date.now() - this.started > this.self.sessionMinutes * 60_000) {
+    if (!st.sessionUnlimited && Date.now() - this.started > st.sessionMinutes * 60_000) {
       this.finish(true);
       return this.toast(this.t.timeUp, true);
     }
@@ -348,22 +354,47 @@ export class BrowserWorld implements World {
 
   private async click(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
     return this.run('browser_click', ctx, async () => {
-      const index = this.indexArg(args.index);
-      if (index === null) return this.toast(this.t.failed('browser_click', 'index must be a whole number of at least 0'), true);
+      const hasIndex = args.index !== undefined;
+      const text = typeof args.text === 'string' ? args.text.trim() : '';
+      if (hasIndex === !!text) return this.toast(this.t.failed('browser_click', 'give either an element number or its visible text'), true);
+      let index: number | null = null;
+      if (hasIndex) {
+        index = this.indexArg(args.index);
+        if (index === null) return this.toast(this.t.failed('browser_click', 'index must be a whole number of at least 0'), true);
+      }
       const blocked = this.begin('browser_click');
       if (blocked) return blocked;
-      const element = asElement(await this.call('element', { index }, ctx.signal));
-      if (!element) return this.toast(this.t.noElement(index), true);
-      const label = this.labelOf(element);
+      let label = text;
+      if (index !== null) {
+        const element = asElement(await this.call('element', { index }, ctx.signal));
+        if (!element) return this.toast(this.t.noElement(index), true);
+        label = this.labelOf(element);
+      }
       const refused = clickRefusal(label);
       if (refused) return this.toast(this.t.refusedClick(label, refused), true);
       if (!this.self.actions && isWriteAction(label)) return this.toast(this.t.lookOnly(label), true);
-      const result = asRecord(await this.call('click', { index }, ctx.signal));
+      const result = asRecord(await this.call('click', index !== null ? { index } : { text }, ctx.signal));
       const state = asState(result?.state);
       if (!state) return this.toast(this.t.failed('browser_click', 'the page did not answer after the click'), true);
       const answer = asRecord(result?.answer) as ClickAnswer | null;
       if (answer?.success === false) return this.toast(this.t.failed('browser_click', answer.message || 'the click failed'), true);
       return this.toast(this.full(state, this.t.clicked(label || `#${index}`)));
+    });
+  }
+
+  private async hover(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.run('browser_hover', ctx, async () => {
+      const index = this.indexArg(args.index);
+      if (index === null) return this.toast(this.t.failed('browser_hover', 'index must be a whole number of at least 0'), true);
+      const blocked = this.begin('browser_hover');
+      if (blocked) return blocked;
+      const element = asElement(await this.call('element', { index }, ctx.signal));
+      if (!element) return this.toast(this.t.noElement(index), true);
+      const label = this.labelOf(element);
+      const result = asRecord(await this.call('hover', { index }, ctx.signal));
+      const state = asState(result?.state);
+      if (!state) return this.toast(this.t.failed('browser_hover', 'the page did not answer after hovering'), true);
+      return this.toast(this.full(state, this.t.hovered(label || `#${index}`)));
     });
   }
 

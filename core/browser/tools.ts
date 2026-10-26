@@ -56,7 +56,20 @@ export const BROWSER_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'browser_click',
     tags: ['act'],
-    description: 'Click an element by the number from the latest page read. Use it to open a video, play or pause, like, favorite, follow or open a comment box. Spending money, private messages and account changes are refused; read the page again after a navigation.',
+    description: 'Click an element by the number from the latest page read, or by its visible text when it has no number (for example the 添加音乐 button beside a video preview). Use it to open a video, play or pause, like, favorite, follow or open a comment box. Spending money, private messages and account changes are refused; read the page again after a navigation.',
+    parameters: {
+      type: 'object',
+      properties: {
+        index: { type: 'integer', minimum: 0, description: 'The number in front of the element, e.g. 12 for [12]. Omit when using text.' },
+        text: { type: 'string', description: 'The visible text of an element that has no number, e.g. 添加音乐. Omit when using index.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'browser_hover',
+    tags: ['act'],
+    description: 'Move the pointer over an element by number, without clicking. Some controls appear only on hover, such as a song\'s 使用 button in a music picker; read the page again afterwards.',
     parameters: {
       type: 'object',
       properties: { index: { type: 'integer', minimum: 0, description: 'The number in front of the element, e.g. 12 for [12].' } },

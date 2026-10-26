@@ -14,10 +14,11 @@ const es419: Translation<CoreText> = {
       title: 'Tiempo propio',
       description: 'Tras un rato sin conversación, puede abrir su propio navegador y mirar. La ventana y sus sesiones son aparte.',
       after: 'Tras el silencio', afterDescription: 'Recibe tiempo propio tras este tiempo sin conversación.',
-      session: 'Como máximo', sessionDescription: 'Un tiempo propio dura como máximo esto; al terminar, el navegador se cierra.',
+      session: 'Como máximo', sessionDescription: 'Un tiempo propio dura como máximo esto; al terminar, el navegador se cierra. Con «Sin límite», no se cierra por tiempo.',
+      unlimited: 'Sin límite', unlimitedDescription: 'Activado: el tiempo propio no termina por tiempo, sino cuando ella cierra el navegador.',
       minutes: 'min',
       sound: 'Sonido del navegador', soundDescription: 'Silenciado por defecto. Al activarlo, se oyen los videos que mira.',
-      actions: 'Permitir me gusta, guardados y danmaku', actionsDescription: 'Desactivado, solo puede mirar. Inicia sesión y resuelve los códigos en su ventana tú mismo.',
+      actions: 'Permitir me gusta, guardados, danmaku y comentarios', actionsDescription: 'Desactivado, solo puede mirar. Inicia sesión y resuelve los códigos en su ventana tú mismo.',
     },
   },
 

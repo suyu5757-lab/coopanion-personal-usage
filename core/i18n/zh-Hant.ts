@@ -14,10 +14,11 @@ const zhHant: Translation<CoreText> = {
       title: '自己的時間',
       description: '沒聊天一段時間後，她可以自己打開瀏覽器逛逛、看看影片。瀏覽器視窗和登入狀態都是她自己的。',
       after: '安靜多久後', afterDescription: '這段時間沒有聊天後，她會得到一段自己的時間。',
-      session: '每次最多', sessionDescription: '一段自己的時間最多持續這麼久，到時瀏覽器自動關上。',
+      session: '每次最多', sessionDescription: '一段自己的時間最多持續這麼久，到時瀏覽器自動關上；打開「不限」時不按時間關閉。',
+      unlimited: '不限', unlimitedDescription: '打開後，一段自己的時間不會按時長自動結束，她關上瀏覽器才結束。',
       minutes: '分鐘',
       sound: '瀏覽器聲音', soundDescription: '預設靜音。打開後，她看的影片會外放。',
-      actions: '允許按讚、收藏和發彈幕', actionsDescription: '關閉後她只能看網頁和影片，不能互動。登入和驗證碼請在她的瀏覽器視窗裡自己完成。',
+      actions: '允許按讚、收藏、發送彈幕和評論', actionsDescription: '關閉後她只能看網頁和影片，不能互動。登入和驗證碼請在她的瀏覽器視窗裡自己完成。',
     },
   },
 

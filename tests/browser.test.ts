@@ -92,10 +92,10 @@ const make = async (opts: { self?: Partial<typeof SELF_TIME_DEFAULTS>; bridge?: 
 describe('selfTime settings', () => {
   it('reads defaults and clamps hand-edited values', () => {
     expect(readSelfTime(undefined)).toEqual(SELF_TIME_DEFAULTS);
-    expect(readSelfTime({ companion: { selfTime: { enabled: true, afterMinutes: 999, sessionMinutes: 1, sound: true, actions: false } } }))
-      .toEqual({ enabled: true, afterMinutes: 240, sessionMinutes: 5, sound: true, actions: false });
+    expect(readSelfTime({ companion: { selfTime: { enabled: true, afterMinutes: 999, sessionMinutes: 1, sessionUnlimited: true, sound: true, actions: false } } }))
+      .toEqual({ enabled: true, afterMinutes: 240, sessionMinutes: 5, sessionUnlimited: true, sound: true, actions: false });
     expect(readSelfTime({ companion: { selfTime: { afterMinutes: 0, sessionMinutes: 999 } } }))
-      .toEqual({ ...SELF_TIME_DEFAULTS, afterMinutes: 5, sessionMinutes: 60 });
+      .toEqual({ ...SELF_TIME_DEFAULTS, afterMinutes: 1, sessionMinutes: 60 });
     expect(readSelfTime({ companion: { selfTime: { enabled: true } }, worlds: { browser: { enabled: false } } }).enabled).toBe(false);
   });
 
@@ -108,6 +108,12 @@ describe('selfTime settings', () => {
     expect(en).toContain('2 minutes');
     expect(en).toContain('15 minutes');
     expect(en).toContain('end_turn');
+    const unlimited = selfTimeLine('zh', 30, 20, true);
+    expect(unlimited).toContain('不限时长');
+    expect(unlimited).not.toContain('最多 20 分钟');
+    const enUnlimited = selfTimeLine('en', 120, 15, true);
+    expect(enUnlimited).toContain('no time limit');
+    expect(enUnlimited).not.toContain('15 minutes');
   });
 });
 
@@ -122,6 +128,12 @@ describe('Coo’s quiet line', () => {
     expect(line).toContain('自己的时间');
     expect(line).toContain('15 分钟');
     expect(line).toContain('上网');
+    const unlimited = coopanionPersona(Cormini, {
+      selfTime: () => ({ ...SELF_TIME_DEFAULTS, enabled: true, sessionUnlimited: true }),
+      modelLanguage: () => 'zh',
+    });
+    const u = new unlimited({ memoryDir: mkdtempSync(join(tmpdir(), 'coo-self-time-')) });
+    expect((u as unknown as { tickText(seconds: number): string }).tickText(30)).toContain('不限时长');
     const off = coopanionPersona(Cormini, { selfTime: () => ({ ...SELF_TIME_DEFAULTS, enabled: false }) });
     const q = new off({ memoryDir: mkdtempSync(join(tmpdir(), 'coo-self-time-')) });
     const quiet = (q as unknown as { tickText(seconds: number): string }).tickText(90);
@@ -203,6 +215,27 @@ describe('browser World', () => {
     expect(bridge.calls.some((c) => c.op === 'click')).toBe(false);
   });
 
+  it('refuses a payment control named by its visible text before calling the page', async () => {
+    const { world, bridge } = await make();
+    bridge.responses.open = page();
+    await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
+    const out = await run(world, 'browser_click', { text: '立即购买' });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('没有点');
+    expect(bridge.calls.some((c) => c.op === 'click')).toBe(false);
+  });
+
+  it('clicks a control by its visible text when it has no number', async () => {
+    const { world, bridge } = await make();
+    bridge.responses.open = page();
+    bridge.responses.click = { answer: { success: true }, state: page({ content: '[3]<div >添加音乐 />' }) };
+    await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
+    const out = await run(world, 'browser_click', { text: '添加音乐' });
+    expect(out.failed).toBeUndefined();
+    expect(out.text).toContain('点了「添加音乐');
+    expect(out.text).toContain('添加音乐');
+  });
+
   it('clicks a like and returns the page after it', async () => {
     const { world, bridge } = await make();
     bridge.responses.open = page();
@@ -213,6 +246,18 @@ describe('browser World', () => {
     expect(out.failed).toBeUndefined();
     expect(out.text).toContain('点了「点赞 12');
     expect(out.text).toContain('13');
+  });
+
+  it('hovers an element and returns the controls it reveals', async () => {
+    const { world, bridge } = await make();
+    bridge.responses.open = page();
+    bridge.responses.hover = { state: page({ content: '[2]<div title=点赞>12 />\n[3]<button >使用 />' }) };
+    await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
+    bridge.element = element();
+    const out = await run(world, 'browser_hover', { index: 2 });
+    expect(out.failed).toBeUndefined();
+    expect(out.text).toContain('鼠标移到「点赞 12');
+    expect(out.text).toContain('使用');
   });
 
   it('refuses a password field and types into a search box', async () => {
@@ -288,8 +333,11 @@ describe('browser World', () => {
   });
 
   it('has an env prompt that names the session and the allowed actions', async () => {
-    const { world } = await make();
-    expect(world.envPromptVars()).toMatchObject({ 'browser.session': '20' });
+    const { world, setSelf } = await make();
+    expect(world.envPromptVars()).toMatchObject({ 'browser.session': '最多 20 分钟' });
+    setSelf({ sessionUnlimited: true });
+    expect(world.envPromptVars()).toMatchObject({ 'browser.session': '不限时长' });
+    setSelf({ sessionUnlimited: false });
     expect(world.envPromptVars()!['browser.actions']).toContain('点赞');
     const doc = world.webUi!('zh').promptDocs?.find((d) => d.role === 'envPrompt');
     expect(doc?.path).toBeTruthy();
@@ -319,6 +367,7 @@ describe('browser World', () => {
     });
     expect(def.defaults()).toEqual({ enabled: false });
     expect(def.describe?.tools.map((t) => t.name)).toContain('browser_open');
+    expect(def.describe?.tools.map((t) => t.name)).toContain('browser_hover');
     expect(def.describe?.events.map((e) => e.type)).toContain('browser.closed');
   });
 });

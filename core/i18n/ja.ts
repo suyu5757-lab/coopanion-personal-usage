@@ -14,10 +14,11 @@ const ja: Translation<CoreText> = {
       title: '自分の時間',
       description: 'しばらく会話がないと、自分でブラウザを開いて動画などを見に行けます。ウィンドウとログインは彼女専用です。',
       after: '静かな時間', afterDescription: 'この時間だけ会話がないと、自分の時間が始まります。',
-      session: '1 回の上限', sessionDescription: '自分の時間は最長これだけ続き、終わるとブラウザが閉じます。',
+      session: '1 回の上限', sessionDescription: '自分の時間は最長これだけ続き、終わるとブラウザが閉じます。「無制限」をオンにすると時間では閉じません。',
+      unlimited: '無制限', unlimitedDescription: 'オンにすると、自分の時間は時間では終わらず、彼女がブラウザを閉じたときに終わります。',
       minutes: '分',
       sound: 'ブラウザの音', soundDescription: '既定はミュートです。オンにすると、見ている動画の音が出ます。',
-      actions: 'いいね・保存・弾幕を許可', actionsDescription: 'オフにすると閲覧だけになります。ログインと認証コードはブラウザウィンドウで本人が行ってください。',
+      actions: 'いいね・保存・弾幕・コメントを許可', actionsDescription: 'オフにすると閲覧だけになります。ログインと認証コードはブラウザウィンドウで本人が行ってください。',
     },
   },
 

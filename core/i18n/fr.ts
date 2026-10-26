@@ -14,10 +14,11 @@ const fr: Translation<CoreText> = {
       title: "Un temps à elle",
       description: "Après un moment sans conversation, elle peut ouvrir son propre navigateur et regarder. La fenêtre et ses connexions sont séparées.",
       after: "Après le calme", afterDescription: "Elle obtient un temps à elle après ce délai sans conversation.",
-      session: "Au plus", sessionDescription: "Un temps à elle dure au plus ce délai ; le navigateur se ferme à la fin.",
+      session: "Au plus", sessionDescription: "Un temps à elle dure au plus ce délai ; le navigateur se ferme à la fin. Avec « Sans limite », il ne se ferme pas après ce délai.",
+      unlimited: "Sans limite", unlimitedDescription: "Activé : un temps à elle ne se termine pas après un délai, mais quand elle ferme le navigateur.",
       minutes: "min",
       sound: "Son du navigateur", soundDescription: "Muet par défaut. Activé, les vidéos qu'elle regarde sont audibles.",
-      actions: "Autoriser likes, favoris et danmaku", actionsDescription: "Désactivé, elle ne peut que regarder. Connectez-vous et saisissez les codes dans sa fenêtre vous-même.",
+      actions: "Autoriser likes, favoris, danmaku et commentaires", actionsDescription: "Désactivé, elle ne peut que regarder. Connectez-vous et saisissez les codes dans sa fenêtre vous-même.",
     },
   },
 

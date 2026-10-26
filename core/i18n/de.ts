@@ -14,10 +14,11 @@ const de: Translation<CoreText> = {
       title: 'Zeit für sich',
       description: 'Nach einer Weile ohne Gespräch darf sie ihren eigenen Browser öffnen und sich umsehen. Fenster und Anmeldungen sind getrennt.',
       after: 'Nach Ruhe', afterDescription: 'Nach so langer Ruhe bekommt sie Zeit für sich.',
-      session: 'Höchstens', sessionDescription: 'Eine Auszeit dauert höchstens so lange; danach schließt sich der Browser.',
+      session: 'Höchstens', sessionDescription: 'Eine Auszeit dauert höchstens so lange; danach schließt sich der Browser. Mit „Unbegrenzt“ schließt er nicht nach Zeit.',
+      unlimited: 'Unbegrenzt', unlimitedDescription: 'Ein: Eine Auszeit endet nicht nach Zeit, sondern wenn sie den Browser schließt.',
       minutes: 'Min.',
       sound: 'Browser-Ton', soundDescription: 'Standardmäßig stumm. Eingeschaltet hört man die Videos, die sie ansieht.',
-      actions: 'Likes, Favoriten und Danmaku erlauben', actionsDescription: 'Aus: Sie darf nur zusehen. Anmeldung und Codes bitte selbst in ihrem Browserfenster eingeben.',
+      actions: 'Likes, Favoriten, Danmaku und Kommentare erlauben', actionsDescription: 'Aus: Sie darf nur zusehen. Anmeldung und Codes bitte selbst in ihrem Browserfenster eingeben.',
     },
   },
 

@@ -41,6 +41,7 @@ export interface BrowserText {
   opened(url: string): string;
   searched(query: string, site: string): string;
   clicked(label: string): string;
+  hovered(label: string): string;
   typed(label: string): string;
   pressed(key: string): string;
   scrolled(down: boolean, pages: number): string;
@@ -83,6 +84,7 @@ const zh: BrowserText = {
   opened: (url) => `[浏览器] 打开了 ${url}`,
   searched: (query, site) => `[浏览器] 在${site}搜索了「${query}」`,
   clicked: (label) => `[浏览器] 点了「${label}」`,
+  hovered: (label) => `[浏览器] 鼠标移到「${label}」上`,
   typed: (label) => `[浏览器] 在「${label}」里输入了文字`,
   pressed: (key) => `[浏览器] 按了 ${key}`,
   scrolled: (down, pages) => `[浏览器] ${down ? '向下' : '向上'}翻了 ${pages} 屏`,
@@ -122,6 +124,7 @@ const en: BrowserText = {
   opened: (url) => `[browser] Opened ${url}`,
   searched: (query, site) => `[browser] Searched ${site} for "${query}"`,
   clicked: (label) => `[browser] Clicked "${label}"`,
+  hovered: (label) => `[browser] Moved the pointer over "${label}"`,
   typed: (label) => `[browser] Typed into "${label}"`,
   pressed: (key) => `[browser] Pressed ${key}`,
   scrolled: (down, pages) => `[browser] Scrolled ${down ? 'down' : 'up'} ${pages} screen${pages === 1 ? '' : 's'}`,
@@ -160,14 +163,16 @@ const en: BrowserText = {
 export const BROWSER_TEXT: Record<ModelLanguage, BrowserText> = { zh, en };
 
 /** The line Cormini's heartbeat delivers when Coo has time of her own. */
-export function selfTimeLine(language: ModelLanguage, quietSeconds: number, minutes: number): string {
+export function selfTimeLine(language: ModelLanguage, quietSeconds: number, minutes: number, unlimited = false): string {
   if (language === 'en') {
     const quiet = quietSeconds < 60 ? `${quietSeconds} seconds` : `${Math.floor(quietSeconds / 60)} minutes`;
-    return `[system] Quiet for ${quiet}. This is your own time, up to ${minutes} minutes: speak if you want to; `
+    const span = unlimited ? 'with no time limit' : `up to ${minutes} minutes`;
+    return `[system] Quiet for ${quiet}. This is your own time, ${span}: speak if you want to; `
       + 'if you want to go online, open your browser and look around Bilibili, Douyin or anywhere else. '
       + 'If you would rather not, end_turn.';
   }
   const quiet = quietSeconds < 60 ? `${quietSeconds} 秒` : `${Math.floor(quietSeconds / 60)} 分钟`;
-  return `[system] 已经安静了 ${quiet}。这是你自己的时间,最多 ${minutes} 分钟:想说话就说;`
+  const span = unlimited ? '不限时长' : `最多 ${minutes} 分钟`;
+  return `[system] 已经安静了 ${quiet}。这是你自己的时间,${span}:想说话就说;`
     + '想自己上网逛逛,可以打开你的浏览器,去 B 站、抖音或别的地方看看。不想动就 end_turn。';
 }

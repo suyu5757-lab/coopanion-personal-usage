@@ -14,10 +14,11 @@ const ptBR: Translation<CoreText> = {
       title: 'Tempo dela',
       description: 'Depois de um tempo sem conversa, ela pode abrir o próprio navegador e olhar. A janela e os logins são separados.',
       after: 'Depois do silêncio', afterDescription: 'Ela ganha um tempo dela depois deste tempo sem conversa.',
-      session: 'No máximo', sessionDescription: 'Um tempo dela dura no máximo isso; ao terminar, o navegador fecha.',
+      session: 'No máximo', sessionDescription: 'Um tempo dela dura no máximo isso; ao terminar, o navegador fecha. Com "Sem limite", ele não fecha por tempo.',
+      unlimited: 'Sem limite', unlimitedDescription: 'Ligado: um tempo dela não termina por tempo, mas quando ela fecha o navegador.',
       minutes: 'min',
       sound: 'Som do navegador', soundDescription: 'Mudo por padrão. Ligado, os vídeos que ela assiste têm som.',
-      actions: 'Permitir curtidas, salvos e danmaku', actionsDescription: 'Desligado, ela só pode olhar. Entre e resolva os códigos na janela dela você mesmo.',
+      actions: 'Permitir curtidas, salvos, danmaku e comentários', actionsDescription: 'Desligado, ela só pode olhar. Entre e resolva os códigos na janela dela você mesmo.',
     },
   },
 

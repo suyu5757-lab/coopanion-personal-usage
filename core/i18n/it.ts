@@ -14,10 +14,11 @@ const it: Translation<CoreText> = {
       title: 'Tempo per sé',
       description: "Dopo un po' senza conversazione può aprire il proprio browser e guardarsi intorno. Finestra e accessi sono separati.",
       after: 'Dopo il silenzio', afterDescription: 'Riceve tempo per sé dopo questo periodo senza conversazione.',
-      session: 'Al massimo', sessionDescription: 'Un tempo per sé dura al massimo così; alla fine il browser si chiude.',
+      session: 'Al massimo', sessionDescription: 'Un tempo per sé dura al massimo così; alla fine il browser si chiude. Con «Senza limite» non si chiude per tempo.',
+      unlimited: 'Senza limite', unlimitedDescription: 'Attivo: un tempo per sé non finisce col tempo, ma quando lei chiude il browser.',
       minutes: 'min',
       sound: 'Audio del browser', soundDescription: 'Muto per impostazione predefinita. Attivo, i video che guarda si sentono.',
-      actions: 'Consenti like, salvataggi e danmaku', actionsDescription: 'Disattivato, può solo guardare. Accedi e inserisci i codici nella sua finestra tu stesso.',
+      actions: 'Consenti like, salvataggi, danmaku e commenti', actionsDescription: 'Disattivato, può solo guardare. Accedi e inserisci i codici nella sua finestra tu stesso.',
     },
   },
 

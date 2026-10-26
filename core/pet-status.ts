@@ -73,6 +73,7 @@ export function petToolDescriber(language: () => Language): DescribeTool {
         return show('search', s.search, query ? s.quoted(query) : undefined);
       }
       case 'browser_click': return show('click', s.click);
+      case 'browser_hover': return show('click', s.move);
       case 'browser_type': return show('type', s.type);
       case 'browser_press': return show('type', s.key, stringArg(args, 'key'));
       case 'browser_scroll': return show('scroll', s.scroll);

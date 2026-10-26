@@ -143,7 +143,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     /** With time of her own on, the quiet line offers the browser as well as speaking first. */
     protected override tickText(quietSeconds: number): string {
       const self = this.selfTimeNow();
-      return self?.enabled ? selfTimeLine(this.modelLang(), quietSeconds, self.sessionMinutes) : super.tickText(quietSeconds);
+      return self?.enabled ? selfTimeLine(this.modelLang(), quietSeconds, self.sessionMinutes, self.sessionUnlimited) : super.tickText(quietSeconds);
     }
 
     /** The setting turned time of her own on, or its quiet interval changed: arm the next wake-up now. */
