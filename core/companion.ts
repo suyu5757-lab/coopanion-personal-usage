@@ -61,6 +61,7 @@ import { withWorlds, type WorldDefinition, type WorldSection } from 'cortico/wor
 import { InstanceLockedError } from 'cortico/core/instance-lock.ts';
 import { CONSOLE } from 'cortico/worlds/console/definition.ts';
 import { desktopPetDefinition, figurePacks, type DesktopPetWorld } from 'cortico-world-desktop-pet';
+import { opencodeDefinition } from 'cortico-world-opencode';
 import COO, { CHATGPT, CHATGPT_PROVIDER, signedIn, usageLimited, vendorOf } from 'cortico-provider-coo';
 import { appWebUiAsset, bundledWebUiAssets } from './bundled-panels.ts';
 import { followPetLook } from './console-theme.ts';
@@ -577,7 +578,12 @@ export async function main(): Promise<void> {
     language: () => language(),
     onSessionEnd: () => coo?.restartRhythm(),
   });
-  const bundled = [CONSOLE, DESKTOP_PET, NOTICE, BROWSER] as WorldDefinition<WorldSection>[];
+  const OPENCODE = opencodeDefinition({
+    modelLanguage: () => modelLanguage(config?.language),
+    // the avatar beside the pet; the task itself does not depend on the page being connected
+    onState: (state) => pet?.guest(state),
+  });
+  const bundled = [CONSOLE, DESKTOP_PET, NOTICE, BROWSER, OPENCODE] as WorldDefinition<WorldSection>[];
 
   // extension providers must be registered before endpoints are resolved
   const extensions = await loadExtensions(repoRoot(), {

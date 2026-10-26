@@ -25,6 +25,7 @@ const windowKey = host ? new URLSearchParams(location.hash.slice(1)).get('key') 
 document.body.classList.add(host ? 'desk' : 'tab');
 
 const stage = $('#stage');
+const guestLayer = $('#guestLayer'), guestPortal = $('#guestPortal');
 const bubble = $('#bubble'), menu = $('#menu');
 const tools = $('#tools');
 // Coo's drawing classes for the menu's avatar; the bubbles and buttons take their colours from Coo's palette
@@ -76,21 +77,25 @@ else ['pointerdown', 'keydown'].forEach((ev) => document.addEventListener(ev, ()
 let below = 0;
 const floorGap = () => (host ? 2 + below : 48);
 const bounds = () => ({ W: innerWidth, H: innerHeight, floorY: innerHeight - floorGap(), S: .42 * prefs.scale });
+const guestBounds = () => { const b = bounds(); return { ...b, S: b.S * .75 }; };
 /**
  * The body on screen (body-host.js), null until the first one is ready, and the words it does (its pack's
  * vocab, by id). `T` is the page's clock, in seconds of frames drawn.
  */
 let body = null, words = new Map(), T = 0;
+let guest = null, guestToken = 0, guestOutTimer = null;
 /** Where the body last said it is (body-host.js `layout`), or null. */
 const at = () => body?.layout ?? null;
 /** What the body is told of the page: talking orders hold its roaming off, and these states. */
 const bodyState = { listening: false, thinking: false, thoughtShown: true, dialogOpen: false };
 const holdRoam = (seconds) => body?.set({ hold: seconds });
-host?.onFloor?.((px) => { below = px; body?.set({ bounds: bounds() }); });
+host?.onFloor?.((px) => { below = px; body?.set({ bounds: bounds() }); guest?.set({ bounds: guestBounds() }); guestPlace(); });
 // the window reads the windows on its display only while the body on screen asks for them (`watchWindows`)
 host?.onWindows?.((desk) => body?.setWindows(desk));
 addEventListener('resize', () => {
   body?.set({ bounds: bounds() });
+  guest?.set({ bounds: guestBounds() });
+  guestPlace();
   // the World reads walk targets and drop spots against the stage the pet is on now
   send({ t: 'hello', screen: { w: innerWidth, h: innerHeight } });
 });
@@ -126,11 +131,13 @@ host?.onShown?.((shown) => { windowShown = shown; sfx.setShown(shown); reportVis
 let overlayOn = false;
 /** The body's box with room for its halo and what floats above its head, joined with the bubbles shown; null with no body. */
 function overlayRect() {
-  const b = at()?.box;
-  if (!b) return null;
-  // the halo reaches about 40% of the body's width out; emotes and z's float up to its height above
-  const side = Math.max(24, .4 * b.w), top = Math.max(48, b.h);
-  const parts = [{ x: b.x - side, y: b.y - top, width: b.w + 2 * side, height: b.h + top + side }];
+  const boxes = [at()?.box, guest?.layout?.box].filter(Boolean);
+  if (!boxes.length) return null;
+  // the halo reaches about 40% of a body's width out; emotes and z's float up to its height above
+  const parts = boxes.map((b) => {
+    const side = Math.max(24, .4 * b.w), top = Math.max(48, b.h);
+    return { x: b.x - side, y: b.y - top, width: b.w + 2 * side, height: b.h + top + side };
+  });
   for (const el of [bubble, ...lines.map((l) => l.el)]) if (!el.hidden) parts.push(rectOf(el));
   const x = Math.max(0, Math.min(...parts.map((r) => r.x))), y = Math.max(0, Math.min(...parts.map((r) => r.y)));
   const right = Math.min(innerWidth, Math.max(...parts.map((r) => r.x + r.width))), bottom = Math.min(innerHeight, Math.max(...parts.map((r) => r.y + r.height)));
@@ -207,6 +214,96 @@ async function applyFigure(s) {
   try { await showFigure(s); } catch (err) { bodyFailed(s.figure, err); }
 }
 
+/* ---------- a summoned guest: its own figure frame beside the pet ---------- */
+function playSummon() {
+  const word = ['summon', 'spout', 'tail-whip', 'wave'].find((w) => words.has(w));
+  if (word) body?.do(word);
+}
+function replayGuestEntrance() {
+  guestLayer.classList.remove('guest-in', 'guest-out');
+  guestPortal.classList.remove('on', 'out');
+  void guestLayer.offsetWidth;
+  guestPortal.classList.add('on');
+  guestLayer.classList.add('guest-in');
+}
+function guestPlace() {
+  if (!guest) return;
+  const main = at();
+  if (!main) return;
+  const b = bounds();
+  const x = Math.min(b.W - 56, Math.max(56, main.x + (main.x < b.W / 2 ? 92 : -92)));
+  guest.place(x, x < main.x ? 1 : -1);
+  guestLayer.style.transformOrigin = `${x}px ${b.H}px`;
+  guestPortal.style.left = `${Math.max(0, x - 39)}px`;
+}
+async function showGuest(state) {
+  const phase = ['boot', 'work', 'wait', 'done', 'oops'].includes(state) ? state : 'work';
+  if (guest) {
+    if (phase === 'boot') { replayGuestEntrance(); playSummon(); }
+    guest.set({ guest: phase, theme: prefs.theme });
+    return;
+  }
+  const token = ++guestToken;
+  const pack = (await (await fetch('/api/figures')).json()).find((p) => p.id === 'opencode');
+  if (!pack) { console.error('the opencode figure pack is not installed'); return; }
+  const main = at();
+  const b = bounds();
+  const x = main ? Math.min(b.W - 56, Math.max(56, main.x + (main.x < b.W / 2 ? 92 : -92))) : b.W * .55;
+  const facing = main && x > main.x ? -1 : 1;
+  const gb = guestBounds();
+  guestLayer.style.transformOrigin = `${x}px ${gb.H}px`;
+  guestPortal.style.left = `${Math.max(0, x - 39)}px`;
+  replayGuestEntrance();
+  let made;
+  try {
+    made = await loadBody({
+      layer: guestLayer, pack, theme: prefs.theme, bounds: gb,
+      start: { x, facing, skin: null },
+      onEvent: () => {},
+      onSound: () => {},
+      onError: (err) => { console.error(err); hideGuest(); },
+    });
+  } catch (err) {
+    console.error(err);
+    guestLayer.classList.remove('guest-in');
+    guestPortal.classList.remove('on');
+    return;
+  }
+  if (token !== guestToken) { made.dispose(); return; }
+  guest = made;
+  made.set({ roam: 'off', guest: phase, theme: prefs.theme });
+  playSummon();
+}
+function hideGuest() {
+  guestToken++;
+  if (!guest) return;
+  const gone = guest;
+  guest = null;
+  guestLayer.classList.remove('guest-in');
+  guestPortal.classList.remove('on');
+  guestLayer.classList.add('guest-out');
+  guestPortal.classList.add('out');
+  if (guestOutTimer) clearTimeout(guestOutTimer);
+  guestOutTimer = setTimeout(() => {
+    guestOutTimer = null;
+    gone.dispose();
+    if (!guest) {
+      guestLayer.classList.remove('guest-out');
+      guestPortal.classList.remove('out');
+      guestLayer.style.transformOrigin = '';
+      guestPortal.style.left = '';
+    }
+  }, 720);
+}
+async function onGuest(m) {
+  try {
+    if (m.show) await showGuest(m.state);
+    else hideGuest();
+  } catch (err) {
+    console.error(err);
+  }
+}
+
 /**
  * The pet window puts the pet where it stood when the World last stopped (`startX`, a share of the window
  * width) from the first `init` only; after a reconnect it stays where it is. While `rememberPosition` is on it
@@ -256,9 +353,9 @@ function applyPrefs(p) {
   if (typeof p.sound === 'boolean') { prefs.sound = p.sound; sfx.set(p.sound); }
   if (p.sounds && typeof p.sounds === 'object') sfx.configure({ kinds: p.sounds, snoreSeconds: p.sounds.snoreSeconds });
   if (p.speech && typeof p.speech === 'object') speech.configure(p.speech);
-  if (p.theme === 'dark' || p.theme === 'light') { prefs.theme = p.theme; applyTheme(p.theme); modeBtn?.show(p.theme); body?.set({ theme: p.theme }); }
+  if (p.theme === 'dark' || p.theme === 'light') { prefs.theme = p.theme; applyTheme(p.theme); modeBtn?.show(p.theme); body?.set({ theme: p.theme }); guest?.set({ theme: p.theme }); }
   if (typeof p.glow === 'number') prefs.glow = p.glow;
-  if (typeof p.scale === 'number') { prefs.scale = p.scale; body?.set({ bounds: bounds() }); }
+  if (typeof p.scale === 'number') { prefs.scale = p.scale; body?.set({ bounds: bounds() }); guest?.set({ bounds: guestBounds() }); guestPlace(); }
   if (typeof p.bubbleSize === 'number') { prefs.bubbleSize = p.bubbleSize; sizeVar('--bubble-size', p.bubbleSize); }
   if (typeof p.fontSize === 'number') { prefs.fontSize = p.fontSize; sizeVar('--bubble-font', p.fontSize); }
   if (typeof p.bubbleSpeed === 'number') prefs.bubbleSpeed = p.bubbleSpeed;
@@ -317,6 +414,7 @@ function onOrder(m) {
     case 'said': if (prefs.saidBubbles) addLine('chat', typeof m.text === 'string' ? m.text : '', false, { images: Number(m.images) || 0, cursor: m.cursor ?? null }); break;
     case 'said-withdrawn': withdrawLine(m.cursor); break;
     case 'status': setStatus(m.status); break;
+    case 'guest': void onGuest(m); break;
     case 'dialog': queue.push({ kind: 'dialog', id: m.id, d: m }); holdRoam(20); break;
     case 'dialog-update': updateDialog(m); break;
     case 'dialog-close': endDialog(m.id); break;
@@ -1751,6 +1849,7 @@ function frame(now) {
     stepStatus();
     setBody({ dialogOpen: !!item || !!listen.phase });
     body?.tick(dt);
+    guest?.tick(dt);
     stepBackdrop(dt);
     stepTools();
     layout(dt);

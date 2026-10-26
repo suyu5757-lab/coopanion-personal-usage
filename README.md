@@ -43,6 +43,7 @@ Coopanion is a desktop pet. **Coo** lives on the bottom edge of your screen: it 
 - **Chat**: hold the talk key and speak, or type; Coo answers in a bubble. Speech is recognized on your machine with FunASR or Whisper, picked by the app language.
 - **Memory**: Coo remembers what you talked about, and knows when you poke it or pat its head. What it knows about you goes in `PARTNER.md` in its workspace, which its prompt includes whole. Every change to the workspace is kept as a version; the Memory page in the advanced mode shows the history. The Windows build carries git; on macOS and Linux git has to be installed.
 - **Computer use**: clicking buttons, typing, switching windows. Coo asks before it acts.
+- **opencode**: hand coding work — writing code, fixing bugs, running tests — to opencode on your machine. Coo relays the task and the result; opencode reads, edits and runs commands only in the directories you allow, and asks in a bubble before every change. Off by default; turn it on on the Worlds page in advanced mode.
 - **Time of her own**: when you are not chatting, she may open her own browser window and look around Bilibili, Douyin or elsewhere, and note down what she found. Off by default; turn it on in Habits.
 - **Activity bubbles**: see when Coo is thinking and what it is working on, with a different animated icon for reading, searching, writing and using the computer. File names appear; the bubble lets clicks through. On by default; turn it off in Habits.
 - **Figures**: Coo, or the **DeepSeek Chan**, a fully animated whale girl with eight vendor color schemes and five outfits (a maid dress, a winter outfit, a crew uniform, workwear and a nightgown). Other figure packs are imported on the Dress up page from a zip or a folder; packs written for figure API 2 keep loading in later versions (see the [figure pack compatibility promise](packages/cortico-world-desktop-pet/README.md#形象包兼容承诺)).
@@ -232,6 +233,18 @@ Once it is on, Coo looks at the screen without asking, and asks before it first 
 To keep Coo off your computer, untick **Let Coo use this computer** in the Computer use section of the Habits page.
 
 If saving a computer-use change fails, the switches and permission choice return to their last saved values.
+
+### Letting Coo summon opencode
+
+Install and sign in to opencode on your machine (`opencode auth login`), then turn on opencode on the Worlds page in advanced mode. Its settings are in the opencode group in advanced mode:
+
+- `bin`: the opencode executable; `opencode` is enough when it is on `PATH`.
+- `workRoots`: the absolute directories it may work in, one per line, or separated by commas or semicolons. With none set it refuses every task.
+- `askSensitive`: on by default; it asks before writing files, running commands, fetching pages and starting subagents. Leave it on unless you have read the commands.
+
+Then ask Coo for the work, for example "get the tests in this project passing". It confirms the directory, hands the task to opencode and keeps talking to you; a small terminal appears beside Coo and shows boot, work, wait, done and oops. When opencode wants to write a file or run a command, Coo puts the original command and path in a bubble with allow once, allow for this session, or reject. If you do not answer, the task stops by itself. When it ends, opencode hands Coo the summary, changed files and commands; Coo can read the full changes with opencode_review to accept the work, or resume the same session with fixes if it does not pass. One task at a time; say stop to stop it.
+
+opencode uses its own model and login, separate from Coo's. The World never passes `--auto` and never approves anything for you. A task starts only inside `workRoots`.
 
 ### Tray / menu bar
 

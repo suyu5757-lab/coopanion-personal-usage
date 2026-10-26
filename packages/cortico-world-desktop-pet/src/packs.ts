@@ -321,6 +321,7 @@ export interface PackScan { packs: FigurePack[]; problems: PackProblem[] }
 export const BUILTIN_PACKS: ReadonlyArray<{ dir: string; base: string }> = [
   { dir: fileURLToPath(new URL('../web/coo/', import.meta.url)), base: '/web/coo/' },
   { dir: fileURLToPath(new URL('../web/whale/', import.meta.url)), base: '/web/whale/' },
+  { dir: fileURLToPath(new URL('../web/opencode/', import.meta.url)), base: '/web/opencode/' },
 ];
 
 /** The built-in packs and those installed under `roots` (each subdirectory one pack); problems are worded in `language`. */

@@ -25,6 +25,7 @@ or handed context. Two of its rules settle most design questions:
 | Core child process entry: assembly, seed files, the `coopanion` World, telemetry | `core/` | `core` |
 | Settings window: Coopanion's own front end over the WebUI HTTP API | `console/` | `console` |
 | Desktop pet World, computer use included (`src/cua/`) | `packages/cortico-world-desktop-pet/` | `desktop-pet` |
+| opencode World: ACP bridge, permissions, sessions | `packages/cortico-world-opencode/` | `opencode` |
 | Model provider | `packages/cortico-provider-coo/` | `provider-coo` |
 | Build, staging and packing | `scripts/`, `installer/`, `electron-builder.yml` | `scripts`, `installer` |
 | Telemetry service | `telemetry-server/` | `telemetry-server` |

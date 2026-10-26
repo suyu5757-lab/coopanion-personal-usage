@@ -36,6 +36,7 @@ import {
 import { capFor, cutChars, petText, type PetText } from './i18n/index.ts';
 import { SpeechText, speechTextSteps } from './speech/index.ts';
 import { PetServer, type PageMessage } from './server.ts';
+import type { GuestOrder } from './guest.ts';
 import { StatusTracker, type DescribeTool } from './status.ts';
 import { WindowHost, resolveHostCommand } from './window-host.ts';
 import { RuntimeStore, type ModelSpec } from './runtime/store.ts';
@@ -460,6 +461,11 @@ export class DesktopPetWorld implements World {
   /** The built-in packs, then the installed ones; scanned on each call (a few small files). */
   packs(): FigurePack[] {
     return this.packScan().packs;
+  }
+
+  /** Shows, updates or hides the summoned guest avatar; false when no pet page is connected. */
+  guest(order: GuestOrder): boolean {
+    return this.server.sendPet({ t: 'guest', ...order });
   }
 
   /** `packs()` with what was wrong in the pack directories, each problem logged once. */

@@ -1,0 +1,158 @@
+{
+  "manifest": 2,
+  "api": 2,
+  "id": "opencode",
+  "version": "1.0.0",
+  "name": {
+    "zh": "opencode",
+    "en": "opencode"
+  },
+  "about": {
+    "zh": "一台小终端:炭黑机身、浅灰屏幕、两只方块眼睛、会眨的光标、一条插头尾巴和一根天线;屏幕上的符号表示它在做什么",
+    "en": "a small terminal: a charcoal shell, a pale screen, two square eyes, a blinking cursor, a plug tail and an antenna; the screen shows what it is doing"
+  },
+  "author": "Pal-AI-Lab",
+  "entry": "figure.js",
+  "export": "createOpencodeBody",
+  "axes": [],
+  "presets": [],
+  "vocab": [
+    {
+      "id": "neutral",
+      "kind": "expression",
+      "names": {
+        "zh": [
+          "平静"
+        ]
+      },
+      "about": {
+        "zh": "默认的脸",
+        "en": "the default face"
+      },
+      "seconds": 0.9
+    },
+    {
+      "id": "happy",
+      "kind": "expression",
+      "names": {
+        "zh": [
+          "开心",
+          "高兴"
+        ]
+      },
+      "about": {
+        "zh": "屏幕变亮,眼睛弯起来",
+        "en": "the screen brightens and the eyes curve"
+      },
+      "seconds": 0.9
+    },
+    {
+      "id": "thinking",
+      "kind": "expression",
+      "names": {
+        "zh": [
+          "思考"
+        ]
+      },
+      "about": {
+        "zh": "眼睛往上看,冒问号",
+        "en": "looks up, a question mark"
+      },
+      "seconds": 0.9
+    },
+    {
+      "id": "wave",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "招手"
+        ]
+      },
+      "about": {
+        "zh": "抬起一只手挥挥",
+        "en": "raises a hand"
+      },
+      "seconds": 1.7
+    },
+    {
+      "id": "boot",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "开机"
+        ]
+      },
+      "about": {
+        "zh": "屏幕亮起来",
+        "en": "the screen lights up"
+      },
+      "seconds": 1.2
+    },
+    {
+      "id": "work",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "工作",
+          "敲键盘"
+        ]
+      },
+      "about": {
+        "zh": "低头敲键盘,屏幕滚着代码",
+        "en": "types on the keyboard, code scrolling"
+      },
+      "seconds": 3.6
+    },
+    {
+      "id": "wait",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "等权限",
+          "等一下"
+        ]
+      },
+      "about": {
+        "zh": "抬头看人,光标变成琥珀色",
+        "en": "looks up, the cursor turns amber"
+      },
+      "seconds": 2.4
+    },
+    {
+      "id": "done",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "完成",
+          "做完了"
+        ]
+      },
+      "about": {
+        "zh": "屏幕打勾,跳一下",
+        "en": "a check on screen, then a hop"
+      },
+      "seconds": 1.6
+    },
+    {
+      "id": "oops",
+      "kind": "motion",
+      "names": {
+        "zh": [
+          "出错",
+          "失败"
+        ]
+      },
+      "about": {
+        "zh": "出现感叹号,垂头",
+        "en": "an exclamation mark, head down"
+      },
+      "seconds": 1.6
+    }
+  ],
+  "sounds": {},
+  "can": {
+    "walk": true
+  },
+  "moves": [],
+  "needs": []
+}
