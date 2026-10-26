@@ -7,6 +7,7 @@ import { downscale, drawCursor, encodeJpeg, fit } from '../../src/cua/engine/ima
 import { displayAt, ordered, toLocal, toNative } from '../../src/cua/engine/display.ts';
 import { CUA_DEFAULTS, type CuaConfig } from '../../src/cua/config.ts';
 import { Cua } from '../../src/cua/cua.ts';
+import type { ActionOptions, CaptureOptions, CuaDriverLike, DriverAction, DriverCapture, DriverChord, DriverZoom } from '../../src/cua/driver.ts';
 import { FakeHost } from '../helpers/fake-host.ts';
 
 describe('parseKeys', () => {
@@ -396,5 +397,125 @@ describe('displays', () => {
     const out = await call('pet_cua_key', { keys: 'win+r' });
     expect(shots).toEqual([2, 1]);
     expect(out.text).toContain('显示器 1/2');
+  });
+});
+
+describe.runIf(process.platform === 'darwin')('background windows through Cua Driver', () => {
+  const SMALL_JPEG = Buffer.from(jpeg.encode({ data: Buffer.alloc(2 * 2 * 4, 255), width: 2, height: 2 }, 80).data);
+  const OK: DriverAction = { effect: 'unverifiable', summary: '' };
+
+  class FakeDriver implements CuaDriverLike {
+    availableValue = true;
+    captures = 0;
+    clicks: Array<{ pid: number; windowId: number; x: number; y: number; captureId: string; button?: string; count?: number }> = [];
+    types: string[] = [];
+    keys: DriverChord[][] = [];
+    scrolls: Array<{ x: number; y: number; down: number; right: number }> = [];
+    drags: Array<{ from: [number, number]; to: [number, number] }> = [];
+    moves: Array<{ x: number; y: number }> = [];
+
+    available(): boolean {
+      return this.availableValue;
+    }
+
+    async capture(pid: number, windowId: number, _opts: CaptureOptions): Promise<DriverCapture> {
+      this.captures += 1;
+      return { pid, windowId, title: 'Calculator', width: 100, height: 80, scale: 2, captureId: `cap-${this.captures}`, bounds: null, jpeg: SMALL_JPEG };
+    }
+
+    async click(pid: number, windowId: number, x: number, y: number, captureId: string, opts?: ActionOptions & { button?: 'left' | 'right' | 'middle'; count?: number }): Promise<DriverAction> {
+      this.clicks.push({ pid, windowId, x, y, captureId, button: opts?.button, count: opts?.count });
+      return OK;
+    }
+
+    async type(_pid: number, _windowId: number, text: string): Promise<DriverAction> {
+      this.types.push(text);
+      return OK;
+    }
+
+    async key(_pid: number, _windowId: number, chords: DriverChord[]): Promise<DriverAction> {
+      this.keys.push(chords);
+      return OK;
+    }
+
+    async scroll(_pid: number, _windowId: number, x: number, y: number, down: number, right: number): Promise<DriverAction> {
+      this.scrolls.push({ x, y, down, right });
+      return OK;
+    }
+
+    async drag(_pid: number, _windowId: number, from: [number, number], to: [number, number]): Promise<DriverAction> {
+      this.drags.push({ from, to });
+      return OK;
+    }
+
+    async move(_pid: number, _windowId: number, x: number, y: number): Promise<DriverAction> {
+      this.moves.push({ x, y });
+      return OK;
+    }
+
+    async zoom(): Promise<DriverZoom> {
+      return { jpeg: SMALL_JPEG, width: 10, height: 10 };
+    }
+  }
+
+  const world = (driver: FakeDriver) => {
+    const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
+    cfg.screenshot.settleMs = 0;
+    return new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en' });
+  };
+  const call = (w: Cua, name: string, args: Record<string, unknown>) =>
+    w.tools().find((t) => t.name === name)!.handler(args, { role: 'main', log: new FakeHost().log }) as Promise<{ text: string; failed?: true; blobs?: unknown[] }>;
+
+  it('captures a window and sends a click to it without the display engine', async () => {
+    const driver = new FakeDriver();
+    const w = world(driver);
+    const target = await call(w, 'pet_cua_window', { window: '123:456' });
+    expect(target.failed).toBeUndefined();
+    expect(target.text).toContain('Calculator');
+    expect(target.blobs).toHaveLength(1);
+    const click = await call(w, 'pet_cua_click', { x: 10, y: 20 });
+    expect(click.failed).toBeUndefined();
+    expect(driver.clicks).toEqual([{ pid: 123, windowId: 456, x: 10, y: 20, captureId: 'cap-1', button: 'left', count: 1 }]);
+    expect(driver.captures).toBe(2);
+    expect(click.text).toContain('Clicked');
+  });
+
+  it('refuses a point outside the window before calling the driver', async () => {
+    const driver = new FakeDriver();
+    const w = world(driver);
+    await call(w, 'pet_cua_window', { window: '123:456' });
+    const out = await call(w, 'pet_cua_click', { x: 100, y: 0 });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('outside the screenshot');
+    expect(driver.clicks).toEqual([]);
+  });
+
+  it('types newlines as Return and reports the whole text', async () => {
+    const driver = new FakeDriver();
+    const w = world(driver);
+    await call(w, 'pet_cua_window', { window: '123:456' });
+    const out = await call(w, 'pet_cua_type', { text: 'a\nb' });
+    expect(out.failed).toBeUndefined();
+    expect(driver.types).toEqual(['a', 'b']);
+    expect(driver.keys).toEqual([[{ modifiers: [], key: 'return' }]]);
+    expect(out.text).toContain('Typed 3 characters');
+  });
+
+  it('gives background keys to the driver in its own vocabulary', async () => {
+    const driver = new FakeDriver();
+    const w = world(driver);
+    await call(w, 'pet_cua_window', { window: '123:456' });
+    expect((await call(w, 'pet_cua_key', { keys: 'ctrl+s' })).failed).toBeUndefined();
+    expect(driver.keys).toEqual([[{ modifiers: ['ctrl'], key: 's' }]]);
+  });
+
+  it('says when the driver is not installed', async () => {
+    const driver = new FakeDriver();
+    driver.availableValue = false;
+    const w = world(driver);
+    const out = await call(w, 'pet_cua_window', { window: '123:456' });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('Cua Driver');
+    expect(driver.captures).toBe(0);
   });
 });
