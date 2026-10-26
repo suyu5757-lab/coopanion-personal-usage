@@ -51,6 +51,12 @@ export interface AffinityConfigSection {
   emotionFloor: number;
   /** 系统前缀里最多列几条余波 */
   emotionInPrompt: number;
+  /** 没过去的事的半衰期（天）。到了时间强度减半 */
+  unresolvedHalfLifeDays: number;
+  /** 低于这个强度就不再算「没过去」 */
+  unresolvedFloor: number;
+  /** 系统前缀里最多列几条没过去的事 */
+  unresolvedInPrompt: number;
 }
 
 export const AFFINITY_DEFAULTS: AffinityConfigSection = {
@@ -71,6 +77,9 @@ export const AFFINITY_DEFAULTS: AffinityConfigSection = {
   emotionHalfLifeMinutes: 90,
   emotionFloor: 0.15,
   emotionInPrompt: 3,
+  unresolvedHalfLifeDays: 7,
+  unresolvedFloor: 0.2,
+  unresolvedInPrompt: 2,
   groupStartScore: {},
 };
 
@@ -80,7 +89,7 @@ export const AFFINITY_CONFIG_GROUP: ConfigGroup = {
   schema: {
     type: 'object',
     title: '好感度',
-    description: '她记住与桌面上这个人的关系分数、格子和情绪。改动热生效。',
+    description: '她记住与桌面上这个人的关系、情绪、表达方式和还没过去的事。改动热生效。',
     properties: {
       'worlds.affinity.masterId': {
         type: 'integer',
@@ -168,6 +177,32 @@ export const AFFINITY_CONFIG_GROUP: ConfigGroup = {
         'x-suffix': '条',
         'x-hot': true,
         description: '只列还没淡掉的那些，新的在前。',
+      },
+      'worlds.affinity.unresolvedHalfLifeDays': {
+        type: 'number',
+        title: '没过去的事留多久',
+        minimum: 0.5,
+        maximum: 90,
+        'x-suffix': '天（半衰期）',
+        'x-hot': true,
+        description: '被放鸽子、被当众否定这类事，强度多久减一半。默认 7 天。',
+      },
+      'worlds.affinity.unresolvedFloor': {
+        type: 'number',
+        title: '没过去的事淡出阈值',
+        minimum: 0,
+        maximum: 1,
+        'x-hot': true,
+        description: '低于这个强度就不再算「没过去」，但修复记录还在。',
+      },
+      'worlds.affinity.unresolvedInPrompt': {
+        type: 'integer',
+        title: '提示词里放几条没过去的事',
+        minimum: 0,
+        maximum: 10,
+        'x-suffix': '条',
+        'x-hot': true,
+        description: '只列还没过去的，新的、强的在前。',
       },
       'worlds.affinity.groupStartScore': {
         type: 'object',

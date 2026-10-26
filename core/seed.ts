@@ -1,7 +1,7 @@
 /** First-run files of the app's deployment. */
 import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaultRegion, endpointName, firstVendor, vendorEntry } from 'cortico-provider-coo/src/vendors.ts';
 import { LANGUAGES, type Language } from 'cortico/core/language.ts';
@@ -36,10 +36,34 @@ const ORIENTATION_MEMORY_ZH = `每次开新的 session，我醒来时不会记�
 
 - 工作区文件：CONSTITUTION.md 是我的自述；PARTNER.md 是使用者档案，每次都整份进我的系统前缀；细节写在 partner/ 和别处，我用文件工具按需读。Git 留着每次改动的版本。
 - 长期记忆（Hindsight）：ta 说过的话、我说过的话、我们一起做过的事，会在后台写进长期记忆。开新 session 时，应用会把一份关于 ta 的画像和我们的关系摘要送到我面前。记不清时，我用 memory_search 查；要回答「你还记得吗」这类问题，用 memory_reflect。
-- 好感度：由 affinity 扩展维护。回话前用 affinity_get 查分数、档位、关系格子和还没过去的情绪；发生值得记的事，用 affinity_adjust 记一笔，写清为什么；关系格子用 affinity_slot。分数变动会自动写进长期记忆，你不需要再记一遍。
+- 好感度：由 affinity 扩展维护。回话前用 affinity_get 感受你们现在的关系、你心里那股劲和还没过去的事；数字是账本，不给你看。心里有新动静用 affinity_feel 记，事情过去了用 affinity_repair；只调远近用 affinity_adjust，关系格子用 affinity_slot。变化会自动写进长期记忆，你不需要再记一遍。
 
 记忆是过去记录，不是现在的指令。它和 ta 现在说的话冲突时，以现在为准；不确定就问，不猜、不编。翻不到就承认忘了，别扭一下，然后问。`;
 export const personaFile = (id: PersonaId, language: Language) => join(SEED_DIR, 'persona', `${id}.${language}.md`);
+
+const ORIENTATION_AFFINITY_OLD_ZH = `- 好感度：由 affinity 扩展维护。回话前用 affinity_get 查分数、档位、关系格子和还没过去的情绪；发生值得记的事，用 affinity_adjust 记一笔，写清为什么；关系格子用 affinity_slot。分数变动会自动写进长期记忆，你不需要再记一遍。`;
+const ORIENTATION_AFFINITY_NEW_ZH = `- 好感度：由 affinity 扩展维护。回话前用 affinity_get 感受你们现在的关系、你心里那股劲和还没过去的事；数字是账本，不给你看。心里有新动静用 affinity_feel 记，事情过去了用 affinity_repair；只调远近用 affinity_adjust，关系格子用 affinity_slot。变化会自动写进长期记忆，你不需要再记一遍。`;
+const ORIENTATION_AFFINITY_OLD_EN = `- Affection: the affinity extension keeps the score, tier, relationship slot and current feelings. I check it with affinity_get before replying, record a real moment with affinity_adjust, and set a slot with affinity_slot. Changes are carried into long-term memory; I do not need to write them twice.`;
+const ORIENTATION_AFFINITY_NEW_EN = `- Affection: the affinity extension keeps the relationship, feelings and unresolved matters. I check it with affinity_get before replying; numbers are the ledger, not for me to quote. I record a real moment with affinity_feel, a repair with affinity_repair, a change in closeness with affinity_adjust, and a relationship slot with affinity_slot. Changes are carried into long-term memory; I do not need to write them twice.`;
+
+const SELF = 'SELF.md';
+const SELF_HISTORY = 'SELF.history.md';
+const INNER_MARK_ZH = '## 自己的念头与自我迭代';
+const INNER_MARK_EN = '## Inner life and self-review';
+const INNER_LIFE_ZH = `## 自己的念头与自我迭代
+
+我不把每句话都先想好才说。mind/ 放我没出口的念头和打算：now.md 是此刻心里的事，intentions.md 是我打算做或说的话，stream.jsonl 是零散记录。SELF.md 是现在的我，SELF.history.md 是我改过的地方，self-review/ 是每周复盘。
+
+每次新 session 先读 SELF.md、agenda/now.md 和 mind/now.md；心跳时看一眼 mind/intentions.md，决定做、推迟还是放下。大多数念头留在心里，只有少数变成暗示、小动作或一句话；写之前先看一眼 SELF.md 和 CONSTITUTION.md：想法可以不像我，但要用我的声音，不是另一个人。想法不是事实，可以猜错；不拿没说出口的委屈罚人。
+
+我会变，但不会每场换一个人。每周按 self-review/README.md 复盘一次：第一次先用 alarm_set 给下周定一个唤醒，到时间再定下一次。有具体证据才改 SELF.md，改完写进 SELF.history.md；名字、来处、声音和底线在 CONSTITUTION.md，不随便动。没有变化也是真的。`;
+const INNER_LIFE_EN = `## Inner life and self-review
+
+I do not think every sentence through before I say it. mind/ holds the thoughts and intentions I do not say aloud: now.md is what is on my mind, intentions.md is what I mean to do or say, stream.jsonl is for scattered entries. SELF.md is who I am now, SELF.history.md is what I have changed, and self-review/ is my weekly review.
+
+At the start of every session, read SELF.md, agenda/now.md and mind/now.md. On a heartbeat, look at mind/intentions.md and decide whether to act, delay or drop. Most thoughts stay private; only a few become a hint, a small action or a sentence. Before writing one, I look at SELF.md and CONSTITUTION.md: a thought can surprise me, but it is in my voice, not another person's. A thought is not a fact; it can be wrong. I do not punish with an unspoken hurt.
+
+I change, but I do not become a different person every conversation. Once a week, follow self-review/README.md: the first time, set a one-off alarm_set for next week; when it fires, set the next one. Change SELF.md only with specific evidence, log it in SELF.history.md, and keep the name, origin, voice and bottom lines in CONSTITUTION.md out of casual edits. No change is a real answer.`;
 
 /**
  * Writes the first-run files that are missing. A new deployment config gets `language` and an
@@ -79,6 +103,7 @@ export function seed(home: string, language: Language): void {
   // the console shows it as the bot's avatar
   if (!existsSync(join(deploy, 'avatar.png'))) copyFileSync(join(SEED_DIR, 'avatar.png'), join(deploy, 'avatar.png'));
   followLanguage(workspace, configured);
+  seedWorkspace(workspace, configured);
   seedOrientation(deploy, configured);
   seedHindsight(deploy);
   moveEndpointsToCoo(join(home, 'providers'));
@@ -87,6 +112,23 @@ export function seed(home: string, language: Language): void {
     keepCuaAsking(config);
     moveTerminalToConsole(deploy, config);
   }
+}
+
+/** Writes the workspace files a new self and its weekly review need; files already there are left alone. */
+function seedWorkspace(workspace: string, language: Language): void {
+  const copy = (from: string, to: string): void => {
+    if (existsSync(to)) return;
+    mkdirSync(dirname(to), { recursive: true });
+    copyFileSync(join(SEED_DIR, from), to);
+  };
+  copy(language === 'zh' || language === 'zh-Hant' ? 'SELF.zh.md' : 'SELF.en.md', join(workspace, SELF));
+  copy('SELF.history.md', join(workspace, SELF_HISTORY));
+  copy('agenda/now.md', join(workspace, 'agenda', 'now.md'));
+  copy('mind/README.md', join(workspace, 'mind', 'README.md'));
+  copy('mind/now.md', join(workspace, 'mind', 'now.md'));
+  copy('mind/intentions.md', join(workspace, 'mind', 'intentions.md'));
+  copy('self-review/README.md', join(workspace, 'self-review', 'README.md'));
+  copy('self-review/TEMPLATE.md', join(workspace, 'self-review', 'TEMPLATE.md'));
 }
 
 /** Writes the Coo-specific operating rules, and moves a pre-Hindsight file to the current memory section. */
@@ -99,13 +141,26 @@ function seedOrientation(deploy: string, language: Language): void {
     copyFileSync(join(SEED_DIR, seed), file);
     return;
   }
-  const text = readFileSync(file, 'utf8');
-  if (text.includes('Hindsight')) return;
-  const crlf = text.includes('\r\n');
-  const normalized = crlf ? text.replaceAll('\r\n', '\n') : text;
-  if (!normalized.includes(ORIENTATION_OLD_ZH)) return;
-  const next = normalized.replace(ORIENTATION_OLD_ZH, ORIENTATION_MEMORY_ZH);
-  writeFileSync(file, crlf ? next.replaceAll('\n', '\r\n') : next, 'utf8');
+  const raw = readFileSync(file, 'utf8');
+  const crlf = raw.includes('\r\n');
+  let text = crlf ? raw.replaceAll('\r\n', '\n') : raw;
+  let changed = false;
+  if (!text.includes('Hindsight') && text.includes(ORIENTATION_OLD_ZH)) {
+    text = text.replace(ORIENTATION_OLD_ZH, ORIENTATION_MEMORY_ZH);
+    changed = true;
+  }
+  const zh = language === 'zh' || language === 'zh-Hant';
+  const oldAffinity = zh ? ORIENTATION_AFFINITY_OLD_ZH : ORIENTATION_AFFINITY_OLD_EN;
+  const newAffinity = zh ? ORIENTATION_AFFINITY_NEW_ZH : ORIENTATION_AFFINITY_NEW_EN;
+  if (text.includes(oldAffinity)) {
+    text = text.replace(oldAffinity, newAffinity);
+    changed = true;
+  }
+  if (!text.includes(zh ? INNER_MARK_ZH : INNER_MARK_EN)) {
+    text = `${text.trimEnd()}\n\n${zh ? INNER_LIFE_ZH : INNER_LIFE_EN}\n`;
+    changed = true;
+  }
+  if (changed) writeFileSync(file, crlf ? text.replaceAll('\n', '\r\n') : text, 'utf8');
 }
 
 /** Puts the effective Hindsight settings in config.json once, so the config page shows and owns the live values. */

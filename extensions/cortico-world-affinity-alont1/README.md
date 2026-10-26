@@ -4,9 +4,9 @@
 
 - 只有一个对象：工具里的 `qq` 可以省略，默认使用 `worlds.affinity.subjectId`
 - 不再把 `masterId` 固定成满分；桌宠里设 `masterId: 0`，关系分从 `startScore` 开始正常积累
-- `affinity_adjust` / `affinity_slot` 会发出 `affinity.changed` 事件，Coopanion 会把它写进 Hindsight
+- `affinity_adjust` / `affinity_feel` / `affinity_repair` / `affinity_slot` 会发出 `affinity.changed` 事件，Coopanion 会把它写进 Hindsight
 - 环境提示词改成 Coo 的桌宠语气，去掉 QQ 号、群起步分和攻击性措辞
-- 关系分、格子、情绪仍然由这个扩展维护；Hindsight 只做长期叙事和每日关系日记
+- 关系、情绪、表达方式和还没过去的事仍然由这个扩展维护；Hindsight 只做长期叙事和每日关系日记
 
 原版说明保留在下面。
 
@@ -45,8 +45,10 @@ Cortico 的 World 收不到消息事件：`WorldHost` 只有 `pushEvent`，没�
 
 | 工具 | 干什么 |
 |---|---|
-| `affinity_get` | 查某个 QQ 号多少分、什么档位、什么格子、该用什么态度 |
-| `affinity_adjust` | 记一笔变化（+ 或 -），并写一句为什么 |
+| `affinity_get` | 感受这个人的关系、她心里的情绪、表达方式和还没过去的事；不报分数 |
+| `affinity_adjust` | 调亲疏（+ 或 -），并写一句为什么；分数是账本，不报出来 |
+| `affinity_feel` | 记一股情绪：多强、为什么、冲着谁、碰到哪条需要、说不说、是不是没过去 |
+| `affinity_repair` | 记一次修复：他做了什么、她接不接受、这件事过去没有 |
 | `affinity_slot` | 给某人定"他算她什么人"；填 `撤` 就撤掉 |
 | `affinity_list` | 看她心里排前面的几个人，连同各自那格 |
 
@@ -125,8 +127,9 @@ corepack pnpm add --ignore-workspace ./plugins/cortico-world-affinity-alont1
 
 ## 用
 
-她不需要你教。`ENV_PROMPT.md` 已经告诉她：回话前先 `affinity_get`，发生值得记的事就
-`affinity_adjust`，认下某个人的性质就 `affinity_slot`。你要做的只是正常聊天。
+她不需要你教。`ENV_PROMPT.md` 已经告诉她：回话前先 `affinity_get` 感受关系，发生值得记的事就
+`affinity_feel`（只调远近用 `affinity_adjust`），事情过去了用 `affinity_repair`，认下某个人的性质就
+`affinity_slot`。你要做的只是正常聊天。
 
 看账本：
 
