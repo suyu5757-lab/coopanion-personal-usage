@@ -1,0 +1,50 @@
+{
+  "name": "cortico-world-opencode",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Cortico World: summons opencode over ACP, routes every file and command permission to the person, and reports the task back as events",
+  "author": "Pal AI Lab",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Pal-AI-Lab/Coopanion.git",
+    "directory": "packages/cortico-world-opencode"
+  },
+  "homepage": "https://github.com/Pal-AI-Lab/Coopanion/tree/main/packages/cortico-world-opencode#readme",
+  "bugs": {
+    "url": "https://github.com/Pal-AI-Lab/Coopanion/issues"
+  },
+  "keywords": [
+    "cortico-world",
+    "cortico",
+    "opencode",
+    "acp",
+    "coding-agent"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.28.6",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "cortico": {
+    "kind": "world",
+    "api": 6
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

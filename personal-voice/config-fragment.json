@@ -9,9 +9,9 @@
       "readSay": true,
       "readAsk": true,
       "readOptions": true,
-      "chunkMinChars": 6,
-      "chunkMaxChars": 60,
-      "gapMs": 0,
+      "chunkMinChars": 8,
+      "chunkMaxChars": 40,
+      "gapMs": 80,
       "prewarm": false,
       "verbose": false,
       "allowSelfTuning": false

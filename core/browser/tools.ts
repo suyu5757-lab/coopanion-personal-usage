@@ -69,12 +69,18 @@ export const BROWSER_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'browser_hover',
     tags: ['act'],
-    description: 'Move the pointer over an element by number, without clicking. Some controls appear only on hover, such as a song\'s 使用 button in a music picker; read the page again afterwards.',
+    description: 'Move the pointer over an element by number, without clicking. Some controls appear only on hover, such as a song\'s 使用 button in a music picker or a share panel; read the page again afterwards.',
     parameters: {
       type: 'object',
       properties: { index: { type: 'integer', minimum: 0, description: 'The number in front of the element, e.g. 12 for [12].' } },
       required: ['index'],
     },
+  },
+  {
+    name: 'browser_share',
+    tags: ['act'],
+    description: 'Open the share panel of the current page or video and return the page with its numbered options. Then click 复制链接 or a destination. Refused while browsing is read-only.',
+    parameters: { type: 'object', properties: {}, required: [] },
   },
   {
     name: 'browser_type',
@@ -130,10 +136,14 @@ export const BROWSER_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
     name: 'browser_watch',
     tags: ['read', 'snapshot'],
     interruptible: true,
-    description: 'Wait while the video plays, then take one screenshot and report the video\'s position. Use browser_play first. Watch a minute or two at a time, not the whole video.',
+    description: 'Wait while the video plays, take a few frames, transcribe its sound (even when the window is muted) and report the video\'s position. Use browser_play first. Watch a minute or two at a time, not the whole video; ask for more frames when motion or a quick change matters.',
     parameters: {
       type: 'object',
-      properties: { seconds: { type: 'number', minimum: 1, maximum: 30, description: 'How long to watch; default 10 seconds.' } },
+      properties: {
+        seconds: { type: 'number', minimum: 1, maximum: 30, description: 'How long to watch; default 10 seconds.' },
+        frames: { type: 'integer', minimum: 1, maximum: 6, description: 'How many frames to take during the wait; default 3, at most one per second.' },
+        audio: { type: 'boolean', description: 'Transcribe the page\'s sound during the wait; default true, false skips it.' },
+      },
       required: [],
     },
   },

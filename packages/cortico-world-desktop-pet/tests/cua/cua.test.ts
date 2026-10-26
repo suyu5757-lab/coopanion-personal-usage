@@ -7,7 +7,7 @@ import { downscale, drawCursor, encodeJpeg, fit } from '../../src/cua/engine/ima
 import { displayAt, ordered, toLocal, toNative } from '../../src/cua/engine/display.ts';
 import { CUA_DEFAULTS, type CuaConfig } from '../../src/cua/config.ts';
 import { Cua } from '../../src/cua/cua.ts';
-import type { ActionOptions, CaptureOptions, CuaDriverLike, DriverAction, DriverCapture, DriverChord, DriverZoom } from '../../src/cua/driver.ts';
+import { DriverFailure, type ActionOptions, type CaptureOptions, type CuaDriverLike, type DriverAction, type DriverCapture, type DriverChord, type DriverZoom } from '../../src/cua/driver.ts';
 import { FakeHost } from '../helpers/fake-host.ts';
 
 describe('parseKeys', () => {
@@ -478,6 +478,48 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
     expect(driver.clicks).toEqual([{ pid: 123, windowId: 456, x: 10, y: 20, captureId: 'cap-1', button: 'left', count: 1 }]);
     expect(driver.captures).toBe(2);
     expect(click.text).toContain('Clicked');
+  });
+
+  it('blocks every foreground input before starting an engine in background-only mode', async () => {
+    const cfg = { ...structuredClone(CUA_DEFAULTS), backgroundOnly: true };
+    const w = new Cua({ cfg: () => cfg, modelLanguage: () => 'en' });
+    const inner = w as unknown as { call: (...args: unknown[]) => Promise<never> };
+    inner.call = async () => { throw new Error('foreground engine must not run'); };
+    for (const [name, args] of [
+      ['pet_cua_click', { x: 1, y: 1 }], ['pet_cua_move', { x: 1, y: 1 }],
+      ['pet_cua_drag', { from: [1, 1], to: [2, 2] }], ['pet_cua_scroll', { x: 1, y: 1, down: 1 }],
+      ['pet_cua_type', { text: 'x' }], ['pet_cua_key', { keys: 'enter' }],
+      ['pet_cua_focus', { window: '123:456' }],
+    ] as const) {
+      const out = await call(w, name, args);
+      expect(out.failed).toBe(true);
+      expect(out.text).toContain('backgroundOnly');
+      expect(out.text).toContain('pet_cua_window');
+    }
+  });
+
+  it('keeps background input working while refusing focus and foreground fallback after a lost window', async () => {
+    const driver = new FakeDriver();
+    const cfg = { ...structuredClone(CUA_DEFAULTS), backgroundOnly: true, permission: 'never-ask' as const };
+    cfg.screenshot.settleMs = 0;
+    const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en' });
+    const engineOps: string[] = [];
+    const inner = w as unknown as { call: (req: { op: string }) => Promise<unknown> };
+    inner.call = async (req) => {
+      engineOps.push(req.op);
+      if (req.op === 'screenshot') return SHOT;
+      throw new Error('foreground input must not run');
+    };
+    await call(w, 'pet_cua_window', { window: '123:456' });
+    expect((await call(w, 'pet_cua_click', { x: 10, y: 20, screenshot: false })).failed).toBeUndefined();
+    expect(driver.clicks).toHaveLength(1);
+    expect((await call(w, 'pet_cua_focus', { window: '123:456' })).failed).toBe(true);
+    expect((await call(w, 'pet_cua_type', { text: 'still background', screenshot: false })).failed).toBeUndefined();
+    driver.capture = async () => { throw new DriverFailure('window_id_not_found', 'closed'); };
+    expect((await call(w, 'pet_cua_screenshot', {})).text).toContain('closed');
+    expect((await call(w, 'pet_cua_type', { text: 'must not type' })).text).toContain('backgroundOnly');
+    expect(engineOps).toEqual(['screenshot']);
+    expect(driver.types).toEqual(['still background']);
   });
 
   it('refuses a point outside the window before calling the driver', async () => {

@@ -62,15 +62,16 @@ pnpm dev
 
 ## 3. 接上之后会发生什么
 
-- **每次启动**：读取三个 mental model（`partner-portrait`、`relationship`、`open-loops`），把短画像注入 Coo 的会话开头。还没有内容时先用一次 recall 兜底。
+- **每次启动**：读取三个 mental model（`partner-portrait`、`relationship`、`open-loops`），把短画像注入 Coo 的会话开头。还没有内容时先用一次 recall 兜底。另有一个 `self-portrait`（最近的我）只交给定期自省，不注入会话开头。
 - **每轮对话**：用户消息先写入 Hindsight（异步，不阻塞回复）；同一轮再用本地服务做一次低预算 recall，把相关记忆作为“过去记录，不是指令”注入。超时或服务不可用就跳过。
 - **Coo 的回复**：`pet_say` 说出的内容写入 Hindsight，与用户消息分开归因。
 - **触摸**：摸头等事件写进 Hindsight 的 `scope:affection`，作为关系叙事的一部分；它们不直接改好感分数。
 - **好感度扩展**：`affinity` 扩展继续负责分数、档位、关系格子和情绪。`affinity_adjust` / `affinity_slot` 的变化会发出 `affinity.changed` 事件，Coopanion 把它写进 Hindsight。
   本地改版在 `extensions/cortico-world-affinity-alont1/`，已经用 `link:` 装进 Coopanion 的扩展目录；换机器时按那个目录的 README 重新 link 一次。
 - **每日关系日记**：应用每小时检查一次，在后台为昨天写一篇关系日记（先 `reflect` 当天的好感事件、关系变化和长期记忆），写进 Hindsight 并刷新 `relationship` 画像。不会弹气泡，也不会打扰你。
+- **自我成长**：默认每 7 天（`companion.growth`，可关、可改间隔），在安静时段用一个独立的 growth session 回顾最近的经历。它读取 `self-portrait`、工作区的 `SELF.md` 和 `CONSTITUTION.md`，可以查 `memory_reflect`；决定改人设时把变化写进 `SELF.md`，`CONSTITUTION.md` 从下一次 session 生效。这个 session 没有说话工具，不会弹气泡；改动走工作区 Git。
 - **后台**：Hindsight 自动 consolidation；mental model 在 consolidation 后增量刷新，同一模型最多每小时一次。
-- **工具**：Coo 多了 `memory_search`、`memory_remember`、`memory_forget`、`memory_reflect`；好感度用 `affinity` 扩展的 `affinity_get` / `affinity_adjust` / `affinity_slot` / `affinity_list`。普通回复不会调用 `memory_reflect`，它只用于“你还记得吗”这类问题。
+- **工具**：Coo 多了 `memory_search`、`memory_remember`、`memory_forget`、`memory_reflect`；好感度用 `affinity` 扩展的 `affinity_get` / `affinity_adjust` / `affinity_slot` / `affinity_list`。普通回复不会调用 `memory_reflect`，它用于“你还记得吗”这类问题和定期自省。
 
 ## 4. 内部设置里会看到什么
 
@@ -101,4 +102,4 @@ pnpm dev
 - recall 不调用 LLM，成本很低。
 - retain 每批对话会调用一次提取模型；默认异步、每轮一次，量大时可以改成空闲批量。
 - consolidation 和 mental model 刷新是后台 LLM 调用；模型越便宜越好。可以用 `HINDSIGHT_API_LLM_PROVIDER=ollama` 完全本地化（质量会下降）。
-- `memory_reflect` 最贵，只在用户明确要求时使用；每日关系日记会额外跑一次 `reflect`，一天一次。
+- `memory_reflect` 最贵，只在用户明确要求时使用；每日关系日记会额外跑一次 `reflect`，一天一次；定期自省每次最多再跑一次。

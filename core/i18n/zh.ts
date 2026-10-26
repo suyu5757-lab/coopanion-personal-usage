@@ -22,6 +22,12 @@ export default {
       sound: '浏览器声音', soundDescription: '默认静音。打开后,她看的视频会外放。',
       actions: '允许点赞、收藏、发送弹幕和评论', actionsDescription: '关闭后她只能看网页和视频,不能互动。登录和验证码请在她的浏览器窗口里自己完成。',
     },
+    growth: {
+      title: '自我成长',
+      description: '每隔一段时间，在安静的时候回顾最近的经历，可能改变她的性格、做事方式或说话方式，并记在自己的成长日志里。改动下一次 session 生效。',
+      every: '每隔', everyDescription: '隔这么多天回顾一次。',
+      days: '天',
+    },
   },
 
   /** 连续几次请求模型失败后,桌宠气泡里的说明 */
@@ -85,7 +91,7 @@ export default {
       forge: { label: '靠谱的、干练的', line: '要做什么？交给我，一会儿就好，库。' },
       heart: { label: '活泼的、陪伴的', line: '我来啦！今天也一直陪着你，库！' },
       winter: { label: '安静的、沉默的', line: '……嗯，库。' },
-      whale: { label: 'DeepSeek 大肥鱼', line: '欢迎回来！这是什么？让我看看，库...' },
+      whale: { label: 'DeepSeek 大肥鱼', line: '哼，回来啦。……才、才不是特意等你，库...' },
     },
     /** 确认按钮旁的一行;`dress` 是设置窗口里装扮页的名字,画在图标后 */
     dressHint: { text: '配色可以在 装扮 中替换', dress: '装扮' },

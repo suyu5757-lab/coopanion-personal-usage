@@ -181,8 +181,9 @@ function readVocab(raw: unknown, skipped: string[], t: PackText): VocabWord[] | 
     }
     const about = namesOf(w.about);
     if (!about) return t.noWordAbout(id);
+    const when = w.when === undefined ? undefined : namesOf(w.when);
     if (typeof w.seconds !== 'number' || !(w.seconds > 0) || !Number.isFinite(w.seconds)) return t.badSeconds(id);
-    out.push({ id, kind: w.kind as VocabWord['kind'], names, about, seconds: w.seconds, ...(w.lasting === true ? { lasting: true } : {}) });
+    out.push({ id, kind: w.kind as VocabWord['kind'], names, about, ...(when ? { when } : {}), seconds: w.seconds, ...(w.lasting === true ? { lasting: true } : {}) });
   }
   return out;
 }
@@ -321,6 +322,7 @@ export interface PackScan { packs: FigurePack[]; problems: PackProblem[] }
 export const BUILTIN_PACKS: ReadonlyArray<{ dir: string; base: string }> = [
   { dir: fileURLToPath(new URL('../web/coo/', import.meta.url)), base: '/web/coo/' },
   { dir: fileURLToPath(new URL('../web/whale/', import.meta.url)), base: '/web/whale/' },
+  { dir: fileURLToPath(new URL('../web/opencode/', import.meta.url)), base: '/web/opencode/' },
 ];
 
 /** The built-in packs and those installed under `roots` (each subdirectory one pack); problems are worded in `language`. */

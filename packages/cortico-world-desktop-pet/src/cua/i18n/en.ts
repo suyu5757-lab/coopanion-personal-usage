@@ -38,6 +38,7 @@ const en: CuaText = {
 
   /** The console's settings. */
   config: {
+    backgroundOnly: {"title": "Use background windows only", "description": "Require a Cua Driver window before input. Refuse whole-screen input and foreground focus; stop on driver failure."},
     group: 'Computer use',
     enabled: { title: 'Turn on computer use' },
     control: { title: 'Allow the mouse and keyboard', description: 'When off, only screenshots and the window list.' },

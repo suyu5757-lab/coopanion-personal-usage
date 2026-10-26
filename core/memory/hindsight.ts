@@ -32,19 +32,24 @@ export interface SessionBriefing {
   source: 'mental-models' | 'recall' | 'none';
 }
 
-const MODEL_IDS = ['partner-portrait', 'relationship', 'open-loops'] as const;
+const BRIEFING_MODEL_IDS = ['partner-portrait', 'relationship', 'open-loops'] as const;
+/** Coo's portrait of herself; read by the periodic self-review, not by the session opening. */
+export const SELF_PORTRAIT_MODEL = 'self-portrait';
+const MODEL_IDS = [...BRIEFING_MODEL_IDS, SELF_PORTRAIT_MODEL] as const;
 type ModelId = typeof MODEL_IDS[number];
 
 const MODEL_QUERIES: Record<ModelId, string> = {
   'partner-portrait': 'Write a compact portrait of the person Coo lives with: their name or how they want to be addressed, stable preferences, routines, boundaries, important people, current projects, and what they expect from Coo. Prefer durable facts; ignore one-off chatter.',
   'relationship': 'Describe the relationship between Coo and the person: shared rituals, affectionate moments, conflicts and repairs, what makes the person feel cared for, and what they dislike. Be concrete and kind; no diagnosis.',
   'open-loops': 'List open loops: promises Coo made, things the person asked Coo to remember or follow up on, and unresolved topics. Include dates when known.',
+  [SELF_PORTRAIT_MODEL]: 'Describe how Coo has been showing up lately, using her own words and the relationship diary: her tone, recurring phrases, what she does when praised, worried, contradicted, bored or needed; what she keeps doing or avoiding; what seems to be changing in her. Focus on Coo, not on the person. Prefer durable patterns over one-off moods. Be concrete and quote a short phrase when it shows the pattern.',
 };
 
 const MODEL_TITLES: Record<ModelId, string> = {
   'partner-portrait': 'The person',
   'relationship': 'Our relationship',
   'open-loops': 'Open loops',
+  [SELF_PORTRAIT_MODEL]: 'Me, lately',
 };
 
 const hash = (text: string) => createHash('sha256').update(text).digest('hex').slice(0, 16);
@@ -179,7 +184,7 @@ export class HindsightMemory {
       name: 'Coopanion',
       reflectMission: 'You are Coo, a small desktop companion who lives on the person\'s screen. Reason from the person\'s stable preferences, routines, boundaries and shared history. Be concrete, warm and brief.',
       retainMission: 'Extract durable facts about the person, Coo, and their shared daily life: names, preferences, routines, boundaries, important people, ongoing projects, promises and relationship patterns. Ignore greetings, filler and one-off small talk. Use the context to decide whether a first-person sentence belongs to the person or to Coo.',
-      observationsMission: 'Consolidate durable preferences, habits, boundaries, important people, ongoing projects, promises and recurring relationship patterns. Drop ephemeral states such as mood-of-the-minute or what was eaten for lunch unless the person made it meaningful.',
+      observationsMission: 'Consolidate durable preferences, habits, boundaries, important people, ongoing projects, promises, Coo\'s recurring ways of speaking and acting, and recurring relationship patterns. Drop ephemeral states such as mood-of-the-minute or what was eaten for lunch unless the person made it meaningful.',
       retainExtractionMode: 'concise',
       enableObservations: true,
       dispositionEmpathy: 4,
@@ -220,7 +225,7 @@ export class HindsightMemory {
     if (this.briefing && Date.now() - this.briefing.at < 60_000) return this.briefing.value;
     const config = this.config!;
     try {
-      const models = await within(Promise.all(MODEL_IDS.map(async (id) => {
+      const models = await within(Promise.all(BRIEFING_MODEL_IDS.map(async (id) => {
         const model = await this.client!.getMentalModel(config.bankId, id, { detail: 'content' });
         return { title: MODEL_TITLES[id], text: model.content ?? '' };
       })), 2500, []);
@@ -244,6 +249,23 @@ export class HindsightMemory {
     } catch (err) {
       this.noteFailure('briefing', err);
       return { text: '', source: 'none' };
+    }
+  }
+
+  /** Coo's own portrait, for the periodic self-review. Empty when memory is off or the model has no content yet. */
+  async selfPortrait(timeoutMs = 2_500): Promise<string> {
+    if (!this.canTry() || !await this.ensureStarted()) return '';
+    try {
+      const config = this.config!;
+      const model = await within<{ content: string }>(
+        this.client!.getMentalModel(config.bankId, SELF_PORTRAIT_MODEL, { detail: 'content' }).then((found) => ({ content: found.content ?? '' })),
+        timeoutMs,
+        { content: '' },
+      );
+      return model.content?.trim() ?? '';
+    } catch (err) {
+      this.noteFailure('self-portrait', err);
+      return '';
     }
   }
 

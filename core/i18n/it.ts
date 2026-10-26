@@ -20,6 +20,12 @@ const it: Translation<CoreText> = {
       sound: 'Audio del browser', soundDescription: 'Muto per impostazione predefinita. Attivo, i video che guarda si sentono.',
       actions: 'Consenti like, salvataggi, danmaku e commenti', actionsDescription: 'Disattivato, può solo guardare. Accedi e inserisci i codici nella sua finestra tu stesso.',
     },
+    growth: {
+      title: 'Crescere da sola',
+      description: 'Ogni tanto, in un momento tranquillo, ripensa alle esperienze recenti e può cambiare come è, come lavora o come parla; lo scrive nel proprio diario di crescita. I cambiamenti valgono dalla sessione successiva.',
+      every: 'Ogni', everyDescription: 'Ripensa a sé dopo questi giorni.',
+      days: 'giorni',
+    },
   },
 
   failure: {
@@ -72,7 +78,7 @@ const it: Translation<CoreText> = {
       forge: { label: 'Affidabile e capace', line: "Cosa c'è da fare? Lascia fare a me, ci metto poco. Coo." },
       heart: { label: 'Vivace, sempre con te', line: 'Eccomi! Ti faccio compagnia tutto il giorno. Coo!' },
       winter: { label: 'Quieto e taciturno', line: '...Mm. Coo.' },
-      whale: { label: 'DeepSeek Chan', line: "Eccoti di nuovo! Cos'è questo? Fammi vedere. Coo..." },
+      whale: { label: 'DeepSeek Chan', line: "Hmph, sei tornato. ...N-non è che ti stessi aspettando, Coo..." },
     },
     dressHint: { text: 'I colori si cambiano in Guardaroba', dress: 'Guardaroba' },
     askRoam: 'Di solito devo starmene in pace o muovermi tanto? Clicca una scheda per vedere cosa farei.',

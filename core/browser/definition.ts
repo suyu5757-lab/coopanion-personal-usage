@@ -18,6 +18,8 @@ export interface BrowserAssembly {
   selfTime: () => SelfTimeConfig;
   modelLanguage: () => ModelLanguage;
   language?: () => Language;
+  /** Transcribes one finished 16 kHz mono utterance from the page's audio; absent when speech recognition is unavailable. */
+  transcribe?: (pcm: Int16Array) => Promise<{ text: string; error?: string | null }>;
   /** A browsing session ended; Coo's next heartbeat starts from now. */
   onSessionEnd?: () => void;
 }
@@ -30,11 +32,12 @@ const SUMMARIES = {
   browser_find: { zh: '在当前页面里找词。', en: 'Finds a word on the current page.' },
   browser_click: { zh: '按编号或可见文字点开视频、点赞或打开输入框。', en: 'Clicks an element by number or by its visible text.' },
   browser_hover: { zh: '把鼠标移到元素上,露出悬停才出现的按钮。', en: 'Moves the pointer over an element to reveal hover-only controls.' },
+  browser_share: { zh: '打开视频或页面的分享面板。', en: 'Opens the share panel of the video or page.' },
   browser_type: { zh: '在搜索框、弹幕或评论框里输入文字。', en: 'Types into a search, danmaku or comment box.' },
   browser_press: { zh: '按 Enter 发送,或按方向键翻动。', en: 'Presses Enter to send, or an arrow key to move.' },
   browser_scroll: { zh: '翻一屏再看。', en: 'Scrolls by screens and reads again.' },
   browser_play: { zh: '播放或暂停页面上的视频。', en: 'Plays or pauses the page video.' },
-  browser_watch: { zh: '看一会儿视频并截一帧。', en: 'Watches the video for a while and takes a screenshot.' },
+  browser_watch: { zh: '看一会儿视频，截几帧并把声音转成文字。', en: 'Watches the video for a while, takes a few frames and transcribes its sound.' },
   browser_screenshot: { zh: '截当前页面。', en: 'Takes a screenshot of the page.' },
   browser_back: { zh: '回到上一页。', en: 'Goes back a page.' },
   browser_close: { zh: '关上她的浏览器窗口。', en: 'Closes her browser window.' },
@@ -53,6 +56,7 @@ export function browserDefinition(assembly: BrowserAssembly): WorldDefinition<Wo
       selfTime: assembly.selfTime,
       modelLanguage: assembly.modelLanguage,
       timezone: ctx.timezone,
+      ...(assembly.transcribe ? { transcribe: assembly.transcribe } : {}),
       ...(assembly.onSessionEnd ? { onSessionEnd: assembly.onSessionEnd } : {}),
     }),
     describe: {

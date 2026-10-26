@@ -14,9 +14,15 @@ importers:
       cortico-provider-coo:
         specifier: workspace:*
         version: link:packages/cortico-provider-coo
+      cortico-world-codex:
+        specifier: workspace:*
+        version: link:packages/cortico-world-codex
       cortico-world-desktop-pet:
         specifier: workspace:*
         version: link:packages/cortico-world-desktop-pet
+      cortico-world-opencode:
+        specifier: workspace:*
+        version: link:packages/cortico-world-opencode
       electron-updater:
         specifier: ^6.8.9
         version: 6.8.9(supports-color@7.2.0)
@@ -112,6 +118,8 @@ importers:
         specifier: 0.128.0
         version: 0.128.0
 
+  packages/cortico-world-codex: {}
+
   packages/cortico-world-desktop-pet:
     dependencies:
       fflate:
@@ -148,6 +156,18 @@ importers:
       tsx:
         specifier: ^4.19.2
         version: 4.23.15
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^2.1.8
+        version: 2.1.9(@types/node@22.20.4)(jsdom@30.1.0(@noble/hashes@2.4.0))(lightningcss@1.32.0)(supports-color@7.2.0)
+
+  packages/cortico-world-opencode:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.10.0
+        version: 22.20.4
       typescript:
         specifier: ^5.7.2
         version: 5.9.3

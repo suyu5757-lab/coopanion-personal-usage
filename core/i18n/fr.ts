@@ -20,6 +20,12 @@ const fr: Translation<CoreText> = {
       sound: "Son du navigateur", soundDescription: "Muet par défaut. Activé, les vidéos qu'elle regarde sont audibles.",
       actions: "Autoriser likes, favoris, danmaku et commentaires", actionsDescription: "Désactivé, elle ne peut que regarder. Connectez-vous et saisissez les codes dans sa fenêtre vous-même.",
     },
+    growth: {
+      title: 'Grandir par elle-même',
+      description: "De temps en temps, dans un moment calme, elle revient sur les expériences récentes et peut changer sa façon d'être, de travailler ou de parler ; elle l'écrit dans son propre journal de croissance. Les changements prennent effet à la session suivante.",
+      every: 'Tous les', everyDescription: 'Elle fait un retour sur elle-même après ce nombre de jours.',
+      days: 'jours',
+    },
   },
 
   failure: {
@@ -72,7 +78,7 @@ const fr: Translation<CoreText> = {
       forge: { label: 'Fiable et efficace', line: "Qu'est-ce qu'il y a à faire ? Laisse-moi faire, j'en ai pour une minute. Coo." },
       heart: { label: 'Enjoué, toujours là', line: 'Me voilà ! Je reste avec toi toute la journée. Coo !' },
       winter: { label: 'Calme et taciturne', line: '...Mm. Coo.' },
-      whale: { label: 'DeepSeek Chan', line: "Bon retour ! Qu'est-ce que c'est ? Fais voir. Coo..." },
+      whale: { label: 'DeepSeek Chan', line: "Hmph, te revoilà. ...C-ce n'est pas comme si je t'attendais, Coo..." },
     },
     dressHint: { text: 'Tu peux changer les couleurs dans Habillage', dress: 'Habillage' },
     askRoam: "D'habitude, tu préfères que je reste tranquille ou que je bouge beaucoup ? Clique sur une carte pour voir ce que je fais.",

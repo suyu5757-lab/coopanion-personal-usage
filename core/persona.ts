@@ -19,7 +19,8 @@
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, statSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
-import type { EventEnvelope, PersonaWebUiDecl, SessionOpeningReason, StoragePart, ToolDef, WorldLifecycleEvent } from 'cortico/core/types.ts';
+import type { CoreApi, EventEnvelope, PersonaWebUiDecl, SessionDecl, SessionOpeningReason, StoragePart, ToolDef, WorldLifecycleEvent } from 'cortico/core/types.ts';
+import type { ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import type { Language } from 'cortico/core/language.ts';
 import type { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import type { GitAuthor, WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
@@ -28,6 +29,9 @@ import type { HindsightMemory } from './memory/hindsight.ts';
 import { memoryStorageText } from './memory/strings.ts';
 import type { SelfTimeConfig } from './browser/config.ts';
 import { selfTimeLine } from './browser/model-text.ts';
+import { GROWTH_DEFAULTS, type GrowthConfig } from './growth/config.ts';
+import { GROWTH_SESSION, GROWTH_TOOL_NAMES, GrowthReview } from './growth/review.ts';
+import { GROWTH_CHECK_MS, GrowthSchedule } from './growth/schedule.ts';
 import type { ModelLanguage } from './language.ts';
 
 /** The workspace file that goes into the prefix as Coo's notes on the person. */
@@ -121,6 +125,13 @@ export interface MemoryDeps {
   /** The live `companion.selfTime`; null when the app does not have it. */
   selfTime?: () => SelfTimeConfig | null;
   modelLanguage?: () => ModelLanguage;
+  /** The live `companion.growth`; reviews only run when a state file is given too. */
+  growth?: () => GrowthConfig;
+  /** Where the next review is recorded; null turns the review off for this Persona. */
+  growthStateFile?: string;
+  /** True while the app is paused; a paused app starts no background review. */
+  paused?: () => boolean;
+  timezone?: () => string;
 }
 
 export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
@@ -130,6 +141,81 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     private readonly longTerm = deps.memory ?? null;
     private readonly selfTimeNow = deps.selfTime ?? (() => null);
     private readonly modelLang = deps.modelLanguage ?? (() => 'zh' as ModelLanguage);
+    private readonly growthNow = deps.growth ?? (() => GROWTH_DEFAULTS);
+    private readonly growthStateFile = deps.growthStateFile ?? null;
+    private readonly pausedNow = deps.paused ?? (() => false);
+    private readonly timezoneNow = deps.timezone ?? (() => 'UTC');
+    private growthSchedule: GrowthSchedule | null = null;
+    private growthCheck: ReturnType<typeof setInterval> | null = null;
+
+    override attach(core: CoreApi): void {
+      super.attach(core);
+      if (!this.growthStateFile) return;
+      const log = {
+        info: (message: string, data?: unknown) => this.core?.log.info(message, data),
+        warn: (message: string, data?: unknown) => this.core?.log.warn(message, data),
+      };
+      const review = new GrowthReview({
+        core: () => this.core,
+        snapshot: () => this.growthSnapshot(),
+        tools: () => this.growthTools(),
+        memory: () => this.longTerm,
+        modelLanguage: () => this.modelLang(),
+        timezone: this.timezoneNow,
+        log,
+      });
+      this.growthSchedule = new GrowthSchedule({
+        stateFile: this.growthStateFile,
+        config: this.growthNow,
+        timers: core.timers,
+        run: () => review.run(),
+        paused: this.pausedNow,
+        log,
+      });
+      try {
+        this.growthSchedule.start();
+      } catch (err) {
+        this.core?.log.warn('[growth] could not start the review schedule', { err: err instanceof Error ? err.message : String(err) });
+      }
+      this.growthCheck = setInterval(() => {
+        void this.growthSchedule?.check().catch((err) => this.core?.log.warn('[growth] check failed', { err: err instanceof Error ? err.message : String(err) }));
+      }, GROWTH_CHECK_MS);
+      this.growthCheck.unref?.();
+    }
+
+    /** Re-arms after `companion.growth` changes. */
+    restartGrowth(): void {
+      this.growthSchedule?.restart();
+    }
+
+    /** Stops the periodic check; the persistent timer is left for the next start to reconcile. */
+    stopGrowth(): void {
+      if (this.growthCheck) clearInterval(this.growthCheck);
+      this.growthCheck = null;
+    }
+
+    private growthSnapshot(): ContextRecord[] {
+      return this.core?.sessionInfo('main').snapshot ?? [];
+    }
+
+    private growthTools(): ToolDef[] {
+      const wanted = new Set<string>(GROWTH_TOOL_NAMES);
+      return this.tools().filter((tool) => wanted.has(tool.name));
+    }
+
+    override declareSessions(): SessionDecl[] {
+      return [
+        ...super.declareSessions(),
+        {
+          id: GROWTH_SESSION,
+          label: 'growth',
+          rounds: () => ({ soft: 12, hard: 24 }),
+          persistent: false,
+          receivesEvents: false,
+          tools: () => this.growthTools(),
+        },
+      ];
+    }
 
     private get git(): WorkspaceGit {
       return this.memory.git;
@@ -294,6 +380,7 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
 
     /** Cormini's delivery: the heartbeat's quiet time starts over, and one line counts the events. */
     override async onDelivery(ctx: { events: EventEnvelope[] }): Promise<void> {
+      if (ctx.events.some((event) => event.origin === 'external')) this.growthSchedule?.noteActivity();
       for (const event of ctx.events) {
         if (event.type !== 'affinity.changed') continue;
         const meta = event.meta as Record<string, unknown> | undefined;

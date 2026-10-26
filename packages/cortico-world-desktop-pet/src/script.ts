@@ -18,6 +18,8 @@ export interface VocabWord {
   names: Record<string, string[]>;
   /** What it looks like on this body, by language. */
   about: Record<string, string>;
+  /** When the bot should pick it, by language; shown in the vocabulary table. */
+  when?: Record<string, string>;
   /** Seconds the page waits after it before the next word in a row. */
   seconds: number;
   /** Held until the next word (sitting, sleeping). */
@@ -150,8 +152,8 @@ const pickIn = <T>(by: Record<string, T>, language: string): T | undefined => by
  */
 const VOCAB_TEXT = {
   zh: {
-    row: (v: VocabWord) => `| ${v.id} | ${(pickIn(v.names, 'zh') ?? []).join(' / ')} | ${pickIn(v.about, 'zh') ?? ''}${v.lasting ? ',保持到下一个动作' : ''} |`,
-    head: '| 词 | 中文 | 样子 |\n|---|---|---|\n',
+    row: (v: VocabWord, withWhen: boolean) => `| ${v.id} | ${(pickIn(v.names, 'zh') ?? []).join(' / ')} | ${pickIn(v.about, 'zh') ?? ''}${v.lasting ? ',保持到下一个动作' : ''} |${withWhen ? ` ${pickIn(v.when ?? {}, 'zh') ?? ''} |` : ''}`,
+    head: (withWhen: boolean) => `| 词 | 中文 | 样子 |${withWhen ? ' 什么时候用 |' : ''}\n|---|---|---|${withWhen ? '---|' : ''}\n`,
     expressions: '表情(持续几秒后回到平常的脸):',
     motions: '动作:',
     changed: '词表变了。',
@@ -160,8 +162,8 @@ const VOCAB_TEXT = {
     kinds: { expression: '表情', motion: '动作' } as Record<VocabWord['kind'], string>,
   },
   en: {
-    row: (v: VocabWord) => `| ${[v.id, ...v.names.en ?? []].join(' / ')} | ${pickIn(v.about, 'en') ?? ''}${v.lasting ? '; held until the next action' : ''} |`,
-    head: '| word | looks like |\n|---|---|\n',
+    row: (v: VocabWord, withWhen: boolean) => `| ${[v.id, ...v.names.en ?? []].join(' / ')} | ${pickIn(v.about, 'en') ?? ''}${v.lasting ? '; held until the next action' : ''} |${withWhen ? ` ${pickIn(v.when ?? {}, 'en') ?? ''} |` : ''}`,
+    head: (withWhen: boolean) => `| word | looks like |${withWhen ? ' use it when |' : ''}\n|---|---|${withWhen ? '---|' : ''}\n`,
     expressions: 'Expressions (they last a few seconds, then the face goes back to normal):',
     motions: 'Motions:',
     changed: 'The vocabulary changed.',
@@ -174,9 +176,10 @@ const VOCAB_TEXT = {
 /** The vocabulary as the bot's prompt shows it: expressions, then motions. */
 export function vocabTable(vocab: readonly VocabWord[], language: ModelLanguage = 'zh'): string {
   const t = VOCAB_TEXT[language];
-  const rows = (kind: VocabWord['kind']) => vocab.filter((v) => v.kind === kind).map(t.row).join('\n');
-  return `${t.expressions}\n\n${t.head}${rows('expression')}\n\n`
-    + `${t.motions}\n\n${t.head}${rows('motion')}`;
+  const withWhen = vocab.some((v) => !!v.when);
+  const rows = (kind: VocabWord['kind']) => vocab.filter((v) => v.kind === kind).map((v) => t.row(v, withWhen)).join('\n');
+  return `${t.expressions}\n\n${t.head(withWhen)}${rows('expression')}\n\n`
+    + `${t.motions}\n\n${t.head(withWhen)}${rows('motion')}`;
 }
 
 /**
@@ -185,9 +188,10 @@ export function vocabTable(vocab: readonly VocabWord[], language: ModelLanguage 
  */
 export function vocabChange(before: readonly VocabWord[], after: readonly VocabWord[], language: ModelLanguage = 'zh'): string {
   const t = VOCAB_TEXT[language];
-  const told = new Map(before.map((v) => [v.id, `${v.kind}${t.row(v)}`]));
+  const withWhen = before.some((v) => !!v.when) || after.some((v) => !!v.when);
+  const told = new Map(before.map((v) => [v.id, `${v.kind}${t.row(v, withWhen)}`]));
   const gone = before.filter((v) => !after.some((w) => w.id === v.id));
-  const fresh = after.filter((v) => told.get(v.id) !== `${v.kind}${t.row(v)}`);
+  const fresh = after.filter((v) => told.get(v.id) !== `${v.kind}${t.row(v, withWhen)}`);
   if (!gone.length && !fresh.length) return '';
   const lines = [t.changed];
   if (gone.length) lines[0] += t.gone(gone);
@@ -195,7 +199,7 @@ export function vocabChange(before: readonly VocabWord[], after: readonly VocabW
     lines[0] += t.fresh;
     for (const kind of ['expression', 'motion'] as const) {
       const rows = fresh.filter((v) => v.kind === kind);
-      if (rows.length) lines.push(`${t.kinds[kind]}:\n\n${t.head}${rows.map(t.row).join('\n')}`);
+      if (rows.length) lines.push(`${t.kinds[kind]}:\n\n${t.head(withWhen)}${rows.map((v) => t.row(v, withWhen)).join('\n')}`);
     }
   }
   return lines.join('\n\n');

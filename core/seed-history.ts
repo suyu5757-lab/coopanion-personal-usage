@@ -1,5 +1,5 @@
 /**
- * SHA-256 (LF line endings) of every self-description an earlier version shipped, by persona. A workspace
+ * SHA-256 (LF line endings) of every self-description an earlier version shipped, or a development build seeded, by persona. A workspace
  * self-description still exactly as one of them is treated as unedited (`personaOf` in seed.ts), so the
  * next start replaces it with the current text of that persona.
  */
@@ -82,4 +82,40 @@ export const EARLIER_PERSONAS: Readonly<Record<string, PersonaId>> = {
   '26372b9b0d34e6fc688466106ced50c6767342b4c74814d3786d036abcac0f10': 'heart',
   '18bd3e5c56ba8e3106008e13cbcb9c405026f817c544de8409e3dbeaec47f6bc': 'winter',
   '6bd3f628883e3eb60273df6fadef6011e789d9f4ad54a63306720b52119e28c0': 'whale',
+  // 0.2.8, before the whale's tsundere rewrite
+  '64f85b9a5a2dca63631b9c674b44022f07522920514d41cd59ee957747e66c03': 'whale',
+  'd8662e708cb9b2f9b7c806098d422bb218156f40bce8db5400a8d6c024623e37': 'whale',
+  'd5aed858c6182557107f465c6fbcb7d6c4f42c5aea6880e34cef574ca871b529': 'whale',
+  '666e8a4dc55e9b66668bda47b881c1bf7362fb5ecd0a8fbb4661fbc112e09111': 'whale',
+  '7052b6f448d854326e2266f7afc732431007e6fffcdd2a7a2c7997cafbde6487': 'whale',
+  '39eeca8003ba7004c7222230ae91bf6bbb122cc4f3e59f6fe5d75bbf1af07b5c': 'whale',
+  'c42fdbcf70c333990b779bc170148b0a0a3b01883780d463ebe76cd805c98537': 'whale',
+  '425c8c24a1134a9c02bf5f90e8b2080e14ce5a9f168e9b2c7f171b08dd877487': 'whale',
+  '655d7ed85ce7dfcf56495f2efc0087962840e296e2ab06b2886dba47c315bff2': 'whale',
+  '719670fb6bf1f806062eddd95167bdb02c0b0c3fcf3be17e81372b340ecc38ae': 'whale',
+  'b023e1b159a93238c1ffdb91134274adf7478c27812181b39fa554c070949989': 'whale',
+  // the tsundere rewrite before the change section; development builds seeded it
+  '31c3432aae8d29260f083f3fe4a30106b99e6eadcce74371dc7da8d23ad8be48': 'whale',
+  'f40a9d2c4c1d2c97e7c92473c8fb5f2dd991bd7ae03e3e0aea60ba7380e8b2c4': 'whale',
+  '47cad36f04fb90e1e18a3d997a61b55320ab5c3982e8ca5d479c2ffbcbadbbbe': 'whale',
+  '5ce3accc6da5c360e63379c1439fb8641a6afe485e4de6c703f7a4ad7565a5f9': 'whale',
+  '027dc0608576a98ab97401b078aaafc7be1057f67821b6d72bbd0a44ab3dfd06': 'whale',
+  'bd4cd6ff38f2fa81d38189273b064b70d81cab67486dea0e6185bcb339b303e9': 'whale',
+  '5e10a6206f2ca1426f9050ff2e610c73b8a791cf51870cdcc4feebb0d8074a54': 'whale',
+  '746048d0a96ec787c12ca7a59e375cf006bcd5a2ca0e02a08a0d0ddcd172ccf2': 'whale',
+  'e45c7d12d22c4beb18257803bfcc62c029ae692f6a838692d65d821c0eeafcb9': 'whale',
+  'c07219f76e2e34985150eb23e52e6ccadde7929bf3283d656b64b5529edd8539': 'whale',
+  '7927ca28e8520296f8eb127ccaa9df55cc70f5b2ccb2efe9c65a69d327b88ff0': 'whale',
+  // the working tree before the change section; development builds seeded it
+  'a3123ace589dd88faa8cb31f30c7369c3c885c5cd4c6a9734bed613d8e2d489f': 'whale',
+  '14e60e74c072823597b4d86fb5f110fa6685590826567b3f99d3aa1c04de8ec9': 'whale',
+  '235edda172e50eb5498fb2e49af00ec6d661db8feac6ee35df57042e01d42606': 'whale',
+  '9775c66daf5e9f457c21056cc63a223ef45b16583635868aa11a7e53df541547': 'whale',
+  '5e3a6e921f009023814deab23d63d0e76c200ff9e9c1b921faed99147a7f397c': 'whale',
+  '1964d32a9b015bcc9bd47991f1f6505386f1889a58bba653b5dea09a0686b604': 'whale',
+  'd0aa8b24ab3a4eb5c63c8f9b252d30c168f833e4b2b796e15c5a4735021d8cc9': 'whale',
+  '20d273284d7d05ddcc45fa9656dd0e41a4bd6a64eaf2716dc345af633336409d': 'whale',
+  'e0e24e8283f48c28db3d1f8ae646c8898bdfc0d2fb31b818348c2303b9e8f387': 'whale',
+  '5ba23d9d873df98317eddee64620fda44c4d17bdf8d06043a86421c5bd2ebf3e': 'whale',
+  '004dfa4fe547168c93ec51a3d34fa45512e2fb3b78a00bbb6b32421d4ee40f6b': 'whale',
 };

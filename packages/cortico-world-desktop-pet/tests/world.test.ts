@@ -115,6 +115,18 @@ describe('tools without a page', () => {
   });
 });
 
+describe('guest avatar', () => {
+  it('sends a guest order to a connected page', async () => {
+    const { world } = await mounted();
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+    expect(world.guest({ show: true, state: 'work', taskId: 't1' })).toBe(true);
+    expect(await page.next((m) => m.t === 'guest')).toMatchObject({ t: 'guest', show: true, state: 'work', taskId: 't1' });
+    expect(world.guest({ show: false, taskId: 't1' })).toBe(true);
+    expect(await page.next((m) => m.t === 'guest')).toMatchObject({ t: 'guest', show: false, taskId: 't1' });
+  });
+});
+
 describe('computer use', () => {
   it('switching it off ends the engine process, and the engine starts again when needed (two spawns)', async () => {
     const { world, cfg } = await mounted((c) => { c.cua.enabled = true; });

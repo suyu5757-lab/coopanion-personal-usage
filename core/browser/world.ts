@@ -15,7 +15,7 @@ import type { Language } from 'cortico/core/language.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import type { ModelLanguage } from '../language.ts';
 import type { BrowserTransport } from './bridge.ts';
-import { CONTENT_MAX, SESSION_MAX_CALLS, TEXT_MAX, WATCH_MAX, type SelfTimeConfig } from './config.ts';
+import { CONTENT_MAX, SESSION_MAX_CALLS, TEXT_MAX, WATCH_FRAMES_DEFAULT, WATCH_FRAMES_MAX, WATCH_MAX, type SelfTimeConfig } from './config.ts';
 import { clickRefusal, isSearchField, isWriteAction, typeRefusal } from './guard.ts';
 import { BROWSER_TEXT, type AgentElement, type BrowserText, type PageState, type VideoState } from './model-text.ts';
 import { BROWSER_TOOL_DECLS } from './tools.ts';
@@ -34,6 +34,8 @@ export interface BrowserWorldOptions {
   modelLanguage: () => ModelLanguage;
   /** The deployment's time zone, for event timestamps. */
   timezone: string;
+  /** Transcribes one finished 16 kHz mono utterance from the page's audio; absent when speech recognition is unavailable. */
+  transcribe?: (pcm: Int16Array) => Promise<{ text: string; error?: string | null }>;
   /** A browsing session ended (closed, timed out or out of calls); Coo's next heartbeat starts from now. */
   onSessionEnd?: () => void;
 }
@@ -43,6 +45,34 @@ interface ClickAnswer { success?: boolean; message?: string }
 interface PlayAnswer { ok?: boolean; error?: string; video?: VideoState | null }
 
 const asRecord = (value: unknown): Record<string, unknown> | null => (value && typeof value === 'object' ? value as Record<string, unknown> : null);
+
+/** When each frame is taken: the whole watch for one frame, both ends and even steps for more. */
+function watchTimes(seconds: number, frames: number): number[] {
+  if (frames <= 1) return [seconds];
+  return Array.from({ length: frames }, (_, index) => Math.round(seconds * index / (frames - 1)));
+}
+
+/** The samples of the page's 16 kHz mono 16-bit WAV, or null for anything else. */
+function pcm16Wav(base64: string): Int16Array | null {
+  const bytes = Buffer.from(base64, 'base64');
+  if (bytes.length < 44 || bytes.toString('ascii', 0, 4) !== 'RIFF' || bytes.toString('ascii', 8, 12) !== 'WAVE') return null;
+  let at = 12, data = -1, size = 0;
+  while (at + 8 <= bytes.length) {
+    const id = bytes.toString('ascii', at, at + 4);
+    const length = bytes.readUInt32LE(at + 4);
+    if (id === 'fmt ') {
+      const format = bytes.readUInt16LE(at + 8), channels = bytes.readUInt16LE(at + 10);
+      const rate = bytes.readUInt32LE(at + 12), bits = bytes.readUInt16LE(at + 22);
+      if (format !== 1 || channels !== 1 || rate !== 16_000 || bits !== 16) return null;
+    }
+    if (id === 'data') { data = at + 8; size = Math.min(length, bytes.length - data); break; }
+    at += 8 + length + (length % 2);
+  }
+  if (data < 0 || size < 2) return null;
+  const pcm = new Int16Array(Math.floor(size / 2));
+  for (let index = 0; index < pcm.length; index++) pcm[index] = bytes.readInt16LE(data + index * 2);
+  return pcm;
+}
 
 const asVideo = (value: unknown): VideoState | null => {
   const v = asRecord(value);
@@ -183,8 +213,8 @@ export class BrowserWorld implements World {
         ? (en ? 'has no time limit' : '不限时长')
         : (en ? `lasts at most ${st.sessionMinutes} minutes` : `最多 ${st.sessionMinutes} 分钟`),
       'browser.actions': st.actions
-        ? (en ? 'likes, favorites, follows, comments and danmaku are allowed' : '可以点赞、收藏、关注、评论和发弹幕')
-        : (en ? 'read only: do not like, favorite, follow, comment or send danmaku' : '只允许看:不要点赞、收藏、关注、评论或发弹幕'),
+        ? (en ? 'likes, favorites, follows, comments, danmaku and sharing are allowed' : '可以点赞、收藏、关注、评论、发弹幕和分享')
+        : (en ? 'read only: do not like, favorite, follow, comment, send danmaku or share' : '只允许看:不要点赞、收藏、关注、评论、发弹幕或分享'),
       'browser.audio': st.sound ? (en ? 'sound on' : '有声音') : (en ? 'muted' : '静音'),
     };
   }
@@ -198,6 +228,7 @@ export class BrowserWorld implements World {
       browser_find: (args, ctx) => this.find(args, ctx),
       browser_click: (args, ctx) => this.click(args, ctx),
       browser_hover: (args, ctx) => this.hover(args, ctx),
+      browser_share: (_args, ctx) => this.share(ctx),
       browser_type: (args, ctx) => this.type(args, ctx),
       browser_press: (args, ctx) => this.press(args, ctx),
       browser_scroll: (args, ctx) => this.scroll(args, ctx),
@@ -391,10 +422,23 @@ export class BrowserWorld implements World {
       const element = asElement(await this.call('element', { index }, ctx.signal));
       if (!element) return this.toast(this.t.noElement(index), true);
       const label = this.labelOf(element);
+      if (!this.self.actions && isWriteAction(label)) return this.toast(this.t.lookOnly(label), true);
       const result = asRecord(await this.call('hover', { index }, ctx.signal));
       const state = asState(result?.state);
       if (!state) return this.toast(this.t.failed('browser_hover', 'the page did not answer after hovering'), true);
       return this.toast(this.full(state, this.t.hovered(label || `#${index}`)));
+    });
+  }
+
+  private async share(ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.run('browser_share', ctx, async () => {
+      const blocked = this.begin('browser_share');
+      if (blocked) return blocked;
+      if (!this.self.actions) return this.toast(this.t.lookOnly('分享'), true);
+      const result = asRecord(await this.call('share', {}, ctx.signal));
+      const state = asState(result?.state);
+      if (!state) return this.toast(this.t.failed('browser_share', 'the page did not answer after opening the share panel'), true);
+      return this.toast(this.full(state, this.t.shared));
     });
   }
 
@@ -469,17 +513,65 @@ export class BrowserWorld implements World {
   private async watch(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
     return this.run('browser_watch', ctx, async () => {
       const seconds = typeof args.seconds === 'number' && Number.isFinite(args.seconds) ? Math.min(WATCH_MAX, Math.max(1, Math.round(args.seconds))) : 10;
+      const asked = typeof args.frames === 'number' && Number.isFinite(args.frames) ? Math.round(args.frames) : WATCH_FRAMES_DEFAULT;
+      const frames = Math.min(WATCH_FRAMES_MAX, Math.max(1, asked), seconds + 1);
+      const times = watchTimes(seconds, frames);
       const blocked = this.begin('browser_watch');
       if (blocked) return blocked;
-      if (ctx.signal?.aborted) return this.toast(this.t.interrupted);
-      await sleep(seconds * 1000, undefined, { signal: ctx.signal }).catch(() => undefined);
-      if (ctx.signal?.aborted) return this.toast(this.t.interrupted);
-      if (this.ended) return this.toast(this.t.timeUp, true);
-      const shot = asRecord(await this.call('screenshot', {}, ctx.signal));
-      const state = asState(shot?.state);
-      if (!shot || !state || typeof shot.base64 !== 'string') return this.toast(this.t.failed('browser_watch', 'the page produced no image'), true);
-      return this.image({ base64: shot.base64, width: Number(shot.width) || 0, height: Number(shot.height) || 0, state }, this.t.watched(seconds));
+      const audioWanted = args.audio !== false && !!this.opts.transcribe;
+      let audioOpen = false;
+      let audioNote = '';
+      try {
+        if (audioWanted) {
+          try {
+            const opened = asRecord(await this.call('audio-start', {}, ctx.signal));
+            audioOpen = opened?.ok === true;
+            if (!audioOpen) audioNote = this.t.audioProblem(typeof opened?.error === 'string' ? opened.error : 'the page did not start recording');
+          } catch (error) {
+            audioNote = this.t.audioProblem(error instanceof Error ? error.message : String(error));
+          }
+        }
+        const started = Date.now();
+        const shots: Shot[] = [];
+        for (const at of times) {
+          const wait = started + at * 1000 - Date.now();
+          if (wait > 0) await sleep(wait, undefined, { signal: ctx.signal }).catch(() => undefined);
+          if (ctx.signal?.aborted) return this.toast(this.t.interrupted);
+          if (this.ended) return this.toast(this.t.timeUp, true);
+          const shot = asRecord(await this.call('screenshot', {}, ctx.signal));
+          const state = asState(shot?.state);
+          if (!shot || !state || typeof shot.base64 !== 'string') {
+            if (!shots.length) return this.toast(this.t.failed('browser_watch', 'the page produced no image'), true);
+            break;
+          }
+          shots.push({ base64: shot.base64, width: Number(shot.width) || 0, height: Number(shot.height) || 0, state });
+        }
+        if (audioOpen) {
+          try {
+            const stopped = asRecord(await this.call('audio-stop', {}, undefined));
+            audioOpen = false;
+            audioNote = await this.heard(stopped);
+          } catch (error) {
+            audioNote = this.t.audioProblem(error instanceof Error ? error.message : String(error));
+          }
+        }
+        return this.frames(shots, seconds, times, audioNote);
+      } finally {
+        if (audioOpen) await this.call('audio-stop', {}, undefined).catch(() => undefined);
+      }
     });
+  }
+
+  /** The transcript line for one audio-stop answer, or why there is none. */
+  private async heard(stopped: Record<string, unknown> | null): Promise<string> {
+    if (stopped?.ok !== true || typeof stopped.wav !== 'string') {
+      return this.t.audioProblem(typeof stopped?.error === 'string' ? stopped.error : 'the page produced no audio');
+    }
+    const pcm = pcm16Wav(stopped.wav);
+    if (!pcm) return this.t.audioProblem('the recording was not 16 kHz mono PCM');
+    const result = await this.opts.transcribe!(pcm);
+    if (result.text) return this.t.heard(result.text);
+    return result.error ? this.t.audioProblem(result.error) : this.t.noSpeech;
   }
 
   private async screenshot(ctx: ToolCallContext): Promise<ToolOutcome> {
@@ -574,6 +666,23 @@ export class BrowserWorld implements World {
         name: 'page.jpg',
         fallbackText: this.t.imageFallback(shot.width, shot.height),
       }],
+    };
+  }
+
+  private frames(shots: Shot[], seconds: number, times: number[], audioNote = ''): ToolOutcome {
+    const last = shots[shots.length - 1]!;
+    const shown = times.slice(0, shots.length);
+    const text = [this.t.watched(seconds, shots.length, shown), this.t.pageLine(last.state.title, last.state.url), this.t.video(last.state.video), audioNote]
+      .filter(Boolean).join('\n');
+    if (!(this.host?.modelFacts.accepts('image/jpeg') ?? true)) return this.toast(`${text}\n${this.t.noImage}`);
+    return {
+      text,
+      blobs: shots.map((shot, index) => ({
+        bytes: Buffer.from(shot.base64, 'base64'),
+        mime: 'image/jpeg',
+        name: `frame-${index + 1}.jpg`,
+        fallbackText: this.t.frameFallback(shot.width, shot.height, shown[index]!),
+      })),
     };
   }
 }

@@ -42,12 +42,16 @@ export interface BrowserText {
   searched(query: string, site: string): string;
   clicked(label: string): string;
   hovered(label: string): string;
+  shared: string;
   typed(label: string): string;
   pressed(key: string): string;
   scrolled(down: boolean, pages: number): string;
   played(paused: boolean): string;
   screenshot: string;
-  watched(seconds: number): string;
+  watched(seconds: number, frames: number, times: number[]): string;
+  heard(text: string): string;
+  noSpeech: string;
+  audioProblem(why: string): string;
   closed: string;
   closedEvent: string;
   notOpen: string;
@@ -67,6 +71,7 @@ export interface BrowserText {
   none(query: string): string;
   truncated: string;
   imageFallback(width: number, height: number): string;
+  frameFallback(width: number, height: number, seconds: number): string;
   noImage: string;
   pageLine(title: string, url: string): string;
   video(video: VideoState | null): string;
@@ -85,12 +90,16 @@ const zh: BrowserText = {
   searched: (query, site) => `[浏览器] 在${site}搜索了「${query}」`,
   clicked: (label) => `[浏览器] 点了「${label}」`,
   hovered: (label) => `[浏览器] 鼠标移到「${label}」上`,
+  shared: '[浏览器] 打开了分享面板。',
   typed: (label) => `[浏览器] 在「${label}」里输入了文字`,
   pressed: (key) => `[浏览器] 按了 ${key}`,
   scrolled: (down, pages) => `[浏览器] ${down ? '向下' : '向上'}翻了 ${pages} 屏`,
   played: (paused) => `[浏览器] ${paused ? '暂停' : '播放'}了视频`,
   screenshot: '[浏览器] 当前页面截图',
-  watched: (seconds) => `[浏览器] 看了 ${seconds} 秒`,
+  watched: (seconds, frames, times) => `[浏览器] 看了 ${seconds} 秒,截了 ${frames} 帧(第 ${times.join('、')} 秒)`,
+  heard: (text) => `[浏览器] 声音里听到:${text}`,
+  noSpeech: '[浏览器] 这段声音里没有听清的话。',
+  audioProblem: (why) => `[浏览器] 声音没能转成文字:${why}。`,
   closed: '[浏览器] 浏览器关上了。',
   closedEvent: '[浏览器] 浏览器窗口被关掉了。',
   notOpen: '[浏览器] 浏览器还没打开;先用 browser_open 打开一个页面。',
@@ -109,7 +118,8 @@ const zh: BrowserText = {
   found: (query, count) => `[浏览器] 页面里找到 ${count} 处「${query}」:`,
   none: (query) => `[浏览器] 页面里没有找到「${query}」。`,
   truncated: '…(后面还有,用 browser_scroll 或 browser_find 继续看)',
-  imageFallback: (width, height) => `[页面截图 ${width}×${height};当前模型看不了图片]`,
+  imageFallback: (width, height) => `[页面截图 ${width}×${height}]`,
+  frameFallback: (width, height, seconds) => `[页面截图 ${width}×${height};第 ${seconds} 秒]`,
   noImage: '(当前模型看不了图片)',
   pageLine: (title, url) => `页面: ${title} — ${url}`,
   video: (video) => {
@@ -125,12 +135,16 @@ const en: BrowserText = {
   searched: (query, site) => `[browser] Searched ${site} for "${query}"`,
   clicked: (label) => `[browser] Clicked "${label}"`,
   hovered: (label) => `[browser] Moved the pointer over "${label}"`,
+  shared: '[browser] Opened the share panel.',
   typed: (label) => `[browser] Typed into "${label}"`,
   pressed: (key) => `[browser] Pressed ${key}`,
   scrolled: (down, pages) => `[browser] Scrolled ${down ? 'down' : 'up'} ${pages} screen${pages === 1 ? '' : 's'}`,
   played: (paused) => `[browser] ${paused ? 'Paused' : 'Played'} the video`,
   screenshot: '[browser] Screenshot of the page',
-  watched: (seconds) => `[browser] Watched for ${seconds} seconds`,
+  watched: (seconds, frames, times) => `[browser] Watched ${seconds} seconds; ${frames} frames at ${times.join(', ')}s`,
+  heard: (text) => `[browser] Heard: ${text}`,
+  noSpeech: '[browser] No clear speech in this stretch of audio.',
+  audioProblem: (why) => `[browser] Could not turn the audio into text: ${why}.`,
   closed: '[browser] Closed the browser.',
   closedEvent: '[browser] The browser window was closed.',
   notOpen: '[browser] The browser is not open; use browser_open first.',
@@ -149,7 +163,8 @@ const en: BrowserText = {
   found: (query, count) => `[browser] Found ${count} place${count === 1 ? '' : 's'} with "${query}" on the page:`,
   none: (query) => `[browser] Found no "${query}" on the page.`,
   truncated: '…(more follows; use browser_scroll or browser_find)',
-  imageFallback: (width, height) => `[page screenshot ${width}×${height}; this model cannot see images]`,
+  imageFallback: (width, height) => `[page screenshot ${width}×${height}]`,
+  frameFallback: (width, height, seconds) => `[page screenshot ${width}×${height}; ${seconds}s]`,
   noImage: '(this model cannot see images)',
   pageLine: (title, url) => `Page: ${title} — ${url}`,
   video: (video) => {
@@ -168,11 +183,13 @@ export function selfTimeLine(language: ModelLanguage, quietSeconds: number, minu
     const quiet = quietSeconds < 60 ? `${quietSeconds} seconds` : `${Math.floor(quietSeconds / 60)} minutes`;
     const span = unlimited ? 'with no time limit' : `up to ${minutes} minutes`;
     return `[system] Quiet for ${quiet}. This is your own time, ${span}: speak if you want to; `
-      + 'if you want to go online, open your browser and look around Bilibili, Douyin or anywhere else. '
+      + 'if something you saw or learned recently is worth telling them, this is a good moment. '
+      + 'If you want to go online, open your browser and look around Bilibili, Douyin or anywhere else. '
       + 'If you would rather not, end_turn.';
   }
   const quiet = quietSeconds < 60 ? `${quietSeconds} 秒` : `${Math.floor(quietSeconds / 60)} 分钟`;
   const span = unlimited ? '不限时长' : `最多 ${minutes} 分钟`;
   return `[system] 已经安静了 ${quiet}。这是你自己的时间,${span}:想说话就说;`
+    + '最近看到或了解到的有意思的事,可以趁现在讲给 ta 听。'
     + '想自己上网逛逛,可以打开你的浏览器,去 B 站、抖音或别的地方看看。不想动就 end_turn。';
 }

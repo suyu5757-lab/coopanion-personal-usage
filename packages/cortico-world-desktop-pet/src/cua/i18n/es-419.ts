@@ -28,6 +28,7 @@ const es419: Translation<CuaText> = {
   },
 
   config: {
+    backgroundOnly: {"title": "Operar solo ventanas en segundo plano", "description": "Requiere una ventana de Cua Driver antes de ingresar datos. Rechaza la entrada en toda la pantalla y el foco en primer plano; se detiene si falla el controlador."},
     group: 'Uso de la computadora',
     enabled: { title: 'Activar el uso de la computadora' },
     control: { title: 'Permitir el mouse y el teclado', description: 'Si está desactivado, solo capturas de pantalla y la lista de ventanas.' },

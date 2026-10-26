@@ -487,7 +487,11 @@
         "zh": "默认的脸",
         "en": "the default face"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "普通说话、没有明显情绪时的默认脸。",
+        "en": "the default face for ordinary talk with no strong feeling."
+      }
     },
     {
       "id": "happy",
@@ -502,7 +506,11 @@
         "zh": "眯眼笑,鲸鳍竖起来,尾巴摇",
         "en": "smiles with narrowed eyes, fins perk up, tail wags"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "听到好消息、被夸、一起笑的时候；轻轻笑一下，不要每句都笑。",
+        "en": "good news, a compliment, a shared joke; a small smile, not on every line."
+      }
     },
     {
       "id": "wink",
@@ -516,7 +524,11 @@
         "zh": "一只眼 ^",
         "en": "one eye turns into ^"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "开个小玩笑、说悄悄话、逗对方一下的时候；偶尔用。",
+        "en": "a small joke, a shared secret, or teasing them; use it now and then."
+      }
     },
     {
       "id": "love",
@@ -531,7 +543,11 @@
         "zh": "眼睛变心形,冒小心心,尾巴摇",
         "en": "heart-shaped eyes, little hearts float up, tail wags"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "真的被触动、想表达喜欢的时候；不要每个夸奖都用。",
+        "en": "genuinely moved, or wanting to show affection; not for every compliment."
+      }
     },
     {
       "id": "shy",
@@ -545,7 +561,11 @@
         "zh": "脸红,眼神躲开",
         "en": "blushes and looks away"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "被夸、被看穿、被直接说中心事的时候。",
+        "en": "being praised, seen through, or told something that hits home."
+      }
     },
     {
       "id": "surprised",
@@ -560,7 +580,11 @@
         "zh": "眼睛放大,头顶感叹号",
         "en": "eyes go wide, an exclamation mark overhead"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "听到意外消息、突然发生事情的时候。",
+        "en": "unexpected news, or something that happens suddenly."
+      }
     },
     {
       "id": "angry",
@@ -574,7 +598,11 @@
         "zh": "皱眉,头顶怒气符号,身体发抖",
         "en": "frowns, an anger mark overhead, body shaking"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "被逗过头、遇到不公平的事；不是普通的不耐烦。",
+        "en": "being teased too far, or something unfair; not ordinary impatience."
+      }
     },
     {
       "id": "sad",
@@ -589,7 +617,11 @@
         "zh": "八字眉,低头,掉眼泪,尾巴垂下",
         "en": "brows slant down, head lowered, tears fall, tail droops"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "真的失望、难过的时候；不是小不顺。",
+        "en": "real disappointment or hurt; not a small inconvenience."
+      }
     },
     {
       "id": "sleepy",
@@ -604,7 +636,11 @@
         "zh": "眯眼打哈欠",
         "en": "squints and yawns"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "夜深、累了、安静下来的时候。",
+        "en": "late night, tired, or a quiet lull."
+      }
     },
     {
       "id": "thinking",
@@ -619,7 +655,11 @@
         "zh": "眼睛往上看,头顶冒圈",
         "en": "looks up, rings rise overhead"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "想问题、被问住、在挑话怎么说的时候。",
+        "en": "working something out, being asked something hard, or choosing what to say."
+      }
     },
     {
       "id": "smug",
@@ -634,7 +674,11 @@
         "zh": "眯眼斜看,嘴角带笑",
         "en": "a narrowed sidelong look and a smirk"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "小赢一把、被夸后有点得意、玩笑式自夸的时候。",
+        "en": "a small win, being praised, or playful bragging."
+      }
     },
     {
       "id": "pout",
@@ -649,7 +693,11 @@
         "zh": "嘴嘟起来,脸红,扭头不看你",
         "en": "pouts, blushes and turns away from you"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "被反驳、假装生气、傲娇地拒绝的时候。",
+        "en": "being contradicted, pretending to be annoyed, or a tsundere refusal."
+      }
     },
     {
       "id": "worried",
@@ -664,7 +712,11 @@
         "zh": "八字眉,冒冷汗",
         "en": "brows slant down, a cold sweat"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "对方晚归、熬夜、生病、让人不放心的时候。",
+        "en": "when they are late, overworking, unwell, or otherwise worrying."
+      }
     },
     {
       "id": "determined",
@@ -679,7 +731,11 @@
         "zh": "眼神压低,一脸认真",
         "en": "a lowered gaze, a serious face"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "开始做事、答应一件事、要认真起来的时候。",
+        "en": "starting a task, making a promise, or getting serious."
+      }
     },
     {
       "id": "flustered",
@@ -694,7 +750,11 @@
         "zh": "眼睛变成 > <,满脸通红冒汗",
         "en": "eyes turn into > <, red all over and sweating"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "被突然夸、被抓住心事、手忙脚乱的时候。",
+        "en": "caught off guard, suddenly praised, or flustered."
+      }
     },
     {
       "id": "scared",
@@ -709,7 +769,11 @@
         "zh": "眼睛瞪大,冒汗,身体发抖",
         "en": "eyes wide, sweating, body shaking"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "真的被吓到、遇到危险的时候；不是开玩笑。",
+        "en": "genuinely startled or in danger; not for a joke."
+      }
     },
     {
       "id": "excited",
@@ -724,7 +788,11 @@
         "zh": "眼睛里闪着星星",
         "en": "stars sparkle in the eyes"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "发现对方会喜欢的东西、期待一件事的时候。",
+        "en": "finding something they will like, or looking forward to something."
+      }
     },
     {
       "id": "cry",
@@ -739,7 +807,11 @@
         "zh": "闭眼大哭,眼泪直流",
         "en": "eyes shut, wailing, tears streaming"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "真的伤心或被打动到极点；很少用。",
+        "en": "really sad, or deeply moved; rare."
+      }
     },
     {
       "id": "confused",
@@ -754,7 +826,11 @@
         "zh": "一脸不解,头顶问号",
         "en": "a puzzled face, a question mark overhead"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "没听懂、遇到奇怪的要求的时候。",
+        "en": "not understanding, or a strange request."
+      }
     },
     {
       "id": "stand",
@@ -769,7 +845,11 @@
         "zh": "站起来(坐着、睡着时)",
         "en": "stands up (when sitting or asleep)"
       },
-      "seconds": 1.2
+      "seconds": 1.2,
+      "when": {
+        "zh": "从坐、睡里起来的时候。",
+        "en": "getting up from sitting or sleeping."
+      }
     },
     {
       "id": "jump",
@@ -784,7 +864,11 @@
         "zh": "原地起跳",
         "en": "jumps on the spot"
       },
-      "seconds": 1.2
+      "seconds": 1.2,
+      "when": {
+        "zh": "突然高兴或吓一跳的时候；比 hop 大。",
+        "en": "a sudden burst of joy or a start; bigger than hop."
+      }
     },
     {
       "id": "hop",
@@ -799,7 +883,11 @@
         "zh": "小小蹦一下",
         "en": "a small hop"
       },
-      "seconds": 0.9
+      "seconds": 0.9,
+      "when": {
+        "zh": "轻轻高兴一下、应一声的时候。",
+        "en": "a small happy reaction, or a little acknowledgment."
+      }
     },
     {
       "id": "look",
@@ -814,7 +902,11 @@
         "zh": "左右张望",
         "en": "looks left and right"
       },
-      "seconds": 2.7
+      "seconds": 2.7,
+      "when": {
+        "zh": "找人、看周围、注意到什么的时候。",
+        "en": "looking for someone, looking around, or noticing something."
+      }
     },
     {
       "id": "turn",
@@ -828,7 +920,11 @@
         "zh": "转向另一边",
         "en": "turns to face the other way"
       },
-      "seconds": 0.4
+      "seconds": 0.4,
+      "when": {
+        "zh": "转身面对或背对、闹别扭的时候。",
+        "en": "turning toward or away from something, or sulking."
+      }
     },
     {
       "id": "nod",
@@ -842,7 +938,11 @@
         "zh": "低头两下",
         "en": "dips the head twice"
       },
-      "seconds": 0.8
+      "seconds": 0.8,
+      "when": {
+        "zh": "同意、确认、答应的时候。",
+        "en": "agreeing, confirming, or saying yes."
+      }
     },
     {
       "id": "shake",
@@ -856,7 +956,11 @@
         "zh": "脸左右转",
         "en": "turns the face left and right"
       },
-      "seconds": 0.8
+      "seconds": 0.8,
+      "when": {
+        "zh": "不同意、拒绝、不认同的时候。",
+        "en": "disagreeing or refusing."
+      }
     },
     {
       "id": "spin",
@@ -870,7 +974,11 @@
         "zh": "原地转一圈",
         "en": "spins around once on the spot"
       },
-      "seconds": 0.8
+      "seconds": 0.8,
+      "when": {
+        "zh": "特别兴奋、庆祝一下的时候；不要常用。",
+        "en": "a burst of excitement or a small celebration; use it rarely."
+      }
     },
     {
       "id": "sit",
@@ -886,7 +994,11 @@
         "en": "sits down"
       },
       "seconds": 0.8,
-      "lasting": true
+      "lasting": true,
+      "when": {
+        "zh": "坐下来陪一会儿、听对方说话的时候；会保持到下一个动作。",
+        "en": "settling down to stay a while or listen; held until the next action."
+      }
     },
     {
       "id": "sleep",
@@ -902,7 +1014,11 @@
         "en": "dozes sitting down"
       },
       "seconds": 0.8,
-      "lasting": true
+      "lasting": true,
+      "when": {
+        "zh": "夜深、困了、结束这一轮的时候；会保持到下一个动作，不要在聊天中用。",
+        "en": "late, sleepy, or ending the turn; held until the next action; not in the middle of a chat."
+      }
     },
     {
       "id": "dizzy",
@@ -917,7 +1033,11 @@
         "zh": "头晕眼花几秒",
         "en": "dizzy for a few seconds"
       },
-      "seconds": 3.2
+      "seconds": 3.2,
+      "when": {
+        "zh": "转晕、被甩得重的时候；不是普通反应。",
+        "en": "after spinning or a hard throw; not a normal reaction."
+      }
     },
     {
       "id": "walk",
@@ -932,7 +1052,11 @@
         "zh": "随便走一段",
         "en": "wanders a little way"
       },
-      "seconds": 12
+      "seconds": 12,
+      "when": {
+        "zh": "在附近走两步；要去远处用 pet_move_to。",
+        "en": "a few steps nearby; use pet_move_to to go somewhere far."
+      }
     },
     {
       "id": "run",
@@ -947,7 +1071,11 @@
         "zh": "跑到屏幕另一头",
         "en": "runs to the other end of the screen"
       },
-      "seconds": 12
+      "seconds": 12,
+      "when": {
+        "zh": "急着去某处、赶时间的时候。",
+        "en": "rushing somewhere, or in a hurry."
+      }
     },
     {
       "id": "wave",
@@ -962,7 +1090,11 @@
         "zh": "举起靠近你的那只手挥一挥",
         "en": "raises the hand nearer to you and waves"
       },
-      "seconds": 1.7
+      "seconds": 1.7,
+      "when": {
+        "zh": "打招呼、道别的时候。",
+        "en": "hello or goodbye."
+      }
     },
     {
       "id": "bow",
@@ -976,7 +1108,11 @@
         "zh": "闭眼,上身往前倾鞠一躬",
         "en": "closes the eyes and bows from the waist"
       },
-      "seconds": 1.7
+      "seconds": 1.7,
+      "when": {
+        "zh": "认真道谢、道歉或致意的时候；可以带点玩笑。",
+        "en": "a sincere thank-you, apology, or greeting; can be playful."
+      }
     },
     {
       "id": "shiver",
@@ -991,7 +1127,11 @@
         "zh": "缩着身子抖一会儿",
         "en": "huddles up and shivers for a while"
       },
-      "seconds": 1.9
+      "seconds": 1.9,
+      "when": {
+        "zh": "冷、害怕、被压得慌的时候；不是普通紧张。",
+        "en": "cold, afraid, or overwhelmed; not ordinary nervousness."
+      }
     },
     {
       "id": "flap",
@@ -1006,7 +1146,11 @@
         "zh": "开心地蹦起来,鲸鳍、尾巴、呆毛一起扑腾",
         "en": "bounces happily, fins, tail and ahoge all flapping"
       },
-      "seconds": 1.5
+      "seconds": 1.5,
+      "when": {
+        "zh": "特别开心、激动的时候；配合真正兴奋的话。",
+        "en": "big excitement; pair it with a genuinely excited line."
+      }
     },
     {
       "id": "tail-whip",
@@ -1026,7 +1170,11 @@
         "zh": "把尾巴高高扬起,再用力甩到地上,尾鳍拍出一片水花",
         "en": "raises the tail high, then slams it down hard, the fluke throwing up a splash"
       },
-      "seconds": 1.3
+      "seconds": 1.3,
+      "when": {
+        "zh": "明显不高兴、戏剧性地拒绝的时候；不是可爱。",
+        "en": "clear annoyance, or a dramatic refusal; not a cute reaction."
+      }
     },
     {
       "id": "peek",
@@ -1045,7 +1193,11 @@
         "zh": "捂住脸,再挪开手从指缝里偷看",
         "en": "covers her face, then peeks out from behind her hand"
       },
-      "seconds": 2.2
+      "seconds": 2.2,
+      "when": {
+        "zh": "害羞又好奇、捂脸偷看的时候。",
+        "en": "shy curiosity, covering the face and peeking through the fingers."
+      }
     },
     {
       "id": "spout",
@@ -1063,7 +1215,11 @@
         "zh": "仰起头,从头顶喷出一道高高的水柱",
         "en": "tilts her head back and spouts a tall plume of water"
       },
-      "seconds": 1.8
+      "seconds": 1.8,
+      "when": {
+        "zh": "开玩笑、庆祝、想逗笑对方的时候；不要在认真谈话里用。",
+        "en": "a joke, a celebration, or trying to make them laugh; not in serious talk."
+      }
     },
     {
       "id": "hug-tail",
@@ -1081,7 +1237,11 @@
         "zh": "把尾巴卷到身前,两只手抱住尾鳍",
         "en": "curls her tail around in front and hugs the fluke"
       },
-      "seconds": 2.4
+      "seconds": 2.4,
+      "when": {
+        "zh": "想安慰自己、觉得小、害羞的时候。",
+        "en": "comforting herself, feeling small, or shy."
+      }
     },
     {
       "id": "swim",
@@ -1099,7 +1259,11 @@
         "zh": "身体前倾,手脚划水,尾巴摆动,身边冒水泡",
         "en": "leans into a swim, paddles and kicks, tail sweeping, bubbles rising"
       },
-      "seconds": 2.8
+      "seconds": 2.8,
+      "when": {
+        "zh": "玩闹的想象、拿水开玩笑的时候；不在认真谈话里用。",
+        "en": "playful imagination, or a water joke; not in serious talk."
+      }
     },
     {
       "id": "shake-off",
@@ -1117,7 +1281,11 @@
         "zh": "像刚出水一样全身抖一抖,把水珠甩开",
         "en": "shakes herself all over like a wet dog, flinging off droplets"
       },
-      "seconds": 1.8
+      "seconds": 1.8,
+      "when": {
+        "zh": "被水喷到、想甩掉尴尬的时候。",
+        "en": "after being sprayed with water, or shaking off embarrassment."
+      }
     },
     {
       "id": "bubbles",
@@ -1135,7 +1303,11 @@
         "zh": "鼓起腮帮子,从嘴里吹出一串泡泡",
         "en": "puffs her cheeks and blows a stream of bubbles"
       },
-      "seconds": 2.6
+      "seconds": 2.6,
+      "when": {
+        "zh": "无聊、想玩、说个古怪笑话的时候。",
+        "en": "bored, playful, or telling a whimsical joke."
+      }
     },
     {
       "id": "float",
@@ -1153,7 +1325,11 @@
         "zh": "轻轻浮离地面,张开手臂慢慢晃",
         "en": "lifts off the floor, arms out, drifting gently"
       },
-      "seconds": 3
+      "seconds": 3,
+      "when": {
+        "zh": "很满足、发呆、做梦一样的时候；不是普通句子。",
+        "en": "a pleased, dreamy moment; not for ordinary lines."
+      }
     },
     {
       "id": "sulk",
@@ -1172,7 +1348,11 @@
         "zh": "蹲下来嘟着嘴,用手指在地上画圈",
         "en": "squats with a pout and draws circles with one finger"
       },
-      "seconds": 3
+      "seconds": 3,
+      "when": {
+        "zh": "假装生闷气、被冷落的时候；不是真的痛苦。",
+        "en": "pretend sulking, or feeling left out; not real distress."
+      }
     },
     {
       "id": "knock",
@@ -1190,7 +1370,11 @@
         "zh": "抬起手在屏幕前敲两下,敲出两圈波纹",
         "en": "raises a hand and taps twice on the screen, leaving two ripples"
       },
-      "seconds": 1.8
+      "seconds": 1.8,
+      "when": {
+        "zh": "无聊、想让人理她的时候；对方明显在忙时最多敲一下，别一直敲。",
+        "en": "bored, or wanting attention; if they are clearly busy, knock once at most and do not keep at it."
+      }
     },
     {
       "id": "peek-out",
@@ -1208,7 +1392,11 @@
         "zh": "从旁边探出半个身子和脑袋张望",
         "en": "leans out from the side to take a look"
       },
-      "seconds": 1.8
+      "seconds": 1.8,
+      "when": {
+        "zh": "试探对方忙不忙、害羞地靠近的时候。",
+        "en": "checking whether they are free, or approaching shyly."
+      }
     },
     {
       "id": "stretch",
@@ -1226,7 +1414,11 @@
         "zh": "闭着眼把两只手臂向两边伸开,把身体拉长",
         "en": "shuts her eyes, stretches both arms out and makes herself taller"
       },
-      "seconds": 2.4
+      "seconds": 2.4,
+      "when": {
+        "zh": "刚醒、坐久了、放松一下的时候。",
+        "en": "waking up, after sitting a long time, or relaxing."
+      }
     },
     {
       "id": "play-dead",
@@ -1244,7 +1436,11 @@
         "zh": "往后一倒躺在地上,眼睛转圈装死",
         "en": "flops onto her back and plays dead with spinning eyes"
       },
-      "seconds": 2.8
+      "seconds": 2.8,
+      "when": {
+        "zh": "被逗得受不了、开个玩笑的时候；不要在真难过时用。",
+        "en": "a joke when teased or overwhelmed; not when they are truly sad."
+      }
     },
     {
       "id": "tail-clap",
@@ -1262,7 +1458,11 @@
         "zh": "用尾鳍在地上连拍两下,像在鼓掌",
         "en": "slaps the fluke on the floor twice as if applauding"
       },
-      "seconds": 1.6
+      "seconds": 1.6,
+      "when": {
+        "zh": "鼓掌、赞许、对方做得好时。",
+        "en": "applause or approval when they did well."
+      }
     },
     {
       "id": "sneeze",
@@ -1280,7 +1480,11 @@
         "zh": "皱起脸憋一下,再猛地打出喷嚏,喷出小水珠",
         "en": "scrunches up, then sneezes hard with a spray of droplets"
       },
-      "seconds": 1.6
+      "seconds": 1.6,
+      "when": {
+        "zh": "一个滑稽的节拍；偶尔用。",
+        "en": "a comic beat; use it rarely."
+      }
     },
     {
       "id": "change",
@@ -1297,7 +1501,11 @@
         "zh": "换装时围着她冒一圈泡泡,换好再散开",
         "en": "a ring of soap bubbles while the outfit changes, clearing when it is done"
       },
-      "seconds": 1.4
+      "seconds": 1.4,
+      "when": {
+        "zh": "只有真的换装时用；不是情绪。",
+        "en": "only when the figure is actually changing; not a mood."
+      }
     },
     {
       "id": "dance",
@@ -1312,7 +1520,11 @@
         "zh": "原地踩着节拍摇摆三秒,冒音符",
         "en": "sways to a beat on the spot for three seconds, music notes floating up"
       },
-      "seconds": 3.4
+      "seconds": 3.4,
+      "when": {
+        "zh": "有音乐、庆祝、开心的时候；不是普通对话。",
+        "en": "music, celebration, or joy; not ordinary talk."
+      }
     }
   ],
   "sounds": {},

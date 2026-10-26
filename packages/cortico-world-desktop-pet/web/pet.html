@@ -11,6 +11,9 @@
 <div class="stage" id="stage">
   <!-- the body (its shadow and particles too), run by its figure pack in a sandboxed frame (body-host.js) -->
   <div class="figure-layer" id="figureLayer"></div>
+  <!-- a summoned guest: the scanline that opens for it, then its own figure frame -->
+  <div class="guest-portal" id="guestPortal" aria-hidden="true"></div>
+  <div class="figure-layer guest-layer" id="guestLayer" aria-hidden="true"></div>
 </div>
 <div class="bubble" id="bubble" role="status" aria-live="polite" hidden></div>
 <div class="menu" id="menu" role="menu" hidden></div>

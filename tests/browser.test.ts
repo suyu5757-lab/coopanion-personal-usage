@@ -28,6 +28,16 @@ const page = (overrides: Partial<Page> = {}): Page => ({
   ...overrides,
 });
 
+/** One second of silence as the 16 kHz mono 16-bit WAV the page records. */
+const wav = (samples = 16_000): string => {
+  const bytes = Buffer.alloc(44 + samples * 2);
+  bytes.write('RIFF', 0); bytes.writeUInt32LE(36 + samples * 2, 4); bytes.write('WAVE', 8);
+  bytes.write('fmt ', 12); bytes.writeUInt32LE(16, 16); bytes.writeUInt16LE(1, 20); bytes.writeUInt16LE(1, 22);
+  bytes.writeUInt32LE(16_000, 24); bytes.writeUInt32LE(32_000, 28); bytes.writeUInt16LE(2, 32); bytes.writeUInt16LE(16, 34);
+  bytes.write('data', 36); bytes.writeUInt32LE(samples * 2, 40);
+  return bytes.toString('base64');
+};
+
 class FakeBridge implements BrowserTransport {
   readonly calls: Array<{ op: string; args: Record<string, unknown> }> = [];
   readonly listeners = new Set<(event: 'closed') => void>();
@@ -57,8 +67,8 @@ const element = (overrides: Record<string, unknown> = {}) => ({
   href: '', disabled: false, visible: true, ...overrides,
 });
 
-const host = (pushed: Array<Record<string, unknown>>) => ({
-  modelFacts: { accepts: () => true },
+const host = (pushed: Array<Record<string, unknown>>, sees = true) => ({
+  modelFacts: { accepts: () => sees },
   pushEvent: async (e: Record<string, unknown>) => {
     pushed.push(e);
     return { ...e, cursor: pushed.length, origin: 'external', contextDelivery: 'deliver' };
@@ -72,7 +82,13 @@ const run = async (world: BrowserWorld, name: string, args: Record<string, unkno
   return typeof out === 'string' ? { text: out } : out;
 };
 
-const make = async (opts: { self?: Partial<typeof SELF_TIME_DEFAULTS>; bridge?: FakeBridge; pushed?: Array<Record<string, unknown>> } = {}) => {
+const make = async (opts: {
+  self?: Partial<typeof SELF_TIME_DEFAULTS>;
+  bridge?: FakeBridge;
+  pushed?: Array<Record<string, unknown>>;
+  sees?: boolean;
+  transcribe?: (pcm: Int16Array) => Promise<{ text: string; error?: string | null }>;
+} = {}) => {
   const bridge = opts.bridge ?? new FakeBridge();
   const pushed = opts.pushed ?? [];
   let self = { ...SELF_TIME_DEFAULTS, enabled: true, ...opts.self };
@@ -81,8 +97,9 @@ const make = async (opts: { self?: Partial<typeof SELF_TIME_DEFAULTS>; bridge?: 
     selfTime: () => self,
     modelLanguage: () => 'zh',
     timezone: 'Asia/Shanghai',
+    ...(opts.transcribe ? { transcribe: opts.transcribe } : {}),
   });
-  await world.start(host(pushed));
+  await world.start(host(pushed, opts.sees ?? true));
   return {
     world, bridge, pushed,
     setSelf: (patch: Partial<typeof self>) => { self = { ...self, ...patch }; },
@@ -158,6 +175,7 @@ describe('browser guard', () => {
     expect(isSearchField({ type: 'search' })).toBe(true);
     expect(isSearchField({ placeholder: '搜索视频' })).toBe(true);
     expect(isWriteAction('点赞')).toBe(true);
+    expect(isWriteAction('分享')).toBe(true);
     expect(isWriteAction('播放')).toBe(false);
   });
 });
@@ -260,6 +278,28 @@ describe('browser World', () => {
     expect(out.text).toContain('使用');
   });
 
+  it('opens the share panel and returns its options', async () => {
+    const { world, bridge } = await make();
+    bridge.responses.open = page();
+    bridge.responses.share = { state: page({ content: '[3]<button >复制链接 />' }) };
+    await run(world, 'browser_open', { url: 'https://www.douyin.com/' });
+    const out = await run(world, 'browser_share', {});
+    expect(out.failed).toBeUndefined();
+    expect(out.text).toContain('分享面板');
+    expect(out.text).toContain('复制链接');
+    expect(bridge.calls.some((c) => c.op === 'share')).toBe(true);
+  });
+
+  it('refuses to share while actions are off', async () => {
+    const { world, bridge } = await make({ self: { actions: false } });
+    bridge.responses.open = page();
+    await run(world, 'browser_open', { url: 'https://www.douyin.com/' });
+    const out = await run(world, 'browser_share', {});
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('只允许看');
+    expect(bridge.calls.some((c) => c.op === 'share')).toBe(false);
+  });
+
   it('refuses a password field and types into a search box', async () => {
     const { world, bridge } = await make();
     bridge.responses.open = page();
@@ -284,6 +324,9 @@ describe('browser World', () => {
     const liked = await run(world, 'browser_click', { index: 2 });
     expect(liked.failed).toBe(true);
     expect(liked.text).toContain('只允许看');
+    const hovered = await run(world, 'browser_hover', { index: 2 });
+    expect(hovered.failed).toBe(true);
+    expect(hovered.text).toContain('只允许看');
     bridge.element = element({ type: 'search', placeholder: '搜索', text: '', label: '' });
     const searched = await run(world, 'browser_type', { index: 2, text: '猫' });
     expect(searched.failed).toBeUndefined();
@@ -298,6 +341,18 @@ describe('browser World', () => {
     const out = await run(world, 'browser_screenshot', {});
     expect(out.text).toContain('截图');
     expect(out.blobs?.[0]).toMatchObject({ mime: 'image/jpeg' });
+    expect(out.blobs?.[0]?.fallbackText).toContain('1100×732');
+    expect(out.blobs?.[0]?.fallbackText).not.toContain('看不了');
+  });
+
+  it('says the model cannot see images only when it does not accept them', async () => {
+    const { world, bridge } = await make({ sees: false });
+    bridge.responses.open = page();
+    bridge.responses.screenshot = { base64: Buffer.from('jpeg').toString('base64'), width: 1100, height: 732, state: page() };
+    await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
+    const out = await run(world, 'browser_screenshot', {});
+    expect(out.blobs).toBeUndefined();
+    expect(out.text).toContain('当前模型看不了图片');
   });
 
   it('watches for a second and reports the video position', async () => {
@@ -308,9 +363,52 @@ describe('browser World', () => {
       state: page({ video: { current: 3, duration: 60, paused: false, muted: true, volume: 0, width: 640, height: 360, src: 'blob:x' } }),
     };
     await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
-    const out = await run(world, 'browser_watch', { seconds: 1 });
+    const out = await run(world, 'browser_watch', { seconds: 1, frames: 2 });
     expect(out.text).toContain('看了 1 秒');
+    expect(out.text).toContain('截了 2 帧');
     expect(out.text).toContain('播放中 0:03 / 1:00, 静音');
+    expect(out.blobs).toHaveLength(2);
+    expect(out.blobs?.[1]?.fallbackText).toContain('第 1 秒');
+    expect(bridge.calls.filter((call) => call.op === 'screenshot')).toHaveLength(2);
+  });
+
+  it('turns the watched sound into text', async () => {
+    let heard: Int16Array | null = null;
+    const { world, bridge } = await make({
+      transcribe: async (pcm) => { heard = pcm; return { text: '你好' }; },
+    });
+    bridge.responses.open = page();
+    bridge.responses.screenshot = { base64: Buffer.from('jpeg').toString('base64'), width: 1100, height: 732, state: page() };
+    bridge.responses['audio-start'] = { ok: true };
+    bridge.responses['audio-stop'] = { ok: true, wav: wav(1600), seconds: 0.1 };
+    await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
+    const out = await run(world, 'browser_watch', { seconds: 1, frames: 1 });
+    expect(out.text).toContain('声音里听到:你好');
+    expect(heard).not.toBeNull();
+    expect(heard!.length).toBe(1600);
+    expect(bridge.calls.map((call) => call.op)).toEqual(expect.arrayContaining(['audio-start', 'audio-stop']));
+  });
+
+  it('keeps the frames when the sound cannot be recorded', async () => {
+    const { world, bridge } = await make({ transcribe: async () => ({ text: '你好' }) });
+    bridge.responses.open = page();
+    bridge.responses.screenshot = { base64: Buffer.from('jpeg').toString('base64'), width: 1100, height: 732, state: page() };
+    bridge.responses['audio-start'] = { ok: false, error: 'no audio' };
+    await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
+    const out = await run(world, 'browser_watch', { seconds: 1, frames: 1 });
+    expect(out.text).toContain('声音没能转成文字:no audio');
+    expect(out.blobs).toHaveLength(1);
+    expect(bridge.calls.some((call) => call.op === 'audio-stop')).toBe(false);
+  });
+
+  it('skips the sound when audio is false', async () => {
+    const { world, bridge } = await make();
+    bridge.responses.open = page();
+    bridge.responses.screenshot = { base64: Buffer.from('jpeg').toString('base64'), width: 1100, height: 732, state: page() };
+    await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
+    const out = await run(world, 'browser_watch', { seconds: 1, frames: 1, audio: false });
+    expect(out.text).not.toContain('声音');
+    expect(bridge.calls.some((call) => call.op === 'audio-start')).toBe(false);
   });
 
   it('tells her when the person closes the window', async () => {
@@ -353,7 +451,7 @@ describe('browser World', () => {
     const { text } = await renderWorldEnvPrompt(world);
     expect(text).toContain('## 你自己的浏览器');
     expect(text).toContain('最多 20 分钟');
-    expect(text).toContain('可以点赞、收藏、关注、评论和发弹幕');
+    expect(text).toContain('可以点赞、收藏、关注、评论、发弹幕和分享');
     expect(text).toContain('静音');
     expect(text).not.toContain('{{browser.');
   });
@@ -368,6 +466,7 @@ describe('browser World', () => {
     expect(def.defaults()).toEqual({ enabled: false });
     expect(def.describe?.tools.map((t) => t.name)).toContain('browser_open');
     expect(def.describe?.tools.map((t) => t.name)).toContain('browser_hover');
+    expect(def.describe?.tools.map((t) => t.name)).toContain('browser_share');
     expect(def.describe?.events.map((e) => e.type)).toContain('browser.closed');
   });
 });

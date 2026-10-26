@@ -17,7 +17,7 @@ export interface SelfTimeConfig {
 }
 
 export const SELF_TIME_DEFAULTS: SelfTimeConfig = {
-  enabled: false,
+  enabled: true,
   afterMinutes: 20,
   sessionMinutes: 20,
   sessionUnlimited: false,
@@ -51,3 +51,7 @@ export const CONTENT_MAX = 14_000;
 export const TEXT_MAX = 12_000;
 /** The longest `browser_watch`, in seconds; the tool's own schema repeats it. */
 export const WATCH_MAX = 30;
+/** The most frames one `browser_watch` may take; the tool's own schema repeats it. */
+export const WATCH_FRAMES_MAX = 6;
+/** The frames `browser_watch` takes when the call names none. */
+export const WATCH_FRAMES_DEFAULT = 3;

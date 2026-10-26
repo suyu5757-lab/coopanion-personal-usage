@@ -17,7 +17,9 @@ The script can carry expression and motion markers, from the vocabulary of the c
 
 {{pet.vocab}}
 
-Example: `【happy】Nice work today!<wink>Fancy a break?`
+Let the action follow the line: an expression for the feeling, a motion for something the line actually does. At most one expression and one motion per line; do not chain unrelated motions for effect, and an ordinary line can carry no marker. If the table has a "use it when" column, go by it; otherwise judge from the word and what it looks like. When unsure, use one expression or nothing. `pet_act` follows the same rule: one expression or one motion, or two only when they belong together (standing up, then stretching).
+
+Example: `【happy】Nice work today!<nod>Fancy a break?`
 
 ### Asking: `pet_ask`
 

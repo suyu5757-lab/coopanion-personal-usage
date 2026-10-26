@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { BUBBLE_SPEED_MAX, DESKTOP_PET_DEFAULTS } from '../src/config.ts';
 import { figurePacks } from '../src/packs.ts';
-import { estimateSeconds, parseActions as actionsIn, parseScript as scriptIn, vocabId, INLINE_TAG_MAX } from '../src/script.ts';
+import { estimateSeconds, parseActions as actionsIn, parseScript as scriptIn, vocabId, vocabTable, INLINE_TAG_MAX } from '../src/script.ts';
 
 // Coo's words, as the body on screen gives them
 const VOCAB = figurePacks([]).packs.find((p) => p.id === 'coo')!.manifest.vocab;
@@ -45,6 +45,17 @@ describe('vocabulary', () => {
       expect(vocabId(v.id, VOCAB)).toBe(v.id);
       for (const z of Object.values(v.names).flat()) expect(vocabId(z, VOCAB)).toBe(v.id);
     }
+  });
+
+  it('shows when to use a word when the pack says so, and leaves the column out otherwise', () => {
+    const whale = figurePacks([]).packs.find((p) => p.id === 'whale')!.manifest.vocab;
+    const zh = vocabTable(whale, 'zh');
+    const en = vocabTable(whale, 'en');
+    expect(zh).toContain('什么时候用');
+    expect(zh).toContain('无聊、想让人理她');
+    expect(en).toContain('use it when');
+    expect(en).toContain('bored, or wanting attention');
+    expect(vocabTable(VOCAB, 'zh')).not.toContain('什么时候用');
   });
 
   it('parseActions separates known from unknown words', () => {

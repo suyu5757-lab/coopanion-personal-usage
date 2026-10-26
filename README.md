@@ -42,14 +42,19 @@ Coopanion is a desktop pet. **Coo** lives on the bottom edge of your screen: it 
 - **Many model services**: OpenAI, Anthropic, Gemini, xAI, OpenRouter, DeepSeek, Kimi, Qwen, MiniMax, Zhipu GLM, Doubao, Baidu Qianfan and StepFun. Pick one and paste an API key, or sign in with a ChatGPT account to use its ChatGPT plan.
 - **Chat**: hold the talk key and speak, or type; Coo answers in a bubble. Speech is recognized on your machine with FunASR or Whisper, picked by the app language.
 - **Memory**: Coo remembers what you talked about, and knows when you poke it or pat its head. What it knows about you goes in `PARTNER.md` in its workspace, which its prompt includes whole. Every change to the workspace is kept as a version; the Memory page in the advanced mode shows the history. The Windows build carries git; on macOS and Linux git has to be installed.
+- **Growing on her own**: every 7 days, during a quiet moment, she reviews recent experience on her own and may change how she is, how she works or how she talks. She records each change in `SELF.md` in her workspace; edits to the persona `CONSTITUTION.md` take effect in the next session, with every change kept in Git. On by default; change the interval or turn it off in Habits.
 - **Computer use**: clicking buttons, typing, switching windows. Coo asks before it acts.
-- **Time of her own**: when you are not chatting, she may open her own browser window and look around Bilibili, Douyin or elsewhere, and note down what she found. Off by default; turn it on in Habits.
+- **Codex**: an optional local assistant for read-only review, background work, result inspection, cancellation and continuation. Enable it in the advanced World settings and configure allowed directories. See [Codex World](packages/cortico-world-codex/README.md).
+- **opencode**: hand coding work — writing code, fixing bugs, running tests — to opencode on your machine. Coo relays the task and the result; opencode reads, edits and runs commands only in the directories you allow, and asks in a bubble before every change. Off by default; turn it on on the Worlds page in advanced mode.
+- **Time of her own**: when you are not chatting, she may open her own browser window and look around Bilibili, Douyin or elsewhere, note down what she found, and share a video's link with you. On by default; turn it off in Habits.
 - **Activity bubbles**: see when Coo is thinking and what it is working on, with a different animated icon for reading, searching, writing and using the computer. File names appear; the bubble lets clicks through. On by default; turn it off in Habits.
 - **Figures**: Coo, or the **DeepSeek Chan**, a fully animated whale girl with eight vendor color schemes and five outfits (a maid dress, a winter outfit, a crew uniform, workwear and a nightgown). Other figure packs are imported on the Dress up page from a zip or a folder; packs written for figure API 2 keep loading in later versions (see the [figure pack compatibility promise](packages/cortico-world-desktop-pet/README.md#形象包兼容承诺)).
 - **Dress up**: Coo's colors (five of them after Cultist Simulator's principles: Lantern, Grail, Forge, Heart, Winter), hats, earrings, glasses and neckwear, plus its size and how often it walks.
 - **Extensions**: install Worlds such as a QQ bot, a drawing room and small games from the Extensions page.
 
 What changed in each version is in [Releases](https://github.com/suyu5757-lab/coopanion-personal-usage/releases).
+
+Current feature release: **v0.4.0**. This personal release provides Apple silicon Mac installers only; older platform builds remain in Releases. See the [changelog](CHANGELOG.md) and [release notes](docs/releases/v0.4.0.en.md).
 
 ## Install
 
@@ -208,7 +213,7 @@ Ask Coo to set an alarm at a local time or after a number of minutes. Daily alar
 
 ### Time of her own
 
-Turn on **Time of her own** under Behavior on the Habits page. After a stretch without a chat (20 minutes by default, at least 1 minute) she gets time of her own, 20 minutes by default; the browser closes when it ends. Turn on **No limit** next to **At most** and it stays open until she closes it. She has her own browser window with its own logins: the first time Bilibili or Douyin needs a sign-in, she asks in a bubble, and you sign in or scan the code in that window; passwords and verification codes are yours to enter. The window is muted by default; **Browser sound** in the same section turns its sound on.
+**Time of her own** is on by default; turn it off under Behavior on the Habits page if you do not want her going online. After a stretch without a chat (20 minutes by default, at least 1 minute) she gets time of her own, 20 minutes by default; the browser closes when it ends. Turn on **No limit** next to **At most** and it stays open until she closes it. She has her own browser window with its own logins: the first time Bilibili or Douyin needs a sign-in, she asks in a bubble, and you sign in or scan the code in that window; passwords and verification codes are yours to enter. The window is muted by default; **Browser sound** in the same section turns its sound on. When she watches a video she takes a few frames over a short stretch and turns that stretch of sound into text with the local speech model (the one voice input uses); when the model is not ready she gets the frames alone. She can open a video's share panel to copy its link and tell it to you.
 
 She can open pages, search, play videos, scroll and read comments; with **Allow likes, saves, danmaku and comments** on, she can also like, save, follow, send danmaku and comment. She never buys, recharges, tips, spends coins, opens a paid membership, sends private messages or changes the account, and she does not download files or fill in personal details. She only browses while you are not chatting; when you speak, she stops and answers.
 
@@ -226,12 +231,25 @@ Once it is on, Coo looks at the screen without asking, and asks before it first 
 - With several displays, Coo looks at one at a time and moves to another when it needs to.
 - When you touch the mouse or keyboard, whole-screen input stops and waits for you.
 - With [Cua Driver](https://github.com/trycua/cua) installed and allowed Accessibility and Screen Recording, Coo can also work on one window in the background: it captures that window and clicks or types in it without moving your pointer or taking focus, so you can keep using the computer. Background window input does not wait for you to stop.
+- Set `worlds.desktop-pet.cua.backgroundOnly` to `true` in `config.json` to require background window input. Whole-screen input and `pet_cua_focus` are refused; select a window with `pet_cua_window` first. If the driver is unavailable or a window closes, input stays blocked. The default is `false`.
 - Logins, passwords and payments are left to you.
 - One wake makes at most 40 model requests; at the limit the turn ends and you can tell Coo to continue. The limit is on the Cormini page in advanced mode and applies after a restart.
 
 To keep Coo off your computer, untick **Let Coo use this computer** in the Computer use section of the Habits page.
 
 If saving a computer-use change fails, the switches and permission choice return to their last saved values.
+
+### Letting Coo summon opencode
+
+Install and sign in to opencode on your machine (`opencode auth login`), then turn on opencode on the Worlds page in advanced mode. Its settings are in the opencode group in advanced mode:
+
+- `bin`: the opencode executable; `opencode` is enough when it is on `PATH`.
+- `workRoots`: the absolute directories it may work in, one per line, or separated by commas or semicolons. With none set it refuses every task.
+- `askSensitive`: on by default; it asks before writing files, running commands, fetching pages and starting subagents. Leave it on unless you have read the commands.
+
+Then ask Coo for the work, for example "get the tests in this project passing". It confirms the directory, hands the task to opencode and keeps talking to you; a small terminal appears beside Coo and shows boot, work, wait, done and oops. When opencode wants to write a file or run a command, Coo puts the original command and path in a bubble with allow once, allow for this session, or reject. If you do not answer, the task stops by itself. When it ends, opencode hands Coo the summary, changed files and commands; Coo can read the full changes with opencode_review to accept the work, or resume the same session with fixes if it does not pass. One task at a time; say stop to stop it.
+
+opencode uses its own model and login, separate from Coo's. The World never passes `--auto` and never approves anything for you. A task starts only inside `workRoots`.
 
 ### Tray / menu bar
 
@@ -250,7 +268,7 @@ Click the tray icon, or right-click Coo and click the gear. The window opens in 
 | Page          | What is there                                                                                                    |
 | ------------- | ---------------------------------------------------------------------------------------------------------------- |
 | Start         | Connect a model (the connected one and the other model services in one place), show or hide the pet on the desktop, preview the pet, pick the interface colors or edit their palette, rerun the guide. The bottom left says Running / Paused, beside pause / resume and shut down. |
-| Habits        | In sections: General (app language, your name, Coo's name, anonymous usage statistics), Behavior (walking, how Coo responds, what Coo may change by itself, time of her own, hover buttons, double-click to type, typing key, status bubble, input bubbles), Display (size, bubble size, text size, bubble speed, frame rate, hide in full screen on Windows, remember position), Sounds (each kind can be turned off), Speech (bubbles read out syllable by syllable in place of the typing babble; pitch and speed by step or custom), Computer use (on/off, mouse and keyboard, when to ask you, how long a yes lasts), Other (OBS overlay, the context ring on the Chat page, off by default) |
+| Habits        | In sections: General (app language, your name, Coo's name, anonymous usage statistics), Behavior (walking, how Coo responds, what Coo may change by itself, growing on her own, time of her own, hover buttons, double-click to type, typing key, status bubble, input bubbles), Display (size, bubble size, text size, bubble speed, frame rate, hide in full screen on Windows, remember position), Sounds (each kind can be turned off), Speech (bubbles read out syllable by syllable in place of the typing babble; pitch and speed by step or custom), Computer use (on/off, mouse and keyboard, when to ask you, how long a yes lasts), Other (OBS overlay, the context ring on the Chat page, off by default) |
 | Dress up      | Figure (Coo, the DeepSeek Whale or an installed figure pack), colors and accessories; changes apply at once. **Import** at the end of the figure row installs packs from a zip or a folder (up to 128 MB at a time); dropping one on the page works too. Replacing an existing pack requires confirmation. An imported pack can be uninstalled: hover its tile, click the delete button in the corner and confirm; the whole pack is deleted, and the pet wearing it changes back to Coo |
 | Voice input   | On/off, recognizer, model download, talk key, microphone, listening mode                                          |
 | System prompt | Coo's system prompt; the persona is the CONSTITUTION section. The sections form one document; all but CONSTITUTION start folded, and folds last until the app quits. Template variables can be inserted and previewed with their current values; in the advanced mode a World's section links to that World's configuration. Ctrl+S saves to file and **Revert all edits** returns to the last save; **Apply now** saves and updates the current conversation's prompt, keeping its messages; **Clear conversation and restart** saves and clears the current conversation, keeping Memory and persona; **Full prompt preview** unfolds the whole prompt as assembled from the current files |

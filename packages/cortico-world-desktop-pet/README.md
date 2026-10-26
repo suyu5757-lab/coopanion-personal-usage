@@ -242,7 +242,7 @@ Windows 上桌宠窗口从前台窗口拿走键盘，打字框关掉后还回去
 | `model` | 交给工厂的 JSON(`opts.model`),可省 |
 | `axes` | 打扮的维度,每维一组选项(`id`、`name`、`thumb`);装扮页每维一行 |
 | `presets` | 维度组合的命名,可带 `accent` 和设置窗口配色 `console` |
-| `vocab` | 这个身体做的全部表情和动作,也就是它在场时 bot 的整张词表:每个词 `id`、`kind`(`expression` / `motion`)、`names`(按语言的名字列表)、`about`(它做这个词的样子)、`seconds`(连着做时等多久再做下一个),`lasting: true` 表示保持到下一个动作;`kind` 是这一版不认识的值时跳过那个词 |
+| `vocab` | 这个身体做的全部表情和动作,也就是它在场时 bot 的整张词表:每个词 `id`、`kind`(`expression` / `motion`)、`names`(按语言的名字列表)、`about`(它做这个词的样子)、`when`(可选,按语言写什么时候该用这个词;有它时词表多一列「什么时候用」)、`seconds`(连着做时等多久再做下一个),`lasting: true` 表示保持到下一个动作;`kind` 是这一版不认识的值时跳过那个词 |
 | `sounds` | 包自带的音频:名字 → `{ file, kind, volume }`,文件是包里的 `.ogg` `.mp3` `.wav`,`kind` 是 `move` `touch` `face` `snore` 之一;不存在的文件、这一版不认识的 `kind` 或文件类型,在扫描时记一条问题,那个声音不响 |
 | `can` | `{ walk: false }` 表示不会走,`pet_move_to` 拒绝默认目标 |
 | `moves` | 这个包给 `pet_move_to` 加的目标,见下文;可省 |
@@ -384,6 +384,8 @@ Cua Driver 自己画一个 agent 光标。要回到整块屏幕,用 `pet_cua_scr
 
 后台点击靠窗口级事件投递,只接受真实 HID 输入、需要前台焦点或系统拖放会话的窗口可能无效;这时回执会说明,可以改用 `pet_cua_focus` 把窗口带到前台。
 没有安装 Cua Driver 时 `pet_cua_window` 不可用,其余工具和以前一样。
+
+`worlds.desktop-pet.cua.backgroundOnly: true` 限制输入只能发往已选定的后台窗口，同时禁用 `pet_cua_focus`。整屏截图仍可使用，但离开后台目标后必须重新选定窗口才能输入。驱动缺失、调用失败或目标关闭都不会触发前台输入。默认值为 `false`。
 
 ### 什么时候先问
 

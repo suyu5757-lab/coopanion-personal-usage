@@ -373,6 +373,7 @@ export class Cua {
 
   /** The environment prompt's background section: available, or why not. */
   private backgroundPrompt(): string {
+    if (this.cfg.backgroundOnly && this.cfg.control) return this.t.backgroundOnly;
     if (process.platform !== 'darwin') return this.t.backgroundUnsupported;
     if (!this.driver.available()) return this.t.backgroundMissing;
     if (!this.cfg.control) return this.t.backgroundViewOnly;
@@ -720,8 +721,11 @@ export class Cua {
   }
 
   private refuseControl(tool: string): ToolOutcome | null {
-    if (this.cfg.control) return null;
-    return { text: this.t.notRun(tool, this.t.viewOnly), failed: true };
+    if (!this.cfg.control) return { text: this.t.notRun(tool, this.t.viewOnly), failed: true };
+    if (this.cfg.backgroundOnly && (!this.target || tool === 'pet_cua_focus')) {
+      return { text: this.t.notRun(tool, this.t.backgroundOnly), failed: true };
+    }
+    return null;
   }
 
   /**

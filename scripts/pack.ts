@@ -50,12 +50,13 @@ if (PORTABLE && process.platform !== 'win32') {
   process.exit(1);
 }
 const rootPkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) as Record<string, unknown> & { version: string };
-const WORKSPACE = ['cortico-world-desktop-pet', 'cortico-provider-coo'];
+const WORKSPACE = ['cortico-world-desktop-pet', 'cortico-world-opencode', 'cortico-provider-coo', 'cortico-world-codex'];
 /**
  * Runtime dependencies: Core (express, ws, undici for the per-host system proxy), the TypeScript loader, pnpm for extension installs, the updater
  * (app/updater.cjs, not in the portable build) or for Steam steamworks.js (app/steam.cjs), and the workspace packages' own.
  */
 const DEPS: Record<string, string> = {
+  '@vectorize-io/hindsight-client': '^1.1.0',
   express: '^4.22.3', ws: '^8.21.3', undici: '7.29.1', tsx: '^4.23.15', pnpm: '11.28.6',
   ...STEAM ? { 'steamworks.js': '0.4.0' } : PORTABLE ? {} : { 'electron-updater': '^6.8.9' },
 };
@@ -103,7 +104,7 @@ const skip = (base: string) => (src: string) => {
   if (rel[0] === 'extensions') return false;
   // the Steam build's whale comes from the Workshop
   if (STEAM && rel[1] === 'whale' && (rel[0] === 'web' || rel[0] === 'examples')) return false;
-  return !rel.some((p) => ['node_modules', '.git', 'tests', 'scratch'].includes(p));
+  return !rel.some((p) => ['node_modules', '.git', 'test', 'tests', 'scratch'].includes(p));
 };
 
 rmSync(OUT, { recursive: true, force: true });

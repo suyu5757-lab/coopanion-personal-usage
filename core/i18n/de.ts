@@ -20,6 +20,12 @@ const de: Translation<CoreText> = {
       sound: 'Browser-Ton', soundDescription: 'Standardmäßig stumm. Eingeschaltet hört man die Videos, die sie ansieht.',
       actions: 'Likes, Favoriten, Danmaku und Kommentare erlauben', actionsDescription: 'Aus: Sie darf nur zusehen. Anmeldung und Codes bitte selbst in ihrem Browserfenster eingeben.',
     },
+    growth: {
+      title: 'Selbst wachsen',
+      description: 'Von Zeit zu Zeit blickt sie in einer ruhigen Minute auf die letzten Erfahrungen zurück und kann ändern, wie sie ist, arbeitet oder spricht; sie schreibt es in ihr eigenes Wachstumsprotokoll. Änderungen gelten ab der nächsten Sitzung.',
+      every: 'Alle', everyDescription: 'Nach so vielen Tagen blickt sie auf sich zurück.',
+      days: 'Tage',
+    },
   },
 
   failure: {
@@ -72,7 +78,7 @@ const de: Translation<CoreText> = {
       forge: { label: 'Zuverlässig und tüchtig', line: "Was gibt's zu tun? Überlass das mir, dauert nicht lange. Coo." },
       heart: { label: 'Lebhaft und immer da', line: 'Da bin ich! Ich leiste dir den ganzen Tag Gesellschaft. Coo!' },
       winter: { label: 'Still und wortkarg', line: '...Mm. Coo.' },
-      whale: { label: 'DeepSeek Chan', line: 'Willkommen zurück! Was ist das? Lass mal sehen. Coo...' },
+      whale: { label: 'DeepSeek Chan', line: 'Hmpf, da bist du ja. ...I-ich habe nicht auf dich gewartet oder so. Coo...' },
     },
     dressHint: { text: 'Die Farben kannst du unter Outfit ändern', dress: 'Outfit' },
     askRoam: 'Soll ich meistens ruhig oder lebhaft sein? Klick eine Karte an, um zu sehen, was ich dann mache.',

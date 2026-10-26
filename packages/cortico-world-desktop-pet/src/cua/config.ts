@@ -18,6 +18,8 @@ export interface CuaConfig {
   enabled: boolean;
   /** false: screenshots and the window list only; every input tool fails with that reason. */
   control: boolean;
+  /** Refuse whole-screen input and focusing windows; input requires a Cua Driver window target. */
+  backgroundOnly: boolean;
   /** See PERMISSION_LEVELS. */
   permission: PermissionLevel;
   /** ask-once: how long a yes holds. */
@@ -43,6 +45,7 @@ export interface CuaConfig {
 export const CUA_DEFAULTS: CuaConfig = {
   enabled: false,
   control: true,
+  backgroundOnly: false,
   permission: 'ask-once',
   grantMinutes: 30,
   screenshot: { maxWidth: 1280, maxHeight: 800, quality: 75, afterAction: true, settleMs: 500 },
@@ -65,6 +68,7 @@ export function cuaConfigGroup(language: Language = 'zh'): ConfigGroup {
       properties: {
         [`${K}.enabled`]: { type: 'boolean', title: c.enabled.title, 'x-hot': true },
         [`${K}.control`]: { type: 'boolean', title: c.control.title, description: c.control.description, 'x-hot': true },
+        [`${K}.backgroundOnly`]: { type: 'boolean', title: c.backgroundOnly.title, description: c.backgroundOnly.description, 'x-hot': true },
         [`${K}.permission`]: { type: 'string', title: c.permission.title, enum: [...PERMISSION_LEVELS], 'x-hot': true, description: c.permission.description },
         [`${K}.grantMinutes`]: { type: 'integer', title: c.grantMinutes.title, minimum: 1, maximum: 1440, 'x-suffix': c.grantMinutes.suffix, description: c.grantMinutes.description, 'x-hot': true },
         [`${K}.userIdleMs`]: { type: 'integer', title: c.userIdleMs.title, minimum: 0, maximum: 30000, 'x-suffix': 'ms', description: c.userIdleMs.description, 'x-hot': true },

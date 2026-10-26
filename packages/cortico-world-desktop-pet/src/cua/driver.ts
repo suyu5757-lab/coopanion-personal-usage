@@ -194,9 +194,10 @@ function failureFrom(err: unknown): DriverFailure {
     raw = null;
   }
   const nested = raw?.error && typeof raw.error === 'object' ? raw.error as Record<string, unknown> : raw;
-  const message = String(nested?.summary ?? nested?.message ?? nested?.hint ?? raw?.summary ?? raw?.message ?? e.stderr ?? e.message ?? 'Cua Driver failed').trim();
+  const message = [nested?.summary, nested?.message, nested?.hint, raw?.summary, raw?.message, e.stderr, e.message]
+    .find((value) => typeof value === 'string' && value.trim()) as string | undefined;
   const code = String(nested?.error_code ?? nested?.code ?? raw?.error_code ?? e.code ?? 'driver_failed');
-  return new DriverFailure(code, message);
+  return new DriverFailure(code, message?.trim() || 'Cua Driver failed');
 }
 
 function actionFrom(raw: Record<string, unknown>): DriverAction {
@@ -344,6 +345,8 @@ export class CuaDriver implements CuaDriverLike {
   private async call<T>(tool: string, args: Record<string, unknown>, opts: { signal?: AbortSignal; screenshotFile?: string } = {}): Promise<T> {
     try {
       const bin = await this.ensure(opts.signal);
+      // CLI session labels expire after inactivity; ordinary actions cannot reopen them.
+      await runFile(bin, ['call', 'start_session', JSON.stringify({ session: this.session })], { timeout: DRIVER_TIMEOUT_MS, signal: opts.signal });
       const argv = ['call', tool, JSON.stringify({ session: this.session, ...args })];
       if (opts.screenshotFile) argv.push('--screenshot-out-file', opts.screenshotFile);
       const { stdout } = await runFile(bin, argv, { timeout: DRIVER_TIMEOUT_MS, signal: opts.signal });

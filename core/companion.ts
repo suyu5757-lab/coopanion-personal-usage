@@ -61,6 +61,8 @@ import { withWorlds, type WorldDefinition, type WorldSection } from 'cortico/wor
 import { InstanceLockedError } from 'cortico/core/instance-lock.ts';
 import { CONSOLE } from 'cortico/worlds/console/definition.ts';
 import { desktopPetDefinition, figurePacks, type DesktopPetWorld } from 'cortico-world-desktop-pet';
+import CODEX from 'cortico-world-codex';
+import { opencodeDefinition } from 'cortico-world-opencode';
 import COO, { CHATGPT, CHATGPT_PROVIDER, signedIn, usageLimited, vendorOf } from 'cortico-provider-coo';
 import { appWebUiAsset, bundledWebUiAssets } from './bundled-panels.ts';
 import { followPetLook } from './console-theme.ts';
@@ -69,6 +71,7 @@ import { NOTICE_ID, noticeDefinition, type NoticeWorld } from './notice.ts';
 import { browserDefinition, BROWSER_ID } from './browser/definition.ts';
 import { BrowserBridge } from './browser/bridge.ts';
 import { readSelfTime, SELF_TIME_DEFAULTS } from './browser/config.ts';
+import { GROWTH_DEFAULTS, readGrowth } from './growth/config.ts';
 import { coreText } from './i18n/index.ts';
 import { petToolDescriber } from './pet-status.ts';
 import { appLanguage, modelLanguage, replyLanguage } from './language.ts';
@@ -156,6 +159,8 @@ function companionGroup(language: Language): ConfigGroup {
         'companion.selfTime.sessionUnlimited': { type: 'boolean', title: s.selfTime.unlimited, description: s.selfTime.unlimitedDescription, 'x-hot': true },
         'companion.selfTime.sound': { type: 'boolean', title: s.selfTime.sound, description: s.selfTime.soundDescription, 'x-hot': true },
         'companion.selfTime.actions': { type: 'boolean', title: s.selfTime.actions, description: s.selfTime.actionsDescription, 'x-hot': true },
+        'companion.growth.enabled': { type: 'boolean', title: s.growth.title, description: s.growth.description, 'x-hot': true },
+        'companion.growth.everyDays': { type: 'integer', title: s.growth.every, minimum: 1, maximum: 60, 'x-suffix': s.growth.days, description: s.growth.everyDescription, 'x-hot': true },
       },
     },
   };
@@ -499,6 +504,10 @@ export async function main(): Promise<void> {
     memory: longTerm,
     selfTime: () => readSelfTime(config),
     modelLanguage: () => modelLanguage(config?.language),
+    growth: () => readGrowth(config),
+    growthStateFile: join(deployDir, 'growth.json'),
+    paused: () => core?.bus.isPaused() === true,
+    timezone: () => config?.timezone ?? 'UTC',
   });
   /** Coo's Persona, once the bot is built. */
   let coo: CoopanionPersona | null = null;
@@ -523,7 +532,7 @@ export async function main(): Promise<void> {
       // e2e harnesses give their persona
       rounds: { soft: 20, hard: 40 },
       context: { ...base.definition.defaults().context, maxTokens: 128_000, keepRatio: 0.25 },
-      companion: { telemetry: true, contextRing: false, selfTime: { ...SELF_TIME_DEFAULTS } },
+      companion: { telemetry: true, contextRing: false, selfTime: { ...SELF_TIME_DEFAULTS }, growth: { ...GROWTH_DEFAULTS } },
     }),
     // Cormini's own build with Coo's Persona class; the workspace is snapshotted before Coo can write to it
     build: (loaded, worlds) => {
@@ -561,7 +570,7 @@ export async function main(): Promise<void> {
       return {
         persona,
         onStart: () => persona.startRhythm(),
-        onStop: () => persona.stopRhythm(),
+        onStop: () => { persona.stopRhythm(); persona.stopGrowth(); },
         webUi: {
           configGroups: [base.contextGroup, settingsGroup, hindsightGroup],
           status: () => ({ context: { maxTokens: cfg.context.maxTokens, softRatio: cfg.context.softRatio } }),
@@ -575,9 +584,17 @@ export async function main(): Promise<void> {
     selfTime: () => readSelfTime(config),
     modelLanguage: () => modelLanguage(config?.language),
     language: () => language(),
+    transcribe: (pcm) => pet
+      ? pet.transcribePcm(pcm)
+      : Promise.resolve({ text: '', error: 'the desktop pet is not running' }),
     onSessionEnd: () => coo?.restartRhythm(),
   });
-  const bundled = [CONSOLE, DESKTOP_PET, NOTICE, BROWSER] as WorldDefinition<WorldSection>[];
+  const OPENCODE = opencodeDefinition({
+    modelLanguage: () => modelLanguage(config?.language),
+    // the avatar beside the pet; the task itself does not depend on the page being connected
+    onState: (state) => pet?.guest(state),
+  });
+  const bundled = [CONSOLE, DESKTOP_PET, NOTICE, BROWSER, OPENCODE, CODEX] as WorldDefinition<WorldSection>[];
 
   // extension providers must be registered before endpoints are resolved
   const extensions = await loadExtensions(repoRoot(), {
@@ -620,6 +637,15 @@ export async function main(): Promise<void> {
     coo?.restartRhythm();
   }, 1000);
   rhythmTimer.unref();
+  // a changed interval or switch re-arms the next self-review without a restart
+  let growth = readGrowth(loaded.config);
+  const growthTimer = setInterval(() => {
+    const next = readGrowth(loaded.config);
+    if (next.enabled === growth.enabled && next.everyDays === growth.everyDays) return;
+    growth = next;
+    coo?.restartGrowth();
+  }, 1000);
+  growthTimer.unref();
   const stats = new Telemetry({
     dir: deployDir,
     version: APP_VERSION,

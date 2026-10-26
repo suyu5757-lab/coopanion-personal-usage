@@ -21,6 +21,8 @@ export interface SpeechStyle {
   /** 音调，如 `+10Hz`。 */
   pitch: string;
   volume: string;
+  /** 当前这句的情绪/表情，由 adapter 换成对应的参考音。 */
+  emotion?: string;
 }
 
 /** 可以随时改的开关；世界每次开口前现写一遍，改配置不用重启。 */
@@ -216,6 +218,7 @@ export class Speaker {
           model: 'gpt-sovits',
           input: text,
           voice: style.voice,
+          emotion: style.emotion ?? '',
           response_format: 'wav',
           sample_rate: 32000,
         }),
@@ -361,6 +364,7 @@ export class Speaker {
           model: 'gpt-sovits',
           input: job.text,
           voice: job.style.voice,
+          emotion: job.style.emotion ?? '',
           response_format: 'wav',
           sample_rate: 32000,
         }),

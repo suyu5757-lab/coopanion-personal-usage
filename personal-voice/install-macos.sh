@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
-# Install the local March 7th GPT-SoVITS voice used by this Coopanion setup.
+# Install the March 7th GPT-SoVITS example voice. The current machine uses the
+# 大肥鱼 voice; running this overwrites its config.
 # Downloads the runtime, base weights and the character pack, then patches
 # the streamvoice extension and enables the voice in companion/config.json.
 set -euo pipefail
+
+if [ "${COOPANION_INSTALL_MARCH7:-}" != "1" ]; then
+  echo "This installs the March 7 example voice and overwrites the current 大肥鱼 config."
+  echo "Set COOPANION_INSTALL_MARCH7=1 to continue."
+  exit 1
+fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUPPORT="${COOPANION_SUPPORT:-$HOME/Library/Application Support/Coopanion}"
@@ -164,5 +171,5 @@ fi
 
 say "完成"
 echo "测试：curl -s http://127.0.0.1:9881/health"
-echo "重启 Coopanion 后，桌宠会使用三月七的本地语音。"
+echo "重启 Coopanion 后，桌宠会使用示例的三月七语音。当前机器已改用大肥鱼，不要重跑本脚本。"
 echo "streamvoice 更新后补丁会被覆盖，重跑：python3 $HERE/patch-streamvoice.py"

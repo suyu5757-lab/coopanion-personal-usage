@@ -20,6 +20,12 @@ const es419: Translation<CoreText> = {
       sound: 'Sonido del navegador', soundDescription: 'Silenciado por defecto. Al activarlo, se oyen los videos que mira.',
       actions: 'Permitir me gusta, guardados, danmaku y comentarios', actionsDescription: 'Desactivado, solo puede mirar. Inicia sesión y resuelve los códigos en su ventana tú mismo.',
     },
+    growth: {
+      title: 'Crecer por su cuenta',
+      description: 'Cada cierto tiempo, en un momento tranquilo, repasa las experiencias recientes y puede cambiar cómo es, cómo trabaja o cómo habla; lo escribe en su propio diario de crecimiento. Los cambios se aplican en la siguiente sesión.',
+      every: 'Cada', everyDescription: 'Vuelve sobre sí misma después de estos días.',
+      days: 'días',
+    },
   },
 
   failure: {
@@ -72,7 +78,7 @@ const es419: Translation<CoreText> = {
       forge: { label: 'Confiable y capaz', line: '¿Qué hay que hacer? Déjamelo a mí, no tardo. Coo.' },
       heart: { label: 'Alegre y compañero', line: '¡Ya llegué! Hoy te acompaño todo el día. Coo!' },
       winter: { label: 'Tranquilo y callado', line: '...Mm. Coo.' },
-      whale: { label: 'DeepSeek Chan', line: '¡Qué bueno que volviste! ¿Qué es eso? Déjame ver. Coo...' },
+      whale: { label: 'DeepSeek Chan', line: 'Hmph, ya volviste. ...N-no es que te estuviera esperando, Coo...' },
     },
     dressHint: { text: 'Los colores se cambian en Vestuario', dress: 'Vestuario' },
     askRoam: '¿La mayor parte del tiempo me quedo en calma o me muevo mucho? Haz clic en una opción para ver qué haría.',

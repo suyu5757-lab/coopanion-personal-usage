@@ -80,6 +80,18 @@ describe('system proxy in the Core runtime', () => {
     closing.push(() => rmSync(dir, { recursive: true, force: true }));
     const script = join(dir, 'core.mjs');
     writeFileSync(script, `
+      // Reserved fixture hosts fail locally, including on machines with a system DNS proxy.
+      const dns = (await import('node:dns')).default;
+      const originalLookup = dns.lookup;
+      dns.lookup = (hostname, options, callback) => {
+        if (hostname === 'model.test' || hostname === 'download.test') {
+          const done = typeof options === 'function' ? options : callback;
+          queueMicrotask(() => done(Object.assign(new Error('fixture host does not resolve'), { code: 'ENOTFOUND' })));
+          return;
+        }
+        return originalLookup(hostname, options, callback);
+      };
+      (await import('node:module')).syncBuiltinESMExports();
       const { SystemProxy, askAppProcess, installSystemProxy } = await import(${JSON.stringify(pathToFileURL(join(process.cwd(), 'core', 'system-proxy.ts')).href)});
       await installSystemProxy(new SystemProxy(askAppProcess(), () => {}, 200), 200);
       const http = await import('node:http');

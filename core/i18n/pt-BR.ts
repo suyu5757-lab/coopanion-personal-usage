@@ -20,6 +20,12 @@ const ptBR: Translation<CoreText> = {
       sound: 'Som do navegador', soundDescription: 'Mudo por padrão. Ligado, os vídeos que ela assiste têm som.',
       actions: 'Permitir curtidas, salvos, danmaku e comentários', actionsDescription: 'Desligado, ela só pode olhar. Entre e resolva os códigos na janela dela você mesmo.',
     },
+    growth: {
+      title: 'Crescer sozinha',
+      description: 'De tempos em tempos, num momento tranquilo, ela revê as experiências recentes e pode mudar como é, como trabalha ou como fala; ela escreve isso no próprio diário de crescimento. As mudanças valem a partir da próxima sessão.',
+      every: 'A cada', everyDescription: 'Ela revê a si mesma depois destes dias.',
+      days: 'dias',
+    },
   },
 
   failure: {
@@ -72,7 +78,7 @@ const ptBR: Translation<CoreText> = {
       forge: { label: 'Confiável e eficiente', line: 'O que precisa fazer? Deixa comigo, é rapidinho. Coo.' },
       heart: { label: 'Animado e companheiro', line: 'Cheguei! Vou te fazer companhia o dia todo. Coo!' },
       winter: { label: 'Quieto e calado', line: '...Hm. Coo.' },
-      whale: { label: 'DeepSeek Chan', line: 'Que bom que você voltou! O que é isso? Deixa eu ver. Coo...' },
+      whale: { label: 'DeepSeek Chan', line: 'Hmph, você voltou. ...N-não é como se eu estivesse te esperando, Coo...' },
     },
     dressHint: { text: 'As cores podem ser trocadas no Guarda-roupa', dress: 'Guarda-roupa' },
     askRoam: 'Na maior parte do tempo eu fico na minha ou corro pra todo lado? Clique em uma opção para ver o que eu faria.',

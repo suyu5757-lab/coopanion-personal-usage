@@ -28,6 +28,7 @@ const it: Translation<CuaText> = {
   },
 
   config: {
+    backgroundOnly: {"title": "Usa solo finestre in secondo piano", "description": "Richiede una finestra Cua Driver prima di inserire dati. Rifiuta input a schermo intero e focus in primo piano; si arresta se il driver fallisce."},
     group: 'Controllo del computer',
     enabled: { title: 'Attiva il controllo del computer' },
     control: { title: 'Consenti mouse e tastiera', description: "Se disattivato, solo screenshot ed elenco delle finestre." },

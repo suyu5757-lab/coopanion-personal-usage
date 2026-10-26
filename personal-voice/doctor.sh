@@ -50,6 +50,9 @@ else
   log "streamvoice 未安装或补丁文件缺失，跳过补丁检查"
 fi
 
-[ -f "$VOICE/gpt-sovits/ref/march7.wav" ] || log "缺少参考音频，请运行 personal-voice/install-macos.sh"
-[ -f "$VOICE/gpt-sovits/repo/GPT_SoVITS/pretrained_models/march7/march7-e10.ckpt" ] \
-  || log "缺少三月七权重，请运行 personal-voice/install-macos.sh"
+[ -f "$VOICE/gpt-sovits/ref/da-fei-yu/neutral.wav" ] || log "缺少中性参考音频"
+[ -f "$VOICE/gpt-sovits/ref/da-fei-yu/angry.wav" ] || log "缺少生气参考音频"
+[ -f "$VOICE/gpt-sovits/repo/GPT_SoVITS/pretrained_models/da-fei-yu-v1/da-fei-yu_e10_s390.pth" ] \
+  || log "缺少大肥鱼 SoVITS 权重 da-fei-yu_e10_s390.pth"
+[ -f "$VOICE/gpt-sovits/repo/GPT_SoVITS/pretrained_models/s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt" ] \
+  || log "缺少 v1 GPT 底模"

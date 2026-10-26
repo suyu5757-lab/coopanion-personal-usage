@@ -19,7 +19,7 @@ describe('figure packs', () => {
   it('reads the built-in Coo and whale', () => {
     const { packs, problems } = figurePacks([]);
     expect(problems).toEqual([]);
-    expect(packs.map((p) => p.id)).toEqual(['coo', 'whale']);
+    expect(packs.map((p) => p.id)).toEqual(['coo', 'whale', 'opencode']);
   });
 
   it('gives the whale a tail whip by every name she answers to', () => {
@@ -75,7 +75,7 @@ describe('figure packs', () => {
     const builtin = BUILTIN_PACKS.map((b) => (b.base === '/web/whale/' ? { ...b, dir: join(root, 'not-shipped') } : b));
     const { packs, problems } = scanPacks(builtin, [root]);
     expect(problems).toEqual([]);
-    expect(packs.map((p) => [p.id, p.builtin, p.base])).toEqual([['coo', true, '/web/coo/'], ['whale', false, '/packs/whale/']]);
+    expect(packs.map((p) => [p.id, p.builtin, p.base])).toEqual([['coo', true, '/web/coo/'], ['opencode', true, '/web/opencode/'], ['whale', false, '/packs/whale/']]);
   });
 
   it('refuses a word name a script could never write: a marker\'s separator in it, longer than an inline marker, or naming two words', () => {
