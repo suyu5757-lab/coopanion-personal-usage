@@ -11,8 +11,8 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Pal-AI-Lab/Coopanion/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/Pal-AI-Lab/Coopanion?color=00a870"></a>
-  <a href="https://github.com/Pal-AI-Lab/Coopanion/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Pal-AI-Lab/Coopanion/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/suyu5757-lab/coopanion-personal-usage/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/suyu5757-lab/coopanion-personal-usage?color=00a870"></a>
+  <a href="https://github.com/suyu5757-lab/coopanion-personal-usage/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/suyu5757-lab/coopanion-personal-usage/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="Windows 10 / 11" src="https://img.shields.io/badge/Windows-10%20%2F%2011-1f6feb">
   <img alt="macOS 13+" src="https://img.shields.io/badge/macOS-13%2B-1f6feb">
   <img alt="Linux x64" src="https://img.shields.io/badge/Linux-x64-1f6feb">
@@ -25,7 +25,7 @@
   <a href="#快速上手">快速上手</a> ｜
   <a href="#日常使用">日常使用</a> ｜
   <a href="#常见问题">常见问题</a> ｜
-  <a href="https://github.com/Pal-AI-Lab/Coopanion/releases">更新记录</a> ｜
+  <a href="https://github.com/suyu5757-lab/coopanion-personal-usage/releases">更新记录</a> ｜
   <a href="docs/DEVELOPMENT.md">参与开发</a>
 </p>
 
@@ -45,11 +45,11 @@ Coopanion 是一个桌宠。桌宠 **Coo** 待在屏幕底边，可以用气泡�
 - **操作电脑**：点按钮、打字、切窗口。动手前先问你。
 - **自己的时间**：没聊天时她自己打开一个独立的浏览器窗口,去 B站、抖音或别处逛逛、看视频,可以自己记进工作区。默认关闭,在「习惯」里打开。
 - **状态气泡**：想事情、看文件、搜索、写入、操作电脑时，头顶用各不相同的小图标和动画显示在做什么，也会显示文件名；气泡点击穿透。默认开启，可在「习惯」关闭。
-- **形象**：Coo，或者 **DeepSeek 大肥鱼**（全动态的鲸鱼娘，八套厂商配色，女仆装、冬装和店员装三套服装）。其他形象包在装扮页从 zip 或文件夹导入；按形象 API 2 写的包在之后的版本里照常加载（见[形象包兼容承诺](packages/cortico-world-desktop-pet/README.md#形象包兼容承诺)）。
+- **形象**：Coo，或者 **DeepSeek 大肥鱼**（全动态的鲸鱼娘，八套厂商配色，女仆装、冬装、店员装、工装和睡裙五套服装）。其他形象包在装扮页从 zip 或文件夹导入；按形象 API 2 写的包在之后的版本里照常加载（见[形象包兼容承诺](packages/cortico-world-desktop-pet/README.md#形象包兼容承诺)）。
 - **装扮**：Coo 的配色（含灯、杯、铸、心、冬五种「性相」配色）、帽子、耳饰、眼镜、颈饰，以及大小和走动频率。
 - **扩展**：在扩展页安装 QQ 机器人、画室、小游戏等 World。
 
-每个版本的改动见 [Releases](https://github.com/Pal-AI-Lab/Coopanion/releases)。
+每个版本的改动见 [Releases](https://github.com/suyu5757-lab/coopanion-personal-usage/releases)。
 
 ## 安装
 
@@ -63,7 +63,7 @@ Coopanion 是一个桌宠。桌宠 **Coo** 待在屏幕底边，可以用气泡�
 
 ### Windows：下载安装包
 
-1. 打开[最新发布](https://github.com/Pal-AI-Lab/Coopanion/releases/latest)，下载 `Coopanion-Setup-版本号.exe`。
+1. 打开[最新发布](https://github.com/suyu5757-lab/coopanion-personal-usage/releases/latest)，下载 `Coopanion-Setup-版本号.exe`。
 2. 双击运行，安装界面跟随系统语言。安装包没有数字签名，Windows 可能弹出「Windows 已保护你的电脑」，点 **更多信息** → **仍要运行**。
 3. 选安装位置（默认 `C:\Users\你的用户名\Coopanion`），点安装。装好后自动启动，桌面上有图标。
 
@@ -75,7 +75,7 @@ Coopanion 是一个桌宠。桌宠 **Coo** 待在屏幕底边，可以用气泡�
 打开 PowerShell，粘贴下面这行并回车：
 
 ```powershell
-irm https://raw.githubusercontent.com/Pal-AI-Lab/Coopanion/main/installer/install.ps1 | iex
+irm https://raw.githubusercontent.com/suyu5757-lab/coopanion-personal-usage/main/installer/install.ps1 | iex
 ```
 
 它会下载最新的安装包并运行，装完删掉下载的文件。
@@ -86,7 +86,7 @@ irm https://raw.githubusercontent.com/Pal-AI-Lab/Coopanion/main/installer/instal
 
 不想安装、要放在移动硬盘里，或者想同时养几只，用便携版：
 
-1. 在[最新发布](https://github.com/Pal-AI-Lab/Coopanion/releases/latest)下载 `Coopanion-版本号-win-x64-portable.zip`，解压到任意文件夹。
+1. 在[最新发布](https://github.com/suyu5757-lab/coopanion-personal-usage/releases/latest)下载 `Coopanion-版本号-win-x64-portable.zip`，解压到任意文件夹。
 2. 运行文件夹里的 `Coopanion.exe`。
 
 便携版的数据在这个文件夹的 `data` 里，除了你打开「开机自动启动」时写的启动项，不往系统里写东西。把整个文件夹复制一份就是另一只，记忆和设置各管各的。同时最多开 5 只（安装版和便携版加在一起），再开时会提示端口都被占用。
@@ -95,7 +95,7 @@ irm https://raw.githubusercontent.com/Pal-AI-Lab/Coopanion/main/installer/instal
 
 ### macOS
 
-1. 打开[最新发布](https://github.com/Pal-AI-Lab/Coopanion/releases/latest)。Apple 芯片下载 `Coopanion-版本号-mac-arm64.dmg`，Intel 下载 `…-mac-x64.dmg`。
+1. 打开[最新发布](https://github.com/suyu5757-lab/coopanion-personal-usage/releases/latest)。Apple 芯片下载 `Coopanion-版本号-mac-arm64.dmg`，Intel 下载 `…-mac-x64.dmg`。
    不确定是哪种：苹果菜单 →「关于本机」，「芯片」一栏写 Apple M 系列就是 Apple 芯片。
 2. 双击 dmg，把 Coopanion 拖进「应用程序」。
 3. 应用没有 Apple 开发者签名，第一次打开会被拦下：先双击打开一次，在提示里点「完成」；再到「系统设置 → 隐私与安全性」，页面底部点「仍要打开」并输入密码。之后就能正常打开。
@@ -106,7 +106,7 @@ irm https://raw.githubusercontent.com/Pal-AI-Lab/Coopanion/main/installer/instal
 
 ### Linux
 
-1. 打开[最新发布](https://github.com/Pal-AI-Lab/Coopanion/releases/latest)，下载 `Coopanion-版本号-linux-x64.deb`（Debian / Ubuntu）或 `Coopanion-版本号-linux-x64.AppImage`（其他发行版）。
+1. 打开[最新发布](https://github.com/suyu5757-lab/coopanion-personal-usage/releases/latest)，下载 `Coopanion-版本号-linux-x64.deb`（Debian / Ubuntu）或 `Coopanion-版本号-linux-x64.AppImage`（其他发行版）。
 2. deb：`sudo apt install ./Coopanion-版本号-linux-x64.deb`，然后从应用菜单打开。
    AppImage：`chmod +x Coopanion-*.AppImage` 后运行。Ubuntu 22.04 及以后要先装 `libfuse2`（`sudo apt install libfuse2t64`）。
 3. 桌宠是透明置顶窗口，需要桌面开启窗口合成（GNOME、KDE 默认开启）。Wayland 下通过 XWayland 运行。
@@ -197,7 +197,7 @@ irm https://raw.githubusercontent.com/Pal-AI-Lab/Coopanion/main/installer/instal
 ### 和 Coo 互动
 
 - **点一下**是戳它，**在头上来回划**是摸头，**按住拖动**是拎起来，松手可以甩出去。默认戳它会让它回应，摸头和拎起只在下次它说话时一并告诉它。在「习惯」页的「回应模式」里可以改：安静是互动都先记着、和它说话时一起回应，积极是所有互动都回应，自定义…可以勾选哪些互动让它马上回应。
-- **表情和动作**：Coo 说话时会配上表情和动作。表情有开心、眨眼、喜欢、害羞、惊讶、生气、难过、犯困、思考、得意、嘟嘴、担心、认真、慌张、害怕、期待（星星眼）、大哭、疑惑；动作有点头、摇头、张望、转身、转圈、跳、坐下、睡觉、招手、鞠躬、发抖、扑腾、甩尾巴、跳舞等。换成大肥鱼时，点头和摇头是真的低头、转脸，招手举起靠近你的那只手，鞠躬时上身往前倾，甩尾巴会把尾鳍高高扬起再拍下来、溅起水花。
+- **表情和动作**：Coo 说话时会配上表情和动作。表情有开心、眨眼、喜欢、害羞、惊讶、生气、难过、犯困、思考、得意、嘟嘴、担心、认真、慌张、害怕、期待（星星眼）、大哭、疑惑；动作有点头、摇头、张望、转身、转圈、跳、坐下、睡觉、招手、鞠躬、发抖、扑腾、甩尾巴、跳舞等。换成大肥鱼时，点头和摇头是真的低头、转脸，招手举起靠近你的那只手，鞠躬时上身往前倾，甩尾巴会把尾鳍高高扬起再拍下来、溅起水花。她还有捂脸偷看、喷水、抱尾巴、游泳、抖水、吹泡泡、飘浮、蹲着画圈、敲屏幕、探头、伸懒腰、装死、拍尾鼓掌和打喷嚏十四个自己的动作。
 - **右键**打开菜单：暂停 / 继续、设置、退出，以及打字、语音输入、夜间模式、音效、隐藏、装扮。
 - **悬停按钮**：鼠标停在 Coo 身上时旁边的按钮，默认是打字和语音，在「习惯」页最多可选六个。
 - **记住位置**：在「习惯」页打开后，下次启动 Coo 回到上次的横向位置。
@@ -206,9 +206,9 @@ irm https://raw.githubusercontent.com/Pal-AI-Lab/Coopanion/main/installer/instal
 
 ### 自己的时间
 
-在「习惯」页的「行为与互动」里打开「自己的时间」。之后只要一段时间没和 Coo 说话（默认 20 分钟），她会得到一段自己的时间，最多 20 分钟；一段结束时浏览器自动关上。她有一个单独的浏览器窗口，登录状态和你的浏览器分开：第一次去 B站、抖音需要登录时，她会在气泡里请你在这个窗口里扫码或登录，密码和验证码由你自己输入。窗口默认静音，可以在同一节打开「浏览器声音」。
+在「习惯」页的「行为与互动」里打开「自己的时间」。之后只要一段时间没和 Coo 说话（默认 20 分钟，最短 1 分钟），她会得到一段自己的时间，默认最多 20 分钟；到时间浏览器自动关上，打开「每次最多」旁边的「不限」后不按时长关闭，她自己关上浏览器才结束。她有一个单独的浏览器窗口，登录状态和你的浏览器分开：第一次去 B站、抖音需要登录时，她会在气泡里请你在这个窗口里扫码或登录，密码和验证码由你自己输入。窗口默认静音，可以在同一节打开「浏览器声音」。
 
-她可以打开网页、搜索、播放视频、滚动和看评论；「允许点赞、收藏和发弹幕」开着时，也可以点赞、收藏、关注、发弹幕和评论。购买、充值、投币、打赏、开通会员、私信和改动账号一律不做，也不下载文件或填写个人信息。她只在你没聊天时自己逛；你一说话，她会停下来回应。
+她可以打开网页、搜索、播放视频、滚动和看评论；「允许点赞、收藏、发送弹幕和评论」开着时，也可以点赞、收藏、关注、发弹幕和评论。购买、充值、投币、打赏、开通会员、私信和改动账号一律不做，也不下载文件或填写个人信息。她只在你没聊天时自己逛；你一说话，她会停下来回应。
 
 ### 让 Coo 操作电脑
 
@@ -222,7 +222,8 @@ irm https://raw.githubusercontent.com/Pal-AI-Lab/Coopanion/main/installer/instal
   - `ask-once`（默认）：看屏幕不问，动手前问一次，之后在「同意有效期」（默认 30 分钟）内不再问；
   - `never-ask`：都不问。
 - 接了几块显示器时，它一次看一块，需要时自己换到别的显示器。
-- 你一动鼠标或键盘，它就停下来等你。
+- 你一动鼠标或键盘，整屏的鼠标键盘操作就停下来等你。
+- 装了 [Cua Driver](https://github.com/trycua/cua) 并给它辅助功能和屏幕录制权限时，Coo 还可以在后台操作一个窗口：它只截那个窗口，在里面点击和打字，不移动你的鼠标、也不抢焦点，你可以同时继续用电脑。后台窗口操作不等你停手。
 - 登录、密码、付款这类步骤交给你自己做。
 - 一次唤醒最多请求模型 40 次，到上限就结束这一轮，要继续就再跟它说。上限在高级模式「Cormini」页修改，重启后生效。
 
@@ -362,13 +363,13 @@ Intel 核显（Mesa 的 iris 驱动）开着快速清屏时，透明窗口里会
 <details>
 <summary><b>想看它在想什么</b></summary>
 
-「对话」页有完整的记录。遇到问题时在这一页点「导出诊断」，把诊断包附在 [Issue](https://github.com/Pal-AI-Lab/Coopanion/issues) 里。
+「对话」页有完整的记录。遇到问题时在这一页点「导出诊断」，把诊断包附在 [Issue](https://github.com/suyu5757-lab/coopanion-personal-usage/issues) 里。
 
 </details>
 
 ## 反馈与参与
 
-- 问题和建议请提 [Issue](https://github.com/Pal-AI-Lab/Coopanion/issues)，写上系统版本、Coopanion 版本和复现步骤。
+- 问题和建议请提 [Issue](https://github.com/suyu5757-lab/coopanion-personal-usage/issues)，写上系统版本、Coopanion 版本和复现步骤。
 - 从源码构建或修改代码见[开发文档](docs/DEVELOPMENT.md)。
 
 ## 致谢

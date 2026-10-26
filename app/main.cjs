@@ -403,7 +403,7 @@ function forward(request, url, origin) {
 }
 
 /** The only remote address the settings page asks: the latest Coopanion release, for the hint under the wordmark. */
-const RELEASE_CHECK = 'https://api.github.com/repos/Pal-AI-Lab/Coopanion/releases/latest';
+const RELEASE_CHECK = 'https://api.github.com/repos/suyu5757-lab/coopanion-personal-usage/releases/latest';
 /** Images of the extension market: package icons and screenshots of the official index, and GitHub avatars. */
 const MARKET_IMAGES = ['https://raw.githubusercontent.com/Pal-AI-Lab/cortico-extensions/', 'https://avatars.githubusercontent.com/'];
 const isLocal = (url) => /^(https?|wss?):\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?\//.test(url);
