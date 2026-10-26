@@ -30,6 +30,20 @@ describe('figure packs', () => {
     expect(vocabId('whip', whale.manifest.vocab)).toBe('tail-whip');
   });
 
+  it('offers the whale\'s fourteen expressive motions to the bot', () => {
+    const whale = figurePacks([]).packs.find((p) => p.id === 'whale')!;
+    const names = [
+      ['peek', '捂脸偷看'], ['spout', '喷水'], ['hug-tail', '抱尾巴'], ['swim', '游泳'],
+      ['shake-off', '抖水'], ['bubbles', '吹泡泡'], ['float', '飘浮'], ['sulk', '蹲着画圈'],
+      ['knock', '敲屏幕'], ['peek-out', '探头'], ['stretch', '伸懒腰'], ['play-dead', '装死'],
+      ['tail-clap', '拍尾鼓掌'], ['sneeze', '打喷嚏'],
+    ];
+    for (const [id, name] of names) {
+      expect(whale.manifest.vocab.find((w) => w.id === id)?.kind).toBe('motion');
+      expect(vocabId(name, whale.manifest.vocab)).toBe(id);
+    }
+  });
+
   it('refuses a pack whose files lie outside it', () => {
     expect(readManifest(pack({ ...base, entry: '../../web/pet-app.js' }))).toMatch(/entry/);
     expect(readManifest(pack({ ...base, model: 'C:/secrets.json' }))).toMatch(/model/);
