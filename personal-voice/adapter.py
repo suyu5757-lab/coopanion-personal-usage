@@ -35,6 +35,7 @@ def gpt_sovits_speech(text, speed):
         "media_type": "wav",
         "streaming_mode": False,
         "speed_factor": float(speed if speed is not None else cfg.get("speed_factor", 1.0)),
+        "temperature": float(cfg.get("temperature", 1.0)),
     }
     req = urllib.request.Request(
         cfg.get("gpt_sovits_url", "http://127.0.0.1:9880").rstrip("/") + "/tts",
