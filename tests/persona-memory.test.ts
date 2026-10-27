@@ -25,6 +25,7 @@ function personaWith() {
   const retainTouch = vi.fn();
   const retainAffinityChange = vi.fn();
   const forgetDocument = vi.fn(async () => ({ local: 1, deleted: 0, pending: 0, failed: 0 }));
+  const forgetMostRecent = vi.fn(async () => null);
   const recallForTurn = vi.fn(async () => ({ text: '[memory] you like tea', route: 'standard' as const, found: true }));
   const sessionBriefing = vi.fn(async () => ({ text: '[memory] portrait', source: 'mental-models' as const }));
   const clearMemory = vi.fn(async () => 'long-term memory cleared');
@@ -35,6 +36,7 @@ function personaWith() {
     retainTouch,
     retainAffinityChange,
     forgetDocument,
+    forgetMostRecent,
     recallForTurn,
     sessionBriefing,
     clear: clearMemory,
@@ -45,7 +47,7 @@ function personaWith() {
     injectInternal: (text: string, kind: string) => calls.push(`${kind}:${text}`),
     injectDeferred: (_kind: string, render: () => string | null | Promise<string | null>) => deferred.push(render),
   } as never;
-  return { p, calls, deferred, retainUser, retainTouch, retainAffinityChange, forgetDocument, recallForTurn, clearMemory };
+  return { p, calls, deferred, retainUser, retainTouch, retainAffinityChange, forgetDocument, forgetMostRecent, recallForTurn, clearMemory };
 }
 
 describe('Coo with long-term memory and the affinity extension', () => {
@@ -76,6 +78,13 @@ describe('Coo with long-term memory and the affinity extension', () => {
     expect(retainUser).toHaveBeenCalledTimes(1);
     expect(forgetDocument).toHaveBeenCalledWith('user:main:1:hash');
     expect(recallForTurn).not.toHaveBeenCalled();
+  });
+
+  it('forgets the newest line from the durable queue when the app restarted since it was said', async () => {
+    const { p, forgetMostRecent, retainUser } = personaWith();
+    await p.onDelivery({ events: [event({ cursor: 1, meta: { text: '不要记这件事' } })] });
+    expect(retainUser).not.toHaveBeenCalled();
+    expect(forgetMostRecent).toHaveBeenCalledWith('main', expect.any(Date));
   });
 
   it('injects the portrait at session start', async () => {
