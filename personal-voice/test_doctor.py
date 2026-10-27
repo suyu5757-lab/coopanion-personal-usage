@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import plistlib
 from pathlib import Path
 import shutil
 import subprocess
@@ -71,14 +72,14 @@ class DoctorTests(unittest.TestCase):
             },
         }), encoding="utf-8")
 
-    def run_doctor(self, *args, env=None):
+    def run_doctor(self, *args, env=None, no_restart=True):
         env = dict(os.environ, **(env or {}))
         env.setdefault("COOPANION_SUPPORT", str(self.support))
         env.setdefault("COOPANION_TTS_CONFIG", str(self.config))
         env.setdefault("COOPANION_STREAMVOICE_SRC", str(self.src))
         env.setdefault("COOPANION_GPT_URL", "http://127.0.0.1:1")
         env.setdefault("COOPANION_ADAPTER_URL", "http://127.0.0.1:1")
-        env["COOPANION_DOCTOR_NO_RESTART"] = "1"
+        env["COOPANION_DOCTOR_NO_RESTART"] = "1" if no_restart else "0"
         return subprocess.run(["bash", str(DOCTOR), *args], capture_output=True, text=True, env=env)
 
     def test_check_reports_and_changes_nothing(self):
@@ -92,6 +93,24 @@ class DoctorTests(unittest.TestCase):
         self.assertFalse((self.src / "speech-plan.ts").exists())
         self.assertFalse(list(self.support.glob("patch-transactions/*.json")))
         self.assertFalse(list(self.src.glob("*.bak-*")))
+
+    def test_default_invocation_is_read_only(self):
+        before = {name: digest(self.src / name) for name in ("clean.ts", "chunker.ts", "speaker.ts", "world.ts")}
+        result = self.run_doctor()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("补丁状态：clean", result.stdout)
+        self.assertEqual({name: digest(self.src / name) for name in before}, before)
+        self.assertFalse((self.src / "speech-plan.ts").exists())
+        self.assertFalse(list(self.support.glob("patch-transactions/*.json")))
+
+    def test_scheduled_doctor_does_not_enable_repair(self):
+        path = HERE / "launchagents/ai.coopanion.voice-doctor.plist.in"
+        config = plistlib.loads(path.read_bytes())
+        args = config["ProgramArguments"]
+        self.assertEqual(args[:2], ["/bin/bash", "__HOME__/Library/Application Support/Coopanion/tts/doctor.sh"])
+        self.assertNotIn("--repair", args)
+        self.assertTrue(config["RunAtLoad"])
+        self.assertEqual(config["StartInterval"], 300)
 
     def test_reports_an_engine_stuck_in_unknown_instead_of_restarting_it(self):
         import threading
@@ -115,6 +134,41 @@ class DoctorTests(unittest.TestCase):
         self.addCleanup(server.shutdown)
         result = self.run_doctor("--check", env={"COOPANION_ADAPTER_URL": "http://127.0.0.1:%d" % server.server_port})
         self.assertIn("引擎状态未知", result.stdout)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        calls = self.root / "service-calls.log"
+        pgrep_marker = self.root / "pgrep-once"
+        launchctl = bin_dir / "launchctl"
+        launchctl.write_text("#!/bin/sh\nprintf 'launchctl %s\\n' \"$*\" >> \"$VOICE_DOCTOR_CALL_LOG\"\nexit 0\n")
+        launchctl.chmod(0o755)
+        pgrep = bin_dir / "pgrep"
+        pgrep.write_text(
+            "#!/bin/sh\nprintf 'pgrep %s\\n' \"$*\" >> \"$VOICE_DOCTOR_CALL_LOG\"\n"
+            "if [ ! -e \"$VOICE_DOCTOR_PGREP_MARKER\" ]; then : > \"$VOICE_DOCTOR_PGREP_MARKER\"; exit 0; fi\n"
+            "exit 1\n"
+        )
+        pgrep.chmod(0o755)
+        for name in ("osascript", "open"):
+            command = bin_dir / name
+            command.write_text(f"#!/bin/sh\nprintf '{name} %s\\n' \"$*\" >> \"$VOICE_DOCTOR_CALL_LOG\"\nexit 0\n")
+            command.chmod(0o755)
+        repair = self.run_doctor(
+            "--repair",
+            env={
+                "COOPANION_ADAPTER_URL": "http://127.0.0.1:%d" % server.server_port,
+                "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+                "VOICE_DOCTOR_CALL_LOG": str(calls),
+                "VOICE_DOCTOR_PGREP_MARKER": str(pgrep_marker),
+            },
+            no_restart=False,
+        )
+        self.assertIn("跳过 GPT-SoVITS 重启", repair.stdout)
+        self.assertNotIn("重启 ai.coopanion.gpt-sovits", repair.stdout)
+        lines = calls.read_text().splitlines()
+        self.assertTrue(any(line.startswith("pgrep ") for line in lines))
+        self.assertTrue(any(line.startswith("osascript ") for line in lines))
+        self.assertTrue(any(line.startswith("open ") for line in lines))
+        self.assertFalse(any(line.startswith("launchctl ") for line in lines))
 
     def test_repair_leaves_a_manual_rollback_alone(self):
         self.assertEqual(self.run_doctor("--repair").returncode, 1)

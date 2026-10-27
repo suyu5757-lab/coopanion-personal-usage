@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 本机语音链路自检。默认只读：报告两个服务和补丁状态，不改文件、不碰 LaunchAgent、不重启应用。
-# --repair 才会按需恢复补丁并重启服务；LaunchAgent 每 5 分钟带这个参数跑一次。
+# 只有显式 --repair 才按需恢复补丁或重启服务、应用；后台 LaunchAgent 只运行只读检查。
 set -u
 
 SUPPORT="${COOPANION_SUPPORT:-$HOME/Library/Application Support/Coopanion}"
@@ -40,9 +40,13 @@ if healthy "$GPT_URL/docs"; then
 else
   PROBLEMS=$((PROBLEMS + 1))
   log "GPT-SoVITS $GPT_URL 不可用"
-  if [ "$REPAIR" -eq 1 ] && [ "$NO_RESTART" -eq 0 ]; then
-    log "重启 ai.coopanion.gpt-sovits"
-    restart_agent ai.coopanion.gpt-sovits
+  if [ "$REPAIR" -eq 1 ]; then
+    if curl -sS --max-time 3 "$ADAPTER_URL/health" 2>/dev/null | grep -q '"engine": *"unknown"'; then
+      log "适配器报告引擎状态未知：跳过 GPT-SoVITS 重启，先确认后端已空闲"
+    elif [ "$NO_RESTART" -eq 0 ]; then
+      log "重启 ai.coopanion.gpt-sovits"
+      restart_agent ai.coopanion.gpt-sovits
+    fi
   fi
 fi
 
@@ -71,6 +75,8 @@ else
   STATUS="$(python3 "$PATCHER" --check --extension-dir "$SRC" --support-dir "$SUPPORT" 2>&1)"
   CODE=$?
   STATE="$(printf '%s\n' "$STATUS" | sed -n 's/^status: //p')"
+  TRANSACTION="$(printf '%s\n' "$STATUS" | sed -n 's/^transaction: //p')"
+  [ -n "$TRANSACTION" ] && log "补丁事务需要恢复：$TRANSACTION"
   case "$STATE" in
     patched) log "补丁已应用" ;;
     clean|patch)

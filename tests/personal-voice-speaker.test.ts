@@ -316,6 +316,24 @@ describe.skipIf(!native)('speaker lifecycle', () => {
     }
   }
 
+  it('waits for startup warm and rejects auditions while stopping', async () => {
+    const player = new SlowWarmPlayer();
+    const speaker = new Speaker(() => {}, player, { url: 'http://tts/v1/audio/speech', requestTimeoutMs: 1_000 });
+    const warming = speaker.warm(STYLE);
+    await until(() => player.pending.length === 1);
+    const stopping = speaker.stop();
+    const audition = await speaker.audition('试听不能在停止时开始。', STYLE);
+    expect(audition).toMatchObject({ ok: false, cancelled: true });
+    expect(player.calls).toBe(0);
+    let settled = false;
+    void stopping.then(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    player.pending.shift()!();
+    await Promise.all([warming, stopping]);
+    expect(settled).toBe(true);
+  });
+
   it('waits for every player warmup hush started, not just the last', async () => {
     const player = new SlowWarmPlayer();
     const speaker = new Speaker(() => {}, player, { url: 'http://tts/v1/audio/speech', requestTimeoutMs: 1_000 });

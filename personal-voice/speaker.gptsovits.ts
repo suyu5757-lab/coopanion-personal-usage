@@ -135,12 +135,14 @@ export class Speaker {
   private stage: string | null = null;
   /** 暂存根目录只有一份：并发初始化共用同一个 Promise，别各建一个。 */
   private stageInit: Promise<string> | null = null;
-  /** 进行中的预热；stop() 要等它收束，才不会在清理后重建目录。 */
-  private warmTask: Promise<void> | null = null;
+  /** 正在执行的 warm() 调用；stop() 会等到每个调用完整结束。 */
+  private readonly warmTasks = new Set<Promise<void>>();
   /** hush() 之后点起来的播放器预热；一次可以有多个，stop() 全部等。 */
   private readonly playerWarms = new Set<Promise<void>>();
   /** stop() 之后到下一次 warm() 之间，不再接受新任务。 */
   private closing = false;
+  /** 并发 stop() 共用同一个收尾任务；warm() 等它完成后才重新打开。 */
+  private stopTask: Promise<void> | null = null;
   private jobs: Job[] = [];
   private current: Job | null = null;
   private epoch = 0;
@@ -194,6 +196,7 @@ export class Speaker {
   /** 预热点：把暂存目录和播放器先备好，第一块能少等几百毫秒。 */
   async warm(_style: SpeechStyle): Promise<void> {
     if (!this.supported()) return;
+    while (this.stopTask) await this.stopTask;
     this.closing = false;
     const task = (async () => {
       try {
@@ -202,19 +205,21 @@ export class Speaker {
         await mkdir(stage, { recursive: true });
         if (this.closing) return;
         await this.player.warm(stage);
+        if (this.closing) return;
       } catch (err) {
         this.log(`预热点失败（不影响朗读）：${(err as Error).message}`);
       }
+      if (this.closing) return;
+      // 第一句就要用到这份清单；没有缓存时等一次（最多 2 秒），别让第一句退回旧规则
+      if (this.capabilities) this.refreshCapability();
+      else await this.fetchCapability();
     })();
-    this.warmTask = task;
+    this.warmTasks.add(task);
     try {
       await task;
     } finally {
-      if (this.warmTask === task) this.warmTask = null;
+      this.warmTasks.delete(task);
     }
-    // 第一句就要用到这份清单；没有缓存时等一次（最多 2 秒），别让第一句退回旧规则
-    if (this.capabilities) this.refreshCapability();
-    else await this.fetchCapability();
   }
 
   /** 本地 GPT-SoVITS 常驻，空转一次合成没有意义。 */
@@ -335,6 +340,9 @@ export class Speaker {
    * 试听优先：先清空队列再试；连点时后一次取消前一次，播放器上最多只有一次试听。
    */
   async audition(text: string, style: SpeechStyle): Promise<AuditionResult> {
+    if (this.closing || this.stopTask) {
+      return { ok: false, ms: 0, cancelled: true, error: '朗读器正在停止' };
+    }
     if (!this.supported()) {
       return { ok: false, ms: 0, error: `朗读要 Windows 或 macOS；${process.platform} 上没有播放器` };
     }
@@ -412,20 +420,28 @@ export class Speaker {
     void task.finally(() => { this.playerWarms.delete(task); });
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    if (this.stopTask) return this.stopTask;
     this.closing = true;
     this.hush();
+    const task = this.finishStop();
+    this.stopTask = task;
+    void task.then(
+      () => { if (this.stopTask === task) this.stopTask = null; },
+      () => { if (this.stopTask === task) this.stopTask = null; },
+    );
+    return task;
+  }
+
+  private async finishStop(): Promise<void> {
     await this.player.stop().catch(() => {});
     // 等在途的合成、试听和播放自己收束；它们可能还在 mkdtemp，清理前不能先删根目录
-    await Promise.race([
-      Promise.allSettled([
-        this.synthChain,
-        this.auditionBusy ?? Promise.resolve(),
-        this.playLock,
-        this.warmTask ?? Promise.resolve(),
-        ...this.playerWarms,
-      ]),
-      sleep(5_000),
+    await Promise.allSettled([
+      this.synthChain,
+      this.auditionBusy ?? Promise.resolve(),
+      this.playLock,
+      ...this.warmTasks,
+      ...this.playerWarms,
     ]);
     const stage = this.stage;
     this.stage = null;

@@ -4,9 +4,11 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 
 HERE = Path(__file__).resolve().parent
@@ -70,11 +72,52 @@ class PatchTests(unittest.TestCase):
         result = self.run_patcher("--check", "--json")
         return result.returncode, json.loads(result.stdout)
 
+    def interrupt_after_first_replace(self):
+        manifest = patcher.load_manifest(self.manifest)
+        result = patcher.inspect(self.src, manifest, HERE)
+        original_replace = patcher.os.replace
+        replaced = 0
+        self.interrupted_file = None
+
+        def interrupt(source, target):
+            nonlocal replaced
+            original_replace(source, target)
+            if Path(target).parent == self.src and ".bak-" not in Path(target).name:
+                replaced += 1
+                if replaced == 1:
+                    self.interrupted_file = Path(target).name
+                    raise SystemExit(99)
+
+        patcher.os.replace = interrupt
+        try:
+            with self.assertRaises(SystemExit):
+                patcher.apply(result, manifest, self.support)
+        finally:
+            patcher.os.replace = original_replace
+        self.assertEqual(replaced, 1)
+
     def test_reports_a_clean_0_4_0_tree_before_touching_it(self):
         code, report = self.status()
         self.assertEqual((code, report["status"]), (1, "clean"))
         self.assertEqual(report["files"]["speech-plan.ts"], "absent")
         self.assertEqual(digest(self.src / "world.ts"), digest(self.src / "world.ts"))
+
+    def test_json_status_alone_is_read_only(self):
+        before = {name: digest(self.src / name) for name in self.upstream}
+        result = self.run_patcher("--json")
+        report = json.loads(result.stdout)
+        self.assertEqual((result.returncode, report["status"]), (1, "clean"))
+        self.assertEqual({name: digest(self.src / name) for name in self.upstream}, before)
+        self.assertFalse((self.src / "speech-plan.ts").exists())
+        self.assertFalse(list(self.support.glob("patch-transactions/*.json")))
+
+    def test_json_cannot_be_combined_with_rollback(self):
+        before = {name: digest(self.src / name) for name in self.upstream}
+        result = self.run_patcher("--json", "--rollback")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("不能和只读查询参数组合", result.stderr)
+        self.assertEqual({name: digest(self.src / name) for name in self.upstream}, before)
+        self.assertFalse(list(self.support.glob("patch-transactions/*.json")))
 
     def test_applies_once_and_stays_applied(self):
         first = self.run_patcher()
@@ -90,6 +133,13 @@ class PatchTests(unittest.TestCase):
         code, report = self.status()
         self.assertEqual((code, report["status"]), (0, "patched"))
 
+    def test_concurrent_apply_is_serialized(self):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: self.run_patcher(), range(2)))
+        self.assertEqual([result.returncode for result in results], [0, 0])
+        self.assertEqual(len(list(self.support.glob("patch-transactions/*.json"))), 1)
+        self.assertEqual(self.status()[1]["status"], "patched")
+
     def test_rollback_restores_every_original_and_removes_added_files(self):
         originals = {name: digest(self.src / name) for name in self.upstream}
         self.assertEqual(self.run_patcher().returncode, 0)
@@ -98,6 +148,17 @@ class PatchTests(unittest.TestCase):
         for name, hashed in originals.items():
             self.assertEqual(digest(self.src / name), hashed)
         self.assertFalse((self.src / "speech-plan.ts").exists())
+
+    def test_backup_preserves_read_only_source_mode(self):
+        source = self.src / "speaker.ts"
+        original = digest(source)
+        source.chmod(0o444)
+        result = self.run_patcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rollback = self.run_patcher("--rollback")
+        self.assertEqual(rollback.returncode, 0, rollback.stderr)
+        self.assertEqual(digest(source), original)
+        self.assertEqual(stat.S_IMODE(source.stat().st_mode), 0o444)
 
     def test_an_older_patch_upgrades_through_rollback(self):
         old = self.root / "old-templates"
@@ -131,6 +192,37 @@ class PatchTests(unittest.TestCase):
         for name, hashed in originals.items():
             self.assertEqual(digest(self.src / name), hashed)
         self.assertFalse((self.src / "speech-plan.ts").exists())
+
+    def test_apply_recovers_a_process_interruption_before_reapplying(self):
+        originals = {name: digest(self.src / name) for name in self.upstream}
+        self.interrupt_after_first_replace()
+        partial = self.run_patcher("--check", "--json")
+        report = json.loads(partial.stdout)
+        self.assertEqual((partial.returncode, report["status"]), (1, "patch"))
+        self.assertEqual(len(report["transactionsPending"]), 1)
+        changed = [name for name, hashed in originals.items() if digest(self.src / name) != hashed]
+        if (self.src / "speech-plan.ts").exists():
+            changed.append("speech-plan.ts")
+        self.assertEqual(changed, [self.interrupted_file])
+
+        recovered = self.run_patcher()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertIn("recovered interrupted patch transaction", recovered.stdout)
+        self.assertEqual(self.status()[1]["status"], "patched")
+        states = [json.loads(path.read_text(encoding="utf-8"))["state"] for path in self.support.glob("patch-transactions/*.json")]
+        self.assertCountEqual(states, ["recovered", "applied"])
+        self.assertFalse(list(self.src.parent.glob(".coopanion-patch-*")))
+
+    def test_manual_rollback_recovers_a_process_interruption_and_pauses_repair(self):
+        originals = {name: digest(self.src / name) for name in self.upstream}
+        self.interrupt_after_first_replace()
+        result = self.run_patcher("--rollback")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_patcher("--paused").returncode, 0)
+        for name, hashed in originals.items():
+            self.assertEqual(digest(self.src / name), hashed)
+        self.assertFalse((self.src / "speech-plan.ts").exists())
+        self.assertFalse(list(self.src.parent.glob(".coopanion-patch-*")))
 
     def test_refuses_an_unknown_upstream_version_and_changes_nothing(self):
         before = {name: digest(self.src / name) for name in self.upstream}

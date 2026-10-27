@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""把 GPT-SoVITS 朗读链路装进 streamvoice 0.4.0：核对上游指纹、事务替换、可回滚。
+"""把 GPT-SoVITS 朗读链路装进 streamvoice 0.4.0：核对上游指纹、可恢复应用、可回滚。
 
-补丁改的是安装目录里的扩展源码，不是本仓库的文件。脚本先核对每个上游文件的 sha256，
-再把结果写进同文件系统的暂存目录、校验 hash，最后逐项原子替换；任何一步失败，已替换的
-文件全部还原。每次成功应用都在支持目录留一份事务清单，`--rollback` 用它回退。
+补丁改的是扩展目录里的文件，不是本仓库源码。脚本先核对每个上游文件的 sha256，
+再把结果写进同文件系统的暂存目录、校验 hash，最后逐项原子替换。事务记录在第一次替换前
+持久化；捕获到错误时立即恢复，进程中断后下次显式应用会先恢复再重新应用。每次事务都
+保留旧、新 hash 与备份位置，`--rollback` 可手动回退。
 
 状态，`--check` 只报告、不改文件：
 
   missing       没找到扩展源码目录
   incompatible  上游文件既不是 0.4.0 原版、也不是本补丁的产物（扩展升级或手改过）
   clean         当前是 0.4.0 原版，可以应用
-  patch         补丁只应用了一部分
+  patch         补丁只应用了一部分，或存在待恢复事务
   patched       补丁已完整应用
 
-退出码：0 = patched；1 = clean 或 patch（还需要动手）；2 = 其它。
+`--check` 和 `--json` 都只读。退出码：0 = patched；1 = clean 或 patch（还需要动手）；2 = 其它。
 """
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -312,11 +315,12 @@ def inspect(src, manifest, template_dir):
     return {"status": status, "facts": facts, "targets": targets, "src": src}
 
 
-def report(result, as_json):
+def report(result, as_json, transactions=()):
     payload = {
         "status": result["status"],
         "extension": str(result["src"]),
         "files": result["facts"],
+        "transactionsPending": [Path(path).name for path in transactions],
     }
     if as_json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -324,6 +328,8 @@ def report(result, as_json):
     print(f"status: {result['status']}")
     print(f"source: {payload['extension']}")
     print("files: " + ", ".join(f"{name}={state}" for name, state in result["facts"].items()))
+    if transactions:
+        print("transaction: recovery required (" + ", ".join(payload["transactionsPending"]) + ")")
     if result["status"] == "clean":
         print("0.4.0 原版；运行不带 --check 的同一命令应用补丁。")
     elif result["status"] == "patched":
@@ -334,20 +340,54 @@ def report(result, as_json):
 
 
 def write_json(path, data):
-    """先写同目录临时文件再替换：写到一半失败也不会把上一条清单截断。"""
+    """Durably replace a transaction record without exposing a partial JSON file."""
     path = Path(path)
-    temp = path.with_name(path.name + ".tmp")
-    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temp, path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    temp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+        sync_directory(path.parent)
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
+def copy_backup(source, backup, staging):
+    """Copy and sync a backup before publishing it beside the source file."""
+    source = Path(source)
+    backup = Path(backup)
+    temp = Path(staging) / f"{backup.name}.pending"
+    with source.open("rb") as original, temp.open("xb") as copied:
+        shutil.copyfileobj(original, copied)
+        copied.flush()
+        shutil.copystat(source, temp)
+        os.fsync(copied.fileno())
+    os.replace(temp, backup)
+    sync_directory(backup.parent)
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def paused(support):
     """最近一次事务是手动回退：doctor 别再自动打回去。"""
-    records = sorted((Path(support) / "patch-transactions").glob("*.json"))
+    records = transaction_records(support)
     if not records:
         return False
     try:
-        return json.loads(records[-1].read_text(encoding="utf-8")).get("state") == "rolled-back"
+        return json.loads(records[-1].read_text(encoding="utf-8")).get("state") in (
+            "rollback-pending", "rolled-back",
+        )
     except (OSError, ValueError):
         return False
 
@@ -358,6 +398,128 @@ def transaction_dir(support):
     return path
 
 
+def transaction_records(support):
+    path = Path(support) / "patch-transactions"
+    return sorted(path.glob("*.json")) if path.is_dir() else []
+
+
+@contextmanager
+def patch_lock(support):
+    """Serialize apply/recovery/rollback while leaving --check strictly read-only."""
+    lock_path = transaction_dir(support) / ".lock"
+    with lock_path.open("a+b") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def transaction_state(record_path):
+    try:
+        return json.loads(Path(record_path).read_text(encoding="utf-8")).get("state")
+    except (OSError, ValueError):
+        return None
+
+
+def active_transactions(support):
+    active = {"preparing", "pending", "recovery-pending", "rollback-pending"}
+    return [path for path in transaction_records(support) if transaction_state(path) in active]
+
+
+def remove_staging(record):
+    raw = record.get("staging")
+    if not raw:
+        return
+    path = Path(raw)
+    src = Path(record["source"])
+    if path.parent != src.parent or not path.name.startswith(".coopanion-patch-"):
+        raise PatchError(f"事务暂存路径不安全：{path}")
+    if path.exists():
+        shutil.rmtree(path)
+        sync_directory(path.parent)
+
+
+def restore_transaction(record_path, final_state):
+    record = json.loads(Path(record_path).read_text(encoding="utf-8"))
+    src = Path(record["source"])
+    entries = record["files"]
+
+    if record.get("phase") == "preparing":
+        # No source file is replaced before the journal reaches pending.
+        for entry in entries:
+            path = src / entry["file"]
+            current = digest(path.read_bytes()) if path.is_file() else None
+            if current != entry["old"]:
+                raise PatchError(f"{entry['file']} 在准备阶段被外部改过，拒绝清理事务")
+        record["state"] = "rollback-pending" if final_state == "rolled-back" else "recovery-pending"
+        write_json(record_path, record)
+        for entry in entries:
+            if entry["backup"]:
+                backup = src / entry["backup"]
+                if backup.exists():
+                    backup.unlink()
+                    sync_directory(src)
+        remove_staging(record)
+        record["state"] = final_state
+        record.pop("phase", None)
+        write_json(record_path, record)
+        return
+
+    # Check the whole target set before restoring any file.
+    for entry in entries:
+        path = src / entry["file"]
+        current = digest(path.read_bytes()) if path.is_file() else None
+        if entry["old"] is None:
+            if current not in (None, entry["new"]):
+                raise PatchError(f"{entry['file']} 在事务后被改过，拒绝恢复")
+            continue
+        if current == entry["old"]:
+            continue
+        if current != entry["new"]:
+            raise PatchError(f"{entry['file']} 在事务后被改过，拒绝恢复")
+        backup = src / entry["backup"]
+        if not backup.is_file() or digest(backup.read_bytes()) != entry["old"]:
+            raise PatchError(f"备份内容与记录的旧 hash 不符：{backup}")
+
+    record["state"] = "rollback-pending" if final_state == "rolled-back" else "recovery-pending"
+    write_json(record_path, record)
+    for entry in reversed(entries):
+        path = src / entry["file"]
+        current = digest(path.read_bytes()) if path.is_file() else None
+        if entry["old"] is None:
+            if current == entry["new"]:
+                path.unlink()
+                sync_directory(src)
+            continue
+        if current == entry["new"]:
+            os.replace(src / entry["backup"], path)
+            sync_directory(src)
+        else:
+            backup = src / entry["backup"]
+            if backup.exists():
+                if digest(backup.read_bytes()) != entry["old"]:
+                    raise PatchError(f"备份内容与记录的旧 hash 不符：{backup}")
+                backup.unlink()
+                sync_directory(src)
+
+    remove_staging(record)
+    record["state"] = final_state
+    record.pop("phase", None)
+    write_json(record_path, record)
+
+
+def recover_pending(support):
+    for record_path in transaction_records(support):
+        state = transaction_state(record_path)
+        if state in ("preparing", "pending", "recovery-pending"):
+            restore_transaction(record_path, "recovered")
+            print(f"recovered interrupted patch transaction {record_path.name}")
+        elif state == "rollback-pending":
+            restore_transaction(record_path, "rolled-back")
+            print(f"completed interrupted manual rollback {record_path.name}")
+
+
 def apply(result, manifest, support):
     src = result["src"]
     targets = result["targets"]
@@ -366,62 +528,77 @@ def apply(result, manifest, support):
         return 0
 
     stamp = time.strftime("%Y%m%d-%H%M%S") + "-" + str(time.time_ns())
-    staging = Path(tempfile.mkdtemp(prefix=".coopanion-patch-", dir=str(src.parent)))
+    staging = src.parent / f".coopanion-patch-{stamp}"
     entries = []
+    for name, text in targets.items():
+        path = src / name
+        exists = path.is_file()
+        entries.append({
+            "file": name,
+            "old": digest(path.read_bytes()) if exists else None,
+            "new": digest(text.encode("utf-8")),
+            "backup": f"{name}.bak-{stamp}" if exists else None,
+        })
+    record = {
+        "stamp": stamp,
+        "state": "preparing",
+        "phase": "preparing",
+        "package": manifest["package"],
+        "version": manifest["version"],
+        "source": str(src),
+        "staging": str(staging),
+        "files": entries,
+    }
+    record_path = transaction_dir(support) / f"{stamp}.json"
     try:
+        # Journal the intended paths before creating any staging or backup files.
+        write_json(record_path, record)
+        staging.mkdir()
         # 1. 全部结果先写进暂存目录并逐个核对
         for name, text in targets.items():
-            (staging / name).write_bytes(text.encode("utf-8"))
+            staged = staging / name
+            with staged.open("wb") as stream:
+                stream.write(text.encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
             if digest((staging / name).read_bytes()) != digest(text.encode("utf-8")):
                 raise PatchError(f"暂存校验失败：{name}")
-        # 2. 备份将被替换的原文件
-        for name in targets:
-            path = src / name
-            if not path.exists():
-                entries.append({"file": name, "old": None, "new": digest(targets[name].encode("utf-8")), "backup": None})
+        sync_directory(staging)
+        # 2. 备份将被替换的原文件，并验证每份备份。
+        for entry in entries:
+            if entry["old"] is None:
                 continue
-            backup = path.with_name(path.name + ".bak-" + stamp)
-            shutil.copy2(path, backup)
-            entries.append({
-                "file": name,
-                "old": digest(path.read_bytes()),
-                "new": digest(targets[name].encode("utf-8")),
-                "backup": backup.name,
-            })
-        # 3. 先把事务写成 pending：中途断电也能照清单回退
-        record = {
-            "stamp": stamp,
-            "state": "pending",
-            "package": manifest["package"],
-            "version": manifest["version"],
-            "source": str(src),
-            "files": entries,
-        }
-        record_path = transaction_dir(support) / f"{stamp}.json"
+            path = src / entry["file"]
+            backup = src / entry["backup"]
+            copy_backup(path, backup, staging)
+            if digest(backup.read_bytes()) != entry["old"]:
+                raise PatchError(f"备份校验失败：{backup}")
+        sync_directory(src)
+        # 3. 在第一次替换前持久化完整事务记录；下次应用可恢复被中断的事务。
+        record["state"] = "pending"
+        record["phase"] = "replacing"
         write_json(record_path, record)
         # 4. 逐项原子替换
         for name in targets:
             os.replace(staging / name, src / name)
+            sync_directory(src)
         for name in targets:
             if digest((src / name).read_bytes()) != digest(targets[name].encode("utf-8")):
                 raise PatchError(f"替换后校验失败：{name}")
-    except Exception:
-        # 全部还原：先撤新增文件，再把备份放回原处
-        for entry in reversed(entries):
-            path = src / entry["file"]
-            if entry["old"] is None:
-                if path.exists():
-                    path.unlink()
-                continue
-            backup = src / entry["backup"]
-            if backup.exists():
-                os.replace(backup, path)
-        shutil.rmtree(staging, ignore_errors=True)
+        remove_staging(record)
+        record["state"] = "applied"
+        record.pop("phase", None)
+        write_json(record_path, record)
+    except Exception as error:
+        if record_path.is_file():
+            try:
+                restore_transaction(record_path, "recovered")
+            except Exception as recovery_error:
+                raise PatchError(f"应用失败，事务保留待恢复：{recovery_error}") from error
+        else:
+            shutil.rmtree(staging, ignore_errors=True)
         raise
 
-    shutil.rmtree(staging, ignore_errors=True)
-    record["state"] = "applied"
-    write_json(record_path, record)
     for entry in entries:
         print(f"patched {entry['file']}  {entry['old'] or '-':<8} -> {entry['new']}")
         print(f"backup  {entry['backup'] or '（新增文件）'}")
@@ -432,45 +609,14 @@ def apply(result, manifest, support):
 
 def rollback(record_path):
     record = json.loads(Path(record_path).read_text(encoding="utf-8"))
-    src = Path(record["source"])
-    entries = record["files"]
-    # 只动还停在这次事务写了的那份的文件；别的状态一律拒绝
-    for entry in entries:
-        path = src / entry["file"]
-        current = digest(path.read_bytes()) if path.is_file() else None
-        if entry["old"] is None:
-            if current is not None and current != entry["new"]:
-                raise PatchError(f"{entry['file']} 在打完补丁后被改过，拒绝回退")
-            continue
-        if current == entry["old"]:
-            continue
-        if current != entry["new"]:
-            raise PatchError(f"{entry['file']} 在打完补丁后被改过，拒绝回退")
-        backup = src / entry["backup"]
-        if not backup.is_file():
-            raise PatchError(f"备份不见了：{backup}")
-        if digest(backup.read_bytes()) != entry["old"]:
-            raise PatchError(f"备份内容与记录的旧 hash 不符：{backup}")
-    # 先把「已回退」写盘：即使恢复途中失败或断电，doctor 也不会自动打回去
-    record["state"] = "rolled-back"
-    write_json(record_path, record)
-    for entry in reversed(entries):
-        path = src / entry["file"]
-        current = digest(path.read_bytes()) if path.is_file() else None
-        if entry["old"] is None:
-            if current is not None:
-                path.unlink()
-            continue
-        if current == entry["old"]:
-            continue
-        os.replace(src / entry["backup"], path)
-    print(f"rolled back {record['stamp']}（{len(entries)} 个文件）")
+    restore_transaction(record_path, "rolled-back")
+    print(f"rolled back {record['stamp']}（{len(record['files'])} 个文件）")
     print("自动修复已暂停：重跑补丁或删掉这条事务记录才会恢复。")
     return 0
 
 
 def latest_record(support):
-    records = sorted((Path(support) / "patch-transactions").glob("*.json"))
+    records = transaction_records(support)
     if not records:
         raise PatchError(f"没有可回退的事务：{Path(support) / 'patch-transactions'}")
     return records[-1]
@@ -488,6 +634,8 @@ def main(argv=None):
     parser.add_argument("--paused", action="store_true", help="最近一次事务是手动回退时退出 0")
     parser.add_argument("--fingerprint", type=Path, default=None, help="打印某个 0.4.0 src 目录打补丁后的指纹")
     args = parser.parse_args(argv)
+    if args.rollback is not None and (args.check or args.json or args.paused or args.fingerprint is not None):
+        parser.error("--rollback 不能和只读查询参数组合")
 
     try:
         if args.paused:
@@ -498,16 +646,21 @@ def main(argv=None):
             return 0
         manifest = load_manifest(args.manifest)
         if args.rollback is not None:
-            path = latest_record(args.support_dir) if args.rollback == "latest" else Path(args.rollback)
-            return rollback(path)
+            with patch_lock(args.support_dir):
+                path = latest_record(args.support_dir) if args.rollback == "latest" else Path(args.rollback)
+                return rollback(path)
         result = inspect(args.extension_dir, manifest, args.templates)
+        transactions = active_transactions(args.support_dir)
+        if transactions and result["status"] != "incompatible":
+            result["status"] = "patch"
         if args.check or args.json:
-            code = report(result, args.json)
-            if args.check:
-                return code
-        if result["status"] in ("missing", "incompatible"):
-            return EXIT[result["status"]]
-        return apply(result, manifest, args.support_dir)
+            return report(result, args.json, transactions)
+        with patch_lock(args.support_dir):
+            recover_pending(args.support_dir)
+            result = inspect(args.extension_dir, manifest, args.templates)
+            if result["status"] in ("missing", "incompatible"):
+                return EXIT[result["status"]]
+            return apply(result, manifest, args.support_dir)
     except PatchError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
