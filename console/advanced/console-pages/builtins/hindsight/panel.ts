@@ -29,7 +29,7 @@ interface HindsightStatus {
     persistenceError: string | null;
   } | null;
   deletions?: { pending: number; done: number; failed: number; tombstones: number; staleTargets: number; persistenceError: string | null } | null;
-  forget?: { tombstones: number; unresolved: number; stale: boolean } | null;
+  forget?: { tombstones: number; unresolved: number; stale: boolean; damaged: boolean } | null;
   lastDelivery?: { at: number; submitted: number; completed: number; failed: number } | null;
   recent: MemoryItem[];
 }
@@ -424,6 +424,7 @@ const panel: WebUiPanel = {
         failed > 0 ? t.queueDead(failed) : '',
         deletions > 0 ? t.deletions(deletions) : '',
         status.forget?.stale ? t.portraitsStale : '',
+        status.forget?.damaged ? t.ledgerDamaged : '',
         isolated > 0 ? t.isolated(isolated) : '',
       ].filter(Boolean).join(' · ');
       bank.title = status.outbox?.lastError ?? '';

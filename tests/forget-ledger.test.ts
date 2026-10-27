@@ -132,8 +132,15 @@ describe('the forget ledger', () => {
     expect(imported.forgotten('bank-a', 'http://a', 'doc-new')).toBe(true);
   });
 
-  it('repeats a deletion once when the source had a retain in flight', () => {
-    let now = new Date('2026-10-27T00:00:00.000Z');
+  it('marks an unreadable ledger and leaves a missing one healthy', () => {
+    const missing = new ForgetLedger(join(dir(), 'forget.json'));
+    expect(missing.damaged()).toBe(false);
+    const broken = join(dir(), 'forget.json');
+    writeFileSync(broken, '{not json');
+    expect(new ForgetLedger(broken).damaged()).toBe(true);
+  });
+
+  it('repeats a deletion once when the source had a retain in flight', () => {    let now = new Date('2026-10-27T00:00:00.000Z');
     const ledger = new ForgetLedger(join(dir(), 'forget.json'), { now: () => now });
     const task = ledger.add({ bankId: 'bank-a', endpoint: 'http://a', documentId: 'doc-1', operationId: 'op-1', reason: 'forget' })!;
     ledger.markDone(task.id);

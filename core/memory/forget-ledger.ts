@@ -5,6 +5,7 @@
  * write, so a restart cannot see a fence without the work it implies.
  */
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { readState, writeState } from '../state-file.ts';
 
 export type DeletionState = 'pending' | 'done' | 'failed';
@@ -118,6 +119,7 @@ function restore(value: unknown): LedgerFile {
 export class ForgetLedger {
   private file: LedgerFile = { v: 2, tasks: [], tombstones: [], epochs: {}, stale: [] };
   private loaded = false;
+  private damagedLedger = false;
   private persistenceError: string | null = null;
 
   constructor(
@@ -132,9 +134,15 @@ export class ForgetLedger {
   private load(): void {
     if (this.loaded) return;
     this.loaded = true;
+    const present = existsSync(this.path);
     try {
-      this.file = readState(this.path, restore) ?? { v: 2, tasks: [], tombstones: [], epochs: {}, stale: [] };
+      const saved = readState(this.path, restore);
+      if (saved) this.file = saved;
+      // A ledger that exists but cannot be read may be missing tombstones; reads must stay closed
+      // until the person clears the bank or restores the file.
+      else if (present) this.damagedLedger = true;
     } catch (err) {
+      this.damagedLedger = present;
       this.persistenceError = `could not read the forget ledger: ${err instanceof Error ? err.message : String(err)}`;
       this.opts.log?.warn('[memory] could not read the forget ledger', { message: err instanceof Error ? err.message : String(err) });
     }
@@ -144,6 +152,7 @@ export class ForgetLedger {
     try {
       writeState(this.path, `${JSON.stringify(this.file, null, 2)}\n`);
       this.persistenceError = null;
+      this.damagedLedger = false;
       return true;
     } catch (err) {
       this.persistenceError = `could not write the forget ledger: ${err instanceof Error ? err.message : String(err)}`;
@@ -218,6 +227,12 @@ export class ForgetLedger {
     this.load();
     return this.file.tombstones.some((entry) =>
       entry.bankId === bankId && entry.endpoint === endpoint && entry.documentId === documentId);
+  }
+
+  /** The file exists but could not be read, so its tombstones are unknown. */
+  damaged(): boolean {
+    this.load();
+    return this.damagedLedger;
   }
 
   /** Bumped by every new fence; a read that started before it must not return its result. */

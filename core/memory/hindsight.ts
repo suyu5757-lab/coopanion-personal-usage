@@ -579,6 +579,8 @@ export class HindsightMemory {
       }));
       // A forget can invalidate the bank while this recall is in flight; do not hand the old text back.
       if (epoch !== this.cacheEpoch) return [];
+      // A ledger that cannot be read may be missing tombstones, so no source can be shown clear.
+      if (this.ledger?.damaged()) return [];
       // A fenced source stays out of every read even if the service still returns it. While a
       // deletion is unresolved, a result with no source cannot be shown to be clear of it.
       const unresolved = this.ledger?.unresolved(config.bankId, config.apiUrl) ?? 0;
@@ -661,6 +663,7 @@ export class HindsightMemory {
     const config = this.config;
     const ledger = this.ledger;
     if (!config || !ledger) return false;
+    if (ledger.damaged()) return true;
     return ledger.unresolved(config.bankId, config.apiUrl) > 0 || ledger.stale(config.bankId, config.apiUrl);
   }
 
@@ -905,14 +908,16 @@ export class HindsightMemory {
     const candidates = this.outbox?.matching((item) => matchesForget(item, asked)) ?? [];
     const cancelled = this.outbox?.cancelMatching((item) => matchesForget(item, asked), 'the person asked to forget this') ?? [];
     const cancelFailed = Math.max(0, candidates.length - cancelled.length);
+    const sourceIds = new Set(candidates.map((entry) => entry.documentId));
     // Fence every source we already know before any remote call. A queue item that could not be
     // cancelled is still fenced, so its text cannot come back through a read.
     const fenced = this.ledger.addMany(candidates.map(sourceOf).filter((input): input is DeletionInput => input !== null), 'the person asked to forget this');
     this.invalidateCache();
+    this.forgetDerived([...sourceIds]);
     if (fenced.failed > 0) {
       return { local: cancelled.length, deleted: 0, pending: 0, failed: fenced.failed + cancelFailed };
     }
-    const sourceIds = new Set(fenced.tasks.map((task) => task.documentId));
+    for (const task of fenced.tasks) sourceIds.add(task.documentId);
     if (this.delivery) await this.delivery.cancelForget(cancelled);
     if (this.canTry() && await this.ensureStarted()) {
       const config = this.config;
@@ -991,8 +996,8 @@ export class HindsightMemory {
       reason: 'the person asked not to remember this',
     }], 'the person asked not to remember this');
     this.invalidateCache();
-    if (fenced.failed > 0) return { local: cancelled.length, deleted: 0, pending: 0, failed: fenced.failed + cancelFailed };
     this.forgetDerived([documentId]);
+    if (fenced.failed > 0) return { local: cancelled.length, deleted: 0, pending: 0, failed: fenced.failed + cancelFailed };
     if (this.delivery) await this.delivery.cancelForget(cancelled);
     if (this.canTry() && await this.ensureStarted()) {
       await this.drainDeletions();
@@ -1054,7 +1059,9 @@ export class HindsightMemory {
     }
   }
 
-  async recent(limit = 20): Promise<Array<{ id: string; text: string; date: string; type: string; documentId: string | null }>> {    if (!this.canTry() || !await this.ensureStarted()) return [];
+  async recent(limit = 20): Promise<Array<{ id: string; text: string; date: string; type: string; documentId: string | null }>> {
+    if (!this.canTry() || !await this.ensureStarted()) return [];
+    if (this.ledger?.damaged()) return [];
     const config = this.config!;
     try {
       const response = await this.client!.listMemories(config.bankId, {
@@ -1083,7 +1090,7 @@ export class HindsightMemory {
     error?: string;
     outbox: ReturnType<MemoryOutbox['status']> | null;
     deletions: ReturnType<ForgetLedger['status']> | null;
-    forget: { tombstones: number; unresolved: number; stale: boolean } | null;
+    forget: { tombstones: number; unresolved: number; stale: boolean; damaged: boolean } | null;
     lastDelivery: { at: number; submitted: number; completed: number; failed: number } | null;
     recall: { fast: number; standard: number; deep: number; measured: number; avgMs: number };
     recent: Array<{ id: string; text: string; date: string; type: string; documentId: string | null }>;
@@ -1102,6 +1109,7 @@ export class HindsightMemory {
             tombstones: this.ledger.status().tombstones,
             unresolved: this.ledger.unresolved(this.config.bankId, this.config.apiUrl),
             stale: this.ledger.stale(this.config.bankId, this.config.apiUrl),
+            damaged: this.ledger.damaged(),
           }
         : null,
       lastDelivery: this.latestDelivery,
