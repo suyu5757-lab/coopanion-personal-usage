@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import { WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
 import { coopanionPersona } from '../core/persona.ts';
+import type { HindsightMemory } from '../core/memory/hindsight.ts';
 import { ExperienceCards } from '../core/growth/experience-cards.ts';
 import { GrowthProposals } from '../core/growth/proposals.ts';
 
@@ -15,6 +16,9 @@ const temp = () => {
   roots.push(root);
   return root;
 };
+
+/** The apply path checks that a proposal's evidence still exists. */
+const liveSources = { enabled: () => true, hasSource: async () => true } as unknown as HindsightMemory;
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -51,7 +55,7 @@ describe('growth proposal review and apply', () => {
     expect(await store.markApplied(written.proposal.id, 'premature')).toBeNull();
     expect(store.transition(written.proposal.id, 'approved')?.state).toBe('approved');
 
-    const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json') });
+    const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory: liveSources });
     const persona = new Persona({ memoryDir: workspace });
     const invoke = persona.webUi('en').invoke;
     expect(invoke).toBeTypeOf('function');
@@ -78,7 +82,7 @@ describe('growth proposal review and apply', () => {
     const written = store.write(proposalInput);
     if (!written.ok) throw new Error(written.errors.join('; '));
     store.transition(written.proposal.id, 'approved');
-    const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json') });
+    const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory: liveSources });
     const persona = new Persona({ memoryDir: workspace });
 
     await expect(persona.webUi('en').invoke!('hindsight', 'growth-proposal-apply', [written.proposal.id]))
@@ -105,13 +109,35 @@ describe('growth proposal review and apply', () => {
     });
     if (!written.ok) throw new Error(written.errors.join('; '));
     store.transition(written.proposal.id, 'approved');
-    const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json') });
+    const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory: liveSources });
     const persona = new Persona({ memoryDir: workspace });
 
     await expect(persona.webUi('en').invoke!('hindsight', 'growth-proposal-apply', [written.proposal.id]))
       .rejects.toThrow(/no longer has one unique copy/);
     expect(readFileSync(join(workspace, 'CONSTITUTION.md'), 'utf8')).toBe('Ask before routine interruptions.\nSpeak briefly.\n');
     expect(git.status().dirty).toBe(false);
+    expect(store.get(written.proposal.id)?.state).toBe('approved');
+  });
+
+  it('refuses a proposal whose evidence is gone from the bank', async () => {
+    const root = temp();
+    const workspace = join(root, 'workspace');
+    const deploy = join(root, 'deploy');
+    mkdirSync(workspace);
+    mkdirSync(deploy);
+    writeFileSync(join(workspace, 'CONSTITUTION.md'), 'Ask before routine interruptions.\n');
+    new WorkspaceGit(workspace).ensureRepo();
+    const store = new GrowthProposals(join(deploy, 'growth-proposals'));
+    const written = store.write(proposalInput);
+    if (!written.ok) throw new Error(written.errors.join('; '));
+    store.transition(written.proposal.id, 'approved');
+    const forgotten = { enabled: () => true, hasSource: async () => false } as unknown as HindsightMemory;
+    const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory: forgotten });
+    const persona = new Persona({ memoryDir: workspace });
+
+    await expect(persona.webUi('en').invoke!('hindsight', 'growth-proposal-apply', [written.proposal.id]))
+      .rejects.toThrow(/sources are gone/);
+    expect(readFileSync(join(workspace, 'CONSTITUTION.md'), 'utf8')).toBe('Ask before routine interruptions.\n');
     expect(store.get(written.proposal.id)?.state).toBe('approved');
   });
 });

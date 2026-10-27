@@ -1025,8 +1025,21 @@ export class HindsightMemory {
     }
   }
 
-  async recent(limit = 20): Promise<Array<{ id: string; text: string; date: string; type: string; documentId: string | null }>> {
-    if (!this.canTry() || !await this.ensureStarted()) return [];
+  /** Does the bank still hold this source, and is it still readable? */
+  async hasSource(documentId: string): Promise<boolean> {
+    if (!this.canTry() || !documentId || !await this.ensureStarted()) return false;
+    const config = this.config!;
+    if (this.ledger?.forgotten(config.bankId, config.apiUrl, documentId)) return false;
+    try {
+      const document = await this.client!.getDocument(config.bankId, documentId, { signal: AbortSignal.timeout(5_000) });
+      return document !== null;
+    } catch (err) {
+      if (isMissing(err)) return false;
+      throw err;
+    }
+  }
+
+  async recent(limit = 20): Promise<Array<{ id: string; text: string; date: string; type: string; documentId: string | null }>> {    if (!this.canTry() || !await this.ensureStarted()) return [];
     const config = this.config!;
     try {
       const response = await this.client!.listMemories(config.bankId, {

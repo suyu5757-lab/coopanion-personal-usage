@@ -485,6 +485,16 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
         if (!status.repo) throw new Error(status.initError ?? 'The Persona workspace has no Git history.');
         if (status.dirty) throw new Error('The Persona workspace has uncommitted changes. Commit or restore them before applying this proposal.');
 
+        // Evidence that is gone must not become a Persona change. A source can be forgotten while
+        // the app was off, so the proposal's list is checked against the bank again here.
+        const memory = this.longTerm;
+        if (!memory?.enabled()) throw new Error('Long-term memory is off, so the proposal sources cannot be checked. Turn it on and try again.');
+        const missing: string[] = [];
+        for (const sourceId of proposal.sourceIds) {
+          if (!await memory.hasSource(sourceId)) missing.push(sourceId);
+        }
+        if (missing.length > 0) throw new Error(`The proposal sources are gone: ${missing.join(', ')}. It was not applied.`);
+
         // Every change is resolved against the same snapshot and every file's final text is built
         // in memory first, so a later change that no longer matches leaves no earlier one applied.
         const originals = new Map<string, { exists: boolean; text: string }>();
