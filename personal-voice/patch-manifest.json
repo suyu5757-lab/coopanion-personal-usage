@@ -7,9 +7,14 @@
     "world.ts": "bc8549cb1ee4324f49761994ab0c27f45f69fe0215eb0c68d6341f9950eb3f59",
     "speaker.ts": "645e08a2a6b7ecfa25d3e73e7d912246f135a52fd0567a2c41d1445a7fcc9b44"
   },
-  "spliced": ["world.ts"],
+  "spliced": [
+    "world.ts"
+  ],
   "written": {
     "speaker.ts": "speaker.gptsovits.ts",
     "speech-plan.ts": "speech-plan.ts"
+  },
+  "results": {
+    "world.ts": "b0fde64cdc5f73f78039422577764e975f356d838c3ac89b397390e6417832e1"
   }
 }

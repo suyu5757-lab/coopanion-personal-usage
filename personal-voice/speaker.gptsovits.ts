@@ -133,6 +133,10 @@ export interface SpeakerStats {
 
 export class Speaker {
   private stage: string | null = null;
+  /** 暂存根目录只有一份：并发初始化共用同一个 Promise，别各建一个。 */
+  private stageInit: Promise<string> | null = null;
+  /** stop() 之后到下一次 warm() 之间，不再接受新任务。 */
+  private closing = false;
   private jobs: Job[] = [];
   private current: Job | null = null;
   private epoch = 0;
@@ -186,10 +190,11 @@ export class Speaker {
   /** 预热点：把暂存目录和播放器先备好，第一块能少等几百毫秒。 */
   async warm(_style: SpeechStyle): Promise<void> {
     if (!this.supported()) return;
+    this.closing = false;
     try {
-      this.stage ??= await mkdtemp(join(tmpdir(), 'coopanion-streamvoice-'));
-      await mkdir(this.stage, { recursive: true });
-      await this.player.warm(this.stage);
+      const stage = await this.stageDir();
+      await mkdir(stage, { recursive: true });
+      await this.player.warm(stage);
     } catch (err) {
       this.log(`预热点失败（不影响朗读）：${(err as Error).message}`);
     }
@@ -236,7 +241,7 @@ export class Speaker {
   /** 把一块排进队列；返回即走，说的时候在后台。队列满了返回 false。 */
   say(text: string, style: SpeechStyle, trace?: SpeechTraceV1): boolean {
     let trimmed = text.trim();
-    if (!trimmed) return false;
+    if (!trimmed || this.closing) return false;
     if (!this.supported()) {
       if (!this.warnedPlatform) {
         this.warnedPlatform = true;
@@ -329,9 +334,11 @@ export class Speaker {
     this.auditionBusy = busy;
     const controller = new AbortController();
     this.auditionController = controller;
+    // 试听和正常朗读用同一个截止时间：服务不响应时不能把整条朗读链吊住
+    const stopClock = this.startClock(controller);
     let dir: string | null = null;
     try {
-      const stage = this.stage ?? (this.stage = await mkdtemp(join(tmpdir(), 'coopanion-streamvoice-')));
+      const stage = await this.stageDir();
       dir = await mkdtemp(join(stage, 'try-'));
       const res = await this.request(text, style, controller, epoch);
       if (ticket !== this.auditionTicket || epoch !== this.epoch) return { ok: false, ms: Date.now() - started, cancelled: true, error: '试听被取消' };
@@ -351,6 +358,7 @@ export class Speaker {
       if (epoch !== this.epoch) return { ok: false, ms: Date.now() - started, cancelled: true, error: '试听被取消' };
       return { ok: false, ms: Date.now() - started, error: (err as Error).message };
     } finally {
+      stopClock();
       if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
       if (this.auditionController === controller) this.auditionController = null;
       if (this.auditionBusy === busy) this.auditionBusy = null;
@@ -384,16 +392,75 @@ export class Speaker {
   }
 
   async stop(): Promise<void> {
+    this.closing = true;
     this.hush();
     await this.player.stop().catch(() => {});
-    if (this.stage) {
-      await rm(this.stage, { recursive: true, force: true }).catch(() => {});
-      this.stage = null;
-    }
+    // 等在途的合成、试听和播放自己收束；它们可能还在 mkdtemp，清理前不能先删根目录
+    await Promise.race([
+      Promise.allSettled([this.synthChain, this.auditionBusy ?? Promise.resolve(), this.playLock]),
+      sleep(5_000),
+    ]);
+    const stage = this.stage;
+    this.stage = null;
+    this.stageInit = null;
+    if (stage) await rm(stage, { recursive: true, force: true }).catch(() => {});
   }
 
   private supported(): boolean {
     return process.platform === 'win32' || process.platform === 'darwin';
+  }
+
+  /** 暂存根目录：并发调用共用同一次 mkdtemp。 */
+  private stageDir(): Promise<string> {
+    if (this.stage) return Promise.resolve(this.stage);
+    this.stageInit ??= this.createStage();
+    return this.stageInit;
+  }
+
+  private async createStage(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), 'coopanion-streamvoice-'));
+    try {
+      if (this.closing) throw new Error('已停止');
+      if (!this.stage) this.stage = dir;
+      return this.stage;
+    } catch (err) {
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+      throw err;
+    } finally {
+      this.stageInit = null;
+    }
+  }
+
+  /** 请求的总时限：从发出到响应体读完。 */
+  private startClock(controller: AbortController): () => void {
+    const timer = setTimeout(
+      () => controller.abort(new Error(`合成超过 ${this.options.requestTimeoutMs}ms`)),
+      this.options.requestTimeoutMs,
+    );
+    return () => clearTimeout(timer);
+  }
+
+  /** 有上限地读完响应体；超过上限立刻停止接收，不先吃进内存。 */
+  private async readCapped(res: Response, limit: number): Promise<Buffer> {
+    const reader = res.body?.getReader();
+    if (!reader) return Buffer.alloc(0);
+    const chunks: Buffer[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > limit) {
+          await reader.cancel().catch(() => {});
+          throw new SpeechError(`响应超过 ${limit} 字节`);
+        }
+        chunks.push(Buffer.from(value));
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return Buffer.concat(chunks);
   }
 
   private kick(): void {
@@ -502,14 +569,21 @@ export class Speaker {
     if (job.epoch !== this.epoch) return;
     job.startedAt = Date.now();
     if (Date.now() - this.failedAt < COOLDOWN_MS) {
+      // 冷却跳过也是终态：记录里不能停在 queued，省略掉的字数要算进统计
       job.dead = true;
+      this.stats.omitted++;
+      this.stats.omittedChars += job.text.length;
+      if (job.trace) {
+        job.trace.playbackStatus = 'cancelled';
+        job.trace.fallbackReason = job.trace.fallbackReason ?? 'service-cooldown';
+      }
       return;
     }
     const controller = new AbortController();
     job.controller = controller;
-    const timer = setTimeout(() => controller.abort(new Error(`合成超过 ${this.options.requestTimeoutMs}ms`)), this.options.requestTimeoutMs);
+    const stopClock = this.startClock(controller);
     try {
-      const stage = this.stage ?? (this.stage = await mkdtemp(join(tmpdir(), 'coopanion-streamvoice-')));
+      const stage = await this.stageDir();
       const dir = await mkdtemp(join(stage, `c${job.seq}-`));
       job.dir = dir;
       // 取消可能发生在任何一步之后：结果丢掉，这次任务占的目录也一并清掉
@@ -543,7 +617,7 @@ export class Speaker {
       this.failedAt = Date.now();
       throw err;
     } finally {
-      clearTimeout(timer);
+      stopClock();
       if (job.controller === controller) job.controller = null;
     }
   }
@@ -568,18 +642,20 @@ export class Speaker {
       signal: controller.signal,
     });
     if (res.status === 429) {
-      await res.text().catch(() => '');
+      await this.readCapped(res, 512).catch(() => Buffer.alloc(0));
       throw new SpeechError('合成服务正忙', true);
     }
-    if (!res.ok) throw new SpeechError(`TTS HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+    if (!res.ok) {
+      const detail = (await this.readCapped(res, 512).catch(() => Buffer.alloc(0))).toString('utf8');
+      throw new SpeechError(`TTS HTTP ${res.status}: ${detail.slice(0, 300)}`);
+    }
     const declared = Number(res.headers.get('content-length') ?? '0');
     if (declared > this.options.maxAudioBytes) {
       await res.body?.cancel().catch(() => {});
       throw new SpeechError(`音频响应太大（${declared} 字节）`);
     }
-    const audio = Buffer.from(await res.arrayBuffer());
+    const audio = await this.readCapped(res, this.options.maxAudioBytes);
     if (epoch !== this.epoch) throw new Error('取消');
-    if (audio.length > this.options.maxAudioBytes) throw new SpeechError(`音频响应太大（${audio.length} 字节）`);
     return {
       audio,
       reference: res.headers.get('x-coopanion-reference') ?? undefined,

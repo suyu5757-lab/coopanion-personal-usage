@@ -62,6 +62,8 @@ PATCH_CHANGED=0
 if [ ! -f "$PATCHER" ]; then
   log "缺少 $PATCHER，无法核对补丁"
   PROBLEMS=$((PROBLEMS + 1))
+elif python3 "$PATCHER" --paused --support-dir "$SUPPORT" 2>/dev/null; then
+  log "上次是手动回退，保持原样：不再自动打补丁（重跑补丁即恢复）"
 else
   STATUS="$(python3 "$PATCHER" --check --extension-dir "$SRC" --support-dir "$SUPPORT" 2>&1)"
   CODE=$?

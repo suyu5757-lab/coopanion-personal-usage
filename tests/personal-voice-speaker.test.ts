@@ -4,7 +4,8 @@
  * 这些用例对应已复现的 S1（取消后旧请求拖住新回复）、S3（试听取消后仍可能播放）、
  * S4（并发试听争用播放器），以及试听与正常朗读共用播放器所有权的规则。
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { createServer, type Server } from 'node:http';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Speaker, inspectWav, type PlayResult, type Player } from '../personal-voice/speaker.gptsovits.ts';
@@ -255,6 +256,57 @@ describe.skipIf(!native)('speaker lifecycle', () => {
     await speaker.stop();
   });
 
+  it('gives an audition its own deadline instead of blocking later lines', async () => {
+    const url = await silentServer();
+    const speaker = new Speaker(() => {}, new FakePlayer(), { url, requestTimeoutMs: 150 });
+    const started = Date.now();
+    const result = await speaker.audition('试听一句。', STYLE);
+    expect(result.ok).toBe(false);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    // 试听退出后普通朗读还能继续排队合成
+    const line = trace('after');
+    speaker.say('下一句。', STYLE, line);
+    await until(() => line.playbackStatus !== 'queued', 3_000);
+    await speaker.stop();
+  });
+
+  it('marks a segment skipped by the failure cooldown as cancelled, not queued', async () => {
+    const { calls, impl } = fakeTts();
+    vi.stubGlobal('fetch', impl);
+    const speaker = new Speaker(() => {}, new FakePlayer(), { url: 'http://tts/v1/audio/speech', requestTimeoutMs: 1_000 });
+    const first = trace('first');
+    speaker.say('第一句。', STYLE, first);
+    await until(() => calls.length === 1);
+    calls[0].resolve(new Response('{"error":"boom"}', { status: 500 }));
+    await until(() => first.playbackStatus === 'failed');
+    const second = trace('second');
+    speaker.say('第二句。', STYLE, second);
+    await until(() => second.playbackStatus !== 'queued');
+    expect(second.playbackStatus).toBe('cancelled');
+    expect(second.fallbackReason).toBe('service-cooldown');
+    expect(speaker.snapshot().omitted).toBe(1);
+    await speaker.stop();
+  });
+
+  it('stops reading a response body that grows past the byte limit', async () => {
+    const speaker = new Speaker(() => {}, new FakePlayer(), {
+      url: 'http://tts/v1/audio/speech',
+      requestTimeoutMs: 1_000,
+      maxAudioBytes: 1_000,
+    });
+    vi.stubGlobal('fetch', async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(8_000));
+        controller.close();
+      },
+    }), { status: 200, headers: { 'content-type': 'audio/wav' } }));
+    const line = trace('big');
+    speaker.say('一句。', STYLE, line);
+    await until(() => line.playbackStatus === 'failed');
+    expect(line.fallbackReason).toContain('超过');
+    await speaker.stop();
+  });
+
   it('keeps the queue bounded and says so once', async () => {
     const { calls, impl } = fakeTts();
     vi.stubGlobal('fetch', impl);
@@ -285,16 +337,14 @@ describe.skipIf(!native)('speaker lifecycle', () => {
 describe.skipIf(!native)('cancellation sequences', () => {
   class VerifyingPlayer extends FakePlayer {
     violations = 0;
-    constructor(private readonly traces: Map<string, SpeechTraceV1>) {
+    constructor(private readonly accept: (id: string) => boolean) {
       super();
     }
     async play(clip: string): Promise<PlayResult> {
       const body = readFileSync(clip).subarray(44).toString('utf8');
-      const text = body.slice(4, body.indexOf('\u0000', 4));
-      // 取消过的那段如果还是进了播放器，这里就记一次
-      const line = this.traces.get(text);
-      if (!line) this.violations++;
-      else if (line.playbackStatus === 'cancelled') this.violations++;
+      const id = body.slice(4, body.indexOf('\u0000', 4));
+      // 判据来自测试自己的记录，不看被测代码写的状态
+      if (!this.accept(id)) this.violations++;
       return super.play(clip);
     }
   }
@@ -323,25 +373,38 @@ describe.skipIf(!native)('cancellation sequences', () => {
     // 让响应无视取消照常回来，专门压「取消之后结果才到」这条路
     const { calls, impl } = fakeTts({ ignoreAbort: true });
     vi.stubGlobal('fetch', impl);
+    const prefix = 'coopanion-streamvoice-';
+    const before = new Set(readdirSync(tmpdir()).filter((name) => name.startsWith(prefix)));
     let played = 0;
     for (let seed = 0; seed < 500; seed++) {
       calls.length = 0;
       const random = lcg(seed + 1);
-      const traces = new Map<string, SpeechTraceV1>();
-      const player = new VerifyingPlayer(traces);
+      // 测试自己记谁还在等声音：hush 把在等的全划掉，播放时必须还在名单里
+      const live = new Set<string>();
+      const player = new VerifyingPlayer((id) => {
+        if (!live.has(id)) return false;
+        live.delete(id);
+        return true;
+      });
       const original = player.play.bind(player);
       player.play = async (clip: string) => { played++; return original(clip); };
       const speaker = new Speaker(() => {}, player, { url: 'http://tts/v1/audio/speech', requestTimeoutMs: 1_000 });
-      const ops = 2 + Math.floor(random() * 4);
+      const ops = 2 + Math.floor(random() * 5);
       for (let i = 0; i < ops; i++) {
         const roll = random();
-        if (roll < 0.5) {
-          const text = `s${seed}-${i}`;
-          const line = trace(text);
-          traces.set(text, line);
-          speaker.say(text, STYLE, line);
-        } else if (roll < 0.8) {
+        if (roll < 0.45) {
+          const id = `s${seed}-${i}`;
+          live.add(id);
+          speaker.say(id, STYLE, trace(id));
+        } else if (roll < 0.7) {
+          live.clear();
           speaker.hush();
+        } else if (roll < 0.85) {
+          // 试听先清空在等的，再把自己排进去
+          live.clear();
+          const id = `a${seed}-${i}`;
+          live.add(id);
+          void speaker.audition(id, STYLE).catch(() => {});
         } else if (calls.length) {
           const at = Math.floor(random() * calls.length);
           const [call] = calls.splice(at, 1);
@@ -349,14 +412,23 @@ describe.skipIf(!native)('cancellation sequences', () => {
         }
         await tick();
       }
-      for (const call of calls.splice(0)) call.resolve(audioResponse(tagged(call.body.input)));
+      // 收尾：把还在路上的响应都放出来，再等它们自己结束
+      for (let i = 0; i < 6; i++) {
+        for (const call of calls.splice(0)) call.resolve(audioResponse(tagged(call.body.input)));
+        await tick();
+      }
       await speaker.stop();
+      await tick();
       expect(player.violations, `seed ${seed}`).toBe(0);
       expect(player.maxConcurrent, `seed ${seed}`).toBeLessThanOrEqual(1);
+      expect(speaker.snapshot().queued, `seed ${seed}`).toBe(0);
     }
     // 序列里必须真的放出过声音，否则这条断言什么都没证明
     expect(played).toBeGreaterThan(20);
-  });
+    // 停止之后不该留下这次创建的暂存目录
+    const after = readdirSync(tmpdir()).filter((name) => name.startsWith(prefix) && !before.has(name));
+    expect(after).toEqual([]);
+  }, 90_000);
 });
 
 describe('wav inspection', () => {

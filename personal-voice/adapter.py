@@ -5,9 +5,11 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -22,6 +24,10 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 # One inference at a time: the local model is the scarce resource, and a client
 # that gave up still leaves the server computing.
 ENGINE = threading.Semaphore(1)
+# A client-side timeout says nothing about the model. Until it is known idle
+# again (an operator restart), new inference requests are refused instead of
+# stacking up behind the one still running.
+ENGINE_UNKNOWN = False
 
 # Marker parts are separated by commas or whitespace, full or half width.
 PARTS = re.compile(r"[,，、;；\s]+")
@@ -36,6 +42,10 @@ class NoReference(Exception):
     """No configured reference is readable, so this line has to stay text."""
 
 
+class BusyUnknown(Exception):
+    """An earlier request timed out; the engine may still be computing."""
+
+
 def load_config():
     with open(CONFIG, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -48,21 +58,48 @@ def config_fingerprint(cfg):
 
 
 def wav_ok(path):
+    """参考音能不能被后端读：真的 WAV 就要有合法格式和非空的 data。"""
     try:
-        with open(path, "rb") as f:
-            head = f.read(64)
-            size = os.fstat(f.fileno()).st_size
+        size = os.path.getsize(path)
     except OSError:
         return False
     if not path.lower().endswith(".wav"):
         return size > 0
-    if size < 44 or head[0:4] != b"RIFF" or head[8:12] != b"WAVE":
+    if size < 44:
         return False
-    if head[12:16] != b"fmt " or int.from_bytes(head[16:20], "little") < 16:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+            if head[0:4] != b"RIFF" or head[8:12] != b"WAVE":
+                return False
+            fmt = None
+            data = None
+            while True:
+                chunk = f.read(8)
+                if len(chunk) < 8:
+                    break
+                name, length = chunk[0:4], int.from_bytes(chunk[4:8], "little")
+                body = f.tell()
+                if name == b"fmt " and length >= 16:
+                    raw = f.read(16)
+                    fmt = (
+                        int.from_bytes(raw[0:2], "little"),
+                        int.from_bytes(raw[2:4], "little"),
+                        int.from_bytes(raw[4:8], "little"),
+                        int.from_bytes(raw[14:16], "little"),
+                    )
+                elif name == b"data":
+                    data = length
+                    if body + length > size:
+                        return False
+                    break
+                f.seek(body + length + (length % 2))
+    except OSError:
         return False
-    channels = int.from_bytes(head[22:24], "little")
-    rate = int.from_bytes(head[24:28], "little")
-    return channels in (1, 2) and 8000 <= rate <= 96000
+    if fmt is None or data is None or data <= 0:
+        return False
+    code, channels, rate, bits = fmt
+    return code in (1, 3, 0xFFFE) and channels in (1, 2) and 8000 <= rate <= 96000 and bits in (8, 16, 24, 32)
 
 
 _health_cache = {}
@@ -130,7 +167,8 @@ def choose_reference(cfg, text, emotion):
     if key and health.get(key):
         return key, None
     if key and key != "neutral" and health.get("neutral"):
-        return "neutral", "%s 参考音不可用" % key
+        # 响应头只能放 ASCII；中文说明留在 stderr 日志里
+        return "neutral", "reference-unavailable:%s" % urllib.parse.quote(str(key), safe="")
     if key is None and health.get("neutral"):
         return "neutral", None
     raise NoReference("没有可用的参考音")
@@ -177,6 +215,9 @@ def gpt_sovits_speech(text, speed, emotion):
     )
     # A cancelled client does not stop the model, so the next request waits for a
     # bounded moment and then gets a clear busy answer instead of piling up.
+    global ENGINE_UNKNOWN
+    if ENGINE_UNKNOWN:
+        raise BusyUnknown()
     wait = float(cfg.get("busy_wait_s", 0.25))
     if not ENGINE.acquire(timeout=max(0.0, wait)):
         raise Busy()
@@ -184,8 +225,22 @@ def gpt_sovits_speech(text, speed, emotion):
         timeout = float(cfg.get("upstream_timeout_s", 120))
         with OPENER.open(req, timeout=timeout) as res:
             return res.read(), key, fallback
+    except Exception as exc:
+        # 客户端超时不能证明后端停了；此后再提交推理前必须人工确认
+        if _is_timeout(exc):
+            ENGINE_UNKNOWN = True
+            raise BusyUnknown() from exc
+        raise
     finally:
         ENGINE.release()
+
+
+def _is_timeout(exc):
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        return isinstance(exc.reason, (TimeoutError, socket.timeout))
+    return False
 
 
 def capabilities(cfg):
@@ -234,7 +289,7 @@ class Handler(BaseHTTPRequestHandler):
                 url = cfg.get("gpt_sovits_url", "http://127.0.0.1:9880").rstrip("/") + "/docs"
                 with OPENER.open(url, timeout=2) as res:
                     ok = res.status == 200
-                self._json(200 if ok else 503, {"ok": ok})
+                self._json(200 if ok else 503, {"ok": ok, "engine": "unknown" if ENGINE_UNKNOWN else "idle"})
             except Exception as exc:
                 self._json(503, {"ok": False, "error": str(exc)})
             return
@@ -276,6 +331,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Retry-After", "1")
             body = json.dumps({"error": "busy"}, ensure_ascii=False).encode("utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except BusyUnknown:
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("X-Coopanion-Fallback", "busy-unknown")
+            self.send_header("Retry-After", "10")
+            body = json.dumps({"error": "busy-unknown"}, ensure_ascii=False).encode("utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

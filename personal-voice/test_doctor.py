@@ -23,6 +23,10 @@ def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def digest_text(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 class DoctorTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -49,12 +53,14 @@ class DoctorTests(unittest.TestCase):
         upstream["world.ts"] = "".join(world)
         for name, text in upstream.items():
             (self.src / name).write_text(text, encoding="utf-8")
+        world_text = patcher.world_patched((self.src / "world.ts").read_text(encoding="utf-8"))
         (self.voice / "patch-manifest.json").write_text(json.dumps({
             "package": "cortico-world-streamvoice",
             "version": "0.4.0",
             "upstream": {name: digest(self.src / name) for name in upstream},
             "spliced": ["world.ts"],
             "written": {"speaker.ts": "speaker.gptsovits.ts", "speech-plan.ts": "speech-plan.ts"},
+            "results": {"world.ts": digest_text(world_text)},
         }), encoding="utf-8")
         self.config = self.root / "adapter-config.json"
         self.config.write_text(json.dumps({
@@ -88,6 +94,21 @@ class DoctorTests(unittest.TestCase):
         self.assertFalse((self.src / "speech-plan.ts").exists())
         self.assertFalse(list(self.support.glob("patch-transactions/*.json")))
         self.assertFalse(list(self.src.glob("*.bak-*")))
+
+    def test_repair_leaves_a_manual_rollback_alone(self):
+        self.assertEqual(self.run_doctor("--repair").returncode, 1)
+        self.assertTrue((self.src / "speech-plan.ts").is_file())
+        patcher_path = self.voice / "patch-streamvoice.py"
+        code = subprocess.run(
+            [sys.executable, str(patcher_path), "--support-dir", str(self.support),
+             "--extension-dir", str(self.src), "--rollback"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(code.returncode, 0, code.stderr)
+        self.assertFalse((self.src / "speech-plan.ts").exists())
+        result = self.run_doctor("--repair")
+        self.assertIn("保持原样", result.stdout)
+        self.assertFalse((self.src / "speech-plan.ts").exists())
 
     def test_repair_applies_the_patch_without_restarting_anything(self):
         result = self.run_doctor("--repair")

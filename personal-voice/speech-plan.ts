@@ -46,6 +46,13 @@ export class MarkupFilter {
     return hits;
   }
 
+  /** 从头算：收尾之后再喂字，就是另一段台词。 */
+  reset(): void {
+    this.hold = '';
+    this.out = 0;
+    this.hits = [];
+  }
+
   private scan(text: string, final: boolean): string {
     this.hold += text;
     let piece = '';
@@ -67,7 +74,8 @@ export class MarkupFilter {
         const end = this.hold.indexOf(close, i + 1);
         if (end < 0) {
           const rest = this.hold.slice(i);
-          if (final || rest.length > MARKER_MAX || rest.includes('\n')) { piece += ch; i++; continue; }
+          // 长度按标记内部算：开括号不算字数，否则恰好 32 字的标记会随切分方式不同而不一样
+          if (final || rest.slice(1).length > MARKER_MAX || rest.includes('\n')) { piece += ch; i++; continue; }
           break;
         }
         const inner = this.hold.slice(i + 1, end);
@@ -161,9 +169,16 @@ export class VoiceChunker {
   flush(): SpeechChunk[] {
     const rest = this.buf.trim();
     const lead = this.buf.length - this.buf.replace(/^\s+/, '').length;
+    const start = this.base + lead;
     this.buf = '';
     if (!rest) return [];
-    return [{ text: rest, start: this.base + lead, end: this.base + lead + rest.length }];
+    return [{ text: rest, start, end: start + rest.length }];
+  }
+
+  /** 从头算：位置和缓冲一起清掉。 */
+  reset(): void {
+    this.buf = '';
+    this.base = 0;
   }
 
   private drain(): SpeechChunk[] {
@@ -194,6 +209,8 @@ export class VoiceChunker {
           continue;
         }
         if (len > max) return this.softCut(max);
+        // 句末刚好落在增量末尾时先不切：收尾引号、括号可能在下一个增量里
+        if (end >= this.buf.length) return 0;
         return end;
       }
       i++;
@@ -286,7 +303,13 @@ export class SpeechPlanner {
     const tail = this.filter.flush();
     this.pending.push(...this.filter.takeHits());
     const chunks = tail ? [...this.chunker.push(tail), ...this.chunker.flush()] : this.chunker.flush();
-    return this.plan(chunks);
+    const out = this.plan(chunks);
+    // 收尾之后这个实例从零开始：再喂字就是另一段台词
+    this.filter.reset();
+    this.chunker.reset();
+    this.pending = [];
+    this.tone = undefined;
+    return out;
   }
 
   private plan(chunks: SpeechChunk[]): PlannedSegment[] {

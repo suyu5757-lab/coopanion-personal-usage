@@ -90,6 +90,35 @@ describe('speech plan', () => {
     expect(segments.every((segment) => segment.marker === undefined)).toBe(true);
   });
 
+  it('treats an inline marker of exactly the limit the same however it is cut', () => {
+    const inner = 'a'.repeat(32);
+    const script = `＜${inner}＞那我们走吧。`;
+    const whole = shape(plan([script], null));
+    for (const size of [1, 2, 7, 33]) expect(shape(plan(split(script, size), null))).toEqual(whole);
+    expect(whole[0]?.marker).toBe(inner);
+    expect(whole[0]?.text).toBe('那我们走吧。');
+    // 能力清单里没有这个标记时，它照样是标记，只是不换声音
+    expect(shape(plan([script]))[0]?.marker).toBeUndefined();
+  });
+
+  it('keeps a closing quote with the sentence it belongs to however it is cut', () => {
+    const script = '【开心】第一句话已经足够长了。”</span>'
+      .replace('</span>', '')
+      .concat('<生气>第二句话也已经足够长了。');
+    const whole = shape(plan([script]));
+    for (const size of [1, 3, 8]) expect(shape(plan(split(script, size)))).toEqual(whole);
+    expect(whole[0]).toEqual({ text: '第一句话已经足够长了。”', marker: '开心' });
+  });
+
+  it('starts over after a flush instead of carrying the old tone and offsets', () => {
+    const planner = new SpeechPlanner({ min: 1, max: 40 }, () => CAP);
+    expect(planner.push('【开心】好的。 ').map((s) => s.marker)).toEqual(['开心']);
+    expect(planner.flush().map((s) => s.marker)).toEqual([]);
+    const next = planner.push('<生气>再见。 ');
+    expect(next.map((s) => s.marker)).toEqual(['生气']);
+    expect(next.map((s) => s.start)).toEqual([0]);
+  });
+
   it('reports the range of each segment in the cleaned text', () => {
     const planner = new SpeechPlanner({ min: 8, max: 40 }, () => CAP);
     const segments = [...planner.push('【开心】第一句话已经足够长了。'), ...planner.flush()];

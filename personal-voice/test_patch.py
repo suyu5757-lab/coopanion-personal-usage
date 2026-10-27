@@ -47,12 +47,15 @@ class PatchTests(unittest.TestCase):
         self.write_manifest({name: digest(self.src / name) for name in self.upstream})
 
     def write_manifest(self, hashes):
+        fixture = (self.src / "world.ts").read_text(encoding="utf-8")
+        world = patcher.world_patched(fixture)
         self.manifest.write_text(json.dumps({
             "package": "cortico-world-streamvoice",
             "version": "0.4.0",
             "upstream": hashes,
             "spliced": ["world.ts"],
             "written": {"speaker.ts": "speaker.gptsovits.ts", "speech-plan.ts": "speech-plan.ts"},
+            "results": {"world.ts": hashlib.sha256(world.encode("utf-8")).hexdigest()},
         }), encoding="utf-8")
 
     def run_patcher(self, *args):
@@ -96,6 +99,14 @@ class PatchTests(unittest.TestCase):
             self.assertEqual(digest(self.src / name), hashed)
         self.assertFalse((self.src / "speech-plan.ts").exists())
 
+    def test_rollback_pauses_automatic_repair(self):
+        self.assertEqual(self.run_patcher().returncode, 0)
+        self.assertEqual(self.run_patcher("--paused").returncode, 1)
+        self.assertEqual(self.run_patcher("--rollback").returncode, 0)
+        self.assertEqual(self.run_patcher("--paused").returncode, 0)
+        self.assertEqual(self.run_patcher().returncode, 0)
+        self.assertEqual(self.run_patcher("--paused").returncode, 1)
+
     def test_rollback_also_handles_a_half_finished_install(self):
         originals = {name: digest(self.src / name) for name in self.upstream}
         self.assertEqual(self.run_patcher().returncode, 0)
@@ -120,6 +131,31 @@ class PatchTests(unittest.TestCase):
         for name in ("clean.ts", "chunker.ts", "speaker.ts"):
             self.assertEqual(digest(self.src / name), before[name])
         self.assertFalse((self.src / "speech-plan.ts").exists())
+
+    def test_a_half_applied_tree_is_not_reported_as_patched(self):
+        self.assertEqual(self.run_patcher().returncode, 0)
+        # 只把 world.ts 还原：其余仍是补丁产物
+        record = json.loads(next(self.support.glob("patch-transactions/*.json")).read_text(encoding="utf-8"))
+        world = next(entry for entry in record["files"] if entry["file"] == "world.ts")
+        (self.src / "world.ts").write_bytes((self.src / world["backup"]).read_bytes())
+        code, report = self.status()
+        self.assertEqual((code, report["status"]), (1, "patch"))
+        self.assertEqual(report["files"]["world.ts"], "upstream")
+
+    def test_a_missing_required_upstream_file_is_incompatible(self):
+        (self.src / "world.ts").unlink()
+        code, report = self.status()
+        self.assertEqual((code, report["status"]), (2, "incompatible"))
+        self.assertEqual(report["files"]["world.ts"], "absent")
+        self.assertEqual(self.run_patcher().returncode, 2)
+
+    def test_drift_outside_the_replaced_regions_is_detected(self):
+        self.assertEqual(self.run_patcher().returncode, 0)
+        world = (self.src / "world.ts").read_text(encoding="utf-8")
+        (self.src / "world.ts").write_text(world.replace("// world fixture", "// world fixture, edited"), encoding="utf-8")
+        code, report = self.status()
+        self.assertEqual((code, report["status"]), (2, "incompatible"))
+        self.assertEqual(report["files"]["world.ts"], "other")
 
     def test_detects_a_hand_edited_installed_file(self):
         self.assertEqual(self.run_patcher().returncode, 0)

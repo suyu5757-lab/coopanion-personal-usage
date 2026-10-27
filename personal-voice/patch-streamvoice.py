@@ -240,6 +240,9 @@ def load_manifest(path):
             raise PatchError(f"清单 {path} 缺少 {key}")
     if "world.ts" not in manifest["upstream"]:
         raise PatchError(f"清单 {path} 没有登记 world.ts")
+    for name in manifest.get("spliced") or []:
+        if not (manifest.get("results") or {}).get(name):
+            raise PatchError(f"清单 {path} 没有登记 {name} 的补丁产物指纹")
     return manifest
 
 
@@ -259,18 +262,21 @@ def inspect(src, manifest, template_dir):
     if not src.is_dir():
         raise PatchError(f"没找到扩展源码目录：{src}")
     tpl = templates(template_dir, manifest)
+    written = set(manifest["written"])
+    spliced = set(manifest.get("spliced") or [])
+    expected = manifest.get("results") or {}
     facts = {}
     for name, pinned in manifest["upstream"].items():
         path = src / name
         if not path.is_file():
             facts[name] = "absent"
             continue
-        text = read_text(path)
-        if digest(text.encode("utf-8")) == pinned:
+        current = digest(path.read_bytes())
+        if current == pinned:
             facts[name] = "upstream"
-        elif name in tpl and text == tpl[name]:
+        elif name in tpl and read_text(path) == tpl[name]:
             facts[name] = "patched"
-        elif name == "world.ts" and world_is_patched(text):
+        elif name in spliced and current == expected.get(name):
             facts[name] = "patched"
         else:
             facts[name] = "other"
@@ -280,12 +286,11 @@ def inspect(src, manifest, template_dir):
         path = src / name
         facts[name] = "absent" if not path.is_file() else ("patched" if read_text(path) == template else "other")
 
-    written = set(manifest["written"])
-    spliced = set(manifest.get("spliced") or [])
-    if any(state == "other" for state in facts.values()):
+    if any(state == "other" for state in facts.values()) \
+            or any(state == "absent" for name, state in facts.items() if name in manifest["upstream"]):
+        # 上游文件缺一个、或内容既不是原版也不是补丁产物：不能猜
         status = "incompatible"
-    elif all(facts[name] == "patched" for name in written) \
-            and all(facts[name] in ("patched", "upstream") for name in spliced) \
+    elif all(facts[name] == "patched" for name in written | spliced) \
             and all(state == "upstream" for name, state in facts.items() if name not in written | spliced):
         status = "patched"
     elif all(state in ("upstream", "absent") for state in facts.values()):
@@ -296,7 +301,11 @@ def inspect(src, manifest, template_dir):
     targets = {}
     if status in ("clean", "patch"):
         if facts["world.ts"] == "upstream":
-            targets["world.ts"] = world_patched(read_text(src / "world.ts"))
+            patched = world_patched(read_text(src / "world.ts"))
+            wanted = expected.get("world.ts")
+            if digest(patched.encode("utf-8")) != wanted:
+                raise PatchError("模板与清单里的补丁产物指纹不一致：先运行 --fingerprint 更新清单")
+            targets["world.ts"] = patched
         for name, text in tpl.items():
             if facts.get(name) != "patched":
                 targets[name] = text
@@ -322,6 +331,25 @@ def report(result, as_json):
     elif result["status"] == "incompatible":
         print("上游文件与 0.4.0 不一致：先确认新版本，再更新清单与补丁，别直接覆盖。")
     return EXIT.get(result["status"], 2)
+
+
+def write_json(path, data):
+    """先写同目录临时文件再替换：写到一半失败也不会把上一条清单截断。"""
+    path = Path(path)
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp, path)
+
+
+def paused(support):
+    """最近一次事务是手动回退：doctor 别再自动打回去。"""
+    records = sorted((Path(support) / "patch-transactions").glob("*.json"))
+    if not records:
+        return False
+    try:
+        return json.loads(records[-1].read_text(encoding="utf-8")).get("state") == "rolled-back"
+    except (OSError, ValueError):
+        return False
 
 
 def transaction_dir(support):
@@ -370,7 +398,7 @@ def apply(result, manifest, support):
             "files": entries,
         }
         record_path = transaction_dir(support) / f"{stamp}.json"
-        record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_json(record_path, record)
         # 4. 逐项原子替换
         for name in targets:
             os.replace(staging / name, src / name)
@@ -393,7 +421,7 @@ def apply(result, manifest, support):
 
     shutil.rmtree(staging, ignore_errors=True)
     record["state"] = "applied"
-    record_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json(record_path, record)
     for entry in entries:
         print(f"patched {entry['file']}  {entry['old'] or '-':<8} -> {entry['new']}")
         print(f"backup  {entry['backup'] or '（新增文件）'}")
@@ -433,7 +461,10 @@ def rollback(record_path):
         if current == entry["old"]:
             continue
         os.replace(src / entry["backup"], path)
+    record["state"] = "rolled-back"
+    write_json(record_path, record)
     print(f"rolled back {record['stamp']}（{len(entries)} 个文件）")
+    print("自动修复已暂停：重跑补丁或删掉这条事务记录才会恢复。")
     return 0
 
 
@@ -453,9 +484,17 @@ def main(argv=None):
     parser.add_argument("--check", action="store_true", help="只报告状态，不改文件")
     parser.add_argument("--json", action="store_true", help="用 JSON 输出状态")
     parser.add_argument("--rollback", nargs="?", const="latest", default=None, help="回退到某个事务（默认最近一次）")
+    parser.add_argument("--paused", action="store_true", help="最近一次事务是手动回退时退出 0")
+    parser.add_argument("--fingerprint", type=Path, default=None, help="打印某个 0.4.0 src 目录打补丁后的指纹")
     args = parser.parse_args(argv)
 
     try:
+        if args.paused:
+            return 0 if paused(args.support_dir) else 1
+        if args.fingerprint is not None:
+            patched = world_patched(read_text(Path(args.fingerprint) / "world.ts"))
+            print(json.dumps({"world.ts": digest(patched.encode("utf-8"))}))
+            return 0
         manifest = load_manifest(args.manifest)
         if args.rollback is not None:
             path = latest_record(args.support_dir) if args.rollback == "latest" else Path(args.rollback)
