@@ -179,6 +179,32 @@ class AdapterTests(unittest.TestCase):
             adapter.gpt_sovits_speech("Hello.", None, "neutral")
         self.assertEqual(len(calls), 1)
 
+    def test_health_keeps_the_unknown_engine_state_when_the_probe_fails(self):
+        adapter.ENGINE_UNKNOWN = True
+
+        class Opener:
+            def open(self, *_args, **_kwargs):
+                raise socket.timeout("docs probe timed out")
+
+        original = adapter.OPENER
+        adapter.OPENER = Opener()
+        self.addCleanup(setattr, adapter, "OPENER", original)
+        handler_server = ThreadingHTTPServer(("127.0.0.1", 0), adapter.Handler)
+        handler_thread = threading.Thread(target=handler_server.serve_forever, daemon=True)
+        handler_thread.start()
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", handler_server.server_port, timeout=5)
+            connection.request("GET", "/health")
+            response = connection.getresponse()
+            body = json.loads(response.read())
+            self.assertEqual(response.status, 503)
+            self.assertEqual(body.get("engine"), "unknown")
+            connection.close()
+        finally:
+            handler_server.shutdown()
+            handler_server.server_close()
+            handler_thread.join()
+
     def test_capabilities_describe_the_voice_without_paths(self):
         report = adapter.capabilities(self.cfg)
         self.assertEqual(report["default"], "neutral")

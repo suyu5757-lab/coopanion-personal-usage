@@ -287,18 +287,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
+            # 引擎状态比后端探活更重要：超时之后哪怕后端还活着，也不能算健康
+            if ENGINE_UNKNOWN:
+                self._json(503, {"ok": False, "engine": "unknown"})
+                return
             try:
                 cfg = load_config()
                 url = cfg.get("gpt_sovits_url", "http://127.0.0.1:9880").rstrip("/") + "/docs"
                 with OPENER.open(url, timeout=2) as res:
                     ok = res.status == 200
-                if ENGINE_UNKNOWN:
-                    # 后端还活着，但上一次推理超时后状态未知：不能算健康
-                    self._json(503, {"ok": False, "engine": "unknown"})
-                else:
-                    self._json(200 if ok else 503, {"ok": ok, "engine": "idle"})
+                self._json(200 if ok else 503, {"ok": ok, "engine": "unknown" if ENGINE_UNKNOWN else "idle"})
             except Exception as exc:
-                self._json(503, {"ok": False, "error": str(exc)})
+                self._json(503, {"ok": False, "engine": "unknown" if ENGINE_UNKNOWN else "idle", "error": str(exc)})
             return
         if self.path == "/capabilities":
             try:

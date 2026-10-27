@@ -137,6 +137,8 @@ export class Speaker {
   private stageInit: Promise<string> | null = null;
   /** 进行中的预热；stop() 要等它收束，才不会在清理后重建目录。 */
   private warmTask: Promise<void> | null = null;
+  /** hush() 之后点起来的播放器预热；stop() 也要等它。 */
+  private playerWarm: Promise<void> | null = null;
   /** stop() 之后到下一次 warm() 之间，不再接受新任务。 */
   private closing = false;
   private jobs: Job[] = [];
@@ -360,7 +362,7 @@ export class Speaker {
       const synthMs = Date.now() - started;
       const result = await this.playOwned(audioFilePath, epoch);
       if (result === 'cut') return { ok: false, ms: Date.now() - started, synthMs, cancelled: true, error: '试听被取消' };
-      void this.player.warm(stage).catch(() => {});
+      this.reWarm(stage);
       if (result === 'played') {
         if (this.options.verbose) this.log(`试听合成 ${synthMs}ms，音频 ${info.durationMs}ms`);
         return { ok: true, ms: Date.now() - started, synthMs };
@@ -398,9 +400,18 @@ export class Speaker {
       void this.discard(job);
     }
     this.player.hush();
-    // 下一次开口别等播放器启动：先把新的一个点起来
-    const stage = this.stage;
-    if (stage) void this.player.warm(stage).catch(() => {});
+    // 下一次开口别等播放器启动：先把新的一个点起来（停止途中就不要再派生了）
+    if (this.stage) this.reWarm(this.stage);
+  }
+
+  /** 重新预热播放器，并把它记进 stop() 的等待集合。 */
+  private reWarm(stage: string): void {
+    if (this.closing) return;
+    const task = this.player.warm(stage).catch(() => {});
+    this.playerWarm = task;
+    void task.finally(() => {
+      if (this.playerWarm === task) this.playerWarm = null;
+    });
   }
 
   async stop(): Promise<void> {
@@ -409,7 +420,13 @@ export class Speaker {
     await this.player.stop().catch(() => {});
     // 等在途的合成、试听和播放自己收束；它们可能还在 mkdtemp，清理前不能先删根目录
     await Promise.race([
-      Promise.allSettled([this.synthChain, this.auditionBusy ?? Promise.resolve(), this.playLock, this.warmTask ?? Promise.resolve()]),
+      Promise.allSettled([
+        this.synthChain,
+        this.auditionBusy ?? Promise.resolve(),
+        this.playLock,
+        this.warmTask ?? Promise.resolve(),
+        this.playerWarm ?? Promise.resolve(),
+      ]),
       sleep(5_000),
     ]);
     const stage = this.stage;

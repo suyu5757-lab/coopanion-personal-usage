@@ -91,10 +91,11 @@ function fakeTts(options: { ignoreAbort?: boolean } = {}) {
 
 class FakePlayer implements Player {
   calls = 0;
+  warmed = 0;
   concurrent = 0;
   maxConcurrent = 0;
   delayMs = 10;
-  async warm(): Promise<void> {}
+  async warm(): Promise<void> { this.warmed++; }
   async play(_clip: string): Promise<PlayResult> {
     this.calls++;
     this.concurrent++;
@@ -305,6 +306,17 @@ describe.skipIf(!native)('speaker lifecycle', () => {
     await until(() => line.playbackStatus === 'failed');
     expect(line.fallbackReason).toContain('超过');
     await speaker.stop();
+  });
+
+  it('does not start a new player warmup while stopping', async () => {
+    const player = new FakePlayer();
+    const speaker = new Speaker(() => {}, player, { url: 'http://tts/v1/audio/speech', requestTimeoutMs: 1_000 });
+    await speaker.warm(STYLE);
+    expect(player.warmed).toBe(1);
+    speaker.hush();
+    expect(player.warmed).toBe(2);
+    await speaker.stop();
+    expect(player.warmed).toBe(2);
   });
 
   it('keeps the queue bounded and says so once', async () => {
