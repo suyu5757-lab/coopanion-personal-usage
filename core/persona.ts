@@ -483,26 +483,39 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
         if (!status.repo) throw new Error(status.initError ?? 'The Persona workspace has no Git history.');
         if (status.dirty) throw new Error('The Persona workspace has uncommitted changes. Commit or restore them before applying this proposal.');
 
+        // Every change is resolved against the same snapshot and every file's final text is built
+        // in memory first, so a later change that no longer matches leaves no earlier one applied.
         const originals = new Map<string, { exists: boolean; text: string }>();
-        let committed = false;
-        try {
-          for (const change of proposal.changes) {
+        const finals = new Map<string, string>();
+        for (const change of proposal.changes) {
+          if (!originals.has(change.file)) {
             const path = join(this.memoryDir, change.file);
             const exists = existsSync(path);
-            const before = exists ? readFileSync(path, 'utf8') : '';
-            originals.set(change.file, { exists, text: before });
-            let after: string;
-            if (change.from !== undefined) {
-              const first = before.indexOf(change.from);
-              if (first < 0 || before.indexOf(change.from, first + change.from.length) >= 0) {
-                throw new Error(`${change.file} no longer has one unique copy of the proposed source text.`);
-              }
-              after = `${before.slice(0, first)}${change.to}${before.slice(first + change.from.length)}`;
-            } else {
-              if (before.includes(change.to)) throw new Error(`${change.file} already contains the proposed line.`);
-              after = `${before.replace(/\s*$/, '')}${before.trim() ? '\n\n' : ''}${change.to}\n`;
+            const text = exists ? readFileSync(path, 'utf8') : '';
+            originals.set(change.file, { exists, text });
+            finals.set(change.file, text);
+          }
+          const before = finals.get(change.file)!;
+          let after: string;
+          if (change.from !== undefined) {
+            const first = before.indexOf(change.from);
+            if (first < 0 || before.indexOf(change.from, first + change.from.length) >= 0) {
+              throw new Error(`${change.file} no longer has one unique copy of the proposed source text.`);
             }
-            writeState(path, after);
+            after = `${before.slice(0, first)}${change.to}${before.slice(first + change.from.length)}`;
+          } else {
+            if (before.includes(change.to)) throw new Error(`${change.file} already contains the proposed line.`);
+            after = `${before.replace(/\s*$/, '')}${before.trim() ? '\n\n' : ''}${change.to}\n`;
+          }
+          finals.set(change.file, after);
+        }
+
+        const written: string[] = [];
+        let committed = false;
+        try {
+          for (const [file, text] of finals) {
+            writeState(join(this.memoryDir, file), text);
+            written.push(file);
           }
           const commit = this.git.commitAll(`Apply growth proposal ${proposal.id}`, AUTHOR_APP);
           if (!commit) throw new Error(this.git.status().commitError ?? 'Git did not create a commit for this proposal.');
@@ -512,7 +525,8 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
           return { commit, proposal: applied };
         } catch (error) {
           if (!committed) {
-            for (const [file, original] of originals) {
+            for (const file of written) {
+              const original = originals.get(file)!;
               const path = join(this.memoryDir, file);
               if (original.exists) writeState(path, original.text);
               else unlinkSync(path);
