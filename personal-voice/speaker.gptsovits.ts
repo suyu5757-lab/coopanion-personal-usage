@@ -137,8 +137,8 @@ export class Speaker {
   private stageInit: Promise<string> | null = null;
   /** 进行中的预热；stop() 要等它收束，才不会在清理后重建目录。 */
   private warmTask: Promise<void> | null = null;
-  /** hush() 之后点起来的播放器预热；stop() 也要等它。 */
-  private playerWarm: Promise<void> | null = null;
+  /** hush() 之后点起来的播放器预热；一次可以有多个，stop() 全部等。 */
+  private readonly playerWarms = new Set<Promise<void>>();
   /** stop() 之后到下一次 warm() 之间，不再接受新任务。 */
   private closing = false;
   private jobs: Job[] = [];
@@ -408,10 +408,8 @@ export class Speaker {
   private reWarm(stage: string): void {
     if (this.closing) return;
     const task = this.player.warm(stage).catch(() => {});
-    this.playerWarm = task;
-    void task.finally(() => {
-      if (this.playerWarm === task) this.playerWarm = null;
-    });
+    this.playerWarms.add(task);
+    void task.finally(() => { this.playerWarms.delete(task); });
   }
 
   async stop(): Promise<void> {
@@ -425,7 +423,7 @@ export class Speaker {
         this.auditionBusy ?? Promise.resolve(),
         this.playLock,
         this.warmTask ?? Promise.resolve(),
-        this.playerWarm ?? Promise.resolve(),
+        ...this.playerWarms,
       ]),
       sleep(5_000),
     ]);

@@ -308,6 +308,35 @@ describe.skipIf(!native)('speaker lifecycle', () => {
     await speaker.stop();
   });
 
+  class SlowWarmPlayer extends FakePlayer {
+    pending: Array<() => void> = [];
+    async warm(): Promise<void> {
+      this.warmed++;
+      await new Promise<void>((resolve) => this.pending.push(resolve));
+    }
+  }
+
+  it('waits for every player warmup hush started, not just the last', async () => {
+    const player = new SlowWarmPlayer();
+    const speaker = new Speaker(() => {}, player, { url: 'http://tts/v1/audio/speech', requestTimeoutMs: 1_000 });
+    const warming = speaker.warm(STYLE);
+    await until(() => player.pending.length === 1);
+    player.pending.shift()!();
+    await warming;
+    speaker.hush();
+    speaker.hush();
+    expect(player.pending.length).toBe(2);
+    const stopping = speaker.stop();
+    let settled = false;
+    void stopping.then(() => { settled = true; });
+    player.pending[1]!();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+    player.pending[0]!();
+    await stopping;
+    expect(settled).toBe(true);
+  });
+
   it('does not start a new player warmup while stopping', async () => {
     const player = new FakePlayer();
     const speaker = new Speaker(() => {}, player, { url: 'http://tts/v1/audio/speech', requestTimeoutMs: 1_000 });
