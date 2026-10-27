@@ -330,6 +330,7 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
     if (op === 'read') { await ensureAgent(); return state(); }
     if (op === 'text') { await ensureAgent(); return agentCall('text'); }
     if (op === 'element') { await ensureAgent(); return agentCall('element', [message.index]); }
+    if (op === 'active') { await ensureAgent(); return agentCall('active'); }
     if (op === 'share') {
       await ensureAgent();
       const point = await agentCall('shareCenter');

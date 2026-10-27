@@ -43,10 +43,12 @@ class FakeBridge implements BrowserTransport {
   readonly listeners = new Set<(event: 'closed') => void>();
   responses: Record<string, unknown | ((args: Record<string, unknown>) => unknown)> = {};
   element: unknown = null;
+  active: unknown = null;
 
   async call(op: string, args: Record<string, unknown> = {}): Promise<unknown> {
     this.calls.push({ op, args });
     if (op === 'element') return this.element;
+    if (op === 'active') return this.active;
     const value = this.responses[op];
     if (value instanceof Error) throw value;
     return typeof value === 'function' ? (value as (args: Record<string, unknown>) => unknown)(args) : value;
@@ -109,8 +111,10 @@ const make = async (opts: {
 describe('selfTime settings', () => {
   it('reads defaults and clamps hand-edited values', () => {
     expect(readSelfTime(undefined)).toEqual(SELF_TIME_DEFAULTS);
+    expect(SELF_TIME_DEFAULTS.enabled).toBe(false);
+    expect(SELF_TIME_DEFAULTS.actions).toBe(false);
     expect(readSelfTime({ companion: { selfTime: { enabled: true, afterMinutes: 999, sessionMinutes: 1, sessionUnlimited: true, sound: true, actions: false } } }))
-      .toEqual({ enabled: true, afterMinutes: 240, sessionMinutes: 5, sessionUnlimited: true, sound: true, actions: false });
+      .toEqual({ enabled: true, afterMinutes: 240, sessionMinutes: 5, sessionUnlimited: true, sound: true, topics: '', actions: false });
     expect(readSelfTime({ companion: { selfTime: { afterMinutes: 0, sessionMinutes: 999 } } }))
       .toEqual({ ...SELF_TIME_DEFAULTS, afterMinutes: 1, sessionMinutes: 60 });
     expect(readSelfTime({ companion: { selfTime: { enabled: true } }, worlds: { browser: { enabled: false } } }).enabled).toBe(false);
@@ -128,6 +132,10 @@ describe('selfTime settings', () => {
     const unlimited = selfTimeLine('zh', 30, 20, true);
     expect(unlimited).toContain('不限时长');
     expect(unlimited).not.toContain('最多 20 分钟');
+    expect(unlimited).toContain('不要搜索或打开浏览器');
+    const allowed = selfTimeLine('zh', 30, 20, false, '开源游戏设计');
+    expect(allowed).toContain('只探索这些主题');
+    expect(allowed).toContain('<topics>\n开源游戏设计\n</topics>');
     const enUnlimited = selfTimeLine('en', 120, 15, true);
     expect(enUnlimited).toContain('no time limit');
     expect(enUnlimited).not.toContain('15 minutes');
@@ -144,7 +152,7 @@ describe('Coo’s quiet line', () => {
     const line = (p as unknown as { tickText(seconds: number): string }).tickText(30);
     expect(line).toContain('自己的时间');
     expect(line).toContain('15 分钟');
-    expect(line).toContain('上网');
+    expect(line).toContain('不要搜索或打开浏览器');
     const unlimited = coopanionPersona(Cormini, {
       selfTime: () => ({ ...SELF_TIME_DEFAULTS, enabled: true, sessionUnlimited: true }),
       modelLanguage: () => 'zh',
@@ -255,7 +263,7 @@ describe('browser World', () => {
   });
 
   it('clicks a like and returns the page after it', async () => {
-    const { world, bridge } = await make();
+    const { world, bridge } = await make({ self: { actions: true } });
     bridge.responses.open = page();
     bridge.responses.click = { answer: { success: true }, state: page({ content: '[2]<div title=点赞>13 />' }) };
     await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
@@ -267,7 +275,7 @@ describe('browser World', () => {
   });
 
   it('hovers an element and returns the controls it reveals', async () => {
-    const { world, bridge } = await make();
+    const { world, bridge } = await make({ self: { actions: true } });
     bridge.responses.open = page();
     bridge.responses.hover = { state: page({ content: '[2]<div title=点赞>12 />\n[3]<button >使用 />' }) };
     await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
@@ -279,7 +287,7 @@ describe('browser World', () => {
   });
 
   it('opens the share panel and returns its options', async () => {
-    const { world, bridge } = await make();
+    const { world, bridge } = await make({ self: { actions: true } });
     bridge.responses.open = page();
     bridge.responses.share = { state: page({ content: '[3]<button >复制链接 />' }) };
     await run(world, 'browser_open', { url: 'https://www.douyin.com/' });
@@ -331,6 +339,62 @@ describe('browser World', () => {
     const searched = await run(world, 'browser_type', { index: 2, text: '猫' });
     expect(searched.failed).toBeUndefined();
     setSelf({ actions: true });
+  });
+
+  it('applies the read-only click guard to Enter and Space on an indexed element', async () => {
+    const { world, bridge } = await make({ self: { actions: false } });
+    bridge.responses.open = page();
+    bridge.responses.press = { state: page() };
+    await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
+    bridge.element = element();
+    const enter = await run(world, 'browser_press', { index: 2, key: 'Enter' });
+    const space = await run(world, 'browser_press', { index: 2, key: 'Space' });
+    expect(enter.failed).toBe(true);
+    expect(space.failed).toBe(true);
+    expect(bridge.calls.some((call) => call.op === 'press')).toBe(false);
+  });
+
+  it('checks the actual focused element when Enter has no index', async () => {
+    const { world, bridge } = await make({ self: { actions: false } });
+    bridge.responses.open = page();
+    bridge.responses.press = { state: page() };
+    await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
+    bridge.active = element();
+    const blocked = await run(world, 'browser_press', { key: 'Enter' });
+    expect(blocked.failed).toBe(true);
+    expect(bridge.calls.some((call) => call.op === 'press')).toBe(false);
+    bridge.active = element({ tag: 'input', text: '', label: '', title: '', type: 'search', placeholder: '搜索' });
+    const allowed = await run(world, 'browser_press', { key: 'Enter' });
+    expect(allowed.failed).toBeUndefined();
+    expect(bridge.calls.some((call) => call.op === 'press')).toBe(true);
+    bridge.active = null;
+    const unknown = await run(world, 'browser_press', { key: 'Space' });
+    expect(unknown.failed).toBe(true);
+  });
+
+  it('refuses keyboard activation of payment and account controls even when actions are on', async () => {
+    const { world, bridge } = await make({ self: { actions: true } });
+    bridge.responses.open = page();
+    bridge.responses.press = { state: page() };
+    await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
+    bridge.element = element({ text: '立即购买', label: '立即购买', title: '' });
+    const buy = await run(world, 'browser_press', { index: 2, key: 'Enter' });
+    bridge.element = element({ text: '退出登录', label: '退出登录', title: '' });
+    const signOut = await run(world, 'browser_press', { index: 2, key: 'Enter' });
+    expect(buy.failed).toBe(true);
+    expect(signOut.failed).toBe(true);
+    expect(bridge.calls.some((call) => call.op === 'press')).toBe(false);
+  });
+
+  it('allows Enter on a write control when actions are explicitly on', async () => {
+    const { world, bridge } = await make({ self: { actions: true } });
+    bridge.responses.open = page();
+    bridge.responses.press = { state: page() };
+    await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
+    bridge.element = element();
+    const out = await run(world, 'browser_press', { index: 2, key: 'Enter' });
+    expect(out.failed).toBeUndefined();
+    expect(bridge.calls.some((call) => call.op === 'press')).toBe(true);
   });
 
   it('takes a screenshot and attaches it when the model accepts images', async () => {
@@ -436,6 +500,8 @@ describe('browser World', () => {
     setSelf({ sessionUnlimited: true });
     expect(world.envPromptVars()).toMatchObject({ 'browser.session': '不限时长' });
     setSelf({ sessionUnlimited: false });
+    expect(world.envPromptVars()!['browser.actions']).toContain('只允许看');
+    setSelf({ actions: true });
     expect(world.envPromptVars()!['browser.actions']).toContain('点赞');
     const doc = world.webUi!('zh').promptDocs?.find((d) => d.role === 'envPrompt');
     expect(doc?.path).toBeTruthy();
@@ -447,13 +513,16 @@ describe('browser World', () => {
   });
 
   it('renders the environment prompt into the prefix with the live settings', async () => {
-    const { world } = await make();
+    const { world, setSelf } = await make();
     const { text } = await renderWorldEnvPrompt(world);
     expect(text).toContain('## 你自己的浏览器');
     expect(text).toContain('最多 20 分钟');
-    expect(text).toContain('可以点赞、收藏、关注、评论、发弹幕和分享');
+    expect(text).toContain('只允许看');
     expect(text).toContain('静音');
     expect(text).not.toContain('{{browser.');
+    setSelf({ actions: true });
+    const { text: allowed } = await renderWorldEnvPrompt(world);
+    expect(allowed).toContain('可以点赞、收藏、关注、评论、发弹幕和分享');
   });
 
   it('describes the tools and the closed event', () => {

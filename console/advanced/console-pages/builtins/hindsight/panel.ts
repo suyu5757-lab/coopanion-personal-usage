@@ -1,4 +1,5 @@
 import type { Disposable, WebUiPanel, WebUiPanelContext } from 'cortico/web/shared/client-panel.ts';
+import { get } from '../../../../base/api.ts';
 import { pick } from '../../../../base/language.ts';
 import { S } from './strings.ts';
 
@@ -7,6 +8,7 @@ interface MemoryItem {
   text: string;
   date: string;
   type: string;
+  documentId?: string | null;
 }
 
 interface HindsightStatus {
@@ -15,7 +17,65 @@ interface HindsightStatus {
   ok: boolean;
   version?: string;
   error?: string;
+  outbox?: {
+    pending: number;
+    sent: number;
+    failed: number;
+    dead: number;
+    orphaned: number;
+    active: number;
+    full: boolean;
+    lastError: string | null;
+    persistenceError: string | null;
+  } | null;
+  deletions?: { pending: number; done: number; failed: number; persistenceError: string | null } | null;
+  lastDelivery?: { at: number; submitted: number; completed: number; failed: number } | null;
   recent: MemoryItem[];
+}
+
+interface GrowthProposal {
+  id: string;
+  createdAt: string;
+  title: string;
+  summary: string;
+  evidence: string[];
+  sourceIds: string[];
+  changes: Array<{ file: string; from?: string; to: string; reason: string }>;
+  risk: 'low' | 'medium' | 'high';
+  state: 'candidate' | 'approved' | 'rejected' | 'applied';
+  appliedCommit?: string;
+}
+
+interface ExperienceCard {
+  id: string;
+  title: string;
+  situation: string;
+  lesson: string;
+  scope: 'conversation' | 'proactive_speech' | 'browser_exploration';
+  sourceIds: string[];
+  state: 'candidate' | 'approved' | 'rejected' | 'deprecated';
+  updatedAt: string;
+}
+
+interface GrowthStatus {
+  schedule: { enabled: boolean; everyDays: number; paused: boolean; forkRunning: boolean; lastReviewAt: string | null; nextReviewAt: string | null; lastStatus: string | null; lastError: string | null; lastProposalCount: number | null; lastFinishedAt: string | null; activeRun: boolean } | null;
+  proposals: GrowthProposal[];
+  experiences: ExperienceCard[];
+  browser: { enabled: boolean; actions: boolean; sessionMinutes: number | null; sessionUnlimited: boolean; maxCallsPerSession: number };
+}
+
+interface SystemHealth {
+  coreRssBytes: number;
+  systemTotalBytes: number;
+  systemFreeBytes: number;
+  memoryPressureFreePercent: number | null;
+  backgroundPausedForMemory: boolean;
+  diskAvailableBytes: number | null;
+}
+
+interface UsageSummary {
+  currency?: string;
+  totals?: { calls?: number; promptTokens?: number; completionTokens?: number; cost?: number; pricedCalls?: number; unpricedCalls?: number } | null;
 }
 
 function when(date: string): string {
@@ -27,7 +87,15 @@ function itemText(text: string): string {
   return clean.length > 420 ? `${clean.slice(0, 419)}…` : clean;
 }
 
-function listOf(ctx: WebUiPanelContext, items: readonly MemoryItem[], empty: string): HTMLElement {
+function bytes(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '—';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let size = Math.max(0, value), index = 0;
+  while (size >= 1024 && index < units.length - 1) { size /= 1024; index += 1; }
+  return `${size.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function listOf(ctx: WebUiPanelContext, items: readonly MemoryItem[], empty: string, sourceLabel: string): HTMLElement {
   const ui = ctx.ui;
   if (items.length === 0) return ui.placeholder(empty);
   const list = ui.h('div', 'hindsight-list');
@@ -36,7 +104,7 @@ function listOf(ctx: WebUiPanelContext, items: readonly MemoryItem[], empty: str
     const info = ui.h('div', 'stinfo');
     info.append(
       ui.h('div', 'stlabel', itemText(item.text)),
-      ui.h('div', 'stloc', `${item.type}${when(item.date) ? ` · ${when(item.date)}` : ''}`),
+      ui.h('div', 'stloc', `${item.type}${when(item.date) ? ` · ${when(item.date)}` : ''}${item.documentId ? ` · ${sourceLabel}: ${item.documentId}` : ''}`),
     );
     row.append(info);
     list.append(row);
@@ -69,9 +137,9 @@ const panel: WebUiPanel = {
         if (!query) return;
         const ok = await ui.confirm({ title: t.forgetConfirmTitle, body: t.forgetConfirmBody, danger: true });
         if (!ok || ctx.signal.aborted) return;
-        const count = await ctx.invoke<number>('forget', [query]);
+        const result = await ctx.invoke<{ local: number; deleted: number; pending: number; failed: number }>('forget', [query]);
         if (ctx.signal.aborted) return;
-        ui.toast(t.forgetDone(count), 'ok');
+        ui.toast(t.forgetDone(result.local, result.deleted, result.pending, result.failed), 'ok');
         await load();
       },
     });
@@ -84,8 +152,20 @@ const panel: WebUiPanel = {
       onClick: async () => {
         const body = rememberInput.value.trim();
         if (!body) return;
-        const result = await ctx.invoke<'stored' | 'empty' | 'sensitive'>('remember', [body]);
+        const result = await ctx.invoke<'stored' | 'empty' | 'sensitive' | 'full' | 'disabled' | 'persistence-error'>('remember', [body]);
         if (ctx.signal.aborted) return;
+        if (result === 'full') {
+          ui.toast(t.queueFull, 'bad');
+          return;
+        }
+        if (result === 'disabled') {
+          ui.toast(t.disabledHint, 'bad');
+          return;
+        }
+        if (result === 'persistence-error') {
+          ui.toast(t.persistenceError, 'bad');
+          return;
+        }
         ui.toast(result === 'stored' ? t.remembered : t.sensitive, result === 'stored' ? 'ok' : 'bad');
         if (result === 'stored') {
           rememberInput.value = '';
@@ -114,7 +194,60 @@ const panel: WebUiPanel = {
     const actions = ui.actions();
     actions.append(clear);
 
-    root.append(header, statusLine, searchRow, results.el, rememberRow, recent.el, actions);
+    const growth = ui.sheet({ title: t.growth });
+    const growthStatus = ui.msgline(t.growthLoading);
+    const proposalList = ui.h('div', 'hindsight-list');
+    const experienceList = ui.h('div', 'hindsight-list');
+    const proposalsSheet = ui.sheet({ title: t.proposals });
+    const experiencesSheet = ui.sheet({ title: t.experienceCards });
+    proposalsSheet.body.append(proposalList);
+    experiencesSheet.body.append(experienceList);
+
+    const cardForm = ui.h('div', 'hindsight-list');
+    const cardTitle = ui.input({ placeholder: t.cardTitle, cls: 'grow' });
+    const cardSituation = ui.textarea({ placeholder: t.cardSituation, cls: 'grow' });
+    const cardLesson = ui.textarea({ placeholder: t.cardLesson, cls: 'grow' });
+    const cardSources = ui.textarea({ placeholder: t.cardSources, cls: 'grow' });
+    const cardScope = ui.h('select', 'grow') as HTMLSelectElement;
+    for (const [value, label] of [
+      ['conversation', t.scopeConversation], ['proactive_speech', t.scopeSpeech], ['browser_exploration', t.scopeBrowser],
+    ]) {
+      const option = ui.h('option', null, label) as HTMLOptionElement;
+      option.value = value;
+      cardScope.append(option);
+    }
+    const addCard = ui.button(t.addCard, {
+      onClick: async () => {
+        try {
+          const card = await ctx.invoke<ExperienceCard>('experience-create', [{
+            title: cardTitle.value,
+            situation: cardSituation.value,
+            lesson: cardLesson.value,
+            scope: cardScope.value,
+            sourceIds: cardSources.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
+          }]);
+          if (ctx.signal.aborted) return;
+          cardTitle.value = '';
+          cardSituation.value = '';
+          cardLesson.value = '';
+          cardSources.value = '';
+          ui.toast(t.cardAdded, 'ok');
+          await loadGrowth();
+        } catch (error) {
+          if (!ctx.signal.aborted) ui.toast(error instanceof Error ? error.message : String(error), 'bad');
+        }
+      },
+    });
+    cardForm.append(cardTitle, cardSituation, cardLesson, cardScope, cardSources, addCard);
+    const addCardSheet = ui.sheet({ title: t.createCard });
+    addCardSheet.body.append(cardForm);
+
+    const health = ui.sheet({ title: t.systemHealth });
+    const healthBody = ui.h('div', 'hindsight-list');
+    const usageLine = ui.h('div', 'stloc', t.usageUnavailable);
+    health.body.append(healthBody, usageLine);
+
+    root.append(header, statusLine, searchRow, results.el, rememberRow, recent.el, actions, growth.el, growthStatus, proposalsSheet.el, experiencesSheet.el, addCardSheet.el, health.el);
 
     async function runSearch(query: string): Promise<void> {
       statusLine.textContent = t.loading;
@@ -122,14 +255,154 @@ const panel: WebUiPanel = {
       const found = await ctx.invoke<MemoryItem[]>('search', [query]);
       if (ctx.signal.aborted) return;
       statusLine.textContent = '';
-      results.body.replaceChildren(listOf(ctx, found, t.noResults));
+      results.body.replaceChildren(listOf(ctx, found, t.noResults, t.sources));
       results.el.hidden = false;
       forget.hidden = found.length === 0;
+    }
+
+    function stateLabel(state: string): string {
+      return state === 'candidate' ? t.candidate
+        : state === 'approved' ? t.approved
+          : state === 'rejected' ? t.rejected
+            : state === 'applied' ? t.applied
+              : state === 'deprecated' ? t.deprecated : state;
+    }
+
+    function proposalRow(proposal: GrowthProposal): HTMLElement {
+      const row = ui.h('div', 'strow');
+      const info = ui.h('div', 'stinfo');
+      info.append(
+        ui.h('div', 'stlabel', proposal.title),
+        ui.h('div', 'stloc', `${stateLabel(proposal.state)} · ${proposal.risk} · ${when(proposal.createdAt)}`),
+        ui.h('p', 'home-note', proposal.summary),
+        ui.h('div', 'stloc', `${t.proposalEvidence}: ${proposal.evidence.join(' · ')}`),
+        ui.h('div', 'stloc', `${t.proposalSources}: ${proposal.sourceIds.join(', ')}`),
+        ...proposal.changes.map((change) => ui.h('div', 'stloc', `${change.file}: ${change.from ? `${change.from} → ` : ''}${change.to} (${change.reason})`)),
+      );
+      const actions = ui.actions();
+      if (proposal.state === 'candidate') {
+        actions.append(ui.button(t.approve, { size: 'sm', onClick: () => void reviewProposal(proposal, 'approved') }));
+        actions.append(ui.button(t.reject, { size: 'sm', variant: 'danger', onClick: () => void reviewProposal(proposal, 'rejected') }));
+      } else if (proposal.state === 'approved') {
+        actions.append(ui.button(t.apply, { size: 'sm', onClick: () => void applyProposal(proposal) }));
+      } else if (proposal.state === 'applied' && proposal.appliedCommit) {
+        info.append(ui.h('div', 'stloc', t.applyDone(proposal.appliedCommit)));
+      }
+      row.append(info, actions);
+      return row;
+    }
+
+    async function reviewProposal(proposal: GrowthProposal, action: 'approved' | 'rejected'): Promise<void> {
+      try {
+        await ctx.invoke('growth-proposal-review', [proposal.id, action]);
+        if (ctx.signal.aborted) return;
+        ui.toast(action === 'approved' ? t.approved : t.rejected, 'ok');
+        await loadGrowth();
+      } catch (error) {
+        if (!ctx.signal.aborted) ui.toast(error instanceof Error ? error.message : String(error), 'bad');
+      }
+    }
+
+    async function applyProposal(proposal: GrowthProposal): Promise<void> {
+      const files = [...new Set(proposal.changes.map((change) => change.file))].join(', ');
+      const ok = await ui.confirm({ title: t.applyConfirmTitle, body: `${t.applyConfirmBody}\n\n${files}`, danger: true });
+      if (!ok || ctx.signal.aborted) return;
+      try {
+        const result = await ctx.invoke<{ commit: string }>('growth-proposal-apply', [proposal.id]);
+        if (ctx.signal.aborted) return;
+        ui.toast(t.applyDone(result.commit), 'ok');
+        await loadGrowth();
+      } catch (error) {
+        if (!ctx.signal.aborted) ui.toast(error instanceof Error ? error.message : String(error), 'bad');
+      }
+    }
+
+    function experienceRow(card: ExperienceCard): HTMLElement {
+      const row = ui.h('div', 'strow');
+      const info = ui.h('div', 'stinfo');
+      const scope = card.scope === 'conversation' ? t.scopeConversation : card.scope === 'proactive_speech' ? t.scopeSpeech : t.scopeBrowser;
+      info.append(
+        ui.h('div', 'stlabel', card.title),
+        ui.h('div', 'stloc', `${stateLabel(card.state)} · ${scope} · ${when(card.updatedAt)}`),
+        ui.h('p', 'home-note', `${card.situation} — ${card.lesson}`),
+        ui.h('div', 'stloc', `${t.proposalSources}: ${card.sourceIds.join(', ')}`),
+      );
+      const actions = ui.actions();
+      if (card.state === 'candidate') {
+        actions.append(ui.button(t.approve, { size: 'sm', onClick: () => void reviewCard(card, 'approved') }));
+        actions.append(ui.button(t.reject, { size: 'sm', variant: 'danger', onClick: () => void reviewCard(card, 'rejected') }));
+      } else if (card.state === 'approved') {
+        actions.append(ui.button(t.deprecate, { size: 'sm', variant: 'danger', onClick: () => void reviewCard(card, 'deprecated') }));
+      }
+      row.append(info, actions);
+      return row;
+    }
+
+    async function reviewCard(card: ExperienceCard, action: 'approved' | 'rejected' | 'deprecated'): Promise<void> {
+      try {
+        await ctx.invoke('experience-review', [card.id, action]);
+        if (ctx.signal.aborted) return;
+        ui.toast(action === 'approved' ? t.approved : action === 'rejected' ? t.rejected : t.deprecate, 'ok');
+        await loadGrowth();
+      } catch (error) {
+        if (!ctx.signal.aborted) ui.toast(error instanceof Error ? error.message : String(error), 'bad');
+      }
+    }
+
+    function healthRow(label: string, value: string): HTMLElement {
+      const row = ui.h('div', 'strow');
+      row.append(ui.h('div', 'stlabel', label), ui.h('div', 'stloc', value));
+      return row;
+    }
+
+    async function loadGrowth(): Promise<void> {
+      growthStatus.textContent = t.growthLoading;
+      growthStatus.className = 'msgline';
+      try {
+        const [data, system] = await Promise.all([
+          ctx.invoke<GrowthStatus>('growth-status'),
+          ctx.invoke<SystemHealth>('system-health'),
+        ]);
+        if (ctx.signal.aborted) return;
+        const schedule = data.schedule;
+        const lastStatus = schedule?.lastStatus === 'ok' ? t.reviewOk
+          : schedule?.lastStatus === 'failed' ? t.reviewFailed
+            : schedule?.lastStatus === 'interrupted' ? t.reviewInterrupted : t.notRun;
+        growthStatus.textContent = schedule
+          ? `${t.growthSchedule}: ${schedule.enabled ? t.enabled : t.off}${schedule.paused ? ` · ${t.paused}` : ''}${schedule.activeRun ? ` · ${t.running}` : ''} · ${t.nextReview}: ${schedule.nextReviewAt ? when(schedule.nextReviewAt) : t.notRun} · ${t.lastReview}: ${schedule.lastFinishedAt ? when(schedule.lastFinishedAt) : t.notRun} · ${lastStatus}${schedule.lastProposalCount !== null ? ` · ${t.proposalCount(schedule.lastProposalCount)}` : ''}${schedule.lastError ? ` · ${t.lastReviewError}: ${schedule.lastError}` : ''}`
+          : `${t.growthSchedule}: ${t.statusOff}`;
+        proposalList.replaceChildren(...(data.proposals.length ? data.proposals.map(proposalRow) : [ui.placeholder(t.noProposals)]));
+        experienceList.replaceChildren(...(data.experiences.length ? data.experiences.map(experienceRow) : [ui.placeholder(t.noExperienceCards)]));
+        healthBody.replaceChildren(
+          healthRow(t.coreMemory, bytes(system.coreRssBytes)),
+          healthRow(t.systemMemoryFree, `${bytes(system.systemFreeBytes)} / ${bytes(system.systemTotalBytes)}`),
+          healthRow(t.memoryPressure, system.memoryPressureFreePercent === null ? '—' : `${system.memoryPressureFreePercent}%`),
+          healthRow(t.diskFree, bytes(system.diskAvailableBytes)),
+          healthRow(t.backgroundWork, system.backgroundPausedForMemory ? t.paused : t.backgroundUnpaused),
+          healthRow(t.browserBudget, `${data.browser.enabled ? t.enabled : t.off}; ${data.browser.actions ? t.browserActionsEnabled : t.browserReadOnly}; ${data.browser.sessionUnlimited ? '∞' : `${data.browser.sessionMinutes ?? 0} min`}; ${data.browser.maxCallsPerSession} calls`),
+        );
+        try {
+          const usage = await get<UsageSummary>('/api/usage?bucket=day&days=1', { signal: ctx.signal });
+          const totals = usage.totals;
+          usageLine.textContent = totals
+            ? `${t.usageToday}: ${totals.calls ?? 0} calls · ${(totals.promptTokens ?? 0) + (totals.completionTokens ?? 0)} tokens · ${totals.cost !== undefined ? `${usage.currency ?? 'USD'} ${totals.cost.toFixed(4)}` : t.usageUnavailable}`
+            : t.usageUnavailable;
+        } catch {
+          if (ctx.signal.aborted) return;
+          usageLine.textContent = t.usageUnavailable;
+        }
+      } catch (error) {
+        if (ctx.signal.aborted) return;
+        growthStatus.textContent = error instanceof Error ? error.message : String(error);
+        growthStatus.className = 'msgline bad';
+        usageLine.textContent = t.usageUnavailable;
+      }
     }
 
     async function load(): Promise<void> {
       statusLine.textContent = t.loading;
       statusLine.className = 'msgline';
+      await loadGrowth();
       let status: HindsightStatus;
       try {
         status = await ctx.invoke<HindsightStatus>('status');
@@ -140,28 +413,42 @@ const panel: WebUiPanel = {
         return;
       }
       if (ctx.signal.aborted) return;
-      bank.textContent = status.bankId ? `${t.bank}: ${status.bankId}` : t.bank;
+      const backlog = status.outbox?.active ?? 0;
+      const failed = status.outbox?.dead ?? 0;
+      const deletions = (status.deletions?.pending ?? 0) + (status.deletions?.failed ?? 0);
+      const isolated = status.outbox?.orphaned ?? 0;
+      bank.textContent = [
+        status.bankId ? `${t.bank}: ${status.bankId}` : t.bank,
+        backlog > 0 ? t.queue(backlog) : '',
+        failed > 0 ? t.queueDead(failed) : '',
+        deletions > 0 ? t.deletions(deletions) : '',
+        isolated > 0 ? t.isolated(isolated) : '',
+      ].filter(Boolean).join(' · ');
+      bank.title = status.outbox?.lastError ?? '';
       if (!status.enabled) {
         statusLine.textContent = t.disabledHint;
         statusLine.className = 'msgline bad';
         recent.body.replaceChildren(ui.placeholder(t.disabledHint));
-        refresh.disabled = true;
+        refresh.disabled = false;
         search.disabled = true;
         remember.disabled = true;
         clear.disabled = true;
         return;
       }
-      statusLine.textContent = status.ok ? t.statusOk : `${t.statusError}${status.error ? `: ${status.error}` : ''}`;
-      statusLine.className = `msgline${status.ok ? '' : ' bad'}`;
-      recent.body.replaceChildren(listOf(ctx, status.recent, t.empty));
+      statusLine.textContent = status.outbox?.persistenceError || status.deletions?.persistenceError
+        || (status.ok ? t.statusOk : `${t.statusError}${status.error ? `: ${status.error}` : ''}`);
+      statusLine.className = `msgline${status.ok && !status.outbox?.persistenceError && !status.deletions?.persistenceError ? '' : ' bad'}`;
+      recent.body.replaceChildren(listOf(ctx, status.recent, t.empty, t.sources));
       refresh.disabled = false;
       search.disabled = false;
       remember.disabled = false;
       clear.disabled = false;
     }
 
+    ctx.root.append(root);
+
     await load();
-    return { dispose: () => { root.replaceChildren(); } };
+    return { dispose: () => { root.remove(); } };
   },
 };
 

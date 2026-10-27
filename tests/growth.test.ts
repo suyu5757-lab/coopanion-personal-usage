@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
@@ -10,8 +10,9 @@ import { coopanionPersona } from '../core/persona.ts';
 import type { HindsightMemory } from '../core/memory/hindsight.ts';
 import { GROWTH_DEFAULTS, readGrowth } from '../core/growth/config.ts';
 import { SELF_REVIEW_TEXT } from '../core/growth/model-text.ts';
-import { GROWTH_SESSION, GrowthReview } from '../core/growth/review.ts';
+import { GROWTH_SESSION, GrowthReview, PROPOSE_GROWTH_TOOL } from '../core/growth/review.ts';
 import { GrowthSchedule } from '../core/growth/schedule.ts';
+import { GrowthProposals, readProposalInput } from '../core/growth/proposals.ts';
 
 class FakeTimers implements TimersApi {
   entries: TimerEntry[] = [];
@@ -59,7 +60,7 @@ function schedule(stateFile: string, opts: {
   const run = vi.fn(opts.run ?? (async () => {}));
   const s = new GrowthSchedule({
     stateFile,
-    config: opts.config ?? (() => ({ ...GROWTH_DEFAULTS })),
+    config: opts.config ?? (() => ({ ...GROWTH_DEFAULTS, enabled: true })),
     timers,
     run,
     now: opts.now,
@@ -68,13 +69,13 @@ function schedule(stateFile: string, opts: {
 }
 
 describe('the growth config', () => {
-  it('defaults to on, every seven days', () => {
-    expect(readGrowth({})).toEqual({ enabled: true, everyDays: 7 });
+  it('defaults to off, every seven days', () => {
+    expect(readGrowth({})).toEqual({ enabled: false, everyDays: 7 });
   });
 
   it('clamps the interval and reads the switch', () => {
     expect(readGrowth({ companion: { growth: { enabled: false, everyDays: 0 } } })).toEqual({ enabled: false, everyDays: 1 });
-    expect(readGrowth({ companion: { growth: { everyDays: 200 } } })).toEqual({ enabled: true, everyDays: 60 });
+    expect(readGrowth({ companion: { growth: { everyDays: 200 } } })).toEqual({ enabled: false, everyDays: 60 });
   });
 });
 
@@ -84,8 +85,10 @@ describe('the self-review prompt', () => {
     expect(en).toContain('You have been softer lately.');
     expect(en).toContain('Person: hello');
     expect(en).toContain('2026-10-26');
+    expect(en).toContain('propose_growth');
     expect(en).not.toMatch(/\p{Script=Han}/u);
     expect(SELF_REVIEW_TEXT.zh({ portrait: '', recent: '', date: '2026-10-26' })).toContain('2026-10-26');
+    expect(SELF_REVIEW_TEXT.zh({ portrait: '', recent: '', date: '2026-10-26' })).toContain('提案');
   });
 });
 
@@ -172,7 +175,7 @@ describe('the growth schedule', () => {
     const run = vi.fn(async () => {});
     const s = new GrowthSchedule({
       stateFile: tempState(),
-      config: () => ({ ...GROWTH_DEFAULTS }),
+      config: () => ({ ...GROWTH_DEFAULTS, enabled: true }),
       timers,
       run,
       now: () => new Date(now),
@@ -200,6 +203,66 @@ describe('the growth schedule', () => {
     expect(await s.check()).toBe(true);
     expect(run).toHaveBeenCalledTimes(2);
   });
+
+  it('records the outcome and proposal count', async () => {
+    const start = new Date('2026-10-01T00:00:00.000Z');
+    let now = start;
+    const stateFile = tempState();
+    const timers = new FakeTimers();
+    const s = new GrowthSchedule({
+      stateFile,
+      config: () => ({ ...GROWTH_DEFAULTS, enabled: true }),
+      timers,
+      run: async () => ({ proposals: 1, note: 'proposed focus mode', cancelled: false }),
+      now: () => new Date(now),
+    });
+    s.start();
+    now = new Date('2026-10-08T00:00:00.000Z');
+    await s.check();
+    const state = JSON.parse(readFileSync(stateFile, 'utf8')) as { lastStatus: string; lastProposalCount: number };
+    expect(state.lastStatus).toBe('ok');
+    expect(state.lastProposalCount).toBe(1);
+  });
+
+  it('does not start a second review while an old fork still runs', async () => {
+    let now = new Date('2026-10-01T00:00:00.000Z');
+    const timers = new FakeTimers();
+    const run = vi.fn(async () => {});
+    const s = new GrowthSchedule({
+      stateFile: tempState(),
+      config: () => ({ ...GROWTH_DEFAULTS, enabled: true }),
+      timers,
+      run,
+      now: () => new Date(now),
+      forkRunning: () => true,
+    });
+    s.start();
+    now = new Date('2026-10-08T00:00:00.000Z');
+    expect(await s.check()).toBe(false);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('marks a review interrupted when the process stopped mid-run', () => {
+    const stateFile = tempState();
+    const start = '2026-10-01T00:00:00.000Z';
+    writeFileSync(stateFile, JSON.stringify({
+      lastReviewAt: null,
+      nextReviewAt: start,
+      activeRunId: 'run-1',
+      activeStartedAt: start,
+    }));
+    const s = new GrowthSchedule({
+      stateFile,
+      config: () => ({ ...GROWTH_DEFAULTS, enabled: true }),
+      timers: new FakeTimers(),
+      run: async () => {},
+      now: () => new Date(start),
+    });
+    s.start();
+    const state = JSON.parse(readFileSync(stateFile, 'utf8')) as { lastStatus: string; activeRunId?: string };
+    expect(state.lastStatus).toBe('interrupted');
+    expect(state.activeRunId).toBeUndefined();
+  });
 });
 
 const tool = (name: string): ToolDef => ({
@@ -215,7 +278,7 @@ function prefix(): ContextRecord[] {
 }
 
 describe('the growth review session', () => {
-  it('feeds the system prefix, the recent stretch and the portrait to a fork with file tools and no speaking tool', async () => {
+  it('feeds the system prefix, the recent stretch and the portrait to a fork with read tools and a proposal tool', async () => {
     const captured: ForkOptions[] = [];
     const core = {
       sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
@@ -225,11 +288,13 @@ describe('the growth review session', () => {
       enabled: () => true,
       selfPortrait: vi.fn(async () => 'You have been softer lately.'),
     } as unknown as HindsightMemory;
+    const proposalsDir = mkdtempSync(join(tmpdir(), 'coo-growth-proposals-'));
     const review = new GrowthReview({
       core: () => core,
       snapshot: prefix,
       tools: () => [tool('read_file')],
       memory: () => memory,
+      proposalsDir,
       modelLanguage: () => 'en',
       timezone: () => 'UTC',
       now: () => new Date('2026-10-26T10:00:00.000Z'),
@@ -242,20 +307,123 @@ describe('the growth review session', () => {
     expect(textOf(opts.messages[1]!)).toContain('You have been softer lately.');
     expect(textOf(opts.messages[1]!)).toContain('Person: hello');
     expect(textOf(opts.messages[1]!)).toContain('2026-10-26');
-    expect(opts.tools?.map((entry) => entry.name)).toEqual(['read_file', 'finish_review']);
+    expect(opts.tools?.map((entry) => entry.name)).toEqual(['read_file', PROPOSE_GROWTH_TOOL, 'finish_review']);
   });
 
-  it('declares a growth session with no speaking, deletion or computer use', () => {
+  it('declares a growth session with read and memory tools but no file writes or speaking', () => {
     const Persona = coopanionPersona(Cormini, { growthStateFile: join(mkdtempSync(join(tmpdir(), 'coo-growth-persona-')), 'growth.json'), timezone: () => 'UTC' });
     const p = new Persona({ memoryDir: mkdtempSync(join(tmpdir(), 'coo-growth-workspace-')) });
     const growth = p.declareSessions().find((session) => session.id === GROWTH_SESSION)!;
     const names = growth.tools().map((entry) => entry.name);
     expect(growth.persistent).toBe(false);
     expect(growth.receivesEvents).toBe(false);
-    expect(names).toContain('edit_file');
+    expect(names).toContain('read_file');
     expect(names).toContain('memory_search');
+    expect(names).not.toContain('edit_file');
+    expect(names).not.toContain('write_file');
+    expect(names).not.toContain('append_file');
+    expect(names).not.toContain(PROPOSE_GROWTH_TOOL);
     expect(names).not.toContain('pet_say');
     expect(names).not.toContain('delete_file');
     expect(names).not.toContain('save_blob');
+  });
+
+  it('saves a proposal as a candidate file and never touches the Persona', async () => {
+    const captured: ForkOptions[] = [];
+    const core = {
+      sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
+      spawnFork: vi.fn(async (opts: ForkOptions) => {
+        captured.push(opts);
+        const propose = opts.tools!.find((entry) => entry.name === PROPOSE_GROWTH_TOOL)!;
+        const finish = opts.tools!.find((entry) => entry.name === 'finish_review')!;
+        const result = await propose.handler({
+          title: 'Focus mode',
+          summary: 'Be quieter while the person is programming.',
+          evidence: ['Person: 我写程序的时候别总来打扰'],
+          sourceIds: ['user-turn-42'],
+          risk: 'low',
+          changes: [{ file: 'CONSTITUTION.md', from: 'old line', to: 'new line', reason: 'the person asked for quiet' }],
+        }, {} as never);
+        expect(result).toContain('[proposal saved]');
+        await finish.handler({ note: 'proposed focus mode' }, {} as never);
+        return '';
+      }),
+    } as unknown as CoreApi;
+    const proposalsDir = mkdtempSync(join(tmpdir(), 'coo-growth-proposals-'));
+    const review = new GrowthReview({
+      core: () => core,
+      snapshot: prefix,
+      tools: () => [],
+      memory: () => null,
+      proposalsDir,
+      modelLanguage: () => 'en',
+      timezone: () => 'UTC',
+    });
+    const result = await review.run();
+    expect(result.proposals).toBe(1);
+    const stored = new GrowthProposals(proposalsDir).list();
+    expect(stored).toHaveLength(1);
+    expect(stored[0]!.state).toBe('candidate');
+    expect(stored[0]!.changes[0]!.file).toBe('CONSTITUTION.md');
+    expect(captured[0]!.tools?.some((entry) => ['write_file', 'edit_file', 'append_file'].includes(entry.name))).toBe(false);
+  });
+
+  it('stops accepting proposals after the deadline', async () => {
+    const captured: ForkOptions[] = [];
+    const core = {
+      sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
+      spawnFork: vi.fn((opts: ForkOptions) => {
+        captured.push(opts);
+        return new Promise<string>(() => {});
+      }),
+    } as unknown as CoreApi;
+    const proposalsDir = mkdtempSync(join(tmpdir(), 'coo-growth-proposals-'));
+    const review = new GrowthReview({
+      core: () => core,
+      snapshot: prefix,
+      tools: () => [],
+      memory: () => null,
+      proposalsDir,
+      modelLanguage: () => 'en',
+      timezone: () => 'UTC',
+      timeoutMs: 10,
+    });
+    await expect(review.run()).rejects.toThrow(/timed out/);
+    const propose = captured[0]!.tools!.find((entry) => entry.name === PROPOSE_GROWTH_TOOL)!;
+    const result = await propose.handler({
+      title: 'Late',
+      summary: 'Should not be written.',
+      evidence: ['person said so'],
+      sourceIds: ['user-turn-late'],
+      risk: 'low',
+      changes: [{ file: 'CONSTITUTION.md', to: 'line', reason: 'because' }],
+    }, {} as never);
+    expect(result).toContain('[review cancelled]');
+    expect(new GrowthProposals(proposalsDir).list()).toHaveLength(0);
+  });
+});
+
+describe('growth proposal validation', () => {
+  it('rejects changes outside the two allowed files and empty evidence', () => {
+    const bad = readProposalInput({
+      title: 'x',
+      summary: 'y',
+      evidence: [],
+      risk: 'low',
+      changes: [{ file: 'seed.txt', to: 'z', reason: 'r' }],
+    });
+    expect('errors' in bad).toBe(true);
+  });
+
+  it('accepts a minimal proposal', () => {
+    const good = readProposalInput({
+      title: 'Focus mode',
+      summary: 'Be quieter while the person programs.',
+      evidence: ['Person: 我写程序的时候别总来打扰'],
+      sourceIds: ['user-turn-42'],
+      risk: 'low',
+      changes: [{ file: 'CONSTITUTION.md', to: 'When they program, wait.', reason: 'asked explicitly' }],
+    });
+    expect('proposal' in good).toBe(true);
   });
 });

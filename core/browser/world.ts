@@ -474,6 +474,19 @@ export class BrowserWorld implements World {
       if (index === null) return this.toast(this.t.failed('browser_press', 'index must be a whole number of at least 0'), true);
       const blocked = this.begin('browser_press');
       if (blocked) return blocked;
+      if (key === 'Enter' || key === 'Space') {
+        const element = asElement(await this.call(index === undefined ? 'active' : 'element', index === undefined ? {} : { index }, ctx.signal));
+        if (!element) {
+          if (!this.self.actions) return this.toast(this.t.lookOnly('unknown focused target'), true);
+        } else {
+          const label = this.labelOf(element);
+          const refused = clickRefusal(label);
+          if (refused) return this.toast(this.t.refusedClick(label, refused), true);
+          if (!this.self.actions && (isWriteAction(label) || !isSearchField(element))) {
+            return this.toast(this.t.lookOnly(label || 'unknown focused target'), true);
+          }
+        }
+      }
       const result = asRecord(await this.call('press', { key, ...(index === undefined ? {} : { index }) }, ctx.signal));
       const state = asState(result?.state);
       if (!state) return this.toast(this.t.failed('browser_press', 'the page returned no state'), true);

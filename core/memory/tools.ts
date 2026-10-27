@@ -35,7 +35,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
     },
     {
       name: 'memory_remember',
-      description: 'Store a durable fact in long-term memory on purpose: a preference, boundary, promise, important person or event the person wants you to keep. Do not use it for small talk.',
+      description: 'Store a durable fact in long-term memory on purpose: a preference, boundary, promise, important person or event the person wants you to keep. If the person corrects an earlier fact, use memory_forget on the old one first, then store the corrected fact. Do not use it for small talk.',
       tags: ['write'],
       parameters: {
         type: 'object',
@@ -52,12 +52,15 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         const result = memory.remember(body, { session: ctx.role });
         if (result === 'sensitive') return '[memory] Nothing was stored: that looks like a secret or a password.';
         if (result === 'empty') return '[memory] Nothing was stored: the fact was empty.';
-        return `[remembered] ${body}`;
+        if (result === 'disabled') return '[memory] Long-term memory is not available.';
+        if (result === 'persistence-error') return '[memory] Nothing was stored: the memory queue could not be written to disk. Tell the person it was not saved.';
+        if (result === 'full') return '[memory] Nothing was stored: the memory queue is full. Tell the person it was not saved.';
+        return `[remembered] ${body} (queued for background extraction)`;
       },
     },
     {
       name: 'memory_forget',
-      description: 'Find memories matching a query and delete their source documents. Use it only when the person asks you to forget something, or corrects a fact. It cannot be undone.',
+      description: 'Find memories matching a query and delete their source documents. Use it when the person asks you to forget something, or when they correct a fact: delete the old source, then store the corrected fact with memory_remember. If they say "that thing just now" and the topic is clear from the conversation, use that topic; if it is not clear, ask which one. It cannot be undone.',
       tags: ['write'],
       parameters: {
         type: 'object',
@@ -69,8 +72,10 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
       handler: async (args) => {
         const memory = deps.memory();
         if (!memory?.enabled()) return '[memory] Long-term memory is not available.';
-        const count = await memory.forget(text(args, 'query'));
-        return count > 0 ? `[forgotten] ${count} source document${count === 1 ? '' : 's'}` : '[memory] Nothing matching was found to forget.';
+        const result = await memory.forget(text(args, 'query'));
+        const total = result.local + result.deleted + result.pending + result.failed;
+        if (total === 0) return '[memory] Nothing matching was found to forget.';
+        return `[forgotten] local cancellations: ${result.local}; remote deletions: ${result.deleted}; pending: ${result.pending}; failed: ${result.failed}`;
       },
     },
     {

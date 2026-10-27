@@ -8,7 +8,7 @@ export interface GrowthConfig {
 }
 
 export const GROWTH_DEFAULTS: GrowthConfig = {
-  enabled: true,
+  enabled: false,
   everyDays: 7,
 };
 

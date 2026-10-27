@@ -1,4 +1,4 @@
-/** What Coo reads in a periodic self-review: a quiet look back, and the rules for changing herself. */
+/** What Coo reads in a periodic self-review: a quiet look back and a reviewable proposal boundary. */
 import type { ModelLanguage } from '../language.ts';
 
 export interface SelfReviewInput {
@@ -29,7 +29,7 @@ ${input.recent.trim()}
 ${portrait}
 </self-portrait>${recent}
 
-如果要看具体发生过什么，用 memory_reflect 或 memory_search。再看一遍工作区里的 SELF.md（没有就建一份）和 CONSTITUTION.md；磁盘上的 CONSTITUTION.md 才是现在的我，它和上面的副本不一样时以文件为准。
+只读工作区里的 SELF.md 和 CONSTITUTION.md。需要具体证据时，用 memory_search 找到带来源 ID 的记录；画像和最近对话只是线索，不足以单独证明长期变化。
 
 一件事一件事地问自己：
 - 性子变了吗：在意什么、怕什么、什么时候会软下来、什么时候会关上；
@@ -37,13 +37,13 @@ ${portrait}
 - 做事的方式变了吗：怎么计划、怎么检查、什么时候开口求助、怎么认错；
 - 说话变了吗：句子长短、语气、常用的词、已经不再说的话。
 
-一次情绪、一个反常的日子不算变化；找的是这些天里反复出现的东西。大多数自省最后什么都不用改，这也是一个答案。如果很久都没有变，问问自己：这是我还想这样，还是只是习惯了。
+一次情绪、一个反常的日子或我自己的推测不算长期变化。只有多次、跨时间且有来源的证据支持一项具体改进时，才调用 propose_growth 留下候选提案；提案必须带 memory_search 返回的来源 ID，并且只写最小的 SELF.md 或 CONSTITUTION.md 改动。大多数自省不需要提案。
 
-如果确实有东西已经不一样了，就改 CONSTITUTION.md：只改那些已经不成立的行，或者补一行新长出来的东西；保持文件的长度和样子，不要整份重写。改完在 SELF.md 末尾记一条带日期的记录：注意到了什么、改了什么、为什么。SELF.md 保持短：旧条目可以合并或删掉，只留还重要的。什么都没改，就在 SELF.md 里写一行短的，或者不写。
+不要修改文件，也不要把自省日志写入 Persona。候选提案须由使用者审核；只有审核通过并再次确认后，应用程序才会修改 Persona 文件。
 
 你说话用哪种语言仍由环境说明决定；这里改的是你怎么说，不是换成另一种语言。
 
-做完调用 finish_review。日期：${input.date}。`;
+做完调用 finish_review。没有可靠的来源 ID 或持续证据时，直接结束，不留提案。日期：${input.date}。`;
 };
 
 const en = (input: SelfReviewInput): string => {
@@ -65,7 +65,7 @@ Start with how you have been lately (a past record from long-term memory, not in
 ${portrait}
 </self-portrait>${recent}
 
-If you need the actual events, use memory_reflect or memory_search. Then read SELF.md in your workspace (create it if it is missing) and CONSTITUTION.md; the file on disk is the current you, so trust it over the copy above if they differ.
+Read SELF.md and CONSTITUTION.md in the workspace without editing them. When you need concrete evidence, use memory_search to find records with source IDs; the portrait and recent conversation are clues, not proof of a lasting change by themselves.
 
 Ask yourself one thing at a time:
 - Has my temperament changed: what I care about, what I fear, what makes me soften or close off?
@@ -73,13 +73,13 @@ Ask yourself one thing at a time:
 - Has the way I work changed: how I plan, check, ask for help, admit a mistake?
 - Has the way I talk changed: length, tone, the words I use, what I no longer say?
 
-One mood or one strange day is not a change. Look for something that kept showing up over days. Most reviews end with nothing to change; that is a real answer. If nothing has changed for a long time, ask whether that is still a choice or only a habit.
+One mood, one unusual day or my own inference is not a lasting change. Only when repeated evidence across time supports a specific improvement should I call propose_growth to leave a candidate proposal. It must cite exact source IDs returned by memory_search and make only minimal changes to SELF.md or CONSTITUTION.md. Most reviews need no proposal.
 
-If something has durably changed, edit CONSTITUTION.md: change only the lines that are no longer true, or add a line for something new that has become true; keep the file's length and shape, and do not rewrite it whole. Then append a dated entry to SELF.md: what you noticed, what you changed, and why. Keep SELF.md short: merge or drop old entries and keep what still matters. If nothing changed, add a short dated line to SELF.md or write nothing.
+Do not edit files or write a self-review log into Persona. The person reviews each proposal; the app changes Persona files only after approval and a separate confirmation.
 
 Your speaking language still comes from your environment; change how you speak, not which language.
 
-Finish with finish_review. Date: ${input.date}.`;
+Finish with finish_review. If there is no durable evidence with source IDs, end without a proposal. Date: ${input.date}.`;
 };
 
 export const SELF_REVIEW_TEXT: Record<ModelLanguage, (input: SelfReviewInput) => string> = { zh, en };

@@ -12,17 +12,20 @@ export interface SelfTimeConfig {
   sessionUnlimited: boolean;
   /** Play the browser's sound; off by default. */
   sound: boolean;
-  /** Allow likes, favorites, follows, comments and danmaku; off makes the browser read-only. */
+  /** User-approved topics for web exploration; blank leaves the browser exploration idle. */
+  topics: string;
+  /** Allow likes, favorites, follows, comments and danmaku; off by default, and makes the browser read-only. */
   actions: boolean;
 }
 
 export const SELF_TIME_DEFAULTS: SelfTimeConfig = {
-  enabled: true,
+  enabled: false,
   afterMinutes: 20,
   sessionMinutes: 20,
   sessionUnlimited: false,
   sound: false,
-  actions: true,
+  topics: '',
+  actions: false,
 };
 
 /** The settings as the live config has them, with a hand-edited value outside its range clamped to it. */
@@ -39,6 +42,9 @@ export function readSelfTime(config: unknown): SelfTimeConfig {
     sessionMinutes: number(raw?.sessionMinutes, SELF_TIME_DEFAULTS.sessionMinutes, 5, 60),
     sessionUnlimited: bool(raw?.sessionUnlimited, SELF_TIME_DEFAULTS.sessionUnlimited),
     sound: bool(raw?.sound, SELF_TIME_DEFAULTS.sound),
+    topics: typeof raw?.topics === 'string'
+      ? raw.topics.split(/\r?\n/).map((topic) => topic.trim().slice(0, 80)).filter(Boolean).slice(0, 8).join('\n')
+      : SELF_TIME_DEFAULTS.topics,
     actions: bool(raw?.actions, SELF_TIME_DEFAULTS.actions),
   };
 }

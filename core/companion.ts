@@ -71,6 +71,7 @@ import { NOTICE_ID, noticeDefinition, type NoticeWorld } from './notice.ts';
 import { browserDefinition, BROWSER_ID } from './browser/definition.ts';
 import { BrowserBridge } from './browser/bridge.ts';
 import { readSelfTime, SELF_TIME_DEFAULTS } from './browser/config.ts';
+import { readResourcePressure } from './resource-pressure.ts';
 import { GROWTH_DEFAULTS, readGrowth } from './growth/config.ts';
 import { coreText } from './i18n/index.ts';
 import { petToolDescriber } from './pet-status.ts';
@@ -157,6 +158,7 @@ function companionGroup(language: Language): ConfigGroup {
         'companion.selfTime.afterMinutes': { type: 'integer', title: s.selfTime.after, minimum: 1, maximum: 240, 'x-suffix': s.selfTime.minutes, 'x-hot': true, description: s.selfTime.afterDescription },
         'companion.selfTime.sessionMinutes': { type: 'integer', title: s.selfTime.session, minimum: 5, maximum: 60, 'x-suffix': s.selfTime.minutes, 'x-hot': true, description: s.selfTime.sessionDescription },
         'companion.selfTime.sessionUnlimited': { type: 'boolean', title: s.selfTime.unlimited, description: s.selfTime.unlimitedDescription, 'x-hot': true },
+        'companion.selfTime.topics': { type: 'string', title: s.selfTime.topics, description: s.selfTime.topicsDescription, 'x-hot': true },
         'companion.selfTime.sound': { type: 'boolean', title: s.selfTime.sound, description: s.selfTime.soundDescription, 'x-hot': true },
         'companion.selfTime.actions': { type: 'boolean', title: s.selfTime.actions, description: s.selfTime.actionsDescription, 'x-hot': true },
         'companion.growth.enabled': { type: 'boolean', title: s.growth.title, description: s.growth.description, 'x-hot': true },
@@ -506,7 +508,7 @@ export async function main(): Promise<void> {
     modelLanguage: () => modelLanguage(config?.language),
     growth: () => readGrowth(config),
     growthStateFile: join(deployDir, 'growth.json'),
-    paused: () => core?.bus.isPaused() === true,
+    paused: () => core?.bus.isPaused() === true || readResourcePressure().paused,
     timezone: () => config?.timezone ?? 'UTC',
   });
   /** Coo's Persona, once the bot is built. */

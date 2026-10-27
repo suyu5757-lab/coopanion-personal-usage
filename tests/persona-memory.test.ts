@@ -21,10 +21,11 @@ function personaWith() {
   const dir = mkdtempSync(join(tmpdir(), 'coo-persona-memory-'));
   const calls: string[] = [];
   const deferred: Array<() => string | null | Promise<string | null>> = [];
-  const retainUser = vi.fn();
+  const retainUser = vi.fn((_text: string, meta: { cursor?: number } = {}) => `user:main:${meta.cursor ?? 0}:hash`);
   const retainTouch = vi.fn();
   const retainAffinityChange = vi.fn();
-  const recallBlock = vi.fn(async () => '[memory] you like tea');
+  const forgetDocument = vi.fn(async () => ({ local: 1, deleted: 0, pending: 0, failed: 0 }));
+  const recallForTurn = vi.fn(async () => ({ text: '[memory] you like tea', route: 'standard' as const, found: true }));
   const sessionBriefing = vi.fn(async () => ({ text: '[memory] portrait', source: 'mental-models' as const }));
   const clearMemory = vi.fn(async () => 'long-term memory cleared');
   const memory = {
@@ -33,7 +34,8 @@ function personaWith() {
     retainUser,
     retainTouch,
     retainAffinityChange,
-    recallBlock,
+    forgetDocument,
+    recallForTurn,
     sessionBriefing,
     clear: clearMemory,
   } as unknown as HindsightMemory;
@@ -43,12 +45,12 @@ function personaWith() {
     injectInternal: (text: string, kind: string) => calls.push(`${kind}:${text}`),
     injectDeferred: (_kind: string, render: () => string | null | Promise<string | null>) => deferred.push(render),
   } as never;
-  return { p, calls, deferred, retainUser, retainTouch, retainAffinityChange, recallBlock, clearMemory };
+  return { p, calls, deferred, retainUser, retainTouch, retainAffinityChange, forgetDocument, recallForTurn, clearMemory };
 }
 
 describe('Coo with long-term memory and the affinity extension', () => {
   it('retains the person’s line, a touch, and an affinity change, then injects recall', async () => {
-    const { p, calls, retainUser, retainTouch, retainAffinityChange, recallBlock } = personaWith();
+    const { p, calls, retainUser, retainTouch, retainAffinityChange, recallForTurn } = personaWith();
     await p.onDelivery({
       events: [
         event({ type: 'desktop-pet.touch', meta: { touch: { kind: 'pet', count: 2 } } }),
@@ -59,8 +61,21 @@ describe('Coo with long-term memory and the affinity extension', () => {
     expect(retainTouch).toHaveBeenCalledWith({ kind: 'pet', count: 2 }, expect.objectContaining({ session: 'main', cursor: 1 }));
     expect(retainAffinityChange).toHaveBeenCalledWith(expect.objectContaining({ subject: 7, score: 21, delta: 1, kind: 'happy', reason: 'shared tea' }));
     expect(retainUser).toHaveBeenCalledWith('I like jasmine tea', expect.objectContaining({ session: 'main', cursor: 3 }));
-    expect(recallBlock).toHaveBeenCalledWith('I like jasmine tea', { timeoutMs: 700 });
+    expect(recallForTurn).toHaveBeenCalledWith('I like jasmine tea');
     expect(calls).toContain('memory:[memory] you like tea');
+  });
+
+  it('does not retain a message that asks not to remember, and freezes recent writes', async () => {
+    const { p, retainUser, forgetDocument, recallForTurn } = personaWith();
+    await p.onDelivery({
+      events: [
+        event({ cursor: 1, meta: { text: 'I like jasmine tea' } }),
+        event({ cursor: 2, meta: { text: '不要记这件事' } }),
+      ],
+    });
+    expect(retainUser).toHaveBeenCalledTimes(1);
+    expect(forgetDocument).toHaveBeenCalledWith('user:main:1:hash');
+    expect(recallForTurn).not.toHaveBeenCalled();
   });
 
   it('injects the portrait at session start', async () => {

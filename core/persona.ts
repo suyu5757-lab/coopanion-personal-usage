@@ -17,8 +17,9 @@
  * passed in: the app loads it from the staged Cortico (`companion.ts`), the tests from vendor/cortico.
  */
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, statSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, statfsSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { freemem, totalmem } from 'node:os';
+import { join, dirname } from 'node:path';
 import type { CoreApi, EventEnvelope, PersonaWebUiDecl, SessionDecl, SessionOpeningReason, StoragePart, ToolDef, WorldLifecycleEvent } from 'cortico/core/types.ts';
 import type { ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import type { Language } from 'cortico/core/language.ts';
@@ -26,13 +27,18 @@ import type { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts'
 import type { GitAuthor, WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
 import { memoryTools } from './memory/tools.ts';
 import type { HindsightMemory } from './memory/hindsight.ts';
+import { isMemoryForgetRequest } from './memory/router.ts';
 import { memoryStorageText } from './memory/strings.ts';
-import type { SelfTimeConfig } from './browser/config.ts';
+import { SESSION_MAX_CALLS, type SelfTimeConfig } from './browser/config.ts';
 import { selfTimeLine } from './browser/model-text.ts';
 import { GROWTH_DEFAULTS, type GrowthConfig } from './growth/config.ts';
-import { GROWTH_SESSION, GROWTH_TOOL_NAMES, GrowthReview } from './growth/review.ts';
+import { GROWTH_SESSION, GROWTH_TOOL_NAMES, GrowthReview, growthMemorySearchTool } from './growth/review.ts';
+import { ExperienceCards } from './growth/experience-cards.ts';
+import { GrowthProposals, type GrowthProposal } from './growth/proposals.ts';
 import { GROWTH_CHECK_MS, GrowthSchedule } from './growth/schedule.ts';
+import { readResourcePressure } from './resource-pressure.ts';
 import type { ModelLanguage } from './language.ts';
+import { writeState } from './state-file.ts';
 
 /** The workspace file that goes into the prefix as Coo's notes on the person. */
 export const PARTNER_FILE = 'PARTNER.md';
@@ -147,9 +153,28 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     private readonly timezoneNow = deps.timezone ?? (() => 'UTC');
     private growthSchedule: GrowthSchedule | null = null;
     private growthCheck: ReturnType<typeof setInterval> | null = null;
+    private lastUserMemory: { documentId: string; at: number } | null = null;
 
     override attach(core: CoreApi): void {
       super.attach(core);
+      this.longTerm?.setLifecycleHooks({
+        forgetSources: (ids) => {
+          const forgotten = new Set(ids);
+          const policies = this.experienceCards()?.list().filter((card) => card.sourceIds.some((id) => forgotten.has(id))) ?? [];
+          const removed = this.growthProposals()?.removeBySource(ids) ?? 0;
+          const cards = this.experienceCards()?.removeBySource(ids) ?? 0;
+          if (removed + cards > 0) {
+            const titles = policies.map((card) => card.title).slice(0, 8);
+            const detail = titles.length ? ` Withdraw these policies: ${titles.join('; ')}.` : '';
+            this.core?.injectInternal(`[memory] A source was forgotten. Do not rely on any proposal or experience policy derived from it; the linked records were removed.${detail}`, 'memory');
+          }
+        },
+        clearDerived: () => {
+          this.growthProposals()?.clear();
+          this.experienceCards()?.clear();
+          this.core?.injectInternal('[memory] Long-term memory was cleared. Disregard all Hindsight-derived experience policies injected earlier in this session; none remain active.', 'memory');
+        },
+      });
       if (!this.growthStateFile) return;
       const log = {
         info: (message: string, data?: unknown) => this.core?.log.info(message, data),
@@ -160,6 +185,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         snapshot: () => this.growthSnapshot(),
         tools: () => this.growthTools(),
         memory: () => this.longTerm,
+        proposalsDir: join(dirname(this.growthStateFile), 'growth-proposals'),
         modelLanguage: () => this.modelLang(),
         timezone: this.timezoneNow,
         log,
@@ -170,6 +196,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         timers: core.timers,
         run: () => review.run(),
         paused: this.pausedNow,
+        forkRunning: () => (this.core?.sessionInfo(GROWTH_SESSION).running ?? 0) > 0,
         log,
       });
       try {
@@ -200,7 +227,51 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
 
     private growthTools(): ToolDef[] {
       const wanted = new Set<string>(GROWTH_TOOL_NAMES);
-      return this.tools().filter((tool) => wanted.has(tool.name));
+      const tools = this.tools().filter((tool) => wanted.has(tool.name) && tool.name !== 'memory_search');
+      return [...tools, growthMemorySearchTool(() => this.longTerm)];
+    }
+
+    private growthDirectory(): string | null {
+      return this.growthStateFile ? dirname(this.growthStateFile) : null;
+    }
+
+    private growthProposals(): GrowthProposals | null {
+      const dir = this.growthDirectory();
+      return dir ? new GrowthProposals(join(dir, 'growth-proposals')) : null;
+    }
+
+    private experienceCards(): ExperienceCards | null {
+      const dir = this.growthDirectory();
+      return dir ? new ExperienceCards(join(dir, 'experience-cards')) : null;
+    }
+
+    private experienceContext(): string {
+      return this.experienceCards()?.approvedContext() ?? '';
+    }
+
+    private systemHealth(): Record<string, unknown> {
+      const pressure = readResourcePressure();
+      let diskAvailableBytes: number | null = null;
+      try {
+        const stat = statfsSync(this.memoryDir);
+        diskAvailableBytes = Number(stat.bavail) * Number(stat.bsize);
+      } catch { /* The deployment directory may not expose filesystem statistics. */ }
+      return {
+        platform: process.platform,
+        coreRssBytes: process.memoryUsage().rss,
+        systemTotalBytes: totalmem(),
+        systemFreeBytes: freemem(),
+        memoryPressureFreePercent: pressure.freePercent,
+        backgroundPausedForMemory: pressure.paused,
+        diskAvailableBytes,
+        browser: {
+          enabled: this.selfTimeNow()?.enabled ?? false,
+          actions: this.selfTimeNow()?.actions ?? false,
+          sessionMinutes: this.selfTimeNow()?.sessionMinutes ?? null,
+          sessionUnlimited: this.selfTimeNow()?.sessionUnlimited ?? false,
+          maxCallsPerSession: SESSION_MAX_CALLS,
+        },
+      };
     }
 
     override declareSessions(): SessionDecl[] {
@@ -229,7 +300,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     /** With time of her own on, the quiet line offers the browser as well as speaking first. */
     protected override tickText(quietSeconds: number): string {
       const self = this.selfTimeNow();
-      return self?.enabled ? selfTimeLine(this.modelLang(), quietSeconds, self.sessionMinutes, self.sessionUnlimited) : super.tickText(quietSeconds);
+      if (self?.enabled && readResourcePressure().paused) {
+        return '[system] Background exploration is paused because system memory pressure is high. Do not open the browser or start a self-review; end_turn.';
+      }
+      return self?.enabled ? selfTimeLine(this.modelLang(), quietSeconds, self.sessionMinutes, self.sessionUnlimited, self.topics) : super.tickText(quietSeconds);
     }
 
     /** The setting turned time of her own on, or its quiet interval changed: arm the next wake-up now. */
@@ -314,7 +388,7 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
       const storage: StoragePart[] = [...(decl.memory?.storage ?? [])];
       const panels = [...(decl.memory?.panels ?? [])];
       const t = memoryStorageText(language);
-      if (this.longTerm) {
+      if (this.longTerm || this.growthStateFile) {
         panels.push({ id: 'hindsight', title: t.hindsightLabel, description: t.hindsightPanelDesc });
       }
       if (this.longTerm?.enabled()) {
@@ -344,6 +418,43 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
     }
 
     private async hindsightInvoke(method: string, args: unknown[]): Promise<unknown> {
+      if (method === 'system-health') return this.systemHealth();
+      if (method === 'growth-status') {
+        return {
+          schedule: this.growthSchedule?.status() ?? null,
+          proposals: this.growthProposals()?.list() ?? [],
+          experiences: this.experienceCards()?.list() ?? [],
+          browser: this.systemHealth().browser,
+        };
+      }
+      if (method === 'growth-proposals') return this.growthProposals()?.list() ?? [];
+      if (method === 'growth-proposal-review') {
+        const id = String(args[0] ?? ''), action = String(args[1] ?? '');
+        if (action !== 'approved' && action !== 'rejected') throw new Error('Review action must be approved or rejected.');
+        const proposal = this.growthProposals()?.transition(id, action, String(args[2] ?? ''));
+        if (!proposal) throw new Error('The proposal is no longer a candidate. Refresh the list.');
+        return proposal;
+      }
+      if (method === 'growth-proposal-apply') return this.applyGrowthProposal(String(args[0] ?? ''));
+      if (method === 'experience-create') {
+        const result = this.experienceCards()?.create((args[0] && typeof args[0] === 'object' ? args[0] : {}) as Record<string, unknown>);
+        if (!result?.ok) throw new Error(result?.errors.join('; ') ?? 'Experience cards are unavailable.');
+        return result.card;
+      }
+      if (method === 'experience-review') {
+        const id = String(args[0] ?? ''), action = String(args[1] ?? '');
+        if (action !== 'approved' && action !== 'rejected' && action !== 'deprecated') throw new Error('Review action is not supported.');
+        const before = this.experienceCards()?.get(id);
+        const card = this.experienceCards()?.transition(id, action);
+        if (!card) throw new Error('The experience card is no longer in that state. Refresh the list.');
+        if (action === 'approved') {
+          const context = this.experienceContext();
+          if (context) this.core?.injectInternal(context, 'memory');
+        } else if (action === 'deprecated') {
+          this.core?.injectInternal(`[memory] The user revoked the experience policy “${before?.title ?? id}”. Do not follow it anymore. ${this.experienceContext() || 'No approved experience policies remain active.'}`, 'memory');
+        }
+        return card;
+      }
       const memory = this.longTerm;
       if (!memory) throw new Error('Hindsight memory is not configured');
       switch (method) {
@@ -362,12 +473,64 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
       }
     }
 
+    private applyGrowthProposal(id: string): Promise<{ commit: string; proposal: GrowthProposal }> {
+      const apply = async () => {
+        const store = this.growthProposals();
+        const proposal = store?.get(id);
+        if (!store || !proposal || proposal.state !== 'approved' || proposal.sourceIds.length === 0) throw new Error('Approve a proposal with source documents before applying it.');
+        this.git.ensureRepo();
+        const status = this.git.status();
+        if (!status.repo) throw new Error(status.initError ?? 'The Persona workspace has no Git history.');
+        if (status.dirty) throw new Error('The Persona workspace has uncommitted changes. Commit or restore them before applying this proposal.');
+
+        const originals = new Map<string, { exists: boolean; text: string }>();
+        let committed = false;
+        try {
+          for (const change of proposal.changes) {
+            const path = join(this.memoryDir, change.file);
+            const exists = existsSync(path);
+            const before = exists ? readFileSync(path, 'utf8') : '';
+            originals.set(change.file, { exists, text: before });
+            let after: string;
+            if (change.from !== undefined) {
+              const first = before.indexOf(change.from);
+              if (first < 0 || before.indexOf(change.from, first + change.from.length) >= 0) {
+                throw new Error(`${change.file} no longer has one unique copy of the proposed source text.`);
+              }
+              after = `${before.slice(0, first)}${change.to}${before.slice(first + change.from.length)}`;
+            } else {
+              if (before.includes(change.to)) throw new Error(`${change.file} already contains the proposed line.`);
+              after = `${before.replace(/\s*$/, '')}${before.trim() ? '\n\n' : ''}${change.to}\n`;
+            }
+            writeState(path, after);
+          }
+          const commit = this.git.commitAll(`Apply growth proposal ${proposal.id}`, AUTHOR_APP);
+          if (!commit) throw new Error(this.git.status().commitError ?? 'Git did not create a commit for this proposal.');
+          committed = true;
+          const applied = store.markApplied(proposal.id, commit);
+          if (!applied) throw new Error('The Persona files were committed, but the proposal state could not be updated.');
+          return { commit, proposal: applied };
+        } catch (error) {
+          if (!committed) {
+            for (const [file, original] of originals) {
+              const path = join(this.memoryDir, file);
+              if (original.exists) writeState(path, original.text);
+              else unlinkSync(path);
+            }
+          }
+          throw error;
+        }
+      };
+      this.commits = this.commits.then(apply, apply);
+      return this.commits as Promise<{ commit: string; proposal: GrowthProposal }>;
+    }
+
     override onOpening(ctx: { reason: SessionOpeningReason }): void {
       this.core?.injectInternal(ctx.reason === 'restarted' ? '[system] The app restarted; the session carries on.' : '[system] The session has started.', 'opening');
-      if (!this.longTerm?.enabled()) return;
+      if (!this.longTerm?.enabled() && !this.experienceCards()?.list('approved').length) return;
       this.core?.injectDeferred('memory', async () => {
-        const briefing = await this.longTerm?.sessionBriefing().catch(() => null);
-        return briefing?.text?.trim() ? briefing.text : null;
+        const briefing = this.longTerm?.enabled() ? await this.longTerm.sessionBriefing().catch(() => null) : null;
+        return [briefing?.text?.trim(), this.experienceContext()].filter(Boolean).join('\n\n') || null;
       });
     }
 
@@ -398,18 +561,32 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
         if (event.type === 'desktop-pet.touch') {
           const touch = event.meta?.touch as { kind?: unknown; count?: unknown; crashed?: unknown } | undefined;
           if (touch) this.longTerm?.retainTouch(touch, { session: 'main', cursor: event.cursor, at: event.ts });
+          this.lastUserMemory = null;
           continue;
         }
         if (event.type !== 'desktop-pet.message' && event.type !== 'desktop-pet.speech' && event.type !== 'desktop-pet.answer') continue;
         const said = typeof event.meta?.text === 'string' ? event.meta.text.trim() : event.text.trim();
         if (!said) continue;
+        if (isMemoryForgetRequest(said)) {
+          const previous = this.lastUserMemory;
+          if (previous && Date.now() - previous.at < 10 * 60_000) {
+            await this.longTerm?.forgetDocument(previous.documentId);
+          }
+          this.lastUserMemory = null;
+          latest = null;
+          continue;
+        }
         latest = said;
-        this.longTerm?.retainUser(said, { session: 'main', cursor: event.cursor, timestamp: event.ts });
+        const documentId = this.longTerm?.retainUser(said, { session: 'main', cursor: event.cursor, timestamp: event.ts });
+        this.lastUserMemory = documentId ? { documentId, at: Date.now() } : null;
       }
 
       if (!latest || !this.longTerm?.enabled()) return;
-      const block = await this.longTerm.recallBlock(latest, { timeoutMs: 700 });
-      if (block) this.core?.injectInternal(block, 'memory');
+      const recalled = await this.longTerm.recallForTurn(latest);
+      if (recalled.text) this.core?.injectInternal(recalled.text, 'memory');
+      else if (recalled.route === 'deep') {
+        this.core?.injectInternal('[memory] No verified record was found for that question. If you are not sure, say so; do not invent dates, names or past events.', 'memory');
+      }
     }
 
     protected override pressureNote(): string {
