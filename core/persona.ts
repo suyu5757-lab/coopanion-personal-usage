@@ -248,7 +248,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     }
 
     private experienceContext(): string {
-      return this.experienceCards()?.approvedContext() ?? '';
+      const cards = this.experienceCards();
+      if (!cards) return '';
+      // A card whose source was fenced stays out even if its file survived a restart.
+      return cards.approvedContext(8, 3200, (card) => card.sourceIds.every((id) => this.longTerm?.sourceVisible(id) ?? true));
     }
 
     private systemHealth(): Record<string, unknown> {

@@ -555,7 +555,7 @@ export class HindsightMemory {
     }
   }
 
-  async searchResults(query: string, opts: RecallOptions = {}): Promise<Array<{ id: string; text: string; type: string; date: string; documentId: string | null }>> {
+  async searchResults(query: string, opts: RecallOptions = {}): Promise<Array<{ id: string; text: string; type: string; date: string; documentId: string | null; metadata?: Record<string, string> }>> {
     if (!this.canTry() || !query.trim() || !await this.ensureStarted()) return [];
     const epoch = this.cacheEpoch;
     const config = this.config!;
@@ -576,6 +576,7 @@ export class HindsightMemory {
         type: String(result.type ?? 'memory'),
         date: String(result.occurred_start ?? result.mentioned_at ?? ''),
         documentId: result.document_id ?? null,
+        ...(result.metadata && Object.keys(result.metadata).length > 0 ? { metadata: result.metadata } : {}),
       }));
       // A forget can invalidate the bank while this recall is in flight; do not hand the old text back.
       if (epoch !== this.cacheEpoch) return [];
@@ -602,6 +603,7 @@ export class HindsightMemory {
       type: result.type,
       occurred_start: result.date,
       document_id: result.documentId ?? undefined,
+      ...(result.metadata ? { metadata: result.metadata } : {}),
     })), { maxChars: opts.maxChars ?? Math.max(800, (opts.maxTokens ?? config.recall.maxTokens) * 5) });
   }
 
@@ -1043,6 +1045,13 @@ export class HindsightMemory {
     } catch (err) {
       this.log?.warn(`[memory] could not refresh mental model ${id}`, { message: err instanceof Error ? err.message : String(err) });
     }
+  }
+
+  /** Does the fence still allow this source to appear in injected text? */
+  sourceVisible(documentId: string): boolean {
+    const config = this.config;
+    if (!config || !this.ledger) return true;
+    return !this.ledger.forgotten(config.bankId, config.apiUrl, documentId);
   }
 
   /** Does the bank still hold this source, and is it still readable? */

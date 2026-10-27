@@ -121,8 +121,8 @@ export class ExperienceCards {
     return next;
   }
 
-  approvedContext(maxCards = 8, maxChars = 3200): string {
-    const cards = this.list('approved').slice(0, maxCards);
+  approvedContext(maxCards = 8, maxChars = 3200, allow: (card: ExperienceCard) => boolean = () => true): string {
+    const cards = this.list('approved').filter(allow).slice(0, maxCards);
     if (cards.length === 0) return '';
     const lines = cards.map((card) => `- Situation: ${card.situation}\n  User-reviewed guidance (${card.scope}): ${card.lesson}`);
     let body = '';

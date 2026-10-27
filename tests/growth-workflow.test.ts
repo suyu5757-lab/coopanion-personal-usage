@@ -190,4 +190,37 @@ describe('experience policy cards', () => {
     expect(injected.at(-1)).toContain('Do not follow it anymore');
     expect(injected.at(-1)).toContain('No approved experience policies remain active.');
   });
+
+  it('does not inject an approved policy whose source was fenced', async () => {
+    const root = temp();
+    const workspace = join(root, 'workspace');
+    const deploy = join(root, 'deploy');
+    mkdirSync(workspace);
+    mkdirSync(deploy);
+    const cards = new ExperienceCards(join(deploy, 'experience-cards'));
+    const created = cards.create({
+      title: 'Quiet coding time',
+      situation: 'The person is coding.',
+      lesson: 'Wait before routine interruptions.',
+      scope: 'proactive_speech',
+      sourceIds: ['user:focus'],
+    });
+    if (!created.ok) throw new Error(created.errors.join('; '));
+    cards.transition(created.card.id, 'approved');
+    const memory = {
+      enabled: () => true,
+      sourceVisible: () => false,
+      sessionBriefing: async () => ({ text: '', source: 'none' }),
+    } as unknown as HindsightMemory;
+    const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory });
+    const persona = new Persona({ memoryDir: workspace });
+    let deferred: (() => string | null | Promise<string | null>) | null = null;
+    persona['core'] = {
+      injectInternal: () => {},
+      injectDeferred: (_kind: string, render: () => string | null | Promise<string | null>) => { deferred = render; },
+    } as never;
+    persona.onOpening({ reason: 'new' });
+    expect(deferred).toBeTypeOf('function');
+    expect((await deferred!()) ?? '').not.toContain('Wait before routine interruptions');
+  });
 });
