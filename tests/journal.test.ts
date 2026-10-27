@@ -14,6 +14,7 @@ function setup(answer = 'A warm, quiet day with tea and a short chat.') {
   const refreshModel = vi.fn(async () => {});
   const memory = {
     enabled: () => true,
+    settled: () => true,
     reflect,
     retainJournal,
     refreshModel,

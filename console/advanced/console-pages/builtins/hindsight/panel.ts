@@ -28,7 +28,8 @@ interface HindsightStatus {
     lastError: string | null;
     persistenceError: string | null;
   } | null;
-  deletions?: { pending: number; done: number; failed: number; persistenceError: string | null } | null;
+  deletions?: { pending: number; done: number; failed: number; tombstones: number; staleTargets: number; persistenceError: string | null } | null;
+  forget?: { tombstones: number; unresolved: number; stale: boolean } | null;
   lastDelivery?: { at: number; submitted: number; completed: number; failed: number } | null;
   recent: MemoryItem[];
 }
@@ -152,7 +153,7 @@ const panel: WebUiPanel = {
       onClick: async () => {
         const body = rememberInput.value.trim();
         if (!body) return;
-        const result = await ctx.invoke<'stored' | 'empty' | 'sensitive' | 'full' | 'disabled' | 'persistence-error'>('remember', [body]);
+        const result = await ctx.invoke<'queued' | 'empty' | 'sensitive' | 'full' | 'disabled' | 'persistence-error' | 'forgotten'>('remember', [body]);
         if (ctx.signal.aborted) return;
         if (result === 'full') {
           ui.toast(t.queueFull, 'bad');
@@ -166,8 +167,8 @@ const panel: WebUiPanel = {
           ui.toast(t.persistenceError, 'bad');
           return;
         }
-        ui.toast(result === 'stored' ? t.remembered : t.sensitive, result === 'stored' ? 'ok' : 'bad');
-        if (result === 'stored') {
+        ui.toast(result === 'queued' ? t.remembered : t.sensitive, result === 'queued' ? 'ok' : 'bad');
+        if (result === 'queued') {
           rememberInput.value = '';
           await load();
         }
@@ -422,6 +423,7 @@ const panel: WebUiPanel = {
         backlog > 0 ? t.queue(backlog) : '',
         failed > 0 ? t.queueDead(failed) : '',
         deletions > 0 ? t.deletions(deletions) : '',
+        status.forget?.stale ? t.portraitsStale : '',
         isolated > 0 ? t.isolated(isolated) : '',
       ].filter(Boolean).join(' · ');
       bank.title = status.outbox?.lastError ?? '';

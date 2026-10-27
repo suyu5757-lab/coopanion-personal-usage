@@ -56,6 +56,8 @@ export const AUTHOR_APP: GitAuthor = { name: 'coopanion', email: 'app@persona.lo
 const IGNORED = 'blobs/';
 /** Tags made by `snapshot`: the workspace as each version of the app first found it. */
 export const SNAPSHOT_TAG = (version: string) => `start-${version}`;
+/** How long after a line a "don't remember that" still refers to it. */
+const FORGET_WINDOW_MS = 10 * 60_000;
 
 /** Write tools and the receipt each starts with when it succeeded (Cormini's workspaceTools.ts and blobs.ts). */
 const WRITES: Record<string, { ok: string; verb: string }> = {
@@ -583,9 +585,8 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
         if (!said) continue;
         if (isMemoryForgetRequest(said)) {
           const previous = this.lastUserMemory;
-          if (previous && Date.now() - previous.at < 10 * 60_000) {
-            await this.longTerm?.forgetDocument(previous.documentId);
-          }
+          if (previous && Date.now() - previous.at < FORGET_WINDOW_MS) await this.longTerm?.forgetDocument(previous.documentId);
+          else await this.longTerm?.forgetMostRecent('main', new Date(Date.now() - FORGET_WINDOW_MS));
           this.lastUserMemory = null;
           latest = null;
           continue;

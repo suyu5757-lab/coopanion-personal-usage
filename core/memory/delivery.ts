@@ -36,6 +36,8 @@ export interface DeliveryOptions {
   now?: () => Date;
   /** The running target; items for another bank/endpoint are isolated before any call. */
   target?: () => { bankId: string; endpoint: string };
+  /** A source the person has fenced; it must not be submitted or followed any further. */
+  forgotten?: (item: OutboxItem) => boolean;
   log?: { warn(message: string, data?: unknown): void };
 }
 
@@ -44,6 +46,7 @@ export class OutboxDelivery {
   private readonly batch: number;
   private readonly poll: number;
   private readonly target?: DeliveryOptions['target'];
+  private readonly forgotten?: DeliveryOptions['forgotten'];
   private readonly log?: DeliveryOptions['log'];
   private running = false;
 
@@ -52,6 +55,7 @@ export class OutboxDelivery {
     this.batch = Math.max(1, opts.batch ?? 4);
     this.poll = Math.max(1, opts.poll ?? 8);
     this.target = opts.target;
+    this.forgotten = opts.forgotten;
     this.log = opts.log;
   }
 
@@ -77,10 +81,17 @@ export class OutboxDelivery {
         this.outbox.quarantine(item.id, 'the memory bank or endpoint changed; this item was not sent');
         continue;
       }
+      if (this.forgotten?.(item)) {
+        this.outbox.markCancelled(item.id, 'the person asked to forget this before it was sent');
+        continue;
+      }
       try {
         const accepted = await this.ops.retain(item);
-        if (this.outbox.get(item.id)?.state === 'cancelled') {
+        // A forget that lands while the request is in flight wins: cancel what was accepted and
+        // leave the source to the deletion queue.
+        if (this.outbox.get(item.id)?.state === 'cancelled' || this.forgotten?.(item)) {
           if (accepted.async && accepted.operationId) await this.ops.cancel({ ...item, operationId: accepted.operationId }).catch(() => {});
+          this.outbox.markCancelled(item.id, 'the person asked to forget this while the retain was in flight');
           continue;
         }
         result.submitted += 1;
@@ -103,6 +114,11 @@ export class OutboxDelivery {
     for (const item of this.outbox.sent(this.poll)) {
       if (!this.matchesTarget(item)) {
         this.outbox.quarantine(item.id, 'the memory bank or endpoint changed; this operation was not polled');
+        continue;
+      }
+      if (this.forgotten?.(item)) {
+        await this.ops.cancel(item).catch(() => {});
+        this.outbox.markCancelled(item.id, 'the person asked to forget this while its operation was running');
         continue;
       }
       try {

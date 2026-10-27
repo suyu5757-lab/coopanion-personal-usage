@@ -94,7 +94,7 @@ export class RelationshipJournal {
   async runDue(): Promise<void> {
     if (!this.enabled || this.running) return;
     const memory = this.memory;
-    if (!memory?.enabled()) return;
+    if (!memory?.enabled() || !memory.settled()) return;
     this.running = true;
     try {
       const today = dayIn(this.timezone, this.now());
@@ -114,6 +114,9 @@ export class RelationshipJournal {
           + 'If nothing happened, say it was a quiet day. '
           + 'Two to four sentences, first person, warm and concrete. No diagnosis, no heading, no bullet list.';
         const answer = await memory.reflect(question, { tags: ['scope:affection'], tagsMatch: 'any', timeoutMs: 120_000 });
+        // A forget during the reflection makes the answer unusable, and a journal entry would
+        // carry the forgotten source into a new document.
+        if (!memory.settled()) return;
         const text = answer || 'A quiet day. Nothing much happened, and that was fine.';
         memory.retainJournal(text, day);
         this.writeLastDay(day);

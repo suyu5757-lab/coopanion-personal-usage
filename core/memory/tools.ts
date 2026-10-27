@@ -35,7 +35,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
     },
     {
       name: 'memory_remember',
-      description: 'Store a durable fact in long-term memory on purpose: a preference, boundary, promise, important person or event the person wants you to keep. If the person corrects an earlier fact, use memory_forget on the old one first, then store the corrected fact. Do not use it for small talk.',
+      description: 'Store a durable fact in long-term memory on purpose: a preference, boundary, promise, important person or event the person wants you to keep. When the person corrects an earlier fact, store the corrected fact as a new one and say what changed; do not delete the earlier one. Do not use it for small talk.',
       tags: ['write'],
       parameters: {
         type: 'object',
@@ -53,14 +53,15 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         if (result === 'sensitive') return '[memory] Nothing was stored: that looks like a secret or a password.';
         if (result === 'empty') return '[memory] Nothing was stored: the fact was empty.';
         if (result === 'disabled') return '[memory] Long-term memory is not available.';
+        if (result === 'forgotten') return '[memory] Nothing was stored: that source was forgotten and is not kept again.';
         if (result === 'persistence-error') return '[memory] Nothing was stored: the memory queue could not be written to disk. Tell the person it was not saved.';
         if (result === 'full') return '[memory] Nothing was stored: the memory queue is full. Tell the person it was not saved.';
-        return `[remembered] ${body} (queued for background extraction)`;
+        return `[remembered] ${body} (saved locally; the service has not confirmed it yet)`;
       },
     },
     {
       name: 'memory_forget',
-      description: 'Find memories matching a query and delete their source documents. Use it when the person asks you to forget something, or when they correct a fact: delete the old source, then store the corrected fact with memory_remember. If they say "that thing just now" and the topic is clear from the conversation, use that topic; if it is not clear, ask which one. It cannot be undone.',
+      description: 'Remove memories matching a query from long-term memory. Use it only when the person asks you to forget something, not to correct a fact. The source stops appearing in your reads immediately; removing it from the service can still be pending, so say it is being removed rather than that it is gone everywhere. If they say "that thing just now" and the topic is clear from the conversation, use that topic; if it is not clear, ask which one. It cannot be undone.',
       tags: ['write'],
       parameters: {
         type: 'object',

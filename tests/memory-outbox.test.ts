@@ -113,6 +113,21 @@ describe('the retain outbox', () => {
     expect(status.oldestPendingAt).toBe(now.toISOString());
     expect(status.lastError).toBe('service unavailable');
   });
+
+  it('keeps a dead critical fact with its payload past the audit window', () => {
+    let now = new Date('2026-10-27T00:00:00.000Z');
+    const path = file();
+    const outbox = new MemoryOutbox(path, { now: () => now });
+    outbox.add(item({ priority: 'critical' }));
+    const queued = outbox.due(now, 1)[0]!;
+    for (let i = 0; i < 8; i++) outbox.markFailed(queued.id, 'still down');
+    expect(outbox.get(queued.id)?.state).toBe('dead');
+    expect(outbox.status()).toMatchObject({ dead: 1, deadRetained: 1, active: 1 });
+    now = new Date(now.getTime() + 8 * 86_400_000);
+    const reopened = new MemoryOutbox(path, { now: () => now });
+    expect(reopened.get(queued.id)?.content).toContain('jasmine tea');
+    expect(reopened.status()).toMatchObject({ dead: 1, deadRetained: 1, active: 1 });
+  });
 });
 
 describe('outbox persistence and recovery', () => {

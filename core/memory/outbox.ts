@@ -47,10 +47,12 @@ export interface OutboxStatus {
   sent: number;
   failed: number;
   dead: number;
+  /** Dead items that still hold a payload: a critical fact that never reached the service. */
+  deadRetained: number;
   cancelled: number;
   /** Items isolated because their bank or endpoint no longer matches the running config. */
   orphaned: number;
-  /** Items that still carry a payload and may be sent. */
+  /** Items that still carry a payload and may be sent, including dead critical facts. */
   active: number;
   full: boolean;
   oldestPendingAt: string | null;
@@ -287,6 +289,22 @@ export class MemoryOutbox {
       (item.state === 'pending' || item.state === 'failed' || item.state === 'sent' || item.state === 'orphaned') && match(item));
   }
 
+  /**
+   * The newest source for a document prefix inside a time window, finished items included. A
+   * "don't remember that" request after a restart still finds what it is about.
+   */
+  recentDocument(prefix: string, since: Date): OutboxItem | null {
+    this.load();
+    let found: OutboxItem | null = null;
+    for (const item of this.items.values()) {
+      if (item.state === 'cancelled') continue;
+      if (!item.documentId.startsWith(prefix)) continue;
+      if (Date.parse(item.createdAt) < since.getTime()) continue;
+      if (!found || item.createdAt > found.createdAt) found = item;
+    }
+    return found;
+  }
+
   /** Cancel queued or in-flight items matching a forget request; returns only persisted cancellations. */
   cancelMatching(match: (item: OutboxItem) => boolean, reason: string): OutboxItem[] {
     this.load();
@@ -355,12 +373,16 @@ export class MemoryOutbox {
   status(): OutboxStatus {
     this.load();
     const counts = { pending: 0, sent: 0, failed: 0, dead: 0, cancelled: 0, orphaned: 0 };
+    let deadRetained = 0;
     let oldest: string | null = null;
     let lastError: string | null = null;
     let lastErrorAt = '';
     for (const item of this.items.values()) {
       if (item.state === 'pending' || item.state === 'sent' || item.state === 'failed') counts[item.state] += 1;
-      if (item.state === 'dead') counts.dead += 1;
+      if (item.state === 'dead') {
+        counts.dead += 1;
+        if (this.retained(item)) deadRetained += 1;
+      }
       if (item.state === 'cancelled') counts.cancelled += 1;
       if (item.state === 'orphaned') counts.orphaned += 1;
       if ((item.state === 'pending' || item.state === 'failed') && (!oldest || item.createdAt < oldest)) oldest = item.createdAt;
@@ -369,9 +391,10 @@ export class MemoryOutbox {
         lastErrorAt = item.updatedAt;
       }
     }
-    const active = counts.pending + counts.sent + counts.failed;
+    const active = counts.pending + counts.sent + counts.failed + deadRetained;
     return {
       ...counts,
+      deadRetained,
       active,
       full: active >= this.maxActive,
       oldestPendingAt: oldest,
@@ -400,14 +423,25 @@ export class MemoryOutbox {
     let count = 0;
     for (const item of this.items.values()) {
       if (item.state === 'pending' || item.state === 'sent' || item.state === 'failed') count += 1;
+      else if (this.retained(item)) count += 1;
     }
     return count;
+  }
+
+  /** A dead item whose payload is the only remaining copy of a fact the person asked to keep. */
+  private retained(item: OutboxItem): boolean {
+    return item.state === 'dead' && item.content.length > 0;
   }
 
   private dropExpiredFinished(): void {
     const cutoff = this.now().getTime() - KEEP_FINISHED_MS;
     for (const [id, item] of this.items) {
-      if ((item.state === 'done' || item.state === 'cancelled' || item.state === 'dead') && Date.parse(item.updatedAt) < cutoff) this.items.delete(id);
+      if (Date.parse(item.updatedAt) >= cutoff) continue;
+      if (item.state === 'done' || item.state === 'cancelled' || item.state === 'dead') {
+        // An unresolved critical fact stays until the person or the console ends it explicitly.
+        if (this.retained(item)) continue;
+        this.items.delete(id);
+      }
     }
   }
 

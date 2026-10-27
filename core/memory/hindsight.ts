@@ -9,7 +9,7 @@ import { sanitizeForMemory } from './policy.ts';
 import { loadHindsightConfig, type HindsightConfig, type HindsightFileConfig } from './config.ts';
 import { DeliveryError, OutboxDelivery, type DeliveryOps, type OperationState } from './delivery.ts';
 import { MemoryOutbox, type OutboxItem, type RetainItem } from './outbox.ts';
-import { DeletionQueue } from './deletions.ts';
+import { ForgetLedger, type DeletionInput } from './forget-ledger.ts';
 import { planRecall, type RecallRoute } from './router.ts';
 
 export interface MemoryLog {
@@ -115,6 +115,18 @@ function matchesForget(item: { content: string }, query: string): boolean {
   return parts.length > 1 && parts.every((part) => text.includes(part));
 }
 
+/** The fenced source behind a queued write; an item without a bank binding cannot be deleted. */
+function sourceOf(item: OutboxItem): DeletionInput | null {
+  if (!item.bankId || !item.endpoint) return null;
+  return {
+    bankId: item.bankId,
+    endpoint: item.endpoint,
+    documentId: item.documentId,
+    ...(item.state === 'sent' ? { operationId: item.operationId } : {}),
+    reason: 'the person asked to forget this',
+  };
+}
+
 function defaultHindsightCommand(port: string): string {
   const mac = join(homedir(), 'Library', 'Application Support', 'Hindsight', 'venv', 'bin', 'hindsight-api');
   const bin = existsSync(mac) ? mac : 'hindsight-api';
@@ -133,7 +145,7 @@ export class HindsightMemory {
   private warnedFullAt = 0;
   private briefing: { at: number; value: SessionBriefing } | null = null;
   private outbox: MemoryOutbox | null = null;
-  private deletions: DeletionQueue | null = null;
+  private ledger: ForgetLedger | null = null;
   private delivery: OutboxDelivery | null = null;
   private opsClient: ReturnType<typeof createClient> | null = null;
   private draining = false;
@@ -185,7 +197,7 @@ export class HindsightMemory {
     this.modelRefreshAt = 0;
     this.draining = false;
     this.outbox = null;
-    this.deletions = null;
+    this.ledger = null;
     this.delivery = null;
     this.opsClient = null;
     this.client = null;
@@ -200,10 +212,15 @@ export class HindsightMemory {
       headers: this.config.apiToken ? { Authorization: `Bearer ${this.config.apiToken}` } : {},
     }));
     this.outbox = new MemoryOutbox(join(rootDir, 'memory-outbox.jsonl'), { log });
-    this.deletions = new DeletionQueue(join(rootDir, 'memory-deletions.json'), { log });
+    this.ledger = new ForgetLedger(join(rootDir, 'memory-forget.json'), { log });
     this.delivery = new OutboxDelivery(this.outbox, this.deliveryOps(), {
       log,
       target: () => ({ bankId: this.config!.bankId, endpoint: this.config!.apiUrl }),
+      forgotten: (item) => this.ledger?.forgotten(
+        item.bankId ?? this.config!.bankId,
+        item.endpoint ?? this.config!.apiUrl,
+        item.documentId,
+      ) ?? false,
     });
     this.booting = this.runBootstrap();
     this.startDelivery();
@@ -244,6 +261,7 @@ export class HindsightMemory {
         this.scheduleModelRefresh();
       }
       await this.drainDeletions();
+      if (this.derivedBlocked()) await this.clearDerived();
     } catch (err) {
       this.noteFailure('retain', err);
     } finally {
@@ -253,9 +271,9 @@ export class HindsightMemory {
 
   /** Retry remote deletions for the current bank; tasks for another bank stay pending. */
   private async drainDeletions(): Promise<void> {
-    if (!this.deletions || !this.canTry() || !await this.ensureStarted()) return;
+    if (!this.ledger || !this.canTry() || !await this.ensureStarted()) return;
     const config = this.config!;
-    for (const task of this.deletions.due(new Date(), 8, { bankId: config.bankId, endpoint: config.apiUrl })) {
+    for (const task of this.ledger.due(new Date(), 8, { bankId: config.bankId, endpoint: config.apiUrl })) {
       if (task.operationId) {
         try {
           const response = await sdk.cancelOperation({
@@ -280,10 +298,10 @@ export class HindsightMemory {
       }
       try {
         await this.client!.deleteDocument(task.bankId, task.documentId);
-        this.deletions.markDone(task.id);
+        this.ledger.markDone(task.id);
       } catch (err) {
-        if (isMissing(err)) this.deletions.markDone(task.id);
-        else this.deletions.markFailed(task.id, err instanceof Error ? err.message : String(err));
+        if (isMissing(err)) this.ledger.markDone(task.id);
+        else this.ledger.markFailed(task.id, err instanceof Error ? err.message : String(err));
       }
     }
   }
@@ -372,6 +390,8 @@ export class HindsightMemory {
       await this.ensureServer();
       await this.ensureBank();
       this.ready = true;
+      // A portrait is rebuilt only after the sources behind it are gone from the bank.
+      if (this.derivedBlocked()) await this.clearDerived();
       await this.ensureMentalModels();
     } catch (err) {
       this.ready = false;
@@ -478,7 +498,8 @@ export class HindsightMemory {
   }
 
   async sessionBriefing(): Promise<SessionBriefing> {
-    if (!this.canTry() || !await this.ensureStarted()) return { text: '', source: 'none' };
+    if (!this.canTry()) return { text: '', source: 'none' };
+    if (!await this.ensureStarted() || this.derivedBlocked()) return { text: '', source: 'none' };
     if (this.briefing && Date.now() - this.briefing.at < 60_000) return this.briefing.value;
     const epoch = this.cacheEpoch;
     const config = this.config!;
@@ -514,7 +535,8 @@ export class HindsightMemory {
 
   /** Coo's own portrait, for the periodic self-review. Empty when memory is off or the model has no content yet. */
   async selfPortrait(timeoutMs = 2_500): Promise<string> {
-    if (!this.canTry() || !await this.ensureStarted()) return '';
+    if (!this.canTry()) return '';
+    if (!await this.ensureStarted() || this.derivedBlocked()) return '';
     const epoch = this.cacheEpoch;
     try {
       const config = this.config!;
@@ -553,7 +575,12 @@ export class HindsightMemory {
         documentId: result.document_id ?? null,
       }));
       // A forget can invalidate the bank while this recall is in flight; do not hand the old text back.
-      return epoch === this.cacheEpoch ? results : [];
+      if (epoch !== this.cacheEpoch) return [];
+      // A fenced source stays out of every read even if the service still returns it. While a
+      // deletion is unresolved, a result with no source cannot be shown to be clear of it.
+      const unresolved = this.ledger?.unresolved(config.bankId, config.apiUrl) ?? 0;
+      return results.filter((result) =>
+        (result.documentId !== null || unresolved === 0) && !this.forgottenSource(result.documentId));
     } catch (err) {
       this.noteFailure('recall', err);
       return [];
@@ -595,7 +622,7 @@ export class HindsightMemory {
       return { text, route: plan.route, found: !!text };
     };
     if (plan.route === 'fast') return finish('');
-    const key = `${config?.bankId ?? ''}|${plan.route}|${query.trim().toLowerCase().slice(0, 300)}`;
+    const key = `${config?.bankId ?? ''}|${config?.apiUrl ?? ''}|${this.visibilityEpoch()}|${plan.route}|${query.trim().toLowerCase().slice(0, 300)}`;
     const cached = plan.route === 'standard' ? this.recallCache.get(key) : undefined;
     if (cached && Date.now() - cached.at < 5 * 60_000) return finish(cached.value);
     const text = await this.recallBlock(query, {
@@ -620,6 +647,66 @@ export class HindsightMemory {
     this.cacheEpoch += 1;
     this.recallCache.clear();
     this.briefing = null;
+  }
+
+  /**
+   * No portrait or reflection may be served while a fenced source is still being removed, or while
+   * the portraits have not been rebuilt without it. Recall stays available because each result is
+   * checked against the fence.
+   */
+  private derivedBlocked(): boolean {
+    const config = this.config;
+    const ledger = this.ledger;
+    if (!config || !ledger) return false;
+    return ledger.unresolved(config.bankId, config.apiUrl) > 0 || ledger.stale(config.bankId, config.apiUrl);
+  }
+
+  /** Whether memory is safe to read as a whole: no forget waiting, no portrait older than one. */
+  settled(): boolean {
+    return !this.derivedBlocked();
+  }
+
+  /**
+   * Clear every portrait so the next refresh is built from what is left in the bank. Clearing the
+   * content is what ends the leak. The bank is released only once every deletion is confirmed and
+   * a full refresh has been submitted against the bank that no longer holds the source.
+   */
+  private async clearDerived(): Promise<void> {
+    const config = this.config;
+    const ledger = this.ledger;
+    if (!config || !ledger || !this.client || !this.ready) return;
+    let cleared = true;
+    for (const id of MODEL_IDS) {
+      try {
+        await this.client.clearMentalModel(config.bankId, id, { signal: AbortSignal.timeout(8_000) });
+      } catch (err) {
+        if (!isMissing(err)) cleared = false;
+      }
+    }
+    this.briefing = null;
+    if (!cleared || ledger.unresolved(config.bankId, config.apiUrl) > 0) return;
+    let refreshed = true;
+    for (const id of MODEL_IDS) {
+      try {
+        await this.client.refreshMentalModel(config.bankId, id, { mode: 'full', signal: AbortSignal.timeout(15_000) });
+      } catch (err) {
+        if (!isMissing(err)) refreshed = false;
+      }
+    }
+    if (refreshed) ledger.markFresh(config.bankId, config.apiUrl);
+  }
+
+  /** Is this source fenced out of this bank's reads? */
+  private forgottenSource(documentId: string | null): boolean {
+    const config = this.config;
+    if (!config || !this.ledger) return false;
+    return documentId !== null && this.ledger.forgotten(config.bankId, config.apiUrl, documentId);
+  }
+
+  /** A read started under this epoch must not be used once a fence is written. */
+  private visibilityEpoch(): number {
+    const config = this.config;
+    return config && this.ledger ? this.ledger.epoch(config.bankId, config.apiUrl) : 0;
   }
 
   retainUser(text: string, meta: { session?: string; cursor?: number; timestamp?: string } = {}): string | null {
@@ -659,24 +746,32 @@ export class HindsightMemory {
     });
   }
 
-  remember(text: string, meta: { session?: string } = {}): 'stored' | 'empty' | 'sensitive' | 'full' | 'disabled' | 'persistence-error' {
+  /**
+   * Queue an explicit fact. The answer says what happened locally: the service has not confirmed
+   * it yet, so a person who needs it kept must be told it is queued, not stored.
+   */
+  remember(text: string, meta: { session?: string } = {}): 'queued' | 'empty' | 'sensitive' | 'full' | 'disabled' | 'persistence-error' | 'forgotten' {
     if (!this.enabled() || !this.outbox) return 'disabled';
     const safe = sanitizeForMemory(text);
     const body = safe.text;
     if (!body) return safe.skip ? 'sensitive' : 'empty';
     const session = meta.session ?? 'main';
+    const at = new Date().toISOString();
     const queued = this.enqueue({
       content: `The person asked Coo to remember: ${body.slice(0, 4000)}`,
-      documentId: `explicit:${session}:${hash(body)}`,
+      // The timestamp makes a later, deliberate re-telling a new source instead of a replay of a
+      // fenced one.
+      documentId: `explicit:${session}:${hash(body)}:${hash(at)}`,
       context: 'The person asked Coo to remember this. It is a fact about the person or their shared life.',
       tags: ['scope:life', 'source:explicit', `session:${session}`],
       priority: 'critical',
-      metadata: sourceMetadata({ actor: 'user', kind: 'fact', status: 'current', saidAt: new Date().toISOString(), userVerified: true }),
+      metadata: sourceMetadata({ actor: 'user', kind: 'fact', status: 'current', saidAt: at, userVerified: true }),
     });
     if (queued === 'full') return 'full';
     if (queued === 'persistence-error') return 'persistence-error';
+    if (queued === 'skipped') return 'forgotten';
     this.invalidateCache();
-    return 'stored';
+    return 'queued';
   }
 
   retainTouch(touch: { kind?: unknown; count?: unknown; crashed?: unknown }, meta: { session?: string; cursor?: number; at?: string } = {}): void {
@@ -741,7 +836,10 @@ export class HindsightMemory {
   }
 
   private enqueue(item: RetainItem): 'queued' | 'full' | 'persistence-error' | 'skipped' {
-    if (!this.enabled() || !this.outbox) return 'skipped';
+    if (!this.enabled() || !this.outbox || !this.config) return 'skipped';
+    // A fenced source never re-enters the bank. A person who changes their mind creates a new
+    // event with its own document id, which is not this one.
+    if (this.ledger?.forgotten(this.config.bankId, this.config.apiUrl, item.documentId)) return 'skipped';
     const result = this.outbox.add({
       ...item,
       bankId: this.config!.bankId,
@@ -788,25 +886,21 @@ export class HindsightMemory {
 
   async forget(query: string): Promise<ForgetResult> {
     const asked = query.trim();
-    if (!asked) return { local: 0, deleted: 0, pending: 0, failed: 0 };
+    if (!asked || !this.config || !this.ledger) return { local: 0, deleted: 0, pending: 0, failed: 0 };
     const candidates = this.outbox?.matching((item) => matchesForget(item, asked)) ?? [];
     const cancelled = this.outbox?.cancelMatching((item) => matchesForget(item, asked), 'the person asked to forget this') ?? [];
     const cancelFailed = Math.max(0, candidates.length - cancelled.length);
-    if (cancelFailed > 0) {
-      this.forgetDerived(candidates.map((item) => item.documentId));
-      return { local: cancelled.length, deleted: 0, pending: 0, failed: cancelFailed };
-    }
-    const sourceIds = new Set(cancelled.map((item) => item.documentId));
-    const scheduled = this.enqueueDeletions(cancelled.map((item) => ({
-      documentId: item.documentId,
-      ...(item.bankId ? { bankId: item.bankId } : {}),
-      ...(item.endpoint ? { endpoint: item.endpoint } : {}),
-      ...(item.state === 'sent' ? { operationId: item.operationId } : {}),
-    })), 'the person asked to forget this');
-    if (this.delivery) await this.delivery.cancelForget(cancelled);
+    // Fence every source we already know before any remote call. A queue item that could not be
+    // cancelled is still fenced, so its text cannot come back through a read.
+    const fenced = this.ledger.addMany(candidates.map(sourceOf).filter((input): input is DeletionInput => input !== null), 'the person asked to forget this');
     this.invalidateCache();
+    if (fenced.failed > 0) {
+      return { local: cancelled.length, deleted: 0, pending: 0, failed: fenced.failed + cancelFailed };
+    }
+    const sourceIds = new Set(fenced.tasks.map((task) => task.documentId));
+    if (this.delivery) await this.delivery.cancelForget(cancelled);
     if (this.canTry() && await this.ensureStarted()) {
-      const config = this.config!;
+      const config = this.config;
       try {
         const response = await this.client!.recall(config.bankId, asked.slice(0, 800), {
           maxTokens: 1200,
@@ -814,101 +908,96 @@ export class HindsightMemory {
           includeEntities: false,
           signal: AbortSignal.timeout(3000),
         });
-        for (const documentId of response.results.map((r) => r.document_id)) {
-          if (!documentId) continue;
-          sourceIds.add(documentId);
-          const task = this.deletions?.add({
-            bankId: config.bankId,
-            endpoint: config.apiUrl,
-            documentId,
-            reason: 'the person asked to forget this',
-          });
-          if (task) scheduled.ids.push(task.id);
-          else scheduled.failed += 1;
-        }
+        const discovered: DeletionInput[] = response.results
+          .map((result) => result.document_id)
+          .filter((documentId): documentId is string => typeof documentId === 'string' && documentId.length > 0)
+          .map((documentId) => ({ bankId: config.bankId, endpoint: config.apiUrl, documentId, reason: 'the person asked to forget this' }));
+        for (const source of discovered) sourceIds.add(source.documentId);
+        const more = this.ledger.addMany(discovered, 'the person asked to forget this');
+        fenced.failed += more.failed;
+        fenced.tasks.push(...more.tasks);
       } catch (err) {
         this.noteFailure('forget', err);
       }
       await this.drainDeletions();
+      await this.clearDerived();
     }
     this.forgetDerived([...sourceIds]);
-    const outcome = this.deletions?.outcome(scheduled.ids) ?? { done: 0, pending: 0, failed: 0 };
+    const outcome = this.ledger.outcome(fenced.tasks.map((task) => task.id));
     return {
       local: cancelled.length,
       deleted: outcome.done,
       pending: outcome.pending,
-      failed: outcome.failed + scheduled.failed + cancelFailed,
+      failed: outcome.failed + fenced.failed + cancelFailed,
     };
   }
 
   private enqueueDeletions(items: Array<{ documentId: string; bankId?: string; endpoint?: string; operationId?: string }>, reason: string): { ids: string[]; failed: number } {
-    const queue = this.deletions;
-    const ids: string[] = [];
-    let failed = 0;
-    if (!queue) return { ids, failed: items.length };
-    for (const item of items) {
-      const task = queue.add({
-        bankId: item.bankId ?? this.config!.bankId,
-        endpoint: item.endpoint ?? this.config!.apiUrl,
-        documentId: item.documentId,
-        ...(item.operationId ? { operationId: item.operationId } : {}),
-        reason,
-      });
-      if (task) ids.push(task.id);
-      else failed += 1;
-    }
-    return { ids, failed };
+    const ledger = this.ledger;
+    if (!ledger) return { ids: [], failed: items.length };
+    const result = ledger.addMany(items.map((item) => ({
+      bankId: item.bankId ?? this.config!.bankId,
+      endpoint: item.endpoint ?? this.config!.apiUrl,
+      documentId: item.documentId,
+      ...(item.operationId ? { operationId: item.operationId } : {}),
+      reason,
+    })), reason);
+    return { ids: result.tasks.map((task) => task.id), failed: result.failed };
   }
 
-  /** Forget exactly one source event; no unrelated recent item is touched. */
   /** Requeue a dead item after the person fixes the service or authorization. */
   retryDead(id: string): boolean {
     return this.outbox?.retryDead(id) ?? false;
   }
 
+  /**
+   * Forget the newest write for a session inside a window, read from the durable queue rather than
+   * from a pointer this process happens to hold.
+   */
+  async forgetMostRecent(session: string, since: Date): Promise<ForgetResult | null> {
+    const item = this.outbox?.recentDocument(`user:${session}:`, since);
+    if (!item) return null;
+    return this.forgetDocument(item.documentId);
+  }
+
+  /** Forget exactly one source event; no unrelated recent item is touched. */
   async forgetDocument(documentId: string): Promise<ForgetResult> {
-    if (!documentId || !this.config) return { local: 0, deleted: 0, pending: 0, failed: 0 };
+    if (!documentId || !this.config || !this.ledger) return { local: 0, deleted: 0, pending: 0, failed: 0 };
     const matched = this.outbox?.matching((item) => item.documentId === documentId) ?? [];
     const cancelled = this.outbox?.cancelMatching((item) => item.documentId === documentId, 'the person asked not to remember this') ?? [];
     const cancelFailed = Math.max(0, matched.length - cancelled.length);
-    if (matched.length > 0 && cancelled.length === 0) {
-      return { local: 0, deleted: 0, pending: 0, failed: matched.length };
-    }
-    const scheduled = this.enqueueDeletions(
-      (cancelled.length > 0 ? cancelled : matched).map((item) => ({
-        documentId: item.documentId,
-        ...(item.bankId ? { bankId: item.bankId } : {}),
-        ...(item.endpoint ? { endpoint: item.endpoint } : {}),
-        ...(item.state === 'sent' ? { operationId: item.operationId } : {}),
-      })),
-      'the person asked not to remember this',
-    );
-    if (cancelled.length === 0) {
-      const task = this.deletions?.add({
-        bankId: this.config!.bankId,
-        endpoint: this.config!.apiUrl,
-        documentId,
-        reason: 'the person asked not to remember this',
-      });
-      if (task) scheduled.ids.push(task.id);
-      else scheduled.failed += 1;
-    }
+    const config = this.config;
+    const inFlight = matched.find((entry) => entry.state === 'sent');
+    const fenced = this.ledger.addMany([{
+      bankId: config.bankId,
+      endpoint: config.apiUrl,
+      documentId,
+      ...(inFlight ? { operationId: inFlight.operationId } : {}),
+      reason: 'the person asked not to remember this',
+    }], 'the person asked not to remember this');
+    this.invalidateCache();
+    if (fenced.failed > 0) return { local: cancelled.length, deleted: 0, pending: 0, failed: fenced.failed + cancelFailed };
     this.forgetDerived([documentId]);
     if (this.delivery) await this.delivery.cancelForget(cancelled);
-    this.invalidateCache();
-    await this.drainDeletions();
-    const outcome = this.deletions?.outcome(scheduled.ids) ?? { done: 0, pending: 0, failed: 0 };
+    if (this.canTry() && await this.ensureStarted()) {
+      await this.drainDeletions();
+      await this.clearDerived();
+    }
+    const outcome = this.ledger.outcome(fenced.tasks.map((task) => task.id));
     return {
       local: cancelled.length,
       deleted: outcome.done,
       pending: outcome.pending,
-      failed: outcome.failed + scheduled.failed + cancelFailed,
+      failed: outcome.failed + fenced.failed + cancelFailed,
     };
   }
 
   async reflect(question: string, opts: { tags?: string[]; tagsMatch?: 'any' | 'all' | 'any_strict' | 'all_strict' | 'exact'; timeoutMs?: number } = {}): Promise<string> {
-    if (!this.canTry() || !question.trim() || !await this.ensureStarted()) return '';
+    if (!this.canTry() || !question.trim()) return '';
+    if (!await this.ensureStarted() || this.derivedBlocked()) return '';
     const config = this.config!;
+    const epoch = this.cacheEpoch;
+    const fence = this.visibilityEpoch();
     try {
       const response = await this.client!.reflect(config.bankId, question.slice(0, 1200), {
         budget: 'mid',
@@ -916,6 +1005,9 @@ export class HindsightMemory {
         ...(opts.tagsMatch ? { tagsMatch: opts.tagsMatch } : {}),
         signal: AbortSignal.timeout(opts.timeoutMs ?? 120_000),
       });
+      // The service reasons over the bank as it was when the call started. A forget during the
+      // call makes the answer unusable: it may quote or summarise a fenced source.
+      if (epoch !== this.cacheEpoch || fence !== this.visibilityEpoch()) return '';
       return response.text.trim();
     } catch (err) {
       this.noteFailure('reflect', err);
@@ -948,7 +1040,7 @@ export class HindsightMemory {
         date: String(item.date ?? ''),
         type: String(item.fact_type ?? 'memory'),
         documentId: item.document_id ?? null,
-      }));
+      })).filter((item) => !this.forgottenSource(item.documentId));
     } catch (err) {
       this.noteFailure('recent', err);
       return [];
@@ -962,7 +1054,8 @@ export class HindsightMemory {
     version?: string;
     error?: string;
     outbox: ReturnType<MemoryOutbox['status']> | null;
-    deletions: ReturnType<DeletionQueue['status']> | null;
+    deletions: ReturnType<ForgetLedger['status']> | null;
+    forget: { tombstones: number; unresolved: number; stale: boolean } | null;
     lastDelivery: { at: number; submitted: number; completed: number; failed: number } | null;
     recall: { fast: number; standard: number; deep: number; measured: number; avgMs: number };
     recent: Array<{ id: string; text: string; date: string; type: string; documentId: string | null }>;
@@ -975,7 +1068,14 @@ export class HindsightMemory {
       ...(health.version ? { version: health.version } : {}),
       ...(health.error ? { error: health.error } : {}),
       outbox: this.outbox?.status() ?? null,
-      deletions: this.deletions?.status() ?? null,
+      deletions: this.ledger?.status() ?? null,
+      forget: this.config && this.ledger
+        ? {
+            tombstones: this.ledger.status().tombstones,
+            unresolved: this.ledger.unresolved(this.config.bankId, this.config.apiUrl),
+            stale: this.ledger.stale(this.config.bankId, this.config.apiUrl),
+          }
+        : null,
       lastDelivery: this.latestDelivery,
       recall: {
         fast: this.recallStats.fast,
@@ -1003,7 +1103,7 @@ export class HindsightMemory {
     const cancelled = this.outbox?.cancelAll('the memory bank was cleared') ?? [];
     if (this.delivery) await this.delivery.cancelForget(cancelled);
     await this.client!.deleteBank(this.config!.bankId);
-    this.deletions?.clearTarget(this.config!.bankId, this.config!.apiUrl);
+    this.ledger?.clearTarget(this.config!.bankId, this.config!.apiUrl);
     try { this.lifecycleHooks?.clearDerived(); }
     catch (error) { this.log?.warn('[memory] derived state could not be removed after bank clear', { err: error instanceof Error ? error.message : String(error) }); }
     this.ready = false;
