@@ -154,6 +154,8 @@ export class HindsightMemory {
   private recallStats = { fast: 0, standard: 0, deep: 0, measured: 0, totalMs: 0 };
   /** Incremented by every invalidation; an in-flight read from an older epoch is discarded. */
   private cacheEpoch = 0;
+  /** Fence epoch whose portraits have already been cleared in this process. */
+  private readonly clearedEpochs = new Map<string, number>();
   private latestDelivery: { at: number; submitted: number; completed: number; failed: number } | null = null;
   private rootDir: string | null = null;
   private autostartTried = false;
@@ -182,6 +184,7 @@ export class HindsightMemory {
     this.unavailableUntil = 0;
     this.warnedFullAt = 0;
     this.recallCache.clear();
+    this.clearedEpochs.clear();
     this.recallStats = { fast: 0, standard: 0, deep: 0, measured: 0, totalMs: 0 };
     this.cacheEpoch += 1;
     this.latestDelivery = null;
@@ -675,16 +678,25 @@ export class HindsightMemory {
     const config = this.config;
     const ledger = this.ledger;
     if (!config || !ledger || !this.client || !this.ready) return;
-    let cleared = true;
-    for (const id of MODEL_IDS) {
-      try {
-        await this.client.clearMentalModel(config.bankId, id, { signal: AbortSignal.timeout(8_000) });
-      } catch (err) {
-        if (!isMissing(err)) cleared = false;
+    const target = JSON.stringify([config.bankId, config.apiUrl]);
+    const epoch = ledger.epoch(config.bankId, config.apiUrl);
+    // One clear per fence: the drain runs every fifteen seconds, and the content only has to go once.
+    if (this.clearedEpochs.get(target) === epoch) {
+      if (ledger.unresolved(config.bankId, config.apiUrl) > 0) return;
+    } else {
+      let cleared = true;
+      for (const id of MODEL_IDS) {
+        try {
+          await this.client.clearMentalModel(config.bankId, id, { signal: AbortSignal.timeout(8_000) });
+        } catch (err) {
+          if (!isMissing(err)) cleared = false;
+        }
       }
+      this.briefing = null;
+      if (!cleared) return;
+      this.clearedEpochs.set(target, epoch);
+      if (ledger.unresolved(config.bankId, config.apiUrl) > 0) return;
     }
-    this.briefing = null;
-    if (!cleared || ledger.unresolved(config.bankId, config.apiUrl) > 0) return;
     let refreshed = true;
     for (const id of MODEL_IDS) {
       try {
@@ -693,7 +705,10 @@ export class HindsightMemory {
         if (!isMissing(err)) refreshed = false;
       }
     }
-    if (refreshed) ledger.markFresh(config.bankId, config.apiUrl);
+    if (refreshed) {
+      ledger.markFresh(config.bankId, config.apiUrl);
+      this.clearedEpochs.delete(target);
+    }
   }
 
   /** Is this source fenced out of this bank's reads? */
