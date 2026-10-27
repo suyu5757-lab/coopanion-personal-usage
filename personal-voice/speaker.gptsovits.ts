@@ -135,6 +135,8 @@ export class Speaker {
   private stage: string | null = null;
   /** 暂存根目录只有一份：并发初始化共用同一个 Promise，别各建一个。 */
   private stageInit: Promise<string> | null = null;
+  /** 进行中的预热；stop() 要等它收束，才不会在清理后重建目录。 */
+  private warmTask: Promise<void> | null = null;
   /** stop() 之后到下一次 warm() 之间，不再接受新任务。 */
   private closing = false;
   private jobs: Job[] = [];
@@ -191,12 +193,22 @@ export class Speaker {
   async warm(_style: SpeechStyle): Promise<void> {
     if (!this.supported()) return;
     this.closing = false;
+    const task = (async () => {
+      try {
+        const stage = await this.stageDir();
+        if (this.closing) return;
+        await mkdir(stage, { recursive: true });
+        if (this.closing) return;
+        await this.player.warm(stage);
+      } catch (err) {
+        this.log(`预热点失败（不影响朗读）：${(err as Error).message}`);
+      }
+    })();
+    this.warmTask = task;
     try {
-      const stage = await this.stageDir();
-      await mkdir(stage, { recursive: true });
-      await this.player.warm(stage);
-    } catch (err) {
-      this.log(`预热点失败（不影响朗读）：${(err as Error).message}`);
+      await task;
+    } finally {
+      if (this.warmTask === task) this.warmTask = null;
     }
     // 第一句就要用到这份清单；没有缓存时等一次（最多 2 秒），别让第一句退回旧规则
     if (this.capabilities) this.refreshCapability();
@@ -397,7 +409,7 @@ export class Speaker {
     await this.player.stop().catch(() => {});
     // 等在途的合成、试听和播放自己收束；它们可能还在 mkdtemp，清理前不能先删根目录
     await Promise.race([
-      Promise.allSettled([this.synthChain, this.auditionBusy ?? Promise.resolve(), this.playLock]),
+      Promise.allSettled([this.synthChain, this.auditionBusy ?? Promise.resolve(), this.playLock, this.warmTask ?? Promise.resolve()]),
       sleep(5_000),
     ]);
     const stage = this.stage;
@@ -418,13 +430,15 @@ export class Speaker {
   }
 
   private async createStage(): Promise<string> {
-    const dir = await mkdtemp(join(tmpdir(), 'coopanion-streamvoice-'));
+    let dir = '';
     try {
+      // 创建目录也要在收尾里：一次 ENOSPC 之后必须还能重试
+      dir = await mkdtemp(join(tmpdir(), 'coopanion-streamvoice-'));
       if (this.closing) throw new Error('已停止');
       if (!this.stage) this.stage = dir;
       return this.stage;
     } catch (err) {
-      await rm(dir, { recursive: true, force: true }).catch(() => {});
+      if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
       throw err;
     } finally {
       this.stageInit = null;

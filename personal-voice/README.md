@@ -96,7 +96,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.coopanion.voice-docto
 `install-macos.sh` 还会安装 `ai.coopanion.voice-doctor`，每 5 分钟带 `--repair` 跑一次：
 
 - GPT-SoVITS（9880）和适配器（9881）是否健康，不健康就重启对应的 LaunchAgent
-- 补丁状态是否为 `patched`；是 `clean` 或 `patch` 就按事务重新应用，`incompatible` 只报告
+- 补丁状态是否为 `patched`；是 `clean` 或 `patch` 就按事务重新应用，`incompatible` 只报告，最近一次是手动回退时保持原样
+- 适配器如果因为上游超时进入「引擎状态未知」，报出来并让人确认后端空闲，不自动重启
 - 适配器配置里每个参考音文件是否都在
 - 只有补丁真的变了，才重启安装版 Coopanion
 
@@ -118,13 +119,13 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.coopanion.voice-docto
 python3 patch-streamvoice.py --check
 ```
 
-`clean` 或 `patch` 就再跑一次不带参数的同一命令；`incompatible` 说明上游不是 0.4.0 了，别直接覆盖，先更新 `patch-manifest.json` 与补丁。每次成功应用都在 `~/Library/Application Support/Coopanion/patch-transactions/` 留一份事务清单（旧 hash、新 hash、备份位置），回退：
+`clean` 或 `patch` 就再跑一次不带参数的同一命令。装了旧版补丁、模板又更新过时状态会是 `incompatible`：先 `--rollback` 回到原版，再应用新版；上游不是 0.4.0 时不要这样升级，先更新 `patch-manifest.json` 与锚点。每次成功应用都在 `~/Library/Application Support/Coopanion/patch-transactions/` 留一份事务清单（旧 hash、新 hash、备份位置），回退：
 
 ```bash
 python3 patch-streamvoice.py --rollback
 ```
 
-改完重启 Coopanion 才会加载。
+回退会把清单标成 `rolled-back`，doctor 看到这个状态就不再自动打补丁；重跑补丁即恢复自动修复。改完重启 Coopanion 才会加载。
 
 ## 隔离运行
 

@@ -48,6 +48,9 @@ fi
 
 if healthy "$ADAPTER_URL/health"; then
   log "TTS 适配器 $ADAPTER_URL 正常"
+elif curl -sS --max-time 3 "$ADAPTER_URL/health" 2>/dev/null | grep -q '"engine": *"unknown"'; then
+  PROBLEMS=$((PROBLEMS + 1))
+  log "适配器拒绝推理：上一次请求超时，引擎状态未知；确认 GPT-SoVITS 空闲后再重启适配器，别让新请求越过并发保护"
 else
   PROBLEMS=$((PROBLEMS + 1))
   log "TTS 适配器 $ADAPTER_URL 不可用"

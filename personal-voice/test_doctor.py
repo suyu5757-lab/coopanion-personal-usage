@@ -71,16 +71,14 @@ class DoctorTests(unittest.TestCase):
             },
         }), encoding="utf-8")
 
-    def run_doctor(self, *args):
-        env = dict(os.environ)
-        env.update({
-            "COOPANION_SUPPORT": str(self.support),
-            "COOPANION_TTS_CONFIG": str(self.config),
-            "COOPANION_STREAMVOICE_SRC": str(self.src),
-            "COOPANION_GPT_URL": "http://127.0.0.1:1",
-            "COOPANION_ADAPTER_URL": "http://127.0.0.1:1",
-            "COOPANION_DOCTOR_NO_RESTART": "1",
-        })
+    def run_doctor(self, *args, env=None):
+        env = dict(os.environ, **(env or {}))
+        env.setdefault("COOPANION_SUPPORT", str(self.support))
+        env.setdefault("COOPANION_TTS_CONFIG", str(self.config))
+        env.setdefault("COOPANION_STREAMVOICE_SRC", str(self.src))
+        env.setdefault("COOPANION_GPT_URL", "http://127.0.0.1:1")
+        env.setdefault("COOPANION_ADAPTER_URL", "http://127.0.0.1:1")
+        env["COOPANION_DOCTOR_NO_RESTART"] = "1"
         return subprocess.run(["bash", str(DOCTOR), *args], capture_output=True, text=True, env=env)
 
     def test_check_reports_and_changes_nothing(self):
@@ -94,6 +92,29 @@ class DoctorTests(unittest.TestCase):
         self.assertFalse((self.src / "speech-plan.ts").exists())
         self.assertFalse(list(self.support.glob("patch-transactions/*.json")))
         self.assertFalse(list(self.src.glob("*.bak-*")))
+
+    def test_reports_an_engine_stuck_in_unknown_instead_of_restarting_it(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Adapter(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b'{"ok": false, "engine": "unknown"}'
+                self.send_response(503)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Adapter)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        result = self.run_doctor("--check", env={"COOPANION_ADAPTER_URL": "http://127.0.0.1:%d" % server.server_port})
+        self.assertIn("引擎状态未知", result.stdout)
 
     def test_repair_leaves_a_manual_rollback_alone(self):
         self.assertEqual(self.run_doctor("--repair").returncode, 1)

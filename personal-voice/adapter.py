@@ -222,6 +222,9 @@ def gpt_sovits_speech(text, speed, emotion):
     if not ENGINE.acquire(timeout=max(0.0, wait)):
         raise Busy()
     try:
+        # 排队期间上一个请求可能已经超时：状态检查与准入必须在同一个临界区
+        if ENGINE_UNKNOWN:
+            raise BusyUnknown()
         timeout = float(cfg.get("upstream_timeout_s", 120))
         with OPENER.open(req, timeout=timeout) as res:
             return res.read(), key, fallback
@@ -289,7 +292,11 @@ class Handler(BaseHTTPRequestHandler):
                 url = cfg.get("gpt_sovits_url", "http://127.0.0.1:9880").rstrip("/") + "/docs"
                 with OPENER.open(url, timeout=2) as res:
                     ok = res.status == 200
-                self._json(200 if ok else 503, {"ok": ok, "engine": "unknown" if ENGINE_UNKNOWN else "idle"})
+                if ENGINE_UNKNOWN:
+                    # 后端还活着，但上一次推理超时后状态未知：不能算健康
+                    self._json(503, {"ok": False, "engine": "unknown"})
+                else:
+                    self._json(200 if ok else 503, {"ok": ok, "engine": "idle"})
             except Exception as exc:
                 self._json(503, {"ok": False, "error": str(exc)})
             return

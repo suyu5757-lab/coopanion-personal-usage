@@ -388,7 +388,8 @@ describe.skipIf(!native)('cancellation sequences', () => {
       });
       const original = player.play.bind(player);
       player.play = async (clip: string) => { played++; return original(clip); };
-      const speaker = new Speaker(() => {}, player, { url: 'http://tts/v1/audio/speech', requestTimeoutMs: 1_000 });
+      // 截止时间压短：没有响应的试听靠它退场，序列不必等一秒
+      const speaker = new Speaker(() => {}, player, { url: 'http://tts/v1/audio/speech', requestTimeoutMs: 50 });
       const ops = 2 + Math.floor(random() * 5);
       for (let i = 0; i < ops; i++) {
         const roll = random();
@@ -417,7 +418,15 @@ describe.skipIf(!native)('cancellation sequences', () => {
         for (const call of calls.splice(0)) call.resolve(audioResponse(tagged(call.body.input)));
         await tick();
       }
-      await speaker.stop();
+      // 停止也会取消还在等的声音：名单里剩下的一个都不许再进播放器。
+      // stop() 等的是真正结算，所以边停边把还在路上的响应放出来。
+      live.clear();
+      const stopping = speaker.stop();
+      for (let i = 0; i < 8; i++) {
+        for (const call of calls.splice(0)) call.resolve(audioResponse(tagged(call.body.input)));
+        await tick();
+      }
+      await stopping;
       await tick();
       expect(player.violations, `seed ${seed}`).toBe(0);
       expect(player.maxConcurrent, `seed ${seed}`).toBeLessThanOrEqual(1);

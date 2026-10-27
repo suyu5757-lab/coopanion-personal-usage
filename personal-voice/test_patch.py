@@ -58,11 +58,11 @@ class PatchTests(unittest.TestCase):
             "results": {"world.ts": hashlib.sha256(world.encode("utf-8")).hexdigest()},
         }), encoding="utf-8")
 
-    def run_patcher(self, *args):
+    def run_patcher(self, *args, templates=None):
         return subprocess.run(
             [sys.executable, str(PATCHER), "--extension-dir", str(self.src),
              "--support-dir", str(self.support), "--manifest", str(self.manifest),
-             "--templates", str(HERE), *args],
+             "--templates", str(templates or HERE), *args],
             capture_output=True, text=True,
         )
 
@@ -98,6 +98,17 @@ class PatchTests(unittest.TestCase):
         for name, hashed in originals.items():
             self.assertEqual(digest(self.src / name), hashed)
         self.assertFalse((self.src / "speech-plan.ts").exists())
+
+    def test_an_older_patch_upgrades_through_rollback(self):
+        old = self.root / "old-templates"
+        old.mkdir()
+        for name in ("speaker.gptsovits.ts", "speech-plan.ts"):
+            (old / name).write_text((HERE / name).read_text(encoding="utf-8") + "\n// old build\n", encoding="utf-8")
+        self.assertEqual(self.run_patcher(templates=old).returncode, 0)
+        self.assertEqual(self.status()[1]["status"], "incompatible")
+        self.assertEqual(self.run_patcher("--rollback").returncode, 0)
+        self.assertEqual(self.run_patcher().returncode, 0)
+        self.assertEqual(self.status()[1]["status"], "patched")
 
     def test_rollback_pauses_automatic_repair(self):
         self.assertEqual(self.run_patcher().returncode, 0)

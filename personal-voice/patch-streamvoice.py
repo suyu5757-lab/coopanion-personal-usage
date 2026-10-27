@@ -451,6 +451,9 @@ def rollback(record_path):
             raise PatchError(f"备份不见了：{backup}")
         if digest(backup.read_bytes()) != entry["old"]:
             raise PatchError(f"备份内容与记录的旧 hash 不符：{backup}")
+    # 先把「已回退」写盘：即使恢复途中失败或断电，doctor 也不会自动打回去
+    record["state"] = "rolled-back"
+    write_json(record_path, record)
     for entry in reversed(entries):
         path = src / entry["file"]
         current = digest(path.read_bytes()) if path.is_file() else None
@@ -461,8 +464,6 @@ def rollback(record_path):
         if current == entry["old"]:
             continue
         os.replace(src / entry["backup"], path)
-    record["state"] = "rolled-back"
-    write_json(record_path, record)
     print(f"rolled back {record['stamp']}（{len(entries)} 个文件）")
     print("自动修复已暂停：重跑补丁或删掉这条事务记录才会恢复。")
     return 0
