@@ -11,7 +11,7 @@
   "main": "app/main.cjs",
   "packageManager": "pnpm@11.28.6",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13"
   },
   "scripts": {
     "dev": "tsx scripts/stage.ts && electron .",
