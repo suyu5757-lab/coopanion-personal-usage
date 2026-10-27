@@ -1054,9 +1054,10 @@ export class HindsightMemory {
     return !this.ledger.forgotten(config.bankId, config.apiUrl, documentId);
   }
 
-  /** Does the bank still hold this source, and is it still readable? */
+  /** Whether the bank still holds this source. Throws when memory cannot be asked at all. */
   async hasSource(documentId: string): Promise<boolean> {
-    if (!this.canTry() || !documentId || !await this.ensureStarted()) return false;
+    if (!documentId) return false;
+    if (!this.canTry() || !await this.ensureStarted()) throw new Error('long-term memory is unavailable, so the source cannot be checked');
     const config = this.config!;
     if (this.ledger?.forgotten(config.bankId, config.apiUrl, documentId)) return false;
     try {
