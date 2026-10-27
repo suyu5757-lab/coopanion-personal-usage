@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -132,8 +132,20 @@ describe('the forget ledger', () => {
     expect(imported.forgotten('bank-a', 'http://a', 'doc-new')).toBe(true);
   });
 
-  it('marks an unreadable ledger and leaves a missing one healthy', () => {
-    const missing = new ForgetLedger(join(dir(), 'forget.json'));
+  it('imports the previous deletion file once and leaves it in place', () => {
+    const root = dir();
+    const legacy = join(root, 'memory-deletions.json');
+    const at = '2026-10-01T00:00:00.000Z';
+    writeFileSync(legacy, JSON.stringify([{ id: 'old', bankId: 'bank-a', endpoint: 'http://a', documentId: 'doc-old', reason: 'forget', state: 'pending', attempts: 0, nextAttemptAt: at, createdAt: at, updatedAt: at }]));
+    const ledger = new ForgetLedger(join(root, 'memory-forget.json'), { legacyFile: legacy });
+    expect(ledger.get('old')?.state).toBe('pending');
+    expect(existsSync(join(root, 'memory-forget.json'))).toBe(true);
+    expect(existsSync(legacy)).toBe(true);
+    const reopened = new ForgetLedger(join(root, 'memory-forget.json'), { legacyFile: legacy });
+    expect(reopened.get('old')?.state).toBe('pending');
+  });
+
+  it('marks an unreadable ledger and leaves a missing one healthy', () => {    const missing = new ForgetLedger(join(dir(), 'forget.json'));
     expect(missing.damaged()).toBe(false);
     const broken = join(dir(), 'forget.json');
     writeFileSync(broken, '{not json');

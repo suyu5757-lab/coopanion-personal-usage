@@ -215,7 +215,7 @@ export class HindsightMemory {
       headers: this.config.apiToken ? { Authorization: `Bearer ${this.config.apiToken}` } : {},
     }));
     this.outbox = new MemoryOutbox(join(rootDir, 'memory-outbox.jsonl'), { log });
-    this.ledger = new ForgetLedger(join(rootDir, 'memory-forget.json'), { log });
+    this.ledger = new ForgetLedger(join(rootDir, 'memory-forget.json'), { log, legacyFile: join(rootDir, 'memory-deletions.json') });
     this.delivery = new OutboxDelivery(this.outbox, this.deliveryOps(), {
       log,
       target: () => ({ bankId: this.config!.bankId, endpoint: this.config!.apiUrl }),

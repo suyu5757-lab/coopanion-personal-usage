@@ -124,7 +124,7 @@ export class ForgetLedger {
 
   constructor(
     private readonly path: string,
-    private readonly opts: { now?: () => Date; log?: DeletionLog } = {},
+    private readonly opts: { now?: () => Date; log?: DeletionLog; legacyFile?: string } = {},
   ) {}
 
   private now(): Date {
@@ -135,6 +135,21 @@ export class ForgetLedger {
     if (this.loaded) return;
     this.loaded = true;
     const present = existsSync(this.path);
+    // The previous version kept its deletion tasks in memory-deletions.json. They are imported
+    // once, before the new ledger is used; the old file is left where it was.
+    if (!present && this.opts.legacyFile && existsSync(this.opts.legacyFile)) {
+      try {
+        const imported = readState(this.opts.legacyFile, restore);
+        if (imported) {
+          this.file = { v: 2, tasks: imported.tasks, tombstones: [], epochs: {}, stale: [] };
+          this.opts.log?.warn('[memory] imported the previous deletion tasks', { tasks: imported.tasks.length });
+          this.persist();
+          return;
+        }
+      } catch (err) {
+        this.opts.log?.warn('[memory] could not read the previous deletion tasks', { message: err instanceof Error ? err.message : String(err) });
+      }
+    }
     try {
       const saved = readState(this.path, restore);
       if (saved) this.file = saved;
