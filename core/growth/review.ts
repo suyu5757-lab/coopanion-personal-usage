@@ -190,6 +190,22 @@ function finishReviewTool(done: { note: string }): ToolDef {
   };
 }
 
+/**
+ * A read that starts or finishes after the deadline is dropped: the fork cannot be aborted, so the
+ * next tool boundary is where a timed-out review stops spending on reads.
+ */
+function guardRead(tool: ToolDef, state: { cancelled: boolean; deadline: number }): ToolDef {
+  return {
+    ...tool,
+    handler: async (args, ctx) => {
+      if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] No further reads were made.';
+      const out = await tool.handler(args, ctx);
+      if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] The review is over; this result is not used.';
+      return out;
+    },
+  };
+}
+
 function proposeGrowthTool(store: GrowthProposals, state: { cancelled: boolean; deadline: number }, done: { proposals: number }): ToolDef {
   return {
     ...PROPOSE_GROWTH_DECL,
@@ -235,7 +251,7 @@ export class GrowthReview {
     const fork = core.spawnFork({
       id: GROWTH_SESSION,
       messages,
-      tools: [...this.d.tools(), proposeGrowthTool(store, state, done), finishReviewTool(done)],
+      tools: [...this.d.tools().map((tool) => guardRead(tool, state)), proposeGrowthTool(store, state, done), finishReviewTool(done)],
       stopWhen: () => {
         if (Date.now() >= deadline) state.cancelled = true;
         return state.cancelled;

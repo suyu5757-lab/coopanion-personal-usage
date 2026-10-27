@@ -370,6 +370,7 @@ describe('the growth review session', () => {
 
   it('stops accepting proposals after the deadline', async () => {
     const captured: ForkOptions[] = [];
+    const read = vi.fn(async () => 'file contents');
     const core = {
       sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
       spawnFork: vi.fn((opts: ForkOptions) => {
@@ -381,7 +382,7 @@ describe('the growth review session', () => {
     const review = new GrowthReview({
       core: () => core,
       snapshot: prefix,
-      tools: () => [],
+      tools: () => [{ ...tool('read_file'), handler: read }],
       memory: () => null,
       proposalsDir,
       modelLanguage: () => 'en',
@@ -400,6 +401,9 @@ describe('the growth review session', () => {
     }, {} as never);
     expect(result).toContain('[review cancelled]');
     expect(new GrowthProposals(proposalsDir).list()).toHaveLength(0);
+    const lateRead = captured[0]!.tools!.find((entry) => entry.name === 'read_file')!;
+    expect(await lateRead.handler({ path: 'SELF.md' }, {} as never)).toContain('[review cancelled]');
+    expect(read).not.toHaveBeenCalled();
   });
 });
 
