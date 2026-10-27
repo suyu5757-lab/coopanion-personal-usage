@@ -9,6 +9,8 @@ interface MemoryItem {
   date: string;
   type: string;
   documentId?: string | null;
+  status?: string;
+  metadata?: Record<string, string>;
 }
 
 interface HindsightStatus {
@@ -20,6 +22,9 @@ interface HindsightStatus {
   outbox?: {
     pending: number;
     sent: number;
+    completed: number;
+    unverified: number;
+    verified: number;
     failed: number;
     dead: number;
     orphaned: number;
@@ -30,7 +35,7 @@ interface HindsightStatus {
   } | null;
   deletions?: { pending: number; done: number; failed: number; tombstones: number; staleTargets: number; persistenceError: string | null } | null;
   forget?: { tombstones: number; unresolved: number; stale: boolean; damaged: boolean } | null;
-  lastDelivery?: { at: number; submitted: number; completed: number; failed: number } | null;
+  lastDelivery?: { at: number; submitted: number; completed: number; verified: number; failed: number } | null;
   recent: MemoryItem[];
 }
 
@@ -59,7 +64,7 @@ interface ExperienceCard {
 }
 
 interface GrowthStatus {
-  schedule: { enabled: boolean; everyDays: number; paused: boolean; forkRunning: boolean; lastReviewAt: string | null; nextReviewAt: string | null; lastStatus: string | null; lastError: string | null; lastProposalCount: number | null; lastFinishedAt: string | null; activeRun: boolean } | null;
+  schedule: { enabled: boolean; blocked: boolean; everyDays: number; paused: boolean; forkRunning: boolean; lastReviewAt: string | null; nextReviewAt: string | null; lastStatus: string | null; lastError: string | null; lastProposalCount: number | null; lastFinishedAt: string | null; activeRun: boolean } | null;
   proposals: GrowthProposal[];
   experiences: ExperienceCard[];
   browser: { enabled: boolean; actions: boolean; sessionMinutes: number | null; sessionUnlimited: boolean; maxCallsPerSession: number };
@@ -96,7 +101,7 @@ function bytes(value: number | null | undefined): string {
   return `${size.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
-function listOf(ctx: WebUiPanelContext, items: readonly MemoryItem[], empty: string, sourceLabel: string): HTMLElement {
+function listOf(ctx: WebUiPanelContext, items: readonly MemoryItem[], empty: string, sourceLabel: string, supersededLabel: string): HTMLElement {
   const ui = ctx.ui;
   if (items.length === 0) return ui.placeholder(empty);
   const list = ui.h('div', 'hindsight-list');
@@ -105,7 +110,7 @@ function listOf(ctx: WebUiPanelContext, items: readonly MemoryItem[], empty: str
     const info = ui.h('div', 'stinfo');
     info.append(
       ui.h('div', 'stlabel', itemText(item.text)),
-      ui.h('div', 'stloc', `${item.type}${when(item.date) ? ` · ${when(item.date)}` : ''}${item.documentId ? ` · ${sourceLabel}: ${item.documentId}` : ''}`),
+      ui.h('div', 'stloc', `${item.type}${(item.status ?? item.metadata?.status) === 'superseded' ? ` · ${supersededLabel}` : ''}${when(item.date) ? ` · ${when(item.date)}` : ''}${item.documentId ? ` · ${sourceLabel}: ${item.documentId}` : ''}`),
     );
     row.append(info);
     list.append(row);
@@ -256,7 +261,7 @@ const panel: WebUiPanel = {
       const found = await ctx.invoke<MemoryItem[]>('search', [query]);
       if (ctx.signal.aborted) return;
       statusLine.textContent = '';
-      results.body.replaceChildren(listOf(ctx, found, t.noResults, t.sources));
+      results.body.replaceChildren(listOf(ctx, found, t.noResults, t.sources, t.superseded));
       results.el.hidden = false;
       forget.hidden = found.length === 0;
     }
@@ -285,7 +290,7 @@ const panel: WebUiPanel = {
         actions.append(ui.button(t.approve, { size: 'sm', onClick: () => void reviewProposal(proposal, 'approved') }));
         actions.append(ui.button(t.reject, { size: 'sm', variant: 'danger', onClick: () => void reviewProposal(proposal, 'rejected') }));
       } else if (proposal.state === 'approved') {
-        actions.append(ui.button(t.apply, { size: 'sm', onClick: () => void applyProposal(proposal) }));
+        actions.append(ui.h('div', 'stloc', t.applyUnavailable));
       } else if (proposal.state === 'applied' && proposal.appliedCommit) {
         info.append(ui.h('div', 'stloc', t.applyDone(proposal.appliedCommit)));
       }
@@ -298,20 +303,6 @@ const panel: WebUiPanel = {
         await ctx.invoke('growth-proposal-review', [proposal.id, action]);
         if (ctx.signal.aborted) return;
         ui.toast(action === 'approved' ? t.approved : t.rejected, 'ok');
-        await loadGrowth();
-      } catch (error) {
-        if (!ctx.signal.aborted) ui.toast(error instanceof Error ? error.message : String(error), 'bad');
-      }
-    }
-
-    async function applyProposal(proposal: GrowthProposal): Promise<void> {
-      const files = [...new Set(proposal.changes.map((change) => change.file))].join(', ');
-      const ok = await ui.confirm({ title: t.applyConfirmTitle, body: `${t.applyConfirmBody}\n\n${files}`, danger: true });
-      if (!ok || ctx.signal.aborted) return;
-      try {
-        const result = await ctx.invoke<{ commit: string }>('growth-proposal-apply', [proposal.id]);
-        if (ctx.signal.aborted) return;
-        ui.toast(t.applyDone(result.commit), 'ok');
         await loadGrowth();
       } catch (error) {
         if (!ctx.signal.aborted) ui.toast(error instanceof Error ? error.message : String(error), 'bad');
@@ -366,11 +357,12 @@ const panel: WebUiPanel = {
         ]);
         if (ctx.signal.aborted) return;
         const schedule = data.schedule;
+        const scheduleEnabled = schedule?.blocked ? t.reviewBlocked : schedule?.enabled ? t.enabled : t.off;
         const lastStatus = schedule?.lastStatus === 'ok' ? t.reviewOk
           : schedule?.lastStatus === 'failed' ? t.reviewFailed
             : schedule?.lastStatus === 'interrupted' ? t.reviewInterrupted : t.notRun;
         growthStatus.textContent = schedule
-          ? `${t.growthSchedule}: ${schedule.enabled ? t.enabled : t.off}${schedule.paused ? ` · ${t.paused}` : ''}${schedule.activeRun ? ` · ${t.running}` : ''} · ${t.nextReview}: ${schedule.nextReviewAt ? when(schedule.nextReviewAt) : t.notRun} · ${t.lastReview}: ${schedule.lastFinishedAt ? when(schedule.lastFinishedAt) : t.notRun} · ${lastStatus}${schedule.lastProposalCount !== null ? ` · ${t.proposalCount(schedule.lastProposalCount)}` : ''}${schedule.lastError ? ` · ${t.lastReviewError}: ${schedule.lastError}` : ''}`
+          ? `${t.growthSchedule}: ${scheduleEnabled}${schedule.paused ? ` · ${t.paused}` : ''}${schedule.activeRun ? ` · ${t.running}` : ''} · ${t.nextReview}: ${schedule.nextReviewAt ? when(schedule.nextReviewAt) : t.notRun} · ${t.lastReview}: ${schedule.lastFinishedAt ? when(schedule.lastFinishedAt) : t.notRun} · ${lastStatus}${schedule.lastProposalCount !== null ? ` · ${t.proposalCount(schedule.lastProposalCount)}` : ''}${schedule.lastError ? ` · ${t.lastReviewError}: ${schedule.lastError}` : ''}`
           : `${t.growthSchedule}: ${t.statusOff}`;
         proposalList.replaceChildren(...(data.proposals.length ? data.proposals.map(proposalRow) : [ui.placeholder(t.noProposals)]));
         experienceList.replaceChildren(...(data.experiences.length ? data.experiences.map(experienceRow) : [ui.placeholder(t.noExperienceCards)]));
@@ -414,24 +406,38 @@ const panel: WebUiPanel = {
         return;
       }
       if (ctx.signal.aborted) return;
-      const backlog = status.outbox?.active ?? 0;
+      const pending = status.outbox?.pending ?? 0;
+      const running = status.outbox?.sent ?? 0;
+      const completed = status.outbox?.completed ?? 0;
+      const unverified = status.outbox?.unverified ?? 0;
+      const verified = status.outbox?.verified ?? 0;
       const failed = status.outbox?.dead ?? 0;
       const deletions = (status.deletions?.pending ?? 0) + (status.deletions?.failed ?? 0);
       const isolated = status.outbox?.orphaned ?? 0;
       bank.textContent = [
         status.bankId ? `${t.bank}: ${status.bankId}` : t.bank,
-        backlog > 0 ? t.queue(backlog) : '',
+        pending > 0 ? t.queuePending(pending) : '',
+        running > 0 ? t.queueRunning(running) : '',
+        completed > 0 ? t.queueComplete(completed) : '',
+        unverified > 0 ? t.queueUnverified(unverified) : '',
+        verified > 0 ? t.queueVerified(verified) : '',
         failed > 0 ? t.queueDead(failed) : '',
         deletions > 0 ? t.deletions(deletions) : '',
+        (status.deletions?.done ?? 0) > 0 ? t.deleteDone(status.deletions!.done) : '',
+        (status.forget?.tombstones ?? 0) > 0 ? t.fenceCount(status.forget!.tombstones) : '',
         status.forget?.stale ? t.portraitsStale : '',
         status.forget?.damaged ? t.ledgerDamaged : '',
         isolated > 0 ? t.isolated(isolated) : '',
+        status.lastDelivery ? t.lastDelivery(status.lastDelivery.submitted, status.lastDelivery.completed, status.lastDelivery.verified, status.lastDelivery.failed) : '',
       ].filter(Boolean).join(' · ');
       bank.title = status.outbox?.lastError ?? '';
       if (!status.enabled) {
-        statusLine.textContent = t.disabledHint;
+        const unavailable = status.error && status.error !== 'disabled'
+          ? `${t.statusError}: ${status.error}`
+          : t.disabledHint;
+        statusLine.textContent = unavailable;
         statusLine.className = 'msgline bad';
-        recent.body.replaceChildren(ui.placeholder(t.disabledHint));
+        recent.body.replaceChildren(ui.placeholder(unavailable));
         refresh.disabled = false;
         search.disabled = true;
         remember.disabled = true;
@@ -441,7 +447,7 @@ const panel: WebUiPanel = {
       statusLine.textContent = status.outbox?.persistenceError || status.deletions?.persistenceError
         || (status.ok ? t.statusOk : `${t.statusError}${status.error ? `: ${status.error}` : ''}`);
       statusLine.className = `msgline${status.ok && !status.outbox?.persistenceError && !status.deletions?.persistenceError ? '' : ' bad'}`;
-      recent.body.replaceChildren(listOf(ctx, status.recent, t.empty, t.sources));
+      recent.body.replaceChildren(listOf(ctx, status.recent, t.empty, t.sources, t.superseded));
       refresh.disabled = false;
       search.disabled = false;
       remember.disabled = false;
