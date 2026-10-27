@@ -1,0 +1,15 @@
+{
+  "package": "cortico-world-streamvoice",
+  "version": "0.4.0",
+  "upstream": {
+    "clean.ts": "e2627c8758aa185730c3d8603915dd49fc3880552e0799ed238196cdf5b55141",
+    "chunker.ts": "b000192e46f195e369da16bdf89acc6a869a1e16e206e7e3245a51c391277ebe",
+    "world.ts": "bc8549cb1ee4324f49761994ab0c27f45f69fe0215eb0c68d6341f9950eb3f59",
+    "speaker.ts": "645e08a2a6b7ecfa25d3e73e7d912246f135a52fd0567a2c41d1445a7fcc9b44"
+  },
+  "spliced": ["world.ts"],
+  "written": {
+    "speaker.ts": "speaker.gptsovits.ts",
+    "speech-plan.ts": "speech-plan.ts"
+  }
+}

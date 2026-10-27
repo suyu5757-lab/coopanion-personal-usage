@@ -14,7 +14,9 @@ GPT-SoVITS 合成，再用 `afplay` 播放。旧的整段 TTS、重复播放器�
 - 配置：`~/Library/Application Support/Coopanion/tts/adapter-config.json` 的 `emotion_refs`、`emotion_aliases`、`emotion_keywords`
 - 训练数据：`~/Library/Application Support/Coopanion/tts/da-fei-yu-train/`
 - 数据来源和许可：见 [models.md](models.md)
-- `patch-streamvoice.py` 同时更新 `speaker.ts`、`clean.ts` 和 `world.ts`，把 `pet_say` 的 `【表情】` 传给 adapter；修改前校验三份源文件并逐份备份。扩展升级后需重新应用；`--check` 只检查，不修改。
+- `patch-streamvoice.py` 换掉 `speaker.ts`、新增 `speech-plan.ts`，并改 `world.ts` 的几处：每段台词带着自己的情绪和来源位置进播放队列。修改前先核对 `clean.ts`、`chunker.ts`、`world.ts`、`speaker.ts` 的 sha256，任何一份对不上就整次不动；应用是事务式的，失败会还原全部文件。`--check` 只报告状态：`clean`（原版可打）、`patch`（只打了一半）、`patched`、`incompatible`（上游版本变了）。
+
+adapter 的 `GET /capabilities` 返回当前参考音、别名、健康状态和配置指纹（只给文件名，不给目录）；`/v1/audio/speech` 的成功响应带 `X-Coopanion-Reference`、`X-Coopanion-Capability`，降级时带 `X-Coopanion-Fallback`。参考音文件读不出来时先退到健康的中性参考，中性也不可用就返回 503，让这一句只留在气泡里。同一台模型一次只跑一条推理：旧请求还在算时新请求短暂等待，等不到就收到 429 `busy`，客户端把这一段当文字处理，不排队堆积。
 
 `adapter-config.json` 可在全局或单个 `emotion_refs` 条目设置 `aux_ref_audio_paths`、`top_k`、`top_p`、`seed`、`parallel_infer`、`repetition_penalty`。单个情绪的值优先；`aux_ref_audio_paths: []` 可取消继承的辅助参考。辅助参考参与音色融合，不保证消除破音或固定音色，必须试听后选用。
 
@@ -81,34 +83,66 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.coopanion.voice-docto
 ## 为什么需要补丁
 
 原版 `streamvoice` 只接 Edge TTS。`speaker.gptsovits.ts` 把合成那一步换成
-`POST http://127.0.0.1:9881/v1/audio/speech`，本地桥接再调用 GPT-SoVITS；切句、队列、`afplay`
-和打断逻辑保持原样。`speaker.original.ts` 是原文件备份，方便对比或回退。
+`POST http://127.0.0.1:9881/v1/audio/speech`，本地桥接再调用 GPT-SoVITS。
+
+`hush()` 中止正在进行的合成请求（连响应体一起），所以新回复不用等旧请求自己超时；试听和正常朗读排在同一条播放流水线上，进播放器之前再复核一次代次，取消过的声音不会晚一步补放。合成有总时限（`requestTimeoutMs`，默认 30 秒）、单响应字节上限和排队上限；超出的人只留在气泡里，日志记一次「语音省略」。播放前检查返回值是不是真的 WAV，并读出实际采样率、声道和时长。
+
+`speech-plan.ts` 负责去标记和切句：每个标记记下它在正文里的位置，切块后按位置分给对应的句段，所以同一段文字不管被切成几个增量，情绪都不会变。只把 adapter 能力清单里认得的标记当情绪，`<点头>` 这类动作不会顶掉上一句的「开心」；能力清单拿不到时退回旧规则（任何标记都算情绪）。
+
+`speaker.original.ts` 是 0.4.0 原文件备份，方便对比或回退。
 
 ## 后台自检
 
-`install-macos.sh` 还会安装 `ai.coopanion.voice-doctor`，每 5 分钟检查一次：
+`install-macos.sh` 还会安装 `ai.coopanion.voice-doctor`，每 5 分钟带 `--repair` 跑一次：
 
 - GPT-SoVITS（9880）和适配器（9881）是否健康，不健康就重启对应的 LaunchAgent
-- `streamvoice/src/speaker.ts` 里是否还有 `TTS_URL`，没有就复制 `speaker.gptsovits.ts` 恢复
-- 补丁确实被覆盖时，才重启安装版 Coopanion 让新代码生效
+- 补丁状态是否为 `patched`；是 `clean` 或 `patch` 就按事务重新应用，`incompatible` 只报告
+- 适配器配置里每个参考音文件是否都在
+- 只有补丁真的变了，才重启安装版 Coopanion
 
-日志在 `~/Library/Application Support/Coopanion/tts/doctor.log`。手动执行：
+不带参数或带 `--check` 时**只报告，不改文件、不动 LaunchAgent、不重启应用**，可以随时拿来审计：
 
 ```bash
-~/Library/Application\ Support/Coopanion/tts/doctor.sh
+~/Library/Application\ Support/Coopanion/tts/doctor.sh --check
 ```
+
+日志在 `~/Library/Application Support/Coopanion/tts/doctor.log`。开发时加 `COOPANION_DOCTOR_NO_RESTART=1`，`--repair` 也只补文件，不重启服务和应用。
 
 这一步只保证补丁和服务；模型权重、`config.json`、API Key 仍需要自己备份。
 
 ## 更新后
 
-`streamvoice` 升级或重新安装会覆盖 `speaker.ts`。正常等 doctor 最多 5 分钟自动恢复；想立即恢复就重跑：
+`streamvoice` 升级或重新安装会重置扩展文件。先看状态：
 
 ```bash
-python3 patch-streamvoice.py
+python3 patch-streamvoice.py --check
 ```
 
-并重启 Coopanion。脚本每次都会在扩展目录留一份 `speaker.ts.bak-*`。
+`clean` 或 `patch` 就再跑一次不带参数的同一命令；`incompatible` 说明上游不是 0.4.0 了，别直接覆盖，先更新 `patch-manifest.json` 与补丁。每次成功应用都在 `~/Library/Application Support/Coopanion/patch-transactions/` 留一份事务清单（旧 hash、新 hash、备份位置），回退：
+
+```bash
+python3 patch-streamvoice.py --rollback
+```
+
+改完重启 Coopanion 才会加载。
+
+## 隔离运行
+
+开发和测试不需要安装版：
+
+```bash
+COOPANION_SUPPORT=/tmp/coopanion-support \
+COOPANION_STREAMVOICE_SRC=/tmp/ext/src \
+COOPANION_TTS_CONFIG=/tmp/adapter.json \
+COOPANION_TTS_URL=http://127.0.0.1:19881/v1/audio/speech \
+python3 patch-streamvoice.py --check
+```
+
+这个目录里的按 `test_*.py` 一起跑：
+
+```bash
+python3 -m unittest discover -s personal-voice -p 'test_*.py'
+```
 
 ## 隐私与许可
 
