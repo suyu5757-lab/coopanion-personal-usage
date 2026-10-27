@@ -8,9 +8,23 @@ import { formatPortrait, formatRecall } from './format.ts';
 import { sanitizeForMemory } from './policy.ts';
 import { loadHindsightConfig, type HindsightConfig, type HindsightFileConfig } from './config.ts';
 import { DeliveryError, OutboxDelivery, type DeliveryOps, type OperationState } from './delivery.ts';
-import { MemoryOutbox, type OutboxItem, type RetainItem } from './outbox.ts';
-import { ForgetLedger, type DeletionInput } from './forget-ledger.ts';
+import { MemoryOutbox, readLegacyOutbox, type OutboxItem, type RetainItem } from './outbox.ts';
+import { ForgetLedger, readLegacyForget, type DeletionInput } from './forget-ledger.ts';
+import { openMemoryStateStore, type MemoryStateStore } from './state-store.ts';
 import { planRecall, type RecallRoute } from './router.ts';
+
+export type MemoryReadStatus = 'found' | 'absent' | 'unavailable' | 'fenced';
+export type TurnRecallStatus = MemoryReadStatus | 'skipped';
+
+export interface MemoryTextRead {
+  text: string;
+  status: MemoryReadStatus;
+}
+
+export interface MemorySearchRead {
+  results: Array<{ id: string; text: string; type: string; date: string; documentId: string | null; metadata?: Record<string, string> }>;
+  status: MemoryReadStatus;
+}
 
 export interface MemoryLog {
   warn(message: string, data?: unknown): void;
@@ -29,6 +43,7 @@ export interface TurnRecall {
   text: string;
   route: RecallRoute;
   found: boolean;
+  status: TurnRecallStatus;
 }
 
 export interface ForgetResult {
@@ -40,6 +55,8 @@ export interface ForgetResult {
   pending: number;
   /** Deletion tasks that failed and will be retried. */
   failed: number;
+  /** Cortico does not expose active-session context invalidation to this extension. */
+  activeContextInvalidated: false;
 }
 
 export interface MemoryLifecycleHooks {
@@ -57,6 +74,14 @@ export interface SourceMeta {
   saidAt?: string;
   eventId?: string;
   userVerified?: boolean;
+  supersedes?: string[];
+}
+
+export interface MemorySourceEvidence {
+  present: boolean;
+  visible: boolean;
+  actor: string | null;
+  status: string | null;
 }
 
 function sourceMetadata(meta: SourceMeta): Record<string, string> {
@@ -65,6 +90,7 @@ function sourceMetadata(meta: SourceMeta): Record<string, string> {
   if (meta.saidAt) out.said_at = meta.saidAt;
   if (meta.eventId) out.source_event_id = meta.eventId;
   if (meta.userVerified !== undefined) out.user_verified = String(meta.userVerified);
+  if (meta.supersedes?.length) out.supersedes_source_ids = JSON.stringify([...new Set(meta.supersedes)]);
   return out;
 }
 
@@ -122,7 +148,7 @@ function sourceOf(item: OutboxItem): DeletionInput | null {
     bankId: item.bankId,
     endpoint: item.endpoint,
     documentId: item.documentId,
-    ...(item.state === 'sent' ? { operationId: item.operationId } : {}),
+    ...(item.state === 'pending' ? {} : { operationId: item.operationId }),
     reason: 'the person asked to forget this',
   };
 }
@@ -146,6 +172,8 @@ export class HindsightMemory {
   private briefing: { at: number; value: SessionBriefing } | null = null;
   private outbox: MemoryOutbox | null = null;
   private ledger: ForgetLedger | null = null;
+  private stateStore: MemoryStateStore | null = null;
+  private storageError: string | null = null;
   private delivery: OutboxDelivery | null = null;
   private opsClient: ReturnType<typeof createClient> | null = null;
   private draining = false;
@@ -154,9 +182,11 @@ export class HindsightMemory {
   private recallStats = { fast: 0, standard: 0, deep: 0, measured: 0, totalMs: 0 };
   /** Incremented by every invalidation; an in-flight read from an older epoch is discarded. */
   private cacheEpoch = 0;
+  /** Whole-bank reads pause while a natural-language forget query is being resolved to sources. */
+  private forgetScanDepth = 0;
   /** Fence epoch whose portraits have already been cleared in this process. */
   private readonly clearedEpochs = new Map<string, number>();
-  private latestDelivery: { at: number; submitted: number; completed: number; failed: number } | null = null;
+  private latestDelivery: { at: number; submitted: number; completed: number; verified: number; failed: number } | null = null;
   private rootDir: string | null = null;
   private autostartTried = false;
   private modelRefreshAt = 0;
@@ -199,23 +229,48 @@ export class HindsightMemory {
     }
     this.modelRefreshAt = 0;
     this.draining = false;
+    this.forgetScanDepth = 0;
     this.outbox = null;
     this.ledger = null;
+    this.stateStore = null;
+    this.storageError = null;
     this.delivery = null;
     this.opsClient = null;
     this.client = null;
     if (!this.config.enabled) return;
-    this.client = new HindsightClient({
-      baseUrl: this.config.apiUrl,
-      ...(this.config.apiToken ? { apiKey: this.config.apiToken } : {}),
-      userAgent: 'coopanion-memory/0.1',
-    });
-    this.opsClient = createClient(createConfig({
-      baseUrl: this.config.apiUrl,
-      headers: this.config.apiToken ? { Authorization: `Bearer ${this.config.apiToken}` } : {},
-    }));
-    this.outbox = new MemoryOutbox(join(rootDir, 'memory-outbox.jsonl'), { log });
-    this.ledger = new ForgetLedger(join(rootDir, 'memory-forget.json'), { log, legacyFile: join(rootDir, 'memory-deletions.json') });
+    try {
+      this.stateStore = openMemoryStateStore(join(rootDir, 'memory-state.sqlite'));
+      if (!this.stateStore.imported('outbox-v1') || !this.stateStore.imported('forget-v1')) {
+        const legacyForget = readLegacyForget(
+          join(rootDir, 'memory-forget.json'),
+          join(rootDir, 'memory-deletions.json'),
+          log,
+        );
+        this.stateStore.importLegacy({
+          outbox: readLegacyOutbox(join(rootDir, 'memory-outbox.jsonl'), log),
+          forget: legacyForget.state,
+          forgetDamaged: legacyForget.damaged,
+        });
+      }
+      this.outbox = new MemoryOutbox(this.stateStore, { log });
+      this.ledger = new ForgetLedger(this.stateStore, { log });
+      this.client = new HindsightClient({
+        baseUrl: this.config.apiUrl,
+        ...(this.config.apiToken ? { apiKey: this.config.apiToken } : {}),
+        userAgent: 'coopanion-memory/0.1',
+      });
+      this.opsClient = createClient(createConfig({
+        baseUrl: this.config.apiUrl,
+        headers: this.config.apiToken ? { Authorization: `Bearer ${this.config.apiToken}` } : {},
+      }));
+    } catch (error) {
+      this.storageError = error instanceof Error ? error.message : String(error);
+      this.log.warn('[memory] local memory database is unavailable; historical memory remains closed', { message: this.storageError });
+      this.stateStore = null;
+      this.outbox = null;
+      this.ledger = null;
+      return;
+    }
     this.delivery = new OutboxDelivery(this.outbox, this.deliveryOps(), {
       log,
       target: () => ({ bankId: this.config!.bankId, endpoint: this.config!.apiUrl }),
@@ -230,7 +285,11 @@ export class HindsightMemory {
   }
 
   enabled(): boolean {
-    return this.config?.enabled === true && this.client !== null;
+    return this.config?.enabled === true
+      && this.client !== null
+      && this.stateStore !== null
+      && this.outbox?.readable() === true
+      && this.ledger?.damaged() === false;
   }
 
   bankId(): string | null {
@@ -256,10 +315,10 @@ export class HindsightMemory {
     try {
       if (!this.canTry() || !await this.ensureStarted()) return;
       const result = await this.delivery.drain();
-      if (result.submitted || result.completed || result.failed) {
+      if (result.submitted || result.completed || result.verified || result.failed) {
         this.latestDelivery = { at: Date.now(), ...result };
       }
-      if (result.completed > 0) {
+      if (result.verified > 0) {
         this.invalidateCache();
         this.scheduleModelRefresh();
       }
@@ -339,6 +398,20 @@ export class HindsightMemory {
         }
       },
       status: (item) => this.operationStatus(item),
+      verify: async (item) => {
+        try {
+          const document = await this.client!.getDocument(item.bankId ?? config().bankId, item.documentId, {
+            signal: AbortSignal.timeout(5_000),
+          });
+          return document !== null
+            && document.id === item.documentId
+            && document.bank_id === (item.bankId ?? config().bankId)
+            && (!item.content || document.original_text === item.content);
+        } catch (err) {
+          if (isMissing(err)) return false;
+          throw err;
+        }
+      },
       retry: async (item) => {
         try {
           const response = await sdk.retryOperation({
@@ -555,8 +628,10 @@ export class HindsightMemory {
     }
   }
 
-  async searchResults(query: string, opts: RecallOptions = {}): Promise<Array<{ id: string; text: string; type: string; date: string; documentId: string | null; metadata?: Record<string, string> }>> {
-    if (!this.canTry() || !query.trim() || !await this.ensureStarted()) return [];
+  async searchResultsDetailed(query: string, opts: RecallOptions = {}): Promise<MemorySearchRead> {
+    if (!query.trim()) return { results: [], status: 'absent' };
+    if (this.forgetScanDepth > 0) return { results: [], status: 'fenced' };
+    if (!this.canTry() || !await this.ensureStarted()) return { results: [], status: 'unavailable' };
     const epoch = this.cacheEpoch;
     const config = this.config!;
     const timeoutMs = opts.timeoutMs ?? config.recall.timeoutMs;
@@ -570,34 +645,50 @@ export class HindsightMemory {
         queryTimestamp: new Date().toISOString(),
         signal: AbortSignal.timeout(timeoutMs),
       });
-      const results = response.results.map((result) => ({
+      const superseded = this.stateStore!.supersededSources(config.bankId, config.apiUrl);
+      const currentRevisions = this.stateStore!.currentRevisionSources(config.bankId, config.apiUrl);
+      const results = response.results.map((result) => {
+        const documentId = result.document_id ?? null;
+        const metadata = result.metadata ? { ...result.metadata } : {};
+        if (documentId && currentRevisions.has(documentId)) metadata.status = 'current';
+        else if (documentId && superseded.has(documentId)) metadata.status = 'superseded';
+        return {
         id: result.id,
         text: String(result.text ?? ''),
         type: String(result.type ?? 'memory'),
         date: String(result.occurred_start ?? result.mentioned_at ?? ''),
-        documentId: result.document_id ?? null,
-        ...(result.metadata && Object.keys(result.metadata).length > 0 ? { metadata: result.metadata } : {}),
-      }));
+        documentId,
+        ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+      };
+      });
       // A forget can invalidate the bank while this recall is in flight; do not hand the old text back.
-      if (epoch !== this.cacheEpoch) return [];
+      if (epoch !== this.cacheEpoch) return { results: [], status: 'fenced' };
       // A ledger that cannot be read may be missing tombstones, so no source can be shown clear.
-      if (this.ledger?.damaged()) return [];
+      if (this.ledger?.damaged()) return { results: [], status: 'fenced' };
       // A fenced source stays out of every read even if the service still returns it. While a
       // deletion is unresolved, a result with no source cannot be shown to be clear of it.
       const unresolved = this.ledger?.unresolved(config.bankId, config.apiUrl) ?? 0;
-      return results.filter((result) =>
+      const visible = results.filter((result) =>
         (result.documentId !== null || unresolved === 0) && !this.forgottenSource(result.documentId));
+      if (visible.length > 0) return { results: visible, status: 'found' };
+      if (results.length > 0 || unresolved > 0) return { results: [], status: 'fenced' };
+      return { results: [], status: 'absent' };
     } catch (err) {
       this.noteFailure('recall', err);
-      return [];
+      return { results: [], status: 'unavailable' };
     }
   }
 
-  async recallBlock(query: string, opts: RecallOptions = {}): Promise<string> {
-    const results = await this.searchResults(query, opts);
-    if (results.length === 0) return '';
+  async searchResults(query: string, opts: RecallOptions = {}): Promise<MemorySearchRead['results']> {
+    return (await this.searchResultsDetailed(query, opts)).results;
+  }
+
+  async recallBlockDetailed(query: string, opts: RecallOptions = {}): Promise<MemoryTextRead> {
+    const read = await this.searchResultsDetailed(query, opts);
+    const results = read.results;
+    if (results.length === 0) return { text: '', status: read.status };
     const config = this.config!;
-    return formatRecall(results.map((result) => ({
+    const text = formatRecall(results.map((result) => ({
       id: result.id,
       text: result.text,
       type: result.type,
@@ -605,6 +696,11 @@ export class HindsightMemory {
       document_id: result.documentId ?? undefined,
       ...(result.metadata ? { metadata: result.metadata } : {}),
     })), { maxChars: opts.maxChars ?? Math.max(800, (opts.maxTokens ?? config.recall.maxTokens) * 5) });
+    return text ? { text, status: 'found' } : { text: '', status: 'absent' };
+  }
+
+  async recallBlock(query: string, opts: RecallOptions = {}): Promise<string> {
+    return (await this.recallBlockDetailed(query, opts)).text;
   }
 
   /**
@@ -620,25 +716,26 @@ export class HindsightMemory {
       maxTokens: config.recall.maxTokens,
       budget: config.recall.budget,
     } : {});
-    const finish = (text: string): TurnRecall => {
+    const finish = (text: string, status: TurnRecallStatus): TurnRecall => {
       this.recallStats[plan.route] += 1;
       if (plan.route !== 'fast') {
         this.recallStats.measured += 1;
         this.recallStats.totalMs += Date.now() - started;
       }
-      return { text, route: plan.route, found: !!text };
+      return { text, route: plan.route, found: !!text, status };
     };
-    if (plan.route === 'fast') return finish('');
+    if (plan.route === 'fast') return finish('', 'skipped');
     const key = `${config?.bankId ?? ''}|${config?.apiUrl ?? ''}|${this.visibilityEpoch()}|${plan.route}|${query.trim().toLowerCase().slice(0, 300)}`;
     const cached = plan.route === 'standard' ? this.recallCache.get(key) : undefined;
-    if (cached && Date.now() - cached.at < 5 * 60_000) return finish(cached.value);
-    const text = await this.recallBlock(query, {
+    if (cached && Date.now() - cached.at < 5 * 60_000) return finish(cached.value, 'found');
+    const read = await this.recallBlockDetailed(query, {
       budget: plan.budget,
       maxTokens: plan.maxTokens,
       timeoutMs: plan.timeoutMs,
       maxChars: plan.maxChars,
     });
-    if (epoch !== this.cacheEpoch) return finish('');
+    if (epoch !== this.cacheEpoch) return finish('', 'fenced');
+    const text = read.text;
     if (text && plan.route === 'standard') {
       this.recallCache.set(key, { at: Date.now(), value: text });
       if (this.recallCache.size > 64) {
@@ -646,7 +743,7 @@ export class HindsightMemory {
         if (!oldest.done) this.recallCache.delete(oldest.value);
       }
     }
-    return finish(text);
+    return finish(text, read.status);
   }
 
   /** Drop recalled text and the session portrait after an explicit write, forget or bank change. */
@@ -662,6 +759,7 @@ export class HindsightMemory {
    * checked against the fence.
    */
   private derivedBlocked(): boolean {
+    if (this.forgetScanDepth > 0) return true;
     const config = this.config;
     const ledger = this.ledger;
     if (!config || !ledger) return false;
@@ -683,6 +781,7 @@ export class HindsightMemory {
     const config = this.config;
     const ledger = this.ledger;
     if (!config || !ledger || !this.client || !this.ready) return;
+    if (!ledger.damaged() && ledger.unresolved(config.bankId, config.apiUrl) === 0 && !ledger.stale(config.bankId, config.apiUrl)) return;
     const target = JSON.stringify([config.bankId, config.apiUrl]);
     const epoch = ledger.epoch(config.bankId, config.apiUrl);
     // One clear per fence: the drain runs every fifteen seconds, and the content only has to go once.
@@ -736,7 +835,7 @@ export class HindsightMemory {
     const session = meta.session ?? 'main';
     const id = meta.cursor === undefined ? hash(body) : String(meta.cursor);
     const saidAt = meta.timestamp ?? new Date().toISOString();
-    const documentId = `user:${session}:${id}:${hash(body).slice(0, 8)}`;
+    const documentId = `user:${session}:${id}`;
     const queued = this.enqueue({
       content: `The person said to Coo: ${body.slice(0, 4000)}`,
       documentId,
@@ -770,12 +869,26 @@ export class HindsightMemory {
    * Queue an explicit fact. The answer says what happened locally: the service has not confirmed
    * it yet, so a person who needs it kept must be told it is queued, not stored.
    */
-  remember(text: string, meta: { session?: string } = {}): 'queued' | 'empty' | 'sensitive' | 'full' | 'disabled' | 'persistence-error' | 'forgotten' {
+  remember(text: string, meta: { session?: string; sourceDocumentId?: string } = {}): 'queued' | 'submitted' | 'unverified' | 'verified' | 'needs-attention' | 'source-missing' | 'empty' | 'sensitive' | 'full' | 'disabled' | 'persistence-error' | 'forgotten' {
+    if (this.config?.enabled && (this.storageError || !this.stateStore || !this.outbox || !this.outbox.readable() || !this.ledger || this.ledger.damaged())) {
+      return 'persistence-error';
+    }
     if (!this.enabled() || !this.outbox) return 'disabled';
     const safe = sanitizeForMemory(text);
     const body = safe.text;
     if (!body) return safe.skip ? 'sensitive' : 'empty';
     const session = meta.session ?? 'main';
+    if (meta.sourceDocumentId) {
+      if (!this.sourceVisible(meta.sourceDocumentId)) return 'forgotten';
+      const state = this.outbox.promoteDocument(meta.sourceDocumentId, this.config!.bankId, this.config!.apiUrl);
+      if (!state) return 'source-missing';
+      this.invalidateCache();
+      if (state === 'verified') return 'verified';
+      if (state === 'sent' || state === 'sending') return 'submitted';
+      if (state === 'done') return 'unverified';
+      if (state === 'dead' || state === 'orphaned' || state === 'cancelled') return 'needs-attention';
+      return 'queued';
+    }
     const at = new Date().toISOString();
     const queued = this.enqueue({
       content: `The person asked Coo to remember: ${body.slice(0, 4000)}`,
@@ -785,7 +898,57 @@ export class HindsightMemory {
       context: 'The person asked Coo to remember this. It is a fact about the person or their shared life.',
       tags: ['scope:life', 'source:explicit', `session:${session}`],
       priority: 'critical',
-      metadata: sourceMetadata({ actor: 'user', kind: 'fact', status: 'current', saidAt: at, userVerified: true }),
+      metadata: sourceMetadata({ actor: 'inference', kind: 'fact', status: 'current', saidAt: at }),
+    });
+    if (queued === 'full') return 'full';
+    if (queued === 'persistence-error') return 'persistence-error';
+    if (queued === 'skipped') return 'forgotten';
+    this.invalidateCache();
+    return 'queued';
+  }
+
+  async correct(
+    text: string,
+    sourceIds: readonly string[],
+    meta: { session?: string; sourceDocumentId?: string } = {},
+  ): Promise<'queued' | 'submitted' | 'unverified' | 'verified' | 'empty' | 'sensitive' | 'full' | 'disabled' | 'persistence-error' | 'forgotten' | 'source-missing' | 'source-unavailable'> {
+    if (this.config?.enabled && (this.storageError || !this.stateStore || !this.outbox || !this.outbox.readable() || !this.ledger || this.ledger.damaged())) {
+      return 'persistence-error';
+    }
+    if (!this.enabled() || !this.outbox || !this.config) return 'disabled';
+    const safe = sanitizeForMemory(text);
+    const body = safe.text;
+    if (!body) return safe.skip ? 'sensitive' : 'empty';
+    const sources = [...new Set(sourceIds.map((id) => id.trim()).filter(Boolean))];
+    if (sources.length === 0 || sources.length > 8) return 'source-missing';
+    for (const sourceId of sources) {
+      if (!this.sourceVisible(sourceId)) return 'forgotten';
+      try {
+        if (!await this.hasSource(sourceId) || !this.sourceVisible(sourceId)) return 'source-missing';
+      } catch {
+        return 'source-unavailable';
+      }
+    }
+    const session = meta.session ?? 'main';
+    if (meta.sourceDocumentId) {
+      if (!this.sourceVisible(meta.sourceDocumentId)) return 'forgotten';
+      const state = this.outbox.linkCorrection(meta.sourceDocumentId, this.config.bankId, this.config.apiUrl, sources);
+      if (!state) return 'source-missing';
+      this.invalidateCache();
+      if (state === 'verified') return 'verified';
+      if (state === 'sent' || state === 'sending') return 'submitted';
+      if (state === 'done') return 'unverified';
+      return 'queued';
+    }
+    const at = new Date().toISOString();
+    const queued = this.enqueue({
+      content: `The person corrected a past fact: ${body.slice(0, 4000)}`,
+      documentId: `correction:${session}:${hash(body)}:${hash(at)}`,
+      context: 'The person explicitly corrected these earlier source records. This is the current account; the earlier records remain available as history.',
+      tags: ['scope:life', 'source:correction', `session:${session}`],
+      timestamp: at,
+      priority: 'critical',
+      metadata: sourceMetadata({ actor: 'inference', kind: 'correction', status: 'current', saidAt: at, supersedes: sources }),
     });
     if (queued === 'full') return 'full';
     if (queued === 'persistence-error') return 'persistence-error';
@@ -906,21 +1069,81 @@ export class HindsightMemory {
 
   async forget(query: string): Promise<ForgetResult> {
     const asked = query.trim();
-    if (!asked || !this.config || !this.ledger) return { local: 0, deleted: 0, pending: 0, failed: 0 };
-    const candidates = this.outbox?.matching((item) => matchesForget(item, asked)) ?? [];
-    const cancelled = this.outbox?.cancelMatching((item) => matchesForget(item, asked), 'the person asked to forget this') ?? [];
+    if (!asked) return { local: 0, deleted: 0, pending: 0, failed: 0, activeContextInvalidated: false };
+    this.forgetScanDepth += 1;
+    this.invalidateCache();
+    try {
+      return await this.forgetMatching(asked);
+    } finally {
+      this.forgetScanDepth -= 1;
+      this.invalidateCache();
+    }
+  }
+
+  private async forgetMatching(asked: string): Promise<ForgetResult> {
+    if (!this.config || !this.ledger) return { local: 0, deleted: 0, pending: 0, failed: 0, activeContextInvalidated: false };
+    const outbox = this.outbox;
+    const ledger = this.ledger;
+    const store = outbox?.stateStore;
+    if (!outbox || !store || store !== ledger.stateStore) return { local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
+    let candidates: OutboxItem[] = [];
+    let cancelled: OutboxItem[] = [];
+    let fenced: ReturnType<ForgetLedger['addMany']> = { tasks: [], failed: 0 };
+    const sourceIds = new Set<string>();
+    try {
+      store.transaction(() => {
+        const matched = outbox.matching((item) => matchesForget(item, asked));
+        const targets = new Map<string, { bankId: string; endpoint: string; documents: Set<string> }>();
+        for (const item of matched) {
+          if (!item.bankId || !item.endpoint) continue;
+          const key = JSON.stringify([item.bankId, item.endpoint]);
+          const target = targets.get(key) ?? { bankId: item.bankId, endpoint: item.endpoint, documents: new Set<string>() };
+          target.documents.add(item.documentId);
+          targets.set(key, target);
+        }
+        for (const target of targets.values()) {
+          let frontier = [...target.documents];
+          while (frontier.length > 0) {
+            const dependents = store.revisionDependents(target.bankId, target.endpoint, frontier)
+              .filter((id) => !target.documents.has(id));
+            for (const dependent of dependents) target.documents.add(dependent);
+            frontier = dependents;
+          }
+        }
+        const belongsToTarget = (item: OutboxItem) => [...targets.values()].some((target) =>
+          item.bankId === target.bankId && item.endpoint === target.endpoint && target.documents.has(item.documentId));
+        candidates = outbox.matching(belongsToTarget);
+        cancelled = outbox.cancelMatching(belongsToTarget, 'the person asked to forget this');
+        const inputs: DeletionInput[] = [];
+        for (const target of targets.values()) {
+          for (const documentId of target.documents) {
+            sourceIds.add(documentId);
+            const inFlight = candidates.find((entry) => entry.bankId === target.bankId
+              && entry.endpoint === target.endpoint && entry.documentId === documentId && entry.state !== 'pending');
+            inputs.push({
+              bankId: target.bankId,
+              endpoint: target.endpoint,
+              documentId,
+              ...(inFlight ? { operationId: inFlight.operationId } : {}),
+              reason: 'the person asked to forget this',
+            });
+          }
+        }
+        // The source fences, revision dependents and local cancellations commit together.
+        fenced = ledger.addMany(inputs, 'the person asked to forget this');
+        if (fenced.failed > 0) throw new Error('the forget fence could not be committed');
+      });
+    } catch (error) {
+      outbox.reload();
+      ledger.reload();
+      this.log?.warn('[memory] forget transaction was not committed', { message: error instanceof Error ? error.message : String(error) });
+      return { local: 0, deleted: 0, pending: 0, failed: Math.max(1, fenced.failed), activeContextInvalidated: false };
+    }
     const cancelFailed = Math.max(0, candidates.length - cancelled.length);
-    const sourceIds = new Set(candidates.map((entry) => entry.documentId));
-    // Fence every source we already know before any remote call. A queue item that could not be
-    // cancelled is still fenced, so its text cannot come back through a read.
-    const fenced = this.ledger.addMany(candidates.map(sourceOf).filter((input): input is DeletionInput => input !== null), 'the person asked to forget this');
     this.invalidateCache();
     this.forgetDerived([...sourceIds]);
-    if (fenced.failed > 0) {
-      return { local: cancelled.length, deleted: 0, pending: 0, failed: fenced.failed + cancelFailed };
-    }
-    for (const task of fenced.tasks) sourceIds.add(task.documentId);
-    if (this.delivery) await this.delivery.cancelForget(cancelled);
+    const additional = { local: 0, deleted: 0, pending: 0, failed: 0 };
+    if (this.delivery) await this.delivery.cancelForget(candidates);
     if (this.canTry() && await this.ensureStarted()) {
       const config = this.config;
       try {
@@ -934,10 +1157,15 @@ export class HindsightMemory {
           .map((result) => result.document_id)
           .filter((documentId): documentId is string => typeof documentId === 'string' && documentId.length > 0)
           .map((documentId) => ({ bankId: config.bankId, endpoint: config.apiUrl, documentId, reason: 'the person asked to forget this' }));
-        for (const source of discovered) sourceIds.add(source.documentId);
-        const more = this.ledger.addMany(discovered, 'the person asked to forget this');
-        fenced.failed += more.failed;
-        fenced.tasks.push(...more.tasks);
+        for (const source of discovered) {
+          if (sourceIds.has(source.documentId)) continue;
+          sourceIds.add(source.documentId);
+          const result = await this.forgetDocument(source.documentId);
+          additional.local += result.local;
+          additional.deleted += result.deleted;
+          additional.pending += result.pending;
+          additional.failed += result.failed;
+        }
       } catch (err) {
         this.noteFailure('forget', err);
       }
@@ -947,10 +1175,11 @@ export class HindsightMemory {
     this.forgetDerived([...sourceIds]);
     const outcome = this.ledger.outcome(fenced.tasks.map((task) => task.id));
     return {
-      local: cancelled.length,
-      deleted: outcome.done,
-      pending: outcome.pending,
-      failed: outcome.failed + fenced.failed + cancelFailed,
+      local: cancelled.length + additional.local,
+      deleted: outcome.done + additional.deleted,
+      pending: outcome.pending + additional.pending,
+      failed: outcome.failed + fenced.failed + cancelFailed + additional.failed,
+      activeContextInvalidated: false,
     };
   }
 
@@ -984,23 +1213,55 @@ export class HindsightMemory {
 
   /** Forget exactly one source event; no unrelated recent item is touched. */
   async forgetDocument(documentId: string): Promise<ForgetResult> {
-    if (!documentId || !this.config || !this.ledger) return { local: 0, deleted: 0, pending: 0, failed: 0 };
-    const matched = this.outbox?.matching((item) => item.documentId === documentId) ?? [];
-    const cancelled = this.outbox?.cancelMatching((item) => item.documentId === documentId, 'the person asked not to remember this') ?? [];
-    const cancelFailed = Math.max(0, matched.length - cancelled.length);
+    if (!documentId || !this.config || !this.ledger) return { local: 0, deleted: 0, pending: 0, failed: 0, activeContextInvalidated: false };
+    const outbox = this.outbox;
+    const ledger = this.ledger;
+    const store = outbox?.stateStore;
+    if (!outbox || !store || store !== ledger.stateStore) return { local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
     const config = this.config;
-    const inFlight = matched.find((entry) => entry.state === 'sent');
-    const fenced = this.ledger.addMany([{
-      bankId: config.bankId,
-      endpoint: config.apiUrl,
-      documentId,
-      ...(inFlight ? { operationId: inFlight.operationId } : {}),
-      reason: 'the person asked not to remember this',
-    }], 'the person asked not to remember this');
+    let matched: OutboxItem[] = [];
+    let cancelled: OutboxItem[] = [];
+    let fenced: ReturnType<ForgetLedger['addMany']> = { tasks: [], failed: 0 };
+    let sourceIds = [documentId];
+    let target = { bankId: config.bankId, endpoint: config.apiUrl };
+    try {
+      store.transaction(() => {
+        const direct = outbox.matching((item) => item.documentId === documentId);
+        const origin = direct.find((item) => item.bankId && item.endpoint);
+        if (origin?.bankId && origin.endpoint) target = { bankId: origin.bankId, endpoint: origin.endpoint };
+        const seen = new Set(sourceIds);
+        let frontier = [...sourceIds];
+        while (frontier.length > 0) {
+          const dependents = store.revisionDependents(target.bankId, target.endpoint, frontier).filter((id) => !seen.has(id));
+          for (const dependent of dependents) seen.add(dependent);
+          sourceIds = [...seen];
+          frontier = dependents;
+        }
+        matched = outbox.matching((item) => item.bankId === target.bankId && item.endpoint === target.endpoint && seen.has(item.documentId));
+        cancelled = outbox.cancelMatching((item) => item.bankId === target.bankId && item.endpoint === target.endpoint && seen.has(item.documentId), 'the person asked not to remember this');
+        const inputs = sourceIds.map((sourceId) => {
+          const inFlight = matched.find((entry) => entry.documentId === sourceId && entry.state !== 'pending');
+          return {
+            bankId: target.bankId,
+            endpoint: target.endpoint,
+            documentId: sourceId,
+            ...(inFlight ? { operationId: inFlight.operationId } : {}),
+            reason: 'the person asked not to remember this',
+          };
+        });
+        fenced = ledger.addMany(inputs, 'the person asked not to remember this');
+        if (fenced.failed > 0) throw new Error('the forget fence could not be committed');
+      });
+    } catch (error) {
+      outbox.reload();
+      ledger.reload();
+      this.log?.warn('[memory] source forget transaction was not committed', { message: error instanceof Error ? error.message : String(error) });
+      return { local: 0, deleted: 0, pending: 0, failed: Math.max(1, fenced.failed), activeContextInvalidated: false };
+    }
+    const cancelFailed = Math.max(0, matched.length - cancelled.length);
     this.invalidateCache();
-    this.forgetDerived([documentId]);
-    if (fenced.failed > 0) return { local: cancelled.length, deleted: 0, pending: 0, failed: fenced.failed + cancelFailed };
-    if (this.delivery) await this.delivery.cancelForget(cancelled);
+    this.forgetDerived(sourceIds);
+    if (this.delivery) await this.delivery.cancelForget(matched);
     if (this.canTry() && await this.ensureStarted()) {
       await this.drainDeletions();
       await this.clearDerived();
@@ -1011,12 +1272,18 @@ export class HindsightMemory {
       deleted: outcome.done,
       pending: outcome.pending,
       failed: outcome.failed + fenced.failed + cancelFailed,
+      activeContextInvalidated: false,
     };
   }
 
   async reflect(question: string, opts: { tags?: string[]; tagsMatch?: 'any' | 'all' | 'any_strict' | 'all_strict' | 'exact'; timeoutMs?: number } = {}): Promise<string> {
-    if (!this.canTry() || !question.trim()) return '';
-    if (!await this.ensureStarted() || this.derivedBlocked()) return '';
+    return (await this.reflectDetailed(question, opts)).text;
+  }
+
+  async reflectDetailed(question: string, opts: { tags?: string[]; tagsMatch?: 'any' | 'all' | 'any_strict' | 'all_strict' | 'exact'; timeoutMs?: number } = {}): Promise<MemoryTextRead> {
+    if (!question.trim()) return { text: '', status: 'absent' };
+    if (this.forgetScanDepth > 0 || this.derivedBlocked()) return { text: '', status: 'fenced' };
+    if (!this.canTry() || !await this.ensureStarted()) return { text: '', status: 'unavailable' };
     const config = this.config!;
     const epoch = this.cacheEpoch;
     const fence = this.visibilityEpoch();
@@ -1029,11 +1296,12 @@ export class HindsightMemory {
       });
       // The service reasons over the bank as it was when the call started. A forget during the
       // call makes the answer unusable: it may quote or summarise a fenced source.
-      if (epoch !== this.cacheEpoch || fence !== this.visibilityEpoch()) return '';
-      return response.text.trim();
+      if (epoch !== this.cacheEpoch || fence !== this.visibilityEpoch()) return { text: '', status: 'fenced' };
+      const text = response.text.trim();
+      return text ? { text, status: 'found' } : { text: '', status: 'absent' };
     } catch (err) {
       this.noteFailure('reflect', err);
-      return '';
+      return { text: '', status: 'unavailable' };
     }
   }
 
@@ -1050,8 +1318,9 @@ export class HindsightMemory {
   /** Does the fence still allow this source to appear in injected text? */
   sourceVisible(documentId: string): boolean {
     const config = this.config;
-    if (!config || !this.ledger) return true;
-    return !this.ledger.forgotten(config.bankId, config.apiUrl, documentId);
+    const ledger = this.ledger;
+    if (!documentId || !this.enabled() || !config || !ledger || ledger.damaged()) return false;
+    return !ledger.forgotten(config.bankId, config.apiUrl, documentId);
   }
 
   /** Whether the bank still holds this source. Throws when memory cannot be asked at all. */
@@ -1069,23 +1338,66 @@ export class HindsightMemory {
     }
   }
 
-  async recent(limit = 20): Promise<Array<{ id: string; text: string; date: string; type: string; documentId: string | null }>> {
-    if (!this.canTry() || !await this.ensureStarted()) return [];
+  /** Read current provenance for a source used to approve or inject a derived policy. */
+  async sourceEvidence(documentId: string): Promise<MemorySourceEvidence> {
+    if (!documentId) return { present: false, visible: false, actor: null, status: null };
+    if (!this.canTry() || !await this.ensureStarted()) throw new Error('long-term memory is unavailable, so the source cannot be checked');
+    const config = this.config!;
+    if (this.ledger?.damaged() || !this.sourceVisible(documentId)) {
+      return { present: false, visible: false, actor: null, status: null };
+    }
+    try {
+      const document = await this.client!.getDocument(config.bankId, documentId, { signal: AbortSignal.timeout(5_000) });
+      const visible = this.sourceVisible(documentId) && !this.ledger?.damaged();
+      if (!document || document.id !== documentId || document.bank_id !== config.bankId || !visible) {
+        return { present: false, visible, actor: null, status: null };
+      }
+      const metadata = document.document_metadata && typeof document.document_metadata === 'object'
+        ? document.document_metadata as Record<string, unknown>
+        : {};
+      const locallySuperseded = this.stateStore!.supersededSources(config.bankId, config.apiUrl).has(documentId);
+      const localCurrent = this.stateStore!.currentRevisionSources(config.bankId, config.apiUrl).has(documentId);
+      return {
+        present: true,
+        visible,
+        actor: typeof metadata.source_actor === 'string' ? metadata.source_actor : null,
+        status: localCurrent ? 'current' : locallySuperseded ? 'superseded'
+          : typeof metadata.status === 'string' ? metadata.status : null,
+      };
+    } catch (err) {
+      if (isMissing(err)) return { present: false, visible: this.sourceVisible(documentId), actor: null, status: null };
+      throw err;
+    }
+  }
+
+  async recent(limit = 20): Promise<Array<{ id: string; text: string; date: string; type: string; documentId: string | null; status?: string }>> {
+    if (this.forgetScanDepth > 0 || !this.canTry() || !await this.ensureStarted()) return [];
     if (this.ledger?.damaged()) return [];
     const config = this.config!;
+    const cacheEpoch = this.cacheEpoch;
+    const fenceEpoch = this.visibilityEpoch();
     try {
       const response = await this.client!.listMemories(config.bankId, {
         limit: Math.min(100, Math.max(1, Math.round(limit))),
         timeField: 'mentioned_at',
         signal: AbortSignal.timeout(3000),
       });
-      return response.items.map((item) => ({
-        id: item.id,
-        text: String(item.text ?? ''),
-        date: String(item.date ?? ''),
-        type: String(item.fact_type ?? 'memory'),
-        documentId: item.document_id ?? null,
-      })).filter((item) => !this.forgottenSource(item.documentId));
+      if (cacheEpoch !== this.cacheEpoch || fenceEpoch !== this.visibilityEpoch() || this.ledger?.damaged()) return [];
+      const unresolved = this.ledger?.unresolved(config.bankId, config.apiUrl) ?? 0;
+      const superseded = this.stateStore!.supersededSources(config.bankId, config.apiUrl);
+      const currentRevisions = this.stateStore!.currentRevisionSources(config.bankId, config.apiUrl);
+      return response.items.map((item) => {
+        const documentId = item.document_id ?? null;
+        return {
+          id: item.id,
+          text: String(item.text ?? ''),
+          date: String(item.date ?? ''),
+          type: String(item.fact_type ?? 'memory'),
+          documentId,
+          ...(documentId && currentRevisions.has(documentId) ? { status: 'current' }
+            : documentId && superseded.has(documentId) ? { status: 'superseded' } : {}),
+        };
+      }).filter((item) => (item.documentId !== null || unresolved === 0) && !this.forgottenSource(item.documentId));
     } catch (err) {
       this.noteFailure('recent', err);
       return [];
@@ -1101,9 +1413,9 @@ export class HindsightMemory {
     outbox: ReturnType<MemoryOutbox['status']> | null;
     deletions: ReturnType<ForgetLedger['status']> | null;
     forget: { tombstones: number; unresolved: number; stale: boolean; damaged: boolean } | null;
-    lastDelivery: { at: number; submitted: number; completed: number; failed: number } | null;
+    lastDelivery: { at: number; submitted: number; completed: number; verified: number; failed: number } | null;
     recall: { fast: number; standard: number; deep: number; measured: number; avgMs: number };
-    recent: Array<{ id: string; text: string; date: string; type: string; documentId: string | null }>;
+    recent: Array<{ id: string; text: string; date: string; type: string; documentId: string | null; status?: string }>;
   }> {
     const health = await this.health();
     return {
@@ -1135,7 +1447,9 @@ export class HindsightMemory {
   }
 
   async health(): Promise<{ ok: boolean; version?: string; error?: string }> {
-    if (!this.enabled()) return { ok: false, error: 'disabled' };
+    if (this.storageError) return { ok: false, error: `local memory database unavailable: ${this.storageError}` };
+    if (!this.config?.enabled) return { ok: false, error: 'disabled' };
+    if (!this.enabled()) return { ok: false, error: 'memory storage unavailable' };
     try {
       const version = await this.client!.getVersion({ signal: AbortSignal.timeout(1500) });
       return { ok: true, version: JSON.stringify(version).slice(0, 120) };

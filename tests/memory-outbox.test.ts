@@ -1,12 +1,19 @@
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryOutbox, type RetainItem } from '../core/memory/outbox.ts';
+import { closeMemoryStateStores } from '../core/memory/state-store.ts';
 import { OutboxDelivery, DeliveryError, type DeliveryOps } from '../core/memory/delivery.ts';
 import { isForgetRequest, isMemoryForgetRequest, planRecall } from '../core/memory/router.ts';
 
-const file = () => join(mkdtempSync(join(tmpdir(), 'coo-outbox-')), 'memory-outbox.jsonl');
+const roots: string[] = [];
+const temp = () => {
+  const root = mkdtempSync(join(tmpdir(), 'coo-outbox-'));
+  roots.push(root);
+  return root;
+};
+const file = () => join(temp(), 'memory-outbox.jsonl');
 let next = 0;
 let docs = 0;
 const id = () => `id-${++next}`;
@@ -22,6 +29,11 @@ const item = (over: Partial<RetainItem> = {}): RetainItem => ({
   ...over,
 });
 
+afterEach(() => {
+  closeMemoryStateStores();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
 describe('the retain outbox', () => {
   it('keeps a queued item across a reopen and reuses its operation id', () => {
     const path = file();
@@ -32,22 +44,53 @@ describe('the retain outbox', () => {
     expect(queued[0]!.operationId).toBe('id-2');
     first.markSent(queued[0]!.id, queued[0]!.operationId);
 
+    closeMemoryStateStores();
     const reopened = new MemoryOutbox(path, { newId: id });
     expect(reopened.sent(10)).toHaveLength(1);
     expect(reopened.sent(10)[0]!.operationId).toBe('id-2');
   });
 
-  it('drops the payload after completion and keeps only status metadata', () => {
+  it('persists a sending state before waiting for the retain acknowledgement', async () => {
+    const path = file();
+    const outbox = new MemoryOutbox(path);
+    outbox.add(item());
+    const queued = outbox.due(new Date(), 1)[0]!;
+    let began!: () => void;
+    let finish!: (result: { async: boolean; operationId: string | null }) => void;
+    const started = new Promise<void>((resolve) => { began = resolve; });
+    const delivery = new OutboxDelivery(outbox, {
+      retain: async () => {
+        began();
+        return await new Promise((resolve) => { finish = resolve; });
+      },
+      status: async () => 'processing',
+      verify: async () => true,
+      retry: async () => {},
+      cancel: async () => {},
+    });
+
+    const draining = delivery.drain();
+    await started;
+    expect(outbox.get(queued.id)?.state).toBe('sending');
+    const reopened = new MemoryOutbox(path);
+    expect(reopened.sent(1)[0]).toMatchObject({ id: queued.id, operationId: queued.operationId, state: 'sending' });
+    finish({ async: true, operationId: queued.operationId });
+    await draining;
+    expect(outbox.get(queued.id)?.state).toBe('sent');
+  });
+
+  it('drops the payload only after the source document is verified', () => {
     const path = file();
     const outbox = new MemoryOutbox(path);
     outbox.add(item());
     const queued = outbox.due(new Date(), 1)[0]!;
     outbox.markDone(queued.id);
+    outbox.markVerified(queued.id);
     expect(outbox.status().active).toBe(0);
-    const text = readFileSync(path, 'utf8');
-    expect(text).not.toContain('jasmine tea');
+    expect(JSON.stringify(outbox.stateStore?.loadOutbox())).not.toContain('jasmine tea');
+    closeMemoryStateStores();
     const reopened = new MemoryOutbox(path);
-    expect(reopened.get(queued.id)?.state).toBe('done');
+    expect(reopened.get(queued.id)?.state).toBe('verified');
     expect(reopened.get(queued.id)?.content).toBe('');
   });
 
@@ -96,9 +139,13 @@ describe('the retain outbox', () => {
 
   it('skips a malformed log line and keeps the readable items', () => {
     const path = file();
-    const outbox = new MemoryOutbox(path);
-    outbox.add(item({ documentId: 'kept' }));
-    appendFileSync(path, '{"v":1,"item":{"broken":true}}\n');
+    const at = new Date().toISOString();
+    const legacy = {
+      ...item({ documentId: 'kept' }),
+      id: 'legacy-event', operationId: 'legacy-operation', state: 'pending', attempts: 0,
+      nextAttemptAt: at, createdAt: at, updatedAt: at,
+    };
+    writeFileSync(path, `${JSON.stringify({ v: 1, item: legacy })}\n{"v":1,"item":{"broken":true}}\n`);
     const reopened = new MemoryOutbox(path);
     expect(reopened.due(new Date(), 10).map((entry) => entry.documentId)).toEqual(['kept']);
   });
@@ -124,6 +171,7 @@ describe('the retain outbox', () => {
     expect(outbox.get(queued.id)?.state).toBe('dead');
     expect(outbox.status()).toMatchObject({ dead: 1, deadRetained: 1, active: 1 });
     now = new Date(now.getTime() + 8 * 86_400_000);
+    closeMemoryStateStores();
     const reopened = new MemoryOutbox(path, { now: () => now });
     expect(reopened.get(queued.id)?.content).toContain('jasmine tea');
     expect(reopened.status()).toMatchObject({ dead: 1, deadRetained: 1, active: 1 });
@@ -132,11 +180,13 @@ describe('the retain outbox', () => {
 
 describe('outbox persistence and recovery', () => {
   it('does not acknowledge an item when the append fails', () => {
-    const path = join(mkdtempSync(join(tmpdir(), 'coo-outbox-')), 'missing', 'outbox.jsonl');
+    const blocked = join(temp(), 'not-a-directory');
+    writeFileSync(blocked, 'file');
+    const path = join(blocked, 'outbox.jsonl');
     const outbox = new MemoryOutbox(path);
     expect(outbox.add(item())).toBe('persistence-error');
     expect(outbox.status().active).toBe(0);
-    expect(outbox.status().persistenceError).toContain('could not write');
+    expect(outbox.status().persistenceError).toContain('memory database');
     expect(new MemoryOutbox(path).status().active).toBe(0);
   });
 
@@ -145,6 +195,7 @@ describe('outbox persistence and recovery', () => {
     const outbox = new MemoryOutbox(path);
     outbox.add(item());
     const queued = outbox.due(new Date(), 1)[0]!;
+    closeMemoryStateStores();
     rmSync(dirname(path), { recursive: true });
     expect(outbox.markSent(queued.id, 'operation')).toBe(false);
     expect(outbox.get(queued.id)?.state).toBe('pending');
@@ -178,7 +229,7 @@ describe('outbox persistence and recovery', () => {
         if (entry.documentId === 'first') outbox.cancelMatching((candidate) => candidate.documentId === 'second', 'forget');
         return { async: true, operationId: entry.operationId };
       },
-      status: async () => 'processing', retry: async () => {}, cancel: async () => {},
+      status: async () => 'processing', verify: async () => true, retry: async () => {}, cancel: async () => {},
     });
     await delivery.drain();
     expect(submitted).toEqual(['first']);
@@ -207,7 +258,7 @@ describe('outbox persistence and recovery', () => {
     const retained: string[] = [];
     const delivery = new OutboxDelivery(outbox, {
       retain: async (entry) => { retained.push(entry.bankId ?? ''); return { async: true, operationId: entry.operationId }; },
-      status: async () => 'processing', retry: async () => {}, cancel: async () => {},
+      status: async () => 'processing', verify: async () => true, retry: async () => {}, cancel: async () => {},
     }, { target: () => ({ bankId: 'bank-b', endpoint: 'http://b.test' }) });
     await delivery.drain();
     expect(retained).toEqual([]);
@@ -245,18 +296,20 @@ describe('outbox persistence and recovery', () => {
         polled.add(entry.operationId);
         return entry.operationId === last.operationId ? 'completed' : 'processing';
       },
+      verify: async () => true,
       retry: async () => {}, cancel: async () => {},
     });
     for (let i = 0; i < 5; i++) await delivery.drain();
     expect(polled.size).toBe(9);
-    expect(outbox.get(last.id)?.state).toBe('done');
+    expect(outbox.get(last.id)?.state).toBe('verified');
   });
 });
 
 describe('the outbox delivery worker', () => {
-  const ops = (over: Partial<DeliveryOps> = {}): DeliveryOps & { retain: ReturnType<typeof vi.fn>; status: ReturnType<typeof vi.fn> } => ({
+  const ops = (over: Partial<DeliveryOps> = {}): DeliveryOps & { retain: ReturnType<typeof vi.fn>; status: ReturnType<typeof vi.fn>; verify: ReturnType<typeof vi.fn> } => ({
     retain: vi.fn(async () => ({ async: true, operationId: 'op-1' })),
     status: vi.fn(async () => 'completed' as const),
+    verify: vi.fn(async () => true),
     retry: vi.fn(async () => {}),
     cancel: vi.fn(async () => {}),
     ...over,
@@ -275,7 +328,28 @@ describe('the outbox delivery worker', () => {
     fake.status.mockResolvedValueOnce('completed');
     await delivery.drain();
     expect(outbox.status().sent).toBe(0);
+    expect(outbox.status().verified).toBe(1);
     expect(outbox.status().active).toBe(0);
+  });
+
+  it('keeps operation completion separate from source read-back verification', async () => {
+    let now = new Date('2026-10-27T00:00:00.000Z');
+    const outbox = new MemoryOutbox(file(), { now: () => now });
+    outbox.add(item());
+    const fake = ops({
+      status: vi.fn(async () => 'completed' as const),
+      verify: vi.fn(async () => false),
+    });
+    const delivery = new OutboxDelivery(outbox, fake, { now: () => now });
+
+    await delivery.drain();
+    expect(outbox.status()).toMatchObject({ completed: 1, unverified: 1, verified: 0, active: 1 });
+    expect(outbox.status().lastError).toContain('no matching readable source document');
+
+    now = new Date(now.getTime() + 10_001);
+    fake.verify.mockResolvedValueOnce(true);
+    await delivery.drain();
+    expect(outbox.status()).toMatchObject({ completed: 0, verified: 1 });
   });
 
   it('retries the same operation instead of submitting a second retain', async () => {
@@ -320,6 +394,7 @@ describe('the outbox delivery worker', () => {
     await delivery.drain();
     expect(outbox.status().active).toBe(0);
     expect(outbox.status().sent).toBe(0);
+    expect(outbox.status().verified).toBe(1);
   });
 
   it('asks the server to retry a failed extraction and keeps polling', async () => {

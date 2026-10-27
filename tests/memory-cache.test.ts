@@ -4,18 +4,20 @@ import { HindsightMemory } from '../core/memory/hindsight.ts';
 describe('recall cache invalidation', () => {
   it('drops an in-flight result and does not write it into the cache', async () => {
     const memory = new HindsightMemory();
-    let resolve!: (text: string) => void;
-    const recall = vi.fn(async () => await new Promise<string>((done) => { resolve = done; }));
-    (memory as unknown as { recallBlock: typeof recall }).recallBlock = recall;
+    let resolve!: (result: { text: string; status: 'found' }) => void;
+    const recall = vi.fn(async () => await new Promise<{ text: string; status: 'found' }>((done) => { resolve = done; }));
+    (memory as unknown as { recallBlockDetailed: typeof recall }).recallBlockDetailed = recall;
     const active = memory.recallForTurn('What should we do tomorrow?');
     memory.invalidateCache();
-    resolve('old synthetic fact');
+    resolve({ text: 'old synthetic fact', status: 'found' });
     const first = await active;
     expect(first.text).toBe('');
-    const recallAgain = vi.fn(async () => 'fresh synthetic fact');
-    (memory as unknown as { recallBlock: typeof recallAgain }).recallBlock = recallAgain;
+    expect(first.status).toBe('fenced');
+    const recallAgain = vi.fn(async () => ({ text: 'fresh synthetic fact', status: 'found' as const }));
+    (memory as unknown as { recallBlockDetailed: typeof recallAgain }).recallBlockDetailed = recallAgain;
     const second = await memory.recallForTurn('What should we do tomorrow?');
     expect(second.text).toBe('fresh synthetic fact');
+    expect(second.status).toBe('found');
     expect(recallAgain).toHaveBeenCalledOnce();
   });
 
@@ -27,6 +29,7 @@ describe('recall cache invalidation', () => {
       recall: { maxTokens: 900, budget: 'low', timeoutMs: 800, types: ['observation'] },
     };
     (memory as unknown as { ready: boolean }).ready = true;
+    (memory as unknown as { enabled: () => boolean }).enabled = () => true;
     let started!: () => void;
     const startedPromise = new Promise<void>((done) => { started = done; });
     const resolvers: Array<(value: { content: string }) => void> = [];

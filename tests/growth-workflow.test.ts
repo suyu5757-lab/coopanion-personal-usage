@@ -1,4 +1,3 @@
-import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,7 +17,16 @@ const temp = () => {
 };
 
 /** The apply path checks that a proposal's evidence still exists. */
-const liveSources = { enabled: () => true, hasSource: async () => true } as unknown as HindsightMemory;
+const liveSources = {
+  enabled: () => true,
+  sourceVisible: () => true,
+  hasSource: async () => true,
+  sourceEvidence: async () => ({ present: true, visible: true, actor: 'user', status: 'current' }),
+} as unknown as HindsightMemory;
+
+function applyGrowthInternally(persona: object, id: string): Promise<unknown> {
+  return (persona as unknown as { applyGrowthProposal(id: string): Promise<unknown> }).applyGrowthProposal(id);
+}
 
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
@@ -34,7 +42,7 @@ const proposalInput = {
 };
 
 describe('growth proposal review and apply', () => {
-  it('requires approval before applying and records the resulting Persona commit', async () => {
+  it('keeps the public apply route closed before G2 acceptance', async () => {
     const root = temp();
     const workspace = join(root, 'workspace');
     const deploy = join(root, 'deploy');
@@ -59,14 +67,11 @@ describe('growth proposal review and apply', () => {
     const persona = new Persona({ memoryDir: workspace });
     const invoke = persona.webUi('en').invoke;
     expect(invoke).toBeTypeOf('function');
-    const result = await invoke!('hindsight', 'growth-proposal-apply', [written.proposal.id]) as { commit: string; proposal: { state: string } };
-
-    expect(result.proposal.state).toBe('applied');
-    expect(result.commit).toBeTruthy();
-    expect(readFileSync(join(workspace, 'CONSTITUTION.md'), 'utf8')).toBe('During focused work, wait before routine interruptions.\n');
-    expect(new GrowthProposals(join(deploy, 'growth-proposals')).get(written.proposal.id)?.appliedCommit).toBe(result.commit);
+    await expect(invoke!('hindsight', 'growth-proposal-apply', [written.proposal.id]))
+      .rejects.toThrow(/not enabled/);
+    expect(readFileSync(join(workspace, 'CONSTITUTION.md'), 'utf8')).toBe('Ask before routine interruptions.\n');
+    expect(new GrowthProposals(join(deploy, 'growth-proposals')).get(written.proposal.id)?.state).toBe('approved');
     expect(git.status().dirty).toBe(false);
-    expect(execFileSync('git', ['-C', workspace, 'show', '--pretty=format:%s', '--no-patch'], { encoding: 'utf8' })).toContain('Apply growth proposal');
   });
 
   it('refuses to apply into a workspace with unrelated uncommitted changes', async () => {
@@ -85,7 +90,7 @@ describe('growth proposal review and apply', () => {
     const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory: liveSources });
     const persona = new Persona({ memoryDir: workspace });
 
-    await expect(persona.webUi('en').invoke!('hindsight', 'growth-proposal-apply', [written.proposal.id]))
+    await expect(applyGrowthInternally(persona, written.proposal.id))
       .rejects.toThrow(/uncommitted changes/);
     expect(readFileSync(join(workspace, 'CONSTITUTION.md'), 'utf8')).toBe('Ask before routine interruptions.\n');
   });
@@ -112,7 +117,7 @@ describe('growth proposal review and apply', () => {
     const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory: liveSources });
     const persona = new Persona({ memoryDir: workspace });
 
-    await expect(persona.webUi('en').invoke!('hindsight', 'growth-proposal-apply', [written.proposal.id]))
+    await expect(applyGrowthInternally(persona, written.proposal.id))
       .rejects.toThrow(/no longer has one unique copy/);
     expect(readFileSync(join(workspace, 'CONSTITUTION.md'), 'utf8')).toBe('Ask before routine interruptions.\nSpeak briefly.\n');
     expect(git.status().dirty).toBe(false);
@@ -135,7 +140,7 @@ describe('growth proposal review and apply', () => {
     const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory: forgotten });
     const persona = new Persona({ memoryDir: workspace });
 
-    await expect(persona.webUi('en').invoke!('hindsight', 'growth-proposal-apply', [written.proposal.id]))
+    await expect(applyGrowthInternally(persona, written.proposal.id))
       .rejects.toThrow(/sources are gone/);
     expect(readFileSync(join(workspace, 'CONSTITUTION.md'), 'utf8')).toBe('Ask before routine interruptions.\n');
     expect(store.get(written.proposal.id)?.state).toBe('approved');
@@ -143,6 +148,27 @@ describe('growth proposal review and apply', () => {
 });
 
 describe('experience policy cards', () => {
+  it('keeps approved policies out when Memory is disabled or its forget state is unsettled', async () => {
+    const root = temp();
+    const workspace = join(root, 'workspace');
+    const deploy = join(root, 'deploy');
+    mkdirSync(workspace);
+    mkdirSync(deploy);
+    const cards = new ExperienceCards(join(deploy, 'experience-cards'));
+    const created = cards.create({ title: 'Quiet time', situation: 'The person is focused.', lesson: 'Wait before interrupting.', scope: 'conversation', sourceIds: ['user-turn-42'] });
+    if (!created.ok) throw new Error(created.errors.join('; '));
+    cards.transition(created.card.id, 'approved');
+
+    for (const memory of [
+      { enabled: () => false, settled: () => true, sourceVisible: () => true },
+      { enabled: () => true, settled: () => false, sourceVisible: () => true },
+    ]) {
+      const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory: memory as unknown as HindsightMemory });
+      const persona = new Persona({ memoryDir: workspace });
+      expect(await (persona as unknown as { experienceContext(): Promise<string> }).experienceContext()).toBe('');
+    }
+  });
+
   it('keeps policies inactive until approval and removes them when their source is forgotten', () => {
     const root = temp();
     const cards = new ExperienceCards(join(root, 'experience-cards'), () => new Date('2026-10-27T00:00:00.000Z'));
@@ -175,7 +201,11 @@ describe('experience policy cards', () => {
     const deploy = join(root, 'deploy');
     mkdirSync(workspace);
     mkdirSync(deploy);
-    const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json') });
+    const memory = {
+      enabled: () => true, settled: () => true, sourceVisible: () => true, hasSource: async () => true,
+      sourceEvidence: async () => ({ present: true, visible: true, actor: 'user', status: 'current' }),
+    } as unknown as HindsightMemory;
+    const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory });
     const persona = new Persona({ memoryDir: workspace });
     const injected: string[] = [];
     persona['core'] = { injectInternal: (text: string) => injected.push(text) } as never;
@@ -191,7 +221,35 @@ describe('experience policy cards', () => {
     expect(injected.at(-1)).toContain('No approved experience policies remain active.');
   });
 
-  it('does not inject an approved policy whose source was fenced', async () => {
+  it('rejects experience cards and proposal approval when a source is gone', async () => {
+    const root = temp();
+    const workspace = join(root, 'workspace');
+    const deploy = join(root, 'deploy');
+    mkdirSync(workspace);
+    mkdirSync(deploy);
+    const memory = {
+      enabled: () => true,
+      settled: () => true,
+      sourceVisible: () => true,
+      hasSource: async () => false,
+      sourceEvidence: async () => ({ present: false, visible: true, actor: null, status: null }),
+    } as unknown as HindsightMemory;
+    const proposals = new GrowthProposals(join(deploy, 'growth-proposals'));
+    const written = proposals.write(proposalInput);
+    if (!written.ok) throw new Error(written.errors.join('; '));
+    const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory });
+    const persona = new Persona({ memoryDir: workspace });
+    const invoke = persona.webUi('en').invoke!;
+
+    await expect(invoke('hindsight', 'experience-create', [{
+      title: 'Quiet coding time', situation: 'The person is coding.', lesson: 'Wait before routine interruptions.',
+      scope: 'proactive_speech', sourceIds: ['user:focus'],
+    }])).rejects.toThrow('sources are missing');
+    await expect(invoke('hindsight', 'growth-proposal-review', [written.proposal.id, 'approved'])).rejects.toThrow('sources cannot be verified');
+    expect(proposals.get(written.proposal.id)?.state).toBe('candidate');
+  });
+
+  it('does not inject an approved policy whose source is missing at session opening', async () => {
     const root = temp();
     const workspace = join(root, 'workspace');
     const deploy = join(root, 'deploy');
@@ -209,7 +267,9 @@ describe('experience policy cards', () => {
     cards.transition(created.card.id, 'approved');
     const memory = {
       enabled: () => true,
-      sourceVisible: () => false,
+      settled: () => true,
+      sourceVisible: () => true,
+      sourceEvidence: async () => ({ present: false, visible: true, actor: null, status: null }),
       sessionBriefing: async () => ({ text: '', source: 'none' }),
     } as unknown as HindsightMemory;
     const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory });

@@ -1,14 +1,25 @@
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { ForgetLedger, VERIFY_DELAY_MS } from '../core/memory/forget-ledger.ts';
 import { MemoryOutbox, type RetainItem } from '../core/memory/outbox.ts';
+import { closeMemoryStateStores } from '../core/memory/state-store.ts';
 import { OutboxDelivery } from '../core/memory/delivery.ts';
 import { HindsightMemory } from '../core/memory/hindsight.ts';
 import { ExperienceCards } from '../core/growth/experience-cards.ts';
 
-const dir = () => mkdtempSync(join(tmpdir(), 'coo-forget-'));
+const roots: string[] = [];
+const dir = () => {
+  const root = mkdtempSync(join(tmpdir(), 'coo-forget-'));
+  roots.push(root);
+  return root;
+};
+
+afterEach(() => {
+  closeMemoryStateStores();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 let docs = 0;
 const item = (over: Partial<RetainItem> = {}): RetainItem => ({
   bankId: 'bank-a',
@@ -22,6 +33,7 @@ const item = (over: Partial<RetainItem> = {}): RetainItem => ({
 });
 
 interface FakeClient {
+  getDocument?: (bankId: string, documentId: string) => Promise<unknown | null>;
   deleteDocument?: (bankId: string, documentId: string) => Promise<void>;
   recall?: (bankId: string, query: string) => Promise<{ results: Array<{ id: string; text: string; type: string; document_id?: string | null }> }>;
   getMentalModel?: (bankId: string, id: string) => Promise<{ content: string }>;
@@ -37,16 +49,19 @@ function memoryWith(outbox: MemoryOutbox, ledger: ForgetLedger, client: FakeClie
     client: FakeClient;
     outbox: MemoryOutbox;
     ledger: ForgetLedger;
+    stateStore: MemoryOutbox['stateStore'];
     delivery: OutboxDelivery;
     ready: boolean;
     unavailableUntil: number;
     drain: () => Promise<void>;
     forget: (query: string) => Promise<{ local: number; deleted: number; pending: number; failed: number }>;
     forgetDocument: (documentId: string) => Promise<{ local: number; deleted: number; pending: number; failed: number }>;
-    searchResults: (query: string) => Promise<Array<{ text: string; documentId: string | null }>>;
+    searchResults: (query: string) => Promise<Array<{ text: string; documentId: string | null; metadata?: Record<string, string> }>>;
+    recent: () => Promise<Array<{ id: string; text: string; date: string; type: string; documentId: string | null }>>;
     sessionBriefing: () => Promise<{ text: string; source: string }>;
     reflect: (question: string) => Promise<string>;
     remember: (text: string) => string;
+    correct: (text: string, sourceIds: readonly string[], meta?: { session?: string }) => Promise<string>;
     settled: () => boolean;
     setLifecycleHooks: (hooks: { forgetSources: (sourceIds: readonly string[]) => void; clearDerived: () => void }) => void;
   };
@@ -67,9 +82,11 @@ function memoryWith(outbox: MemoryOutbox, ledger: ForgetLedger, client: FakeClie
   };
   memory.outbox = outbox;
   memory.ledger = ledger;
+  memory.stateStore = outbox.stateStore;
   memory.delivery = new OutboxDelivery(outbox, {
     retain: async (entry) => ({ async: true, operationId: entry.operationId }),
     status: async () => 'processing',
+    verify: async () => true,
     retry: async () => {},
     cancel: async () => {},
   });
@@ -84,12 +101,14 @@ describe('persistence acknowledgement', () => {
       config: Record<string, unknown>;
       client: Record<string, unknown>;
       outbox: MemoryOutbox;
+      stateStore: MemoryOutbox['stateStore'];
       remember: (text: string) => string;
       retainUser: (text: string, meta: { session?: string; cursor?: number }) => string | null;
     };
     memory.config = { enabled: true, bankId: 'bank-a', apiUrl: 'http://hindsight.test' };
     memory.client = {};
     memory.outbox = new MemoryOutbox(join(dir(), 'missing', 'outbox.jsonl'));
+    memory.stateStore = memory.outbox.stateStore;
     expect(memory.remember('synthetic fact')).toBe('persistence-error');
     expect(memory.retainUser('synthetic line', { session: 'main', cursor: 1 })).toBeNull();
   });
@@ -99,6 +118,82 @@ describe('persistence acknowledgement', () => {
     const memory = memoryWith(outbox, new ForgetLedger(join(dir(), 'forget.json')), {});
     expect(memory.remember('synthetic preference')).toBe('queued');
     expect(outbox.status().active).toBe(1);
+  });
+
+  it('links a correction to verified sources and marks the earlier version after delivery', async () => {
+    const root = dir();
+    const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
+    const ledger = new ForgetLedger(join(root, 'forget.json'));
+    let correctionId = '';
+    const memory = memoryWith(outbox, ledger, {
+      getDocument: async (_bankId, documentId) => documentId === 'doc-old' ? { id: documentId } : null,
+      recall: async () => ({ results: [
+        { id: 'old', text: 'The person plans to move to Kyoto.', type: 'observation', document_id: 'doc-old' },
+        { id: 'new', text: 'The person plans to move to Osaka.', type: 'observation', document_id: correctionId, metadata: { source_actor: 'user', status: 'current', user_verified: 'true' } },
+      ] }),
+    });
+    expect(await memory.correct('The person plans to move to Osaka.', ['doc-old'])).toBe('queued');
+    const queued = outbox.matching((entry) => entry.metadata?.kind === 'correction')[0]!;
+    correctionId = queued.documentId;
+    expect(queued.metadata?.supersedes_source_ids).toBe('["doc-old"]');
+    expect(outbox.stateStore?.supersededSources('bank-a', 'http://hindsight.test').size).toBe(0);
+    outbox.markSent(queued.id, queued.operationId);
+    outbox.markDone(queued.id);
+    expect(outbox.markVerified(queued.id)).toBe(true);
+    expect(outbox.stateStore?.supersededSources('bank-a', 'http://hindsight.test')).toEqual(new Set(['doc-old']));
+    const results = await memory.searchResults('move');
+    expect(results.find((result) => result.documentId === 'doc-old')?.metadata?.status).toBe('superseded');
+    expect(results.find((result) => result.documentId === correctionId)?.metadata?.status).toBe('current');
+  });
+
+  it('fences local correction records when their earlier source is forgotten', async () => {
+    const root = dir();
+    const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
+    const ledger = new ForgetLedger(join(root, 'forget.json'));
+    outbox.add(item({
+      documentId: 'doc-correction',
+      content: 'corrected synthetic fact',
+      priority: 'critical',
+      metadata: { source_actor: 'user', kind: 'correction', status: 'current', supersedes_source_ids: '["doc-old"]' },
+    }));
+    const correction = outbox.due(new Date(), 1)[0]!;
+    outbox.markSent(correction.id, correction.operationId);
+    outbox.markDone(correction.id);
+    outbox.markVerified(correction.id);
+    let deleted = 0;
+    const memory = memoryWith(outbox, ledger, { deleteDocument: async () => { deleted += 1; } });
+
+    const result = await memory.forgetDocument('doc-old');
+    expect(result).toMatchObject({ deleted: 2, pending: 0, failed: 0 });
+    expect(deleted).toBe(2);
+    expect(ledger.forgotten('bank-a', 'http://hindsight.test', 'doc-old')).toBe(true);
+    expect(ledger.forgotten('bank-a', 'http://hindsight.test', 'doc-correction')).toBe(true);
+  });
+
+  it('holds recall while a natural-language forget query is resolving source IDs', async () => {
+    const root = dir();
+    const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
+    const ledger = new ForgetLedger(join(root, 'forget.json'));
+    let begin!: () => void;
+    let finish!: (value: { results: Array<{ id: string; text: string; type: string; document_id?: string | null }> }) => void;
+    let resolving = true;
+    const started = new Promise<void>((resolve) => { begin = resolve; });
+    const memory = memoryWith(outbox, ledger, {
+      recall: async () => {
+        if (!resolving) return { results: [] };
+        resolving = false;
+        begin();
+        return await new Promise((resolve) => { finish = resolve; });
+      },
+      deleteDocument: async () => {},
+    });
+
+    const forgetting = memory.forget('a remote-only synthetic topic');
+    await started;
+    expect(await memory.searchResults('another topic')).toEqual([]);
+    finish({ results: [] });
+    await forgetting;
+    expect(await memory.searchResults('another topic')).toEqual([]);
   });
 });
 
@@ -139,7 +234,7 @@ describe('the forget ledger', () => {
     writeFileSync(legacy, JSON.stringify([{ id: 'old', bankId: 'bank-a', endpoint: 'http://a', documentId: 'doc-old', reason: 'forget', state: 'pending', attempts: 0, nextAttemptAt: at, createdAt: at, updatedAt: at }]));
     const ledger = new ForgetLedger(join(root, 'memory-forget.json'), { legacyFile: legacy });
     expect(ledger.get('old')?.state).toBe('pending');
-    expect(existsSync(join(root, 'memory-forget.json'))).toBe(true);
+    expect(existsSync(join(root, 'memory-state.sqlite'))).toBe(true);
     expect(existsSync(legacy)).toBe(true);
     const reopened = new ForgetLedger(join(root, 'memory-forget.json'), { legacyFile: legacy });
     expect(reopened.get('old')?.state).toBe('pending');
@@ -167,6 +262,47 @@ describe('the forget ledger', () => {
 });
 
 describe('remote deletion tasks', () => {
+  it('verifies a retain operation that was still pending when the person forgot it', async () => {
+    const root = dir();
+    const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
+    outbox.add(item({ documentId: 'in-flight', content: 'synthetic trip' }));
+    const queued = outbox.due(new Date(), 1)[0]!;
+    const ledgerPath = join(root, 'forget.json');
+    let now = new Date();
+    const ledger = new ForgetLedger(ledgerPath, { now: () => now });
+    let began!: () => void;
+    let finish!: (accepted: { async: boolean; operationId: string | null }) => void;
+    const started = new Promise<void>((resolve) => { began = resolve; });
+    let deletes = 0;
+    let cancellations = 0;
+    const memory = memoryWith(outbox, ledger, { deleteDocument: async () => { deletes += 1; } });
+    memory.delivery = new OutboxDelivery(outbox, {
+      retain: async () => {
+        began();
+        return await new Promise((resolve) => { finish = resolve; });
+      },
+      status: async () => 'processing',
+      verify: async () => true,
+      retry: async () => {},
+      cancel: async () => { cancellations += 1; throw new Error('cancel refused'); },
+    });
+
+    const delivery = memory.delivery.drain();
+    await started;
+    const result = await memory.forgetDocument(queued.documentId);
+    const task = ledger.stateStore?.loadForgetState().state?.tasks[0] as { operationId?: string; state: string; verifications: number } | undefined;
+    expect(task).toBeDefined();
+    expect(result).toMatchObject({ deleted: 0, pending: 1, failed: 0 });
+    expect(task).toMatchObject({ operationId: queued.operationId, state: 'pending', verifications: 1 });
+    expect(deletes).toBe(1);
+
+    finish({ async: true, operationId: queued.operationId });
+    await delivery;
+    expect(cancellations).toBe(2);
+    now = new Date(now.getTime() + VERIFY_DELAY_MS + 1);
+    expect(ledger.due(now, 8)).toHaveLength(1);
+  });
+
   it('keeps an offline deletion pending and deletes it after the service returns', async () => {
     const root = dir();
     const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
@@ -225,6 +361,27 @@ describe('remote deletion tasks', () => {
 });
 
 describe('the fence covers reads and writes', () => {
+  it('does not call a source visible when Memory is off or its ledger cannot be read', () => {
+    const root = dir();
+    const file = join(root, 'forget.json');
+    writeFileSync(file, '{broken');
+    const memory = new HindsightMemory() as unknown as {
+      config: Record<string, unknown>;
+      client: FakeClient | null;
+      ledger: ForgetLedger | null;
+      sourceVisible: (documentId: string) => boolean;
+    };
+    memory.config = { enabled: true, bankId: 'bank-a', apiUrl: 'http://hindsight.test' };
+    memory.client = {};
+    memory.ledger = new ForgetLedger(file);
+    expect(memory.sourceVisible('doc-1')).toBe(false);
+
+    memory.config = { enabled: false, bankId: 'bank-a', apiUrl: 'http://hindsight.test' };
+    memory.client = null;
+    memory.ledger = null;
+    expect(memory.sourceVisible('doc-1')).toBe(false);
+  });
+
   it('does not return a source the service hands back after the deletion', async () => {
     const root = dir();
     const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
@@ -253,6 +410,19 @@ describe('the fence covers reads and writes', () => {
     expect(ledger.unresolved('bank-a', 'http://hindsight.test')).toBe(1);
     expect(await memory.searchResults('anything')).toEqual([]);
     expect(await memory.sessionBriefing()).toEqual({ text: '', source: 'none' });
+  });
+
+  it('does not show source-less recent memories while a deletion is unresolved', async () => {
+    const root = dir();
+    const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
+    const ledger = new ForgetLedger(join(root, 'forget.json'));
+    const memory = memoryWith(outbox, ledger, {
+      deleteDocument: async () => { throw new Error('offline'); },
+      listMemories: async () => ({ items: [{ id: 'memory-1', text: 'synthetic observation', date: '', fact_type: 'observation', document_id: null }] }),
+    });
+    await memory.forgetDocument('remote-only');
+    expect(ledger.unresolved('bank-a', 'http://hindsight.test')).toBe(1);
+    expect(await memory.recent()).toEqual([]);
   });
 
   it('does not queue a redelivered event whose source was forgotten', async () => {

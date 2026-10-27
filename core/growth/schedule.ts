@@ -38,6 +38,8 @@ export interface GrowthScheduleDeps {
   paused?: () => boolean;
   /** True while a growth fork still runs; a timed-out fork must not be joined by another. */
   forkRunning?: () => boolean;
+  /** False until the local cancellation and background budget gates are accepted. */
+  allowed?: () => boolean;
 }
 
 const isIso = (value: unknown): value is string => typeof value === 'string' && !Number.isNaN(Date.parse(value));
@@ -64,6 +66,7 @@ export class GrowthSchedule {
     enabled: boolean;
     everyDays: number;
     paused: boolean;
+    blocked: boolean;
     forkRunning: boolean;
     lastReviewAt: string | null;
     nextReviewAt: string | null;
@@ -74,10 +77,12 @@ export class GrowthSchedule {
     activeRun: boolean;
   } {
     const state = this.state;
+    const allowed = this.d.allowed?.() ?? true;
     return {
-      enabled: this.d.config().enabled,
+      enabled: this.d.config().enabled && allowed,
       everyDays: this.d.config().everyDays,
       paused: this.d.paused?.() ?? false,
+      blocked: this.d.config().enabled && !allowed,
       forkRunning: this.d.forkRunning?.() ?? false,
       lastReviewAt: state?.lastReviewAt ?? null,
       nextReviewAt: state?.nextReviewAt ?? null,
@@ -137,7 +142,7 @@ export class GrowthSchedule {
   /** Runs one review when it is due and quiet. Returns whether a review ran. */
   async check(): Promise<boolean> {
     const config = this.d.config();
-    if (!config.enabled || this.running || !this.state || this.d.paused?.()) return false;
+    if (!config.enabled || !(this.d.allowed?.() ?? true) || this.running || !this.state || this.d.paused?.()) return false;
     if (this.d.forkRunning?.()) return false;
     const now = this.now();
     if (Date.parse(this.state.nextReviewAt) > now.getTime()) return false;
@@ -245,7 +250,7 @@ export class GrowthSchedule {
   /** The timer is only a wake-up for a running app; a due review is picked up by the periodic check. */
   private arm(): void {
     this.cancelTimers();
-    if (!this.d.config().enabled || !this.state) return;
+    if (!this.d.config().enabled || !(this.d.allowed?.() ?? true) || !this.state) return;
     const at = Date.parse(this.state.nextReviewAt);
     if (at <= this.now().getTime()) return;
     const result = this.d.timers.set(this.state.nextReviewAt, { kind: GROWTH_TIMER });

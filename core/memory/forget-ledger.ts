@@ -6,7 +6,8 @@
  */
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { readState, writeState } from '../state-file.ts';
+import { openMemoryStateStore, type ForgetStateSnapshot, type MemoryStateStore } from './state-store.ts';
+import { readState } from '../state-file.ts';
 
 export type DeletionState = 'pending' | 'done' | 'failed';
 
@@ -56,7 +57,7 @@ export interface DeletionLog {
 
 export type DeletionInput = Omit<DeletionTask, 'id' | 'state' | 'attempts' | 'verifications' | 'nextAttemptAt' | 'createdAt' | 'updatedAt'>;
 
-interface LedgerFile {
+export interface LedgerFile extends ForgetStateSnapshot {
   v: 2;
   tasks: DeletionTask[];
   tombstones: ForgetTombstone[];
@@ -83,7 +84,7 @@ function isTask(value: unknown): value is DeletionTask {
     && typeof task.updatedAt === 'string';
 }
 
-function restore(value: unknown): LedgerFile {
+export function restoreLedger(value: unknown): LedgerFile {
   // The previous file was a bare array of tasks; its entries carry no fence, so they are imported
   // as tasks only and the bank stays readable until a new forget writes one.
   if (Array.isArray(value)) {
@@ -116,16 +117,50 @@ function restore(value: unknown): LedgerFile {
   };
 }
 
+export function readLegacyForget(path: string, legacyFile?: string, log?: DeletionLog): { state: LedgerFile; damaged: boolean } {
+  const present = existsSync(path);
+  const source = present ? path : legacyFile && existsSync(legacyFile) ? legacyFile : null;
+  if (!source) return { state: { v: 2, tasks: [], tombstones: [], epochs: {}, stale: [] }, damaged: false };
+  try {
+    const saved = readState(source, restoreLedger);
+    if (!saved) return { state: { v: 2, tasks: [], tombstones: [], epochs: {}, stale: [] }, damaged: present };
+    return {
+      state: present
+        ? saved
+        : { v: 2, tasks: saved.tasks, tombstones: [], epochs: {}, stale: [] },
+      damaged: false,
+    };
+  } catch (error) {
+    log?.warn('[memory] could not read a legacy forget ledger', { message: error instanceof Error ? error.message : String(error) });
+    return { state: { v: 2, tasks: [], tombstones: [], epochs: {}, stale: [] }, damaged: true };
+  }
+}
+
 export class ForgetLedger {
   private file: LedgerFile = { v: 2, tasks: [], tombstones: [], epochs: {}, stale: [] };
   private loaded = false;
   private damagedLedger = false;
   private persistenceError: string | null = null;
+  private initializationError: string | null = null;
+  readonly stateStore: MemoryStateStore | null;
 
   constructor(
-    private readonly path: string,
+    pathOrStore: string | MemoryStateStore,
     private readonly opts: { now?: () => Date; log?: DeletionLog; legacyFile?: string } = {},
-  ) {}
+  ) {
+    try {
+      this.stateStore = typeof pathOrStore === 'string' ? openMemoryStateStore(pathOrStore) : pathOrStore;
+      if (typeof pathOrStore === 'string' && !this.stateStore.imported('forget-v1')) {
+        const imported = readLegacyForget(pathOrStore, this.opts.legacyFile, this.opts.log);
+        this.stateStore.importForget(imported.state, imported.damaged);
+      }
+    } catch (error) {
+      this.stateStore = null;
+      this.initializationError = error instanceof Error ? error.message : String(error);
+      this.damagedLedger = true;
+      this.persistenceError = `could not open the memory database: ${this.initializationError}`;
+    }
+  }
 
   private now(): Date {
     return this.opts.now?.() ?? new Date();
@@ -134,43 +169,30 @@ export class ForgetLedger {
   private load(): void {
     if (this.loaded) return;
     this.loaded = true;
-    const present = existsSync(this.path);
-    // The previous version kept its deletion tasks in memory-deletions.json. They are imported
-    // once, before the new ledger is used; the old file is left where it was.
-    if (!present && this.opts.legacyFile && existsSync(this.opts.legacyFile)) {
-      try {
-        const imported = readState(this.opts.legacyFile, restore);
-        if (imported) {
-          this.file = { v: 2, tasks: imported.tasks, tombstones: [], epochs: {}, stale: [] };
-          this.opts.log?.warn('[memory] imported the previous deletion tasks', { tasks: imported.tasks.length });
-          this.persist();
-          return;
-        }
-      } catch (err) {
-        this.opts.log?.warn('[memory] could not read the previous deletion tasks', { message: err instanceof Error ? err.message : String(err) });
-      }
-    }
+    if (!this.stateStore) return;
     try {
-      const saved = readState(this.path, restore);
-      if (saved) this.file = saved;
-      // A ledger that exists but cannot be read may be missing tombstones; reads must stay closed
-      // until the person clears the bank or restores the file.
-      else if (present) this.damagedLedger = true;
+      const saved = this.stateStore.loadForgetState();
+      if (saved.state) this.file = saved.state as LedgerFile;
+      this.damagedLedger = saved.damaged;
     } catch (err) {
-      this.damagedLedger = present;
-      this.persistenceError = `could not read the forget ledger: ${err instanceof Error ? err.message : String(err)}`;
+      this.damagedLedger = true;
+      this.persistenceError = `could not read the memory database: ${err instanceof Error ? err.message : String(err)}`;
       this.opts.log?.warn('[memory] could not read the forget ledger', { message: err instanceof Error ? err.message : String(err) });
     }
   }
 
   private persist(): boolean {
+    if (this.damagedLedger || !this.stateStore) {
+      this.persistenceError ??= `could not write the memory database: ${this.initializationError ?? 'forget state is damaged'}`;
+      return false;
+    }
     try {
-      writeState(this.path, `${JSON.stringify(this.file, null, 2)}\n`);
+      this.stateStore.saveForgetState(this.file);
       this.persistenceError = null;
       this.damagedLedger = false;
       return true;
     } catch (err) {
-      this.persistenceError = `could not write the forget ledger: ${err instanceof Error ? err.message : String(err)}`;
+      this.persistenceError = `could not write the memory database: ${err instanceof Error ? err.message : String(err)}`;
       this.opts.log?.warn('[memory] could not write the forget ledger', { message: err instanceof Error ? err.message : String(err) });
       return false;
     }
@@ -182,6 +204,10 @@ export class ForgetLedger {
    */
   addMany(inputs: readonly DeletionInput[], reason: string): { tasks: DeletionTask[]; failed: number } {
     this.load();
+    if (this.damagedLedger || !this.stateStore) {
+      this.persistenceError ??= `could not write the memory database: ${this.initializationError ?? 'forget state is damaged'}`;
+      return { tasks: [], failed: Math.max(1, inputs.length) };
+    }
     const before = this.file;
     const at = this.now().toISOString();
     const tasks: DeletionTask[] = [];
@@ -294,6 +320,13 @@ export class ForgetLedger {
   get(id: string): DeletionTask | null {
     this.load();
     return this.file.tasks.find((task) => task.id === id) ?? null;
+  }
+
+  reload(): void {
+    this.file = { v: 2, tasks: [], tombstones: [], epochs: {}, stale: [] };
+    this.loaded = false;
+    this.damagedLedger = false;
+    this.persistenceError = null;
   }
 
   /**

@@ -72,7 +72,7 @@ import { browserDefinition, BROWSER_ID } from './browser/definition.ts';
 import { BrowserBridge } from './browser/bridge.ts';
 import { readSelfTime, SELF_TIME_DEFAULTS } from './browser/config.ts';
 import { readResourcePressure } from './resource-pressure.ts';
-import { GROWTH_DEFAULTS, readGrowth } from './growth/config.ts';
+import { GROWTH_DEFAULTS, migrateLegacyGrowthConfig, readGrowth } from './growth/config.ts';
 import { coreText } from './i18n/index.ts';
 import { petToolDescriber } from './pet-status.ts';
 import { appLanguage, modelLanguage, replyLanguage } from './language.ts';
@@ -610,6 +610,10 @@ export async function main(): Promise<void> {
   const definition = withWorlds(definitionBase, [...bundled, ...extensions.worlds]);
 
   const loaded = loadDeployment(definition, deployDir, repoRoot(), join(repoRoot(), 'bots', 'cormini'), providersRoot());
+  const growthDisabled = migrateLegacyGrowthConfig(loaded.rootDir, loaded.config, {
+    warn: (message, data) => console.warn(message, data ?? ''),
+  });
+  if (growthDisabled) console.info('[growth] disabled the previously saved schedule until G2 acceptance');
   config = loaded.config;
   Object.assign(settingsGroup, companionGroup(language()));
   Object.assign(hindsightGroup, hindsightConfigGroup(language()));

@@ -167,6 +167,26 @@ describe('the growth schedule', () => {
     expect(run).not.toHaveBeenCalled();
   });
 
+  it('keeps automatic review gated while cancellation and budget support is unavailable', async () => {
+    let now = new Date('2026-10-01T00:00:00.000Z');
+    const timers = new FakeTimers();
+    const run = vi.fn(async () => {});
+    const s = new GrowthSchedule({
+      stateFile: tempState(),
+      config: () => ({ enabled: true, everyDays: 7 }),
+      timers,
+      run,
+      now: () => new Date(now),
+      allowed: () => false,
+    });
+    s.start();
+    now = new Date('2026-10-20T00:00:00.000Z');
+    expect(s.status()).toMatchObject({ enabled: false, blocked: true });
+    expect(await s.check()).toBe(false);
+    expect(timers.entries).toHaveLength(0);
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it('waits while the app is paused', async () => {
     const start = new Date('2026-10-01T00:00:00.000Z');
     let now = start;
@@ -350,11 +370,17 @@ describe('the growth review session', () => {
       }),
     } as unknown as CoreApi;
     const proposalsDir = mkdtempSync(join(tmpdir(), 'coo-growth-proposals-'));
+    const memory = {
+      enabled: () => true,
+      sourceVisible: () => true,
+      hasSource: async () => true,
+      selfPortrait: async () => '',
+    } as unknown as HindsightMemory;
     const review = new GrowthReview({
       core: () => core,
       snapshot: prefix,
       tools: () => [],
-      memory: () => null,
+      memory: () => memory,
       proposalsDir,
       modelLanguage: () => 'en',
       timezone: () => 'UTC',

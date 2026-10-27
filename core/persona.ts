@@ -33,10 +33,11 @@ import { SESSION_MAX_CALLS, type SelfTimeConfig } from './browser/config.ts';
 import { selfTimeLine } from './browser/model-text.ts';
 import { GROWTH_DEFAULTS, type GrowthConfig } from './growth/config.ts';
 import { GROWTH_SESSION, GROWTH_TOOL_NAMES, GrowthReview, growthMemorySearchTool } from './growth/review.ts';
-import { ExperienceCards } from './growth/experience-cards.ts';
+import { ExperienceCards, readExperienceCardInput } from './growth/experience-cards.ts';
 import { GrowthProposals, type GrowthProposal } from './growth/proposals.ts';
 import { GROWTH_CHECK_MS, GrowthSchedule } from './growth/schedule.ts';
 import { readResourcePressure } from './resource-pressure.ts';
+import { memoryReadNotice } from './memory/model-text.ts';
 import type { ModelLanguage } from './language.ts';
 import { writeState } from './state-file.ts';
 
@@ -199,6 +200,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         run: () => review.run(),
         paused: this.pausedNow,
         forkRunning: () => (this.core?.sessionInfo(GROWTH_SESSION).running ?? 0) > 0,
+        allowed: () => false,
         log,
       });
       try {
@@ -247,11 +249,34 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return dir ? new ExperienceCards(join(dir, 'experience-cards')) : null;
     }
 
-    private experienceContext(): string {
+    private async verifiedMemorySources(sourceIds: readonly string[]): Promise<boolean> {
+      const memory = this.longTerm;
+      if (!memory?.enabled() || !memory.settled() || sourceIds.length === 0) return false;
+      const actors = new Set(['user', 'coo', 'affinity', 'tool', 'inference']);
+      const statuses = new Set(['current', 'planned', 'completed']);
+      for (const sourceId of new Set(sourceIds)) {
+        if (!memory.sourceVisible(sourceId)) return false;
+        try {
+          const source = await memory.sourceEvidence(sourceId);
+          if (!source.present || !source.visible || !source.actor || !actors.has(source.actor)
+            || !source.status || !statuses.has(source.status) || !memory.sourceVisible(sourceId)) return false;
+        } catch {
+          return false;
+        }
+      }
+      return memory.enabled() && memory.settled() && sourceIds.every((id) => memory.sourceVisible(id));
+    }
+
+    private async experienceContext(): Promise<string> {
       const cards = this.experienceCards();
-      if (!cards) return '';
-      // A card whose source was fenced stays out even if its file survived a restart.
-      return cards.approvedContext(8, 3200, (card) => card.sourceIds.every((id) => this.longTerm?.sourceVisible(id) ?? true));
+      const memory = this.longTerm;
+      if (!cards || !memory?.enabled() || !memory.settled()) return '';
+      const valid = new Set<string>();
+      for (const card of cards.list('approved').slice(0, 8)) {
+        if (await this.verifiedMemorySources(card.sourceIds)) valid.add(card.id);
+      }
+      if (!memory.enabled() || !memory.settled()) return '';
+      return cards.approvedContext(8, 3200, (card) => valid.has(card.id));
     }
 
     private systemHealth(): Record<string, unknown> {
@@ -366,7 +391,12 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
 
     protected override tools(): ToolDef[] {
       const base = super.tools().map((t) => (WRITES[t.name] ? this.committed(t, WRITES[t.name]!) : t));
-      return [...base, ...memoryTools({ memory: () => this.longTerm })];
+      return [...base, ...memoryTools({
+        memory: () => this.longTerm,
+        currentUserSource: (session) => session === 'main' && Date.now() - (this.lastUserMemory?.at ?? 0) < FORGET_WINDOW_MS
+          ? this.lastUserMemory?.documentId ?? null
+          : null,
+      })];
     }
 
     /** The tool, committing the workspace after each call that succeeded. */
@@ -436,27 +466,50 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
       if (method === 'growth-proposal-review') {
         const id = String(args[0] ?? ''), action = String(args[1] ?? '');
         if (action !== 'approved' && action !== 'rejected') throw new Error('Review action must be approved or rejected.');
-        const proposal = this.growthProposals()?.transition(id, action, String(args[2] ?? ''));
+        const store = this.growthProposals();
+        const current = store?.get(id);
+        if (action === 'approved') {
+          const memory = this.longTerm;
+          if (!current || !memory?.enabled() || !await this.verifiedMemorySources(current.sourceIds)) {
+            throw new Error('The proposal sources cannot be verified.');
+          }
+        }
+        const proposal = store?.transition(id, action, String(args[2] ?? ''));
         if (!proposal) throw new Error('The proposal is no longer a candidate. Refresh the list.');
         return proposal;
       }
-      if (method === 'growth-proposal-apply') return this.applyGrowthProposal(String(args[0] ?? ''));
+      if (method === 'growth-proposal-apply') throw new Error('Growth proposal application is not enabled.');
       if (method === 'experience-create') {
-        const result = this.experienceCards()?.create((args[0] && typeof args[0] === 'object' ? args[0] : {}) as Record<string, unknown>);
+        const input = (args[0] && typeof args[0] === 'object' ? args[0] : {}) as Record<string, unknown>;
+        const parsed = readExperienceCardInput(input);
+        if ('errors' in parsed) throw new Error(parsed.errors.join('; '));
+        const memory = this.longTerm;
+        if (!memory?.enabled() || !await this.verifiedMemorySources(parsed.card.sourceIds)) {
+          throw new Error('The experience sources are missing, fenced or lack current provenance.');
+        }
+        const result = this.experienceCards()?.create(input);
         if (!result?.ok) throw new Error(result?.errors.join('; ') ?? 'Experience cards are unavailable.');
         return result.card;
       }
       if (method === 'experience-review') {
         const id = String(args[0] ?? ''), action = String(args[1] ?? '');
         if (action !== 'approved' && action !== 'rejected' && action !== 'deprecated') throw new Error('Review action is not supported.');
-        const before = this.experienceCards()?.get(id);
-        const card = this.experienceCards()?.transition(id, action);
+        const cards = this.experienceCards();
+        const before = cards?.get(id);
+        if (action === 'approved') {
+          const memory = this.longTerm;
+          if (!before || !memory?.enabled() || !await this.verifiedMemorySources(before.sourceIds)) {
+            throw new Error('The experience sources cannot be verified.');
+          }
+        }
+        const card = cards?.transition(id, action);
         if (!card) throw new Error('The experience card is no longer in that state. Refresh the list.');
         if (action === 'approved') {
-          const context = this.experienceContext();
+          const context = await this.experienceContext();
           if (context) this.core?.injectInternal(context, 'memory');
         } else if (action === 'deprecated') {
-          this.core?.injectInternal(`[memory] The user revoked the experience policy “${before?.title ?? id}”. Do not follow it anymore. ${this.experienceContext() || 'No approved experience policies remain active.'}`, 'memory');
+          const context = await this.experienceContext();
+          this.core?.injectInternal(`[memory] The user revoked the experience policy “${before?.title ?? id}”. Do not follow it anymore. ${context || 'No approved experience policies remain active.'}`, 'memory');
         }
         return card;
       }
@@ -559,7 +612,7 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
       if (!this.longTerm?.enabled() && !this.experienceCards()?.list('approved').length) return;
       this.core?.injectDeferred('memory', async () => {
         const briefing = this.longTerm?.enabled() ? await this.longTerm.sessionBriefing().catch(() => null) : null;
-        return [briefing?.text?.trim(), this.experienceContext()].filter(Boolean).join('\n\n') || null;
+        return [briefing?.text?.trim(), await this.experienceContext()].filter(Boolean).join('\n\n') || null;
       });
     }
 
@@ -612,8 +665,8 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
       if (!latest || !this.longTerm?.enabled()) return;
       const recalled = await this.longTerm.recallForTurn(latest);
       if (recalled.text) this.core?.injectInternal(recalled.text, 'memory');
-      else if (recalled.route === 'deep') {
-        this.core?.injectInternal('[memory] No verified record was found for that question. If you are not sure, say so; do not invent dates, names or past events.', 'memory');
+      else if (recalled.route === 'deep' && recalled.status !== 'skipped') {
+        this.core?.injectInternal(`${memoryReadNotice(recalled.status)} If you are not sure, say so; do not invent dates, names or past events.`, 'memory');
       }
     }
 

@@ -46,7 +46,8 @@ export function formatRecall(results: readonly RecallResult[], opts: { header?: 
     if (!text || seen.has(text)) continue;
     seen.add(text);
     const type = result.type ?? 'memory';
-    const line = `- (${type}, ${when(result)}${provenance(result)}) ${text}`;
+    const source = typeof result.document_id === 'string' && result.document_id ? `, source_id:${result.document_id}` : '';
+    const line = `- (${type}, ${when(result)}${provenance(result)}${source}) ${text}`;
     if (used + line.length > maxChars || lines.length >= maxItems) break;
     lines.push(line);
     used += line.length;

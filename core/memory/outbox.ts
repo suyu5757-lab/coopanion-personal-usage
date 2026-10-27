@@ -1,14 +1,14 @@
 /**
- * A small durable queue for retain requests. The file is JSONL, one record per state change;
- * every append is fsynced, so a crash keeps whatever was acknowledged. Completed payloads are
- * dropped from disk, and only their status metadata stays for a short audit window.
+ * A small durable queue for retain requests. SQLite commits every state change before the caller
+ * can report it. Completed payloads are dropped while status metadata stays for a short audit window.
  */
-import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs';
-import { writeState } from '../state-file.ts';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { extname } from 'node:path';
+import { openMemoryStateStore, type MemoryStateStore } from './state-store.ts';
 
 export type RetainPriority = 'critical' | 'normal' | 'low';
-export type OutboxState = 'pending' | 'sent' | 'done' | 'failed' | 'dead' | 'cancelled' | 'orphaned';
+export type OutboxState = 'pending' | 'sending' | 'sent' | 'done' | 'verified' | 'failed' | 'dead' | 'cancelled' | 'orphaned';
 
 export interface RetainItem {
   /** The bank and endpoint this payload belongs to; a retry never follows a changed config. */
@@ -28,11 +28,14 @@ export interface OutboxItem extends RetainItem {
   id: string;
   /** Sent with the first request and reused on every retry of the same payload. */
   operationId: string;
+  requestHash: string;
   state: OutboxState;
   attempts: number;
   nextAttemptAt: string;
   /** A failed extraction is not polled again before this time. */
   nextPollAt?: string;
+  nextVerifyAt?: string;
+  verificationAttempts: number;
   lastError?: string;
   createdAt: string;
   updatedAt: string;
@@ -45,6 +48,10 @@ export interface OutboxLog {
 export interface OutboxStatus {
   pending: number;
   sent: number;
+  /** Remote operation completion does not prove the source document can be read. */
+  completed: number;
+  unverified: number;
+  verified: number;
   failed: number;
   dead: number;
   /** Dead items that still hold a payload: a critical fact that never reached the service. */
@@ -63,16 +70,10 @@ export interface OutboxStatus {
 
 export type AddResult = 'queued' | 'full' | 'persistence-error';
 
-interface LogRecord {
-  v: 1;
-  item: OutboxItem;
-}
-
 const MAX_ACTIVE = 512;
 const MAX_TOTAL = 2048;
 const MAX_ATTEMPTS = 8;
 const KEEP_FINISHED_MS = 7 * 86_400_000;
-const LINE_MAX = 1_000_000;
 
 const iso = (date: Date) => date.toISOString();
 
@@ -83,19 +84,20 @@ function parseItem(value: unknown): OutboxItem | null {
   if (typeof item.operationId !== 'string' || typeof item.content !== 'string') return null;
   if (typeof item.context !== 'string' || !Array.isArray(item.tags)) return null;
   if (!item.tags.every((tag) => typeof tag === 'string')) return null;
-  if (typeof item.state !== 'string' || !['pending', 'sent', 'done', 'failed', 'dead', 'cancelled', 'orphaned'].includes(item.state)) return null;
+  if (typeof item.state !== 'string' || !['pending', 'sending', 'sent', 'done', 'verified', 'failed', 'dead', 'cancelled', 'orphaned'].includes(item.state)) return null;
   if (typeof item.attempts !== 'number' || typeof item.nextAttemptAt !== 'string') return null;
   if (typeof item.createdAt !== 'string' || typeof item.updatedAt !== 'string') return null;
   const priority = item.priority === 'critical' || item.priority === 'low' ? item.priority : 'normal';
   const metadata = item.metadata && typeof item.metadata === 'object'
     ? Object.fromEntries(Object.entries(item.metadata).filter(([, value]) => typeof value === 'string')) as Record<string, string>
     : undefined;
-  return {
+  const parsed: OutboxItem = {
     id: item.id,
     ...(typeof item.bankId === 'string' ? { bankId: item.bankId } : {}),
     ...(typeof item.endpoint === 'string' ? { endpoint: item.endpoint } : {}),
     documentId: item.documentId,
     operationId: item.operationId,
+    requestHash: typeof item.requestHash === 'string' ? item.requestHash : '',
     content: item.content,
     context: item.context,
     tags: item.tags,
@@ -104,12 +106,56 @@ function parseItem(value: unknown): OutboxItem | null {
     priority,
     state: item.state as OutboxState,
     attempts: item.attempts,
+    verificationAttempts: typeof item.verificationAttempts === 'number' ? item.verificationAttempts : 0,
     nextAttemptAt: item.nextAttemptAt,
     ...(typeof item.nextPollAt === 'string' ? { nextPollAt: item.nextPollAt } : {}),
+    ...(typeof item.nextVerifyAt === 'string' ? { nextVerifyAt: item.nextVerifyAt } : {}),
     ...(typeof item.lastError === 'string' ? { lastError: item.lastError } : {}),
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
   };
+  parsed.requestHash ||= requestHashFor(parsed);
+  return parsed;
+}
+
+export function requestHashFor(item: Pick<OutboxItem, 'bankId' | 'endpoint' | 'documentId' | 'content' | 'context' | 'tags' | 'metadata' | 'timestamp'>): string {
+  return createHash('sha256').update(JSON.stringify({
+    bankId: item.bankId,
+    endpoint: item.endpoint,
+    documentId: item.documentId,
+    content: item.content,
+    context: item.context,
+    tags: item.tags,
+    metadata: item.metadata ?? null,
+    timestamp: item.timestamp ?? null,
+  })).digest('hex');
+}
+
+export function readLegacyOutbox(file: string, log?: OutboxLog): OutboxItem[] {
+  if (!existsSync(file)) return [];
+  const text = readFileSync(file, 'utf8');
+  const items = new Map<string, OutboxItem>();
+  let bad = 0;
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const record = JSON.parse(line) as { v?: unknown; item?: unknown };
+      if (record.v !== 1) throw new Error('unknown outbox record');
+      const item = parseItem(record.item);
+      if (!item) throw new Error('invalid outbox item');
+      if (!item.bankId || !item.endpoint) {
+        if (item.state === 'pending' || item.state === 'sending' || item.state === 'sent' || item.state === 'done' || item.state === 'failed') {
+          item.state = 'orphaned';
+          item.lastError = 'this item predates bank/endpoint binding; choose a target before sending it';
+        }
+      }
+      items.set(item.id, item);
+    } catch {
+      bad += 1;
+    }
+  }
+  if (bad > 0) log?.warn('[memory] skipped unreadable retain outbox lines', { bad, file });
+  return [...items.values()];
 }
 
 export class MemoryOutbox {
@@ -121,56 +167,62 @@ export class MemoryOutbox {
   private readonly maxTotal: number;
   private loaded = false;
   private persistenceError: string | null = null;
+  private readError = false;
+  private initializationError: string | null = null;
   /** Runtime-only poll order; fairness does not need a disk write every fifteen seconds. */
   private readonly polledAt = new Map<string, number>();
+  readonly stateStore: MemoryStateStore | null;
 
-  constructor(private readonly file: string, opts: { now?: () => Date; newId?: () => string; log?: OutboxLog; maxActive?: number; maxTotal?: number } = {}) {
+  constructor(fileOrStore: string | MemoryStateStore, opts: { now?: () => Date; newId?: () => string; log?: OutboxLog; maxActive?: number; maxTotal?: number } = {}) {
     this.now = opts.now ?? (() => new Date());
     this.newId = opts.newId ?? (() => randomUUID());
     this.log = opts.log;
     this.maxActive = Math.max(1, opts.maxActive ?? MAX_ACTIVE);
     this.maxTotal = Math.max(this.maxActive, opts.maxTotal ?? MAX_TOTAL);
+    try {
+      this.stateStore = typeof fileOrStore === 'string' ? openMemoryStateStore(fileOrStore) : fileOrStore;
+      if (typeof fileOrStore === 'string' && extname(fileOrStore) === '.jsonl' && !this.stateStore.imported('outbox-v1')) {
+        this.stateStore.importOutbox(readLegacyOutbox(fileOrStore, this.log));
+      }
+    } catch (error) {
+      this.stateStore = null;
+      this.initializationError = error instanceof Error ? error.message : String(error);
+    }
   }
 
-  /** Read the log, apply records in order, and drop finished metadata older than the audit window. */
+  /** Load committed delivery state and drop finished metadata older than the audit window. */
   load(): void {
     if (this.loaded) return;
     this.loaded = true;
-    if (!existsSync(this.file)) return;
-    let text: string;
-    try {
-      text = readFileSync(this.file, 'utf8');
-    } catch (err) {
+    if (!this.stateStore) {
       this.loaded = false;
-      this.persistenceError = `could not read the queue: ${err instanceof Error ? err.message : String(err)}`;
+      this.readError = true;
+      this.persistenceError = `could not open the memory database: ${this.initializationError ?? 'unavailable'}`;
+      return;
+    }
+    try {
+      for (const raw of this.stateStore.loadOutbox()) {
+        const item = parseItem(raw);
+        if (!item) throw new Error('invalid memory operation row');
+        this.items.set(item.id, item);
+      }
+    } catch (err) {
+      this.items.clear();
+      this.loaded = false;
+      this.readError = true;
+      this.persistenceError = `could not read the memory database: ${err instanceof Error ? err.message : String(err)}`;
       this.log?.warn('[memory] could not read the retain outbox', { message: err instanceof Error ? err.message : String(err) });
       return;
     }
-    let bad = 0;
-    for (const line of text.split('\n')) {
-      if (!line.trim()) continue;
-      try {
-        const record = JSON.parse(line) as Partial<LogRecord>;
-        if (record.v !== 1) throw new Error('unknown outbox record');
-        const item = parseItem(record.item);
-        if (!item) throw new Error('invalid outbox item');
-        if (!item.bankId || !item.endpoint) {
-          if (item.state === 'pending' || item.state === 'sent' || item.state === 'failed') {
-            item.state = 'orphaned';
-            item.lastError = 'this item predates bank/endpoint binding; choose a target before sending it';
-          }
-        }
-        this.items.set(item.id, item);
-      } catch {
-        bad += 1;
-      }
-    }
-    if (bad > 0) this.log?.warn('[memory] skipped unreadable retain outbox lines', { bad, file: this.file });
+    const before = new Map(this.items);
     this.dropExpiredFinished();
-    this.compact();
+    if (this.items.size !== before.size && !this.persistAll()) {
+      this.items.clear();
+      for (const [id, item] of before) this.items.set(id, item);
+    }
   }
 
-  /** Queue one item; it is acknowledged only after the append and fsync succeed. */
+  /** Queue one item; it is acknowledged only after its SQLite transaction commits. */
   add(item: RetainItem): AddResult {
     this.load();
     if (!this.loaded) return 'persistence-error';
@@ -179,16 +231,17 @@ export class MemoryOutbox {
       this.log?.warn('[memory] retain item has no target binding', { documentId: item.documentId });
       return 'persistence-error';
     }
-    const at = iso(this.now());
-    const active = this.activeCount();
-    if (active >= this.maxTotal || (active >= this.maxActive && item.priority !== 'critical')) return 'full';
-    // The document id is the identity of the source. Re-enqueuing an active item would submit the
-    // same document twice and let `replace` delete extraction that is still in flight.
+    // The document id is the source event identity. A replay never creates another remote write.
     for (const existing of this.items.values()) {
       if (existing.documentId !== item.documentId) continue;
       if (existing.bankId !== item.bankId || existing.endpoint !== item.endpoint) continue;
-      if (existing.state === 'pending' || existing.state === 'sent' || existing.state === 'failed') return 'queued';
+      if (existing.requestHash === requestHashFor({ ...item, bankId: item.bankId, endpoint: item.endpoint })) return 'queued';
+      this.persistenceError = 'an event ID was reused with a different retain request';
+      return 'persistence-error';
     }
+    const at = iso(this.now());
+    const active = this.activeCount();
+    if (active >= this.maxTotal || (active >= this.maxActive && item.priority !== 'critical')) return 'full';
     const queued: OutboxItem = {
       ...item,
       id: this.newId(),
@@ -197,32 +250,80 @@ export class MemoryOutbox {
       bankId: item.bankId,
       endpoint: item.endpoint,
       state: 'pending',
+      requestHash: '',
       attempts: 0,
+      verificationAttempts: 0,
       nextAttemptAt: at,
       createdAt: at,
       updatedAt: at,
     };
+    queued.requestHash = requestHashFor(queued);
     if (!this.append(queued)) return 'persistence-error';
     this.items.set(queued.id, queued);
     return 'queued';
   }
 
+  /** Promote the source event already recorded for the current user message. */
+  promoteDocument(documentId: string, bankId: string, endpoint: string): OutboxState | null {
+    this.load();
+    const item = [...this.items.values()].find((entry) => entry.documentId === documentId
+      && entry.bankId === bankId && entry.endpoint === endpoint);
+    if (!item || !this.update(item.id, (current) => ({ ...current, priority: 'critical' }))) return null;
+    return this.items.get(item.id)?.state ?? null;
+  }
+
+  /** Link the current user event to the earlier sources it corrects without creating a duplicate. */
+  linkCorrection(documentId: string, bankId: string, endpoint: string, sourceIds: readonly string[]): OutboxState | null {
+    this.load();
+    const item = [...this.items.values()].find((entry) => entry.documentId === documentId
+      && entry.bankId === bankId && entry.endpoint === endpoint);
+    if (!item || ['cancelled', 'dead', 'orphaned'].includes(item.state) || !this.stateStore) return null;
+    const before = item;
+    try {
+      return this.stateStore.transaction(() => {
+        if (!this.stateStore!.linkRevision(item.id, sourceIds)) throw new Error('the correction event could not be linked');
+        if (!this.update(item.id, (current) => ({ ...current, priority: 'critical' }))) throw new Error('the correction event could not be promoted');
+        return this.items.get(item.id)?.state ?? null;
+      });
+    } catch (error) {
+      this.items.set(item.id, before);
+      this.persistenceError = `could not link the correction event: ${error instanceof Error ? error.message : String(error)}`;
+      return null;
+    }
+  }
+
   /** Pending or failed items whose retry time has come, oldest first. */
   due(now: Date, limit: number): OutboxItem[] {
     this.load();
+    this.isolateChangedRequests();
     const at = now.getTime();
     return [...this.items.values()]
-      .filter((item) => (item.state === 'pending' || item.state === 'failed') && Date.parse(item.nextAttemptAt) <= at)
+      .filter((item) => (item.state === 'pending' || item.state === 'failed')
+        && item.requestHash === requestHashFor(item)
+        && Date.parse(item.nextAttemptAt) <= at)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
       .slice(0, Math.max(1, limit));
   }
 
-  /** Accepted items whose operation still has to be checked, least recently polled first. */
+  /** Requests that may have reached the service, least recently polled first. */
   sent(limit: number, now: Date = this.now()): OutboxItem[] {
     this.load();
+    this.isolateChangedRequests();
     return [...this.items.values()]
-      .filter((item) => item.state === 'sent' && (!item.nextPollAt || Date.parse(item.nextPollAt) <= now.getTime()))
+      .filter((item) => (item.state === 'sending' || item.state === 'sent')
+        && item.requestHash === requestHashFor(item)
+        && (!item.nextPollAt || Date.parse(item.nextPollAt) <= now.getTime()))
       .sort((a, b) => (this.polledAt.get(a.id) ?? 0) - (this.polledAt.get(b.id) ?? 0) || a.createdAt.localeCompare(b.createdAt))
+      .slice(0, Math.max(1, limit));
+  }
+
+  /** Completed operations whose source document has not yet been read back. */
+  verificationDue(limit: number, now: Date = this.now()): OutboxItem[] {
+    this.load();
+    return [...this.items.values()]
+      .filter((item) => item.state === 'done' && item.requestHash === requestHashFor(item)
+        && (!item.nextVerifyAt || Date.parse(item.nextVerifyAt) <= now.getTime()))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
       .slice(0, Math.max(1, limit));
   }
 
@@ -231,15 +332,44 @@ export class MemoryOutbox {
     this.polledAt.set(id, Date.now());
   }
 
+  /** Persist the operation ID before starting a request whose acknowledgement may be lost. */
+  markSending(id: string): boolean {
+    return this.update(id, (item) => ({ ...item, state: 'sending', lastError: undefined }), ['pending', 'failed']);
+  }
+
   markSent(id: string, operationId: string): boolean {
-    return this.update(id, (item) => ({ ...item, operationId, state: 'sent', nextPollAt: undefined, lastError: undefined }), ['pending', 'failed']);
+    return this.update(id, (item) => ({ ...item, operationId, state: 'sent', nextPollAt: undefined, lastError: undefined }), ['pending', 'sending', 'failed']);
   }
 
   markDone(id: string): boolean {
-    const changed = this.update(id, (item) => ({ ...item, state: 'done', content: '', metadata: undefined, lastError: undefined }), ['pending', 'sent', 'failed', 'orphaned']);
+    const changed = this.update(id, (item) => ({
+      ...item,
+      state: 'done',
+      nextVerifyAt: iso(this.now()),
+      verificationAttempts: 0,
+      lastError: undefined,
+    }), ['pending', 'sending', 'sent', 'failed', 'orphaned']);
     this.polledAt.delete(id);
-    if (changed) this.compact();
     return changed;
+  }
+
+  markVerified(id: string): boolean {
+    return this.update(id, (item) => ({
+      ...item, state: 'verified', content: '', metadata: undefined, nextVerifyAt: undefined, lastError: undefined,
+    }), ['done']);
+  }
+
+  noteVerificationRetry(id: string, error: string): boolean {
+    return this.update(id, (item) => {
+      const attempts = item.verificationAttempts + 1;
+      const delay = Math.min(15 * 60_000, 5_000 * 2 ** Math.min(attempts, 8));
+      return {
+        ...item,
+        verificationAttempts: attempts,
+        nextVerifyAt: iso(new Date(this.now().getTime() + delay)),
+        lastError: error.slice(0, 300),
+      };
+    }, ['done']);
   }
 
   markFailed(id: string, error: string, options: { permanent?: boolean } = {}): boolean {
@@ -256,7 +386,7 @@ export class MemoryOutbox {
         nextPollAt: undefined,
         lastError: error.slice(0, 300),
       };
-    }, ['pending', 'sent', 'failed']);
+    }, ['pending', 'sending', 'sent', 'failed']);
   }
 
   /** Record a failed status check. `count` is for an extraction the server itself reported failed. */
@@ -272,13 +402,12 @@ export class MemoryOutbox {
         nextPollAt: dead || options.count !== true ? undefined : iso(new Date(this.now().getTime() + Math.min(10 * 60_000, 30_000 * 2 ** Math.min(attempts, 5)))),
         lastError: error.slice(0, 300),
       };
-    }, ['sent']);
+    }, ['sending', 'sent']);
   }
 
   markCancelled(id: string, reason: string): boolean {
-    const changed = this.update(id, (item) => ({ ...item, state: 'cancelled', content: '', metadata: undefined, lastError: reason.slice(0, 300) }), ['pending', 'sent', 'failed', 'orphaned']);
+    const changed = this.update(id, (item) => ({ ...item, state: 'cancelled', content: '', metadata: undefined, nextVerifyAt: undefined, lastError: reason.slice(0, 300) }), ['pending', 'sending', 'sent', 'done', 'failed', 'orphaned']);
     this.polledAt.delete(id);
-    if (changed) this.compact();
     return changed;
   }
 
@@ -286,7 +415,7 @@ export class MemoryOutbox {
   matching(match: (item: OutboxItem) => boolean): OutboxItem[] {
     this.load();
     return [...this.items.values()].filter((item) =>
-      (item.state === 'pending' || item.state === 'failed' || item.state === 'sent' || item.state === 'orphaned') && match(item));
+      (item.state === 'pending' || item.state === 'sending' || item.state === 'failed' || item.state === 'sent' || item.state === 'done' || item.state === 'orphaned') && match(item));
   }
 
   /**
@@ -310,23 +439,22 @@ export class MemoryOutbox {
     this.load();
     const cancelled: OutboxItem[] = [];
     for (const item of this.items.values()) {
-      if (item.state !== 'pending' && item.state !== 'failed' && item.state !== 'sent' && item.state !== 'orphaned') continue;
+      if (item.state !== 'pending' && item.state !== 'sending' && item.state !== 'failed' && item.state !== 'sent' && item.state !== 'done' && item.state !== 'orphaned') continue;
       if (!match(item)) continue;
-      if (!this.update(item.id, (current) => ({ ...current, state: 'cancelled', content: '', metadata: undefined, lastError: reason.slice(0, 300) }))) continue;
+      if (!this.update(item.id, (current) => ({ ...current, state: 'cancelled', content: '', metadata: undefined, nextVerifyAt: undefined, lastError: reason.slice(0, 300) }))) continue;
       this.polledAt.delete(item.id);
       cancelled.push(item);
     }
-    if (cancelled.length > 0) this.compact();
     return cancelled;
   }
 
   cancelAll(reason: string): OutboxItem[] {
-    return this.cancelMatching((item) => item.state !== 'done' && item.state !== 'cancelled' && item.state !== 'dead', reason);
+    return this.cancelMatching((item) => item.state !== 'verified' && item.state !== 'cancelled' && item.state !== 'dead', reason);
   }
 
   /** Isolate an item whose persisted target no longer matches the running config. */
   quarantine(id: string, reason: string): boolean {
-    return this.update(id, (item) => ({ ...item, state: 'orphaned', lastError: reason.slice(0, 300) }), ['pending', 'sent', 'failed']);
+    return this.update(id, (item) => ({ ...item, state: 'orphaned', nextVerifyAt: undefined, lastError: reason.slice(0, 300) }), ['pending', 'sending', 'sent', 'done', 'failed']);
   }
 
   /** Explicitly bind an isolated item to a new target; the old operation id is never reused. */
@@ -336,6 +464,7 @@ export class MemoryOutbox {
       bankId,
       endpoint,
       operationId: this.newId(),
+      requestHash: requestHashFor({ ...item, bankId, endpoint }),
       state: 'failed',
       attempts: 0,
       nextAttemptAt: iso(this.now()),
@@ -370,28 +499,47 @@ export class MemoryOutbox {
     return this.items.get(id) ?? null;
   }
 
+  readable(): boolean {
+    this.load();
+    return !!this.stateStore && this.loaded && !this.readError;
+  }
+
+  reload(): void {
+    this.items.clear();
+    this.polledAt.clear();
+    this.loaded = false;
+    this.persistenceError = null;
+    this.readError = false;
+  }
+
   status(): OutboxStatus {
     this.load();
-    const counts = { pending: 0, sent: 0, failed: 0, dead: 0, cancelled: 0, orphaned: 0 };
+    const counts = { pending: 0, sent: 0, completed: 0, unverified: 0, verified: 0, failed: 0, dead: 0, cancelled: 0, orphaned: 0 };
     let deadRetained = 0;
     let oldest: string | null = null;
     let lastError: string | null = null;
     let lastErrorAt = '';
     for (const item of this.items.values()) {
-      if (item.state === 'pending' || item.state === 'sent' || item.state === 'failed') counts[item.state] += 1;
+      if (item.state === 'pending' || item.state === 'failed') counts[item.state] += 1;
+      else if (item.state === 'sending' || item.state === 'sent') counts.sent += 1;
+      if (item.state === 'done') {
+        counts.completed += 1;
+        counts.unverified += 1;
+      }
+      if (item.state === 'verified') counts.verified += 1;
       if (item.state === 'dead') {
         counts.dead += 1;
         if (this.retained(item)) deadRetained += 1;
       }
       if (item.state === 'cancelled') counts.cancelled += 1;
       if (item.state === 'orphaned') counts.orphaned += 1;
-      if ((item.state === 'pending' || item.state === 'failed') && (!oldest || item.createdAt < oldest)) oldest = item.createdAt;
+      if ((item.state === 'pending' || item.state === 'sending' || item.state === 'done' || item.state === 'failed') && (!oldest || item.createdAt < oldest)) oldest = item.createdAt;
       if (item.lastError && item.updatedAt > lastErrorAt) {
         lastError = item.lastError;
         lastErrorAt = item.updatedAt;
       }
     }
-    const active = counts.pending + counts.sent + counts.failed + deadRetained;
+    const active = counts.pending + counts.sent + counts.failed + deadRetained + counts.unverified;
     return {
       ...counts,
       deadRetained,
@@ -403,17 +551,21 @@ export class MemoryOutbox {
     };
   }
 
-  /** Rewrite only the items that still matter. Finished payloads are already empty. */
+  /** Remove expired status rows while retaining every unresolved payload. */
   compact(): boolean {
     this.load();
+    if (!this.loaded) return false;
+    const before = new Map(this.items);
     this.dropExpiredFinished();
-    const records = [...this.items.values()].map((item) => JSON.stringify({ v: 1, item } satisfies LogRecord));
     try {
-      writeState(this.file, records.length ? `${records.join('\n')}\n` : '');
+      if (!this.stateStore) throw new Error(this.initializationError ?? 'memory database is unavailable');
+      this.stateStore.replaceOutbox([...this.items.values()]);
       this.persistenceError = null;
       return true;
     } catch (err) {
-      this.persistenceError = `could not compact the queue: ${err instanceof Error ? err.message : String(err)}`;
+      this.items.clear();
+      for (const [id, item] of before) this.items.set(id, item);
+      this.persistenceError = `could not compact the memory database: ${err instanceof Error ? err.message : String(err)}`;
       this.log?.warn('[memory] could not compact the retain outbox', { message: err instanceof Error ? err.message : String(err) });
       return false;
     }
@@ -422,7 +574,8 @@ export class MemoryOutbox {
   private activeCount(): number {
     let count = 0;
     for (const item of this.items.values()) {
-      if (item.state === 'pending' || item.state === 'sent' || item.state === 'failed') count += 1;
+      if (item.state === 'pending' || item.state === 'sending' || item.state === 'sent' || item.state === 'failed') count += 1;
+      else if (item.state === 'done') count += 1;
       else if (this.retained(item)) count += 1;
     }
     return count;
@@ -433,13 +586,24 @@ export class MemoryOutbox {
     return item.state === 'dead' && item.content.length > 0;
   }
 
+  private isolateChangedRequests(): void {
+    for (const item of this.items.values()) {
+      if (!['pending', 'sending', 'sent', 'done', 'failed'].includes(item.state) || item.requestHash === requestHashFor(item)) continue;
+      this.update(item.id, (current) => ({
+        ...current,
+        state: 'orphaned',
+        lastError: 'the saved retain request does not match its committed hash',
+      }));
+    }
+  }
+
   private dropExpiredFinished(): void {
     const cutoff = this.now().getTime() - KEEP_FINISHED_MS;
     for (const [id, item] of this.items) {
       if (Date.parse(item.updatedAt) >= cutoff) continue;
-      if (item.state === 'done' || item.state === 'cancelled' || item.state === 'dead') {
+      if (item.state === 'done' || item.state === 'verified' || item.state === 'cancelled' || item.state === 'dead') {
         // An unresolved critical fact stays until the person or the console ends it explicitly.
-        if (this.retained(item)) continue;
+        if (this.retained(item) || item.state === 'done') continue;
         this.items.delete(id);
       }
     }
@@ -457,31 +621,27 @@ export class MemoryOutbox {
   }
 
   private append(item: OutboxItem): boolean {
-    const line = `${JSON.stringify({ v: 1, item } satisfies LogRecord)}\n`;
-    if (line.length > LINE_MAX) {
-      this.persistenceError = 'the retain item is too large for the queue';
-      this.log?.warn('[memory] retain item too large for the outbox', { id: item.id, bytes: line.length });
-      return false;
-    }
-    const bytes = Buffer.from(line, 'utf8');
-    let fd: number | null = null;
     try {
-      fd = openSync(this.file, 'a');
-      let offset = 0;
-      while (offset < bytes.length) {
-        const written = writeSync(fd, bytes, offset, bytes.length - offset);
-        if (written <= 0) throw new Error('short write');
-        offset += written;
-      }
-      fsyncSync(fd);
+      if (!this.stateStore) throw new Error(this.initializationError ?? 'memory database is unavailable');
+      this.stateStore.saveOutbox(item);
       this.persistenceError = null;
       return true;
     } catch (err) {
-      this.persistenceError = `could not write the queue: ${err instanceof Error ? err.message : String(err)}`;
-      this.log?.warn('[memory] could not append to the retain outbox', { id: item.id, message: err instanceof Error ? err.message : String(err) });
+      this.persistenceError = `could not write the memory database: ${err instanceof Error ? err.message : String(err)}`;
+      this.log?.warn('[memory] could not save the retain outbox item', { id: item.id, message: err instanceof Error ? err.message : String(err) });
       return false;
-    } finally {
-      if (fd !== null) closeSync(fd);
+    }
+  }
+
+  private persistAll(): boolean {
+    try {
+      if (!this.stateStore) throw new Error(this.initializationError ?? 'memory database is unavailable');
+      this.stateStore.replaceOutbox([...this.items.values()]);
+      this.persistenceError = null;
+      return true;
+    } catch (err) {
+      this.persistenceError = `could not write the memory database: ${err instanceof Error ? err.message : String(err)}`;
+      return false;
     }
   }
 }

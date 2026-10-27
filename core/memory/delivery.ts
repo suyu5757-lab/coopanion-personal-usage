@@ -10,6 +10,8 @@ export interface DeliveryOps {
   /** Submit one retain request to the item's own bank. `operationId` is fixed before the first attempt. */
   retain(item: OutboxItem): Promise<{ async: boolean; operationId: string | null }>;
   status(item: OutboxItem): Promise<OperationState>;
+  /** Read the source document after remote completion. */
+  verify(item: OutboxItem): Promise<boolean>;
   retry(item: OutboxItem): Promise<void>;
   /** Stop a queued or processing operation; a terminal operation may answer 409. */
   cancel(item: OutboxItem): Promise<void>;
@@ -24,7 +26,10 @@ export class DeliveryError extends Error {
 
 export interface DeliveryResult {
   submitted: number;
+  /** Remote operation reached its terminal completed state. */
   completed: number;
+  /** The source document was read back from the bank. */
+  verified: number;
   failed: number;
 }
 
@@ -60,7 +65,7 @@ export class OutboxDelivery {
   }
 
   async drain(): Promise<DeliveryResult> {
-    if (this.running) return { submitted: 0, completed: 0, failed: 0 };
+    if (this.running) return { submitted: 0, completed: 0, verified: 0, failed: 0 };
     this.running = true;
     try {
       return await this.drainOnce();
@@ -70,7 +75,7 @@ export class OutboxDelivery {
   }
 
   private async drainOnce(): Promise<DeliveryResult> {
-    const result: DeliveryResult = { submitted: 0, completed: 0, failed: 0 };
+    const result: DeliveryResult = { submitted: 0, completed: 0, verified: 0, failed: 0 };
     for (const snapshot of this.outbox.due(this.now(), this.batch)) {
       // The batch is only a candidate list. Read the current item again immediately before
       // submitting so a cancellation or payload change between due() and this turn cannot send
@@ -85,12 +90,15 @@ export class OutboxDelivery {
         this.outbox.markCancelled(item.id, 'the person asked to forget this before it was sent');
         continue;
       }
+      if (!this.outbox.markSending(item.id)) continue;
+      const sending = this.outbox.get(item.id);
+      if (!sending || sending.state !== 'sending') continue;
       try {
-        const accepted = await this.ops.retain(item);
+        const accepted = await this.ops.retain(sending);
         // A forget that lands while the request is in flight wins: cancel what was accepted and
         // leave the source to the deletion queue.
-        if (this.outbox.get(item.id)?.state === 'cancelled' || this.forgotten?.(item)) {
-          if (accepted.async && accepted.operationId) await this.ops.cancel({ ...item, operationId: accepted.operationId }).catch(() => {});
+        if (this.outbox.get(sending.id)?.state === 'cancelled' || this.forgotten?.(sending)) {
+          if (accepted.async && accepted.operationId) await this.ops.cancel({ ...sending, operationId: accepted.operationId }).catch(() => {});
           this.outbox.markCancelled(item.id, 'the person asked to forget this while the retain was in flight');
           continue;
         }
@@ -104,11 +112,11 @@ export class OutboxDelivery {
           result.failed += 1;
           continue;
         }
-        this.outbox.markSent(item.id, accepted.operationId);
+        this.outbox.markSent(sending.id, accepted.operationId);
       } catch (err) {
         result.failed += 1;
         const error = err instanceof Error ? err.message : String(err);
-        this.outbox.markFailed(item.id, error, { permanent: err instanceof DeliveryError && err.permanent });
+        this.outbox.markFailed(sending.id, error, { permanent: err instanceof DeliveryError && err.permanent });
       }
     }
     for (const item of this.outbox.sent(this.poll)) {
@@ -144,7 +152,28 @@ export class OutboxDelivery {
           this.outbox.noteRetry(item.id, message);
         }
       } finally {
-        if (this.outbox.get(item.id)?.state === 'sent') this.outbox.markPolled(item.id);
+        const current = this.outbox.get(item.id)?.state;
+        if (current === 'sending' || current === 'sent') this.outbox.markPolled(item.id);
+      }
+    }
+    for (const item of this.outbox.verificationDue(this.poll, this.now())) {
+      if (!this.matchesTarget(item)) {
+        this.outbox.quarantine(item.id, 'the memory bank or endpoint changed; this source was not verified');
+        continue;
+      }
+      if (this.forgotten?.(item)) {
+        this.outbox.markCancelled(item.id, 'the person asked to forget this before source verification');
+        continue;
+      }
+      try {
+        if (await this.ops.verify(item)) {
+          if (this.outbox.markVerified(item.id)) result.verified += 1;
+        } else {
+          this.outbox.noteVerificationRetry(item.id, 'the completed operation has no matching readable source document yet');
+        }
+      } catch (err) {
+        this.outbox.noteVerificationRetry(item.id, err instanceof Error ? err.message : String(err));
+        result.failed += 1;
       }
     }
     return result;
@@ -159,7 +188,7 @@ export class OutboxDelivery {
   /** Cancel operations for items the person asked to forget, then drop their payloads. */
   async cancelForget(items: readonly OutboxItem[]): Promise<void> {
     for (const item of items) {
-      if (item.state !== 'sent' || !this.matchesTarget(item)) continue;
+      if ((item.state !== 'sending' && item.state !== 'sent' && item.state !== 'failed') || !this.matchesTarget(item)) continue;
       try {
         await this.ops.cancel(item);
       } catch (err) {

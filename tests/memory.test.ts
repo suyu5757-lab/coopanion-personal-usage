@@ -96,11 +96,11 @@ describe('memory formatting', () => {
 
   it('keeps who said it and whether it is a plan or already done', () => {
     const text = formatRecall([
-      recallResult({ text: 'plans to move to Hangzhou', metadata: { source_actor: 'user', status: 'planned' } }),
+      recallResult({ text: 'plans to move to Hangzhou', document_id: 'doc-plan', metadata: { source_actor: 'user', status: 'planned' } }),
       recallResult({ id: 'f2', text: 'already moved', metadata: { source_actor: 'user', status: 'completed', user_verified: 'true' } }),
       recallResult({ id: 'f3', text: 'seems to like rain', metadata: { source_actor: 'inference' } }),
     ]);
-    expect(text).toContain('(observation, undated, the person said, planned) plans to move to Hangzhou');
+    expect(text).toContain('(observation, undated, the person said, planned, source_id:doc-plan) plans to move to Hangzhou');
     expect(text).toContain('(observation, undated, the person said, completed, confirmed by the person) already moved');
     expect(text).toContain('(observation, undated, inferred) seems to like rain');
   });
