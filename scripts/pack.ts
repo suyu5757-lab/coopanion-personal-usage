@@ -22,12 +22,12 @@
 import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { unzipSync } from 'fflate';
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url));
-const OUT = join(ROOT, 'build', 'app');
 const run = (cmd: string, args: string[], cwd: string) => {
   const r = spawnSync(cmd, args, { cwd, stdio: 'inherit', shell: process.platform === 'win32' });
   if (r.status !== 0) process.exit(r.status ?? 1);
@@ -39,6 +39,16 @@ const TEST = process.env.COOPANION_CHANNEL === 'test';
 const TEST_RUN_ID = String(process.env.COOPANION_TEST_RUN_ID ?? '');
 if (TEST && !/^[a-z0-9][a-z0-9-]{0,63}$/.test(TEST_RUN_ID)) {
   throw new Error('COOPANION_TEST_RUN_ID must be a short lowercase identifier');
+}
+const require = createRequire(import.meta.url);
+const { testIdentity } = require('../app/test-channel.cjs') as {
+  testIdentity(runId: string): { productName: string; appId: string };
+};
+const TEST_IDENTITY = TEST ? testIdentity(TEST_RUN_ID) : null;
+const OUT = join(ROOT, 'build', TEST ? join('test-app', TEST_RUN_ID) : 'app');
+const TEST_OUTPUT = TEST ? join(ROOT, 'dist', 'test', TEST_RUN_ID) : null;
+if (TEST && (existsSync(OUT) || existsSync(TEST_OUTPUT!))) {
+  throw new Error(`Test App run ${TEST_RUN_ID} already has build output; choose a new runId`);
 }
 const STEAM_APP_ID = Number(process.env.STEAM_APP_ID);
 if (STEAM && !(Number.isInteger(STEAM_APP_ID) && STEAM_APP_ID > 0)) {
@@ -178,11 +188,11 @@ cpSync(join(ROOT, 'build', 'browser-agent.js'), join(OUT, 'build', 'browser-agen
 cpSync(join(ROOT, 'build', 'panels'), join(OUT, 'build', 'panels'), { recursive: true, filter: (src) => !src.endsWith('.map') });
 writeFileSync(join(OUT, 'package.json'), JSON.stringify({
   name: TEST ? 'coopanion-test' : rootPkg.name,
-  productName: TEST ? 'Coopanion Test' : rootPkg.productName,
+  productName: TEST_IDENTITY?.productName ?? rootPkg.productName,
   version: rootPkg.version, description: rootPkg.description,
   license: rootPkg.license, author: rootPkg.author, homepage: rootPkg.homepage, type: 'module', main: 'app/main.cjs',
   dependencies: DEPS,
-  coopanion: TEST ? { channel: 'test', runId: TEST_RUN_ID }
+  coopanion: TEST ? { channel: 'test', runId: TEST_RUN_ID, appId: TEST_IDENTITY!.appId }
     : STEAM ? { channel: 'steam', steamAppId: STEAM_APP_ID }
       : { channel: PORTABLE ? 'portable' : 'github' },
 }, null, 2));
@@ -195,10 +205,17 @@ if (STEAM) {
   for (const dir of ['win64', 'linux64', 'osx']) if (dir !== own) rmSync(join(dist, dir), { recursive: true, force: true });
 }
 const stagedPackage = JSON.parse(readFileSync(join(OUT, 'package.json'), 'utf8')) as {
+  coopanion?: { appId?: string };
   dependencies: Record<string, string>;
   productName: string;
   version: string;
 };
+if (TEST && (
+  stagedPackage.productName !== TEST_IDENTITY?.productName
+  || stagedPackage.coopanion?.appId !== TEST_IDENTITY?.appId
+)) {
+  throw new Error('The staged Test App identity does not match COOPANION_TEST_RUN_ID');
+}
 for (const name of WORKSPACE) {
   const from = join(ROOT, 'packages', name);
   cpSync(from, join(OUT, 'node_modules', name), { recursive: true, filter: skip(from) });
@@ -219,7 +236,7 @@ const buildManifest = {
   ...(TEST ? { runId: TEST_RUN_ID } : {}),
   source: { commit: sourceCommit, worktreeDirty: sourceDirty },
   platform: { os: process.platform, architecture: ARCH, node: process.version, electron: rootPkg.devDependencies?.electron ?? null },
-  app: { productName: stagedPackage.productName, version: stagedPackage.version, appId: TEST ? 'ai.pal.coopanion.test' : 'ai.pal.coopanion' },
+  app: { productName: stagedPackage.productName, version: stagedPackage.version, appId: TEST ? TEST_IDENTITY!.appId : 'ai.pal.coopanion' },
   signature: process.platform === 'darwin' ? 'ad-hoc (identity -); not notarized' : 'platform default; not attested',
   npmResolvedLockSha256: existsSync(packageLock) ? sha256(packageLock) : null,
   directRuntimeDependencies: Object.fromEntries(Object.entries(stagedPackage.dependencies).sort(([a], [b]) => a.localeCompare(b))),
