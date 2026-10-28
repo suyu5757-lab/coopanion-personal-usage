@@ -435,7 +435,7 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
       return {
         pid, ownerPid: pid, windowId, title: 'Calculator', width: 100, height: 80, scale: 2,
         captureId: `cap-${this.captures}`, snapshotId, truncated, truncationReason: truncated ? 'max_elements' : null,
-        elementsComplete: !truncated, elements, bounds: null, jpeg: SMALL_JPEG,
+        elementsComplete: !truncated, elements, bounds: null, processIdentity: null, jpeg: SMALL_JPEG,
       };
     }
 

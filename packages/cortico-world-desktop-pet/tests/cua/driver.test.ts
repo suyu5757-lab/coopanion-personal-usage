@@ -76,7 +76,10 @@ if(args[1]==='click'){
 process.exit(2);
 `);
     chmodSync(bin, 0o755);
-    const options = { binaryPath: bin, endpoint: 'unix-socket' as const, socketPath: socket, session: 'run-test-1', lifecycle: 'external-managed' as const };
+    const options = {
+      binaryPath: bin, endpoint: 'unix-socket' as const, socketPath: socket, session: 'run-test-1', lifecycle: 'external-managed' as const,
+      resolveProcessIdentity: async () => null,
+    };
     return { dir, state, options };
   };
 
@@ -90,6 +93,7 @@ process.exit(2);
         title: 'Test window', pid: 12, ownerPid: 12, windowId: 34,
         captureId: 'cap-1', snapshotId: 's0000002a', truncated: true,
         truncationReason: 'max_elements', elementsComplete: false,
+        processIdentity: null,
         elements: [{ token: 's0000002a:7', index: 7, role: 'button', label: 'Save file', value: 'draft.txt', actions: ['press'], parentIndex: 2, depth: 3 }],
       });
       expect(capture.snapshotId).toMatch(/^s[0-9a-f]{8}$/);

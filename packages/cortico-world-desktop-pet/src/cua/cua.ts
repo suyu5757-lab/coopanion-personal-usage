@@ -104,6 +104,8 @@ interface WindowTarget {
   title: string;
   captureId: string;
   snapshotId: string;
+  bounds: DriverCapture['bounds'];
+  processIdentity: DriverCapture['processIdentity'];
   elements: DriverElement[];
   truncated: boolean;
   truncationReason: string | null;
@@ -475,6 +477,7 @@ export class Cua {
       this.target = {
         handle, pid, ownerPid: cap.ownerPid, windowId, title: title || cap.title || handle,
         captureId: cap.captureId, snapshotId: cap.snapshotId, elements: cap.elements,
+        bounds: cap.bounds, processIdentity: cap.processIdentity,
         truncated: cap.truncated, truncationReason: cap.truncationReason, elementsComplete: cap.elementsComplete,
         width: cap.width, height: cap.height,
       };
@@ -521,6 +524,8 @@ export class Cua {
       ...target,
       ownerPid: cap.ownerPid,
       title: target.title || cap.title,
+      bounds: cap.bounds,
+      processIdentity: cap.processIdentity,
       captureId: screenshot ? cap.captureId : target.captureId,
       snapshotId: cap.snapshotId,
       elements: cap.elements,

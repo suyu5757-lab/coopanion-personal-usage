@@ -7,6 +7,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import jpeg from 'jpeg-js';
+import { resolveDarwinProcessIdentity, type DarwinProcessIdentity } from './window-identity.ts';
 
 const DRIVER_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT = 20 * 1024 * 1024;
@@ -39,6 +40,8 @@ export interface DriverCapture {
   elementsComplete: boolean | null;
   elements: DriverElement[];
   bounds: { x: number; y: number; width: number; height: number } | null;
+  /** Read-only OS metadata; null when macOS cannot establish the process identity. */
+  processIdentity: DarwinProcessIdentity | null;
   jpeg: Buffer;
 }
 
@@ -112,6 +115,8 @@ export interface CuaDriverOptions {
   socketPath: string;
   session: string;
   lifecycle: 'external-managed';
+  /** Tests may replace OS metadata lookup without starting or inspecting a system process. */
+  resolveProcessIdentity?: (pid: number, signal?: AbortSignal) => Promise<DarwinProcessIdentity | null>;
 }
 
 const MODIFIERS = new Set(['cmd', 'shift', 'option', 'ctrl', 'fn']);
@@ -270,6 +275,10 @@ export class CuaDriver implements CuaDriverLike {
       }
       const bounds = raw.window_bounds && typeof raw.window_bounds === 'object' ? raw.window_bounds as DriverCapture['bounds'] : null;
       const ownerPid = Number.isInteger(raw.owner_pid) ? Number(raw.owner_pid) : null;
+      const processIdentity = ownerPid === pid
+        ? await (this.options?.resolveProcessIdentity
+          ?? ((targetPid: number, signal?: AbortSignal) => resolveDarwinProcessIdentity(targetPid, { signal })))(pid, opts.signal)
+        : null;
       return {
         pid,
         ownerPid,
@@ -305,6 +314,7 @@ export class CuaDriver implements CuaDriverLike {
           }];
         }),
         bounds,
+        processIdentity,
         jpeg: bytes,
       };
     } finally {
