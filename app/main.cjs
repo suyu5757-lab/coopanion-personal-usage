@@ -62,8 +62,9 @@ const ICONS = join(__dirname, 'icons');
 /** Window icon: on Windows the .ico, so the taskbar picks the size it draws instead of scaling a 512 px PNG. */
 const WINDOW_ICON = join(ICONS, process.platform === 'win32' ? 'icon.ico' : 'icon.png');
 /** The build's channel and, for `steam`, its Steam app id (see the module header). */
-const BUILD = JSON.parse(readFileSync(join(APP_ROOT, 'package.json'), 'utf8')).coopanion ?? {};
-const TEST_APP = testChannelConfig(BUILD, app.getPath('appData'));
+const APP_PACKAGE = JSON.parse(readFileSync(join(APP_ROOT, 'package.json'), 'utf8'));
+const BUILD = APP_PACKAGE.coopanion ?? {};
+const TEST_APP = testChannelConfig(APP_PACKAGE, app.getPath('appData'));
 const TEST = TEST_APP !== null;
 const RUN_ID = TEST_APP?.runId ?? `app-${process.pid}`;
 const APP_NAME = TEST_APP?.appName ?? 'Coopanion';
@@ -203,7 +204,14 @@ function restoreStrandedData() {
 const askStranded = INSTALLED && !PET_HOST && DATA === BESIDE && restoreStrandedData();
 
 // before anything asks Electron for a path: the single-instance lock and the profile live in userData
+if (TEST) mkdirSync(DATA, { recursive: true });
 app.setPath('userData', DATA);
+if (TEST) {
+  const sessionData = join(DATA, 'session');
+  mkdirSync(join(DATA, 'Crashpad'), { recursive: true });
+  mkdirSync(sessionData, { recursive: true });
+  app.setPath('sessionData', sessionData);
+}
 app.setPath('crashDumps', join(DATA, 'Crashpad'));
 process.env.TEMP = process.env.TMP = process.env.TMPDIR = join(DATA, 'tmp');
 mkdirSync(process.env.TEMP, { recursive: true });
@@ -211,7 +219,16 @@ mkdirSync(process.env.TEMP, { recursive: true });
 /* ---------- pet window mode ---------- */
 if (PET_HOST) {
   const arg = (name) => { const hit = process.argv.find((a) => a.startsWith(`--${name}=`)); return hit ? hit.slice(name.length + 3) : ''; };
-  app.setPath('userData', join(app.getPath('userData'), 'pet-window'));
+  const petData = join(app.getPath('userData'), 'pet-window');
+  if (TEST) mkdirSync(petData, { recursive: true });
+  app.setPath('userData', petData);
+  if (TEST) {
+    const sessionData = join(petData, 'session');
+    mkdirSync(join(petData, 'Crashpad'), { recursive: true });
+    mkdirSync(sessionData, { recursive: true });
+    app.setPath('sessionData', sessionData);
+    app.setPath('crashDumps', join(petData, 'Crashpad'));
+  }
   if (MAC) app.dock?.hide();
   const { runPetHost } = require(require.resolve('cortico-world-desktop-pet/host/electron-main.cjs'));
   runPetHost({ url: arg('pet-url'), parentPid: Number(arg('parent-pid')) || 0, tray: false });
