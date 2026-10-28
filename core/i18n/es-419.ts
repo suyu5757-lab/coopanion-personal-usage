@@ -19,7 +19,7 @@ const es419: Translation<CoreText> = {
       minutes: 'min',
       sound: 'Sonido del navegador', soundDescription: 'Silenciado por defecto. Al activarlo, se oyen los videos que mira.',
       topics: 'Temas web permitidos', topicsDescription: 'Un tema por línea. Déjalo vacío para pausar la exploración web. Cada sesión dura como máximo 20 minutos y 80 llamadas al navegador; las páginas son fuentes externas.',
-      actions: 'Permitir me gusta, guardados, seguimientos, danmaku, comentarios y compartir', actionsDescription: 'Desactivado, solo puede mirar. Inicia sesión y resuelve los códigos en su ventana tú mismo.',
+      actions: 'Permitir me gusta, guardados, seguir, compartir, danmaku, comentarios, subir medios e imágenes con ChatGPT', actionsDescription: 'Desactivado, solo puede navegar; no puede dar me gusta, seguir, compartir, comentar, subir medios ni generar imágenes con ChatGPT. Inicia sesión y resuelve los códigos en su ventana tú mismo.',
     },
     growth: {
       title: 'Crecer por su cuenta',
@@ -47,6 +47,13 @@ const es419: Translation<CoreText> = {
   quit: 'Salir de la app',
 
   noticeLabel: 'Notificaciones de la app',
+
+  browserSend: {
+    question: (account: string, where: string, text: string) => `¿Publicar esto desde la cuenta «${account}» en «${where}»?\n\n${text}\n\nSe envía una sola vez.`,
+    yes: 'Publicar',
+    no: 'No publicar',
+    unresolved: (count: number) => `No se pudo confirmar el envío de ${count} contenido anterior desde su navegador. Revisa su ventana antes de volver a enviar.`,
+  },
 
   status: {
     read: 'Leyendo', browse: 'Revisando', memory: 'memoria', find: 'Localizando', search: 'Buscando', write: 'Escribiendo', edit: 'Editando', append: 'Agregando a',

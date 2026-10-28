@@ -19,7 +19,7 @@ const ja: Translation<CoreText> = {
       minutes: '分',
       sound: 'ブラウザの音', soundDescription: '既定はミュートです。オンにすると、見ている動画の音が出ます。',
       topics: '許可するウェブ探索テーマ', topicsDescription: '1 行に 1 テーマ。空欄ならウェブ探索を停止します。1 回 20 分、ブラウザー操作は最大 80 回です。ウェブページは外部情報源として扱います。',
-      actions: 'いいね・保存・フォロー・弾幕・コメント・シェアを許可', actionsDescription: 'オフにすると閲覧だけになります。ログインと認証コードはブラウザウィンドウで本人が行ってください。',
+      actions: 'いいね・保存・フォロー・共有・弾幕・コメント・メディアのアップロード・ChatGPT画像生成を許可', actionsDescription: 'オフにすると閲覧のみになり、いいね、フォロー、共有、コメント、メディアのアップロード、ChatGPT画像生成は使えません。ログインと認証コードはブラウザウィンドウで本人が行ってください。',
     },
     growth: {
       title: '自分で育つ',
@@ -47,6 +47,13 @@ const ja: Translation<CoreText> = {
   quit: 'アプリを終了',
 
   noticeLabel: 'アプリの通知',
+
+  browserSend: {
+    question: (account: string, where: string, text: string) => `アカウント「${account}」から「${where}」にこの内容を投稿しますか？\n\n${text}\n\n送信は一度だけです。`,
+    yes: '投稿',
+    no: '投稿しない',
+    unresolved: (count: number) => `前回、送信されたか確認できなかった内容が ${count} 件あります。Coo のブラウザーウィンドウで確認してから、再送するか決めてください。`,
+  },
 
   status: {
     read: '読み取り中', browse: '閲覧中', memory: '記憶', find: '探索中', search: '検索中', write: '書き込み中', edit: '編集中', append: '追記中',

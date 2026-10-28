@@ -19,7 +19,7 @@ const fr: Translation<CoreText> = {
       minutes: "min",
       sound: "Son du navigateur", soundDescription: "Muet par défaut. Activé, les vidéos qu'elle regarde sont audibles.",
       topics: 'Sujets web autorisés', topicsDescription: 'Un sujet par ligne. Laissez vide pour suspendre la navigation. Chaque session dure au plus 20 minutes et 80 appels navigateur ; les pages restent des sources externes.',
-      actions: "Autoriser likes, favoris, abonnements, danmaku, commentaires et partages", actionsDescription: "Désactivé, elle ne peut que regarder. Connectez-vous et saisissez les codes dans sa fenêtre vous-même.",
+      actions: "Autoriser likes, favoris, abonnements, partages, danmaku, commentaires, envoi de médias et création d’images avec ChatGPT", actionsDescription: "Désactivé, elle peut seulement naviguer ; les likes, abonnements, partages, commentaires, envois de médias et génération d’images avec ChatGPT sont désactivés. Connectez-vous et saisissez les codes dans sa fenêtre vous-même.",
     },
     growth: {
       title: 'Grandir par elle-même',
@@ -47,6 +47,13 @@ const fr: Translation<CoreText> = {
   quit: "Quitter l'application",
 
   noticeLabel: "Notifications de l'app",
+
+  browserSend: {
+    question: (account: string, where: string, text: string) => `Publier ce contenu depuis le compte « ${account} » dans « ${where} » ?\n\n${text}\n\nIl ne sera envoyé qu'une fois.`,
+    yes: 'Publier',
+    no: 'Ne pas publier',
+    unresolved: (count: number) => `${count} contenu${count === 1 ? '' : 's'} envoyé${count === 1 ? '' : 's'} depuis son navigateur n'ont pas pu être confirmés. Vérifiez sa fenêtre avant de renvoyer.`,
+  },
 
   status: {
     read: 'Lit', browse: 'Parcourt', memory: 'mémoire', find: 'Cherche', search: 'Recherche', write: 'Écrit', edit: 'Modifie', append: 'Complète',

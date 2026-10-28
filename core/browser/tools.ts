@@ -1,7 +1,6 @@
 /**
  * Tool declarations for Coo's own browser. Descriptions are English whatever the model-text language;
- * receipts are in `model-text.ts`. Indices come from the latest read or action, and every action
- * returns the page as it is afterwards.
+ * receipts are in `model-text.ts`. Page indices and file input ids come from the latest read or action.
  */
 import type { ToolDef } from 'cortico/core/types.ts';
 
@@ -34,7 +33,7 @@ export const BROWSER_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'browser_read',
     tags: ['read'],
-    description: 'Read the current page: title, address, scroll position, and the numbered interactive elements with their text and attributes. Numbers are what browser_click and browser_type take.',
+    description: 'Read the current page: title, address, scroll position, numbered interactive elements and file inputs with accept/multiple attributes. Element numbers are what browser_click and browser_type take; fileIds are for browser_upload_media.',
     parameters: { type: 'object', properties: {}, required: [] },
   },
   {
@@ -56,7 +55,7 @@ export const BROWSER_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'browser_click',
     tags: ['act'],
-    description: 'Click an element by the number from the latest page read, or by its visible text when it has no number (for example the 添加音乐 button beside a video preview). Use it to open a video, play or pause, like, favorite, follow or open a comment box. Spending money, private messages and account changes are refused; read the page again after a navigation.',
+    description: 'Click an element by the number from the latest page read, or by its visible text when it has no number (for example the 添加音乐 button beside a video preview). Use it to open a video, play or pause, like, favorite, follow or open a comment box. Spending money, private messages, account changes and destructive delete/remove controls are refused. Read the page again after it changes. A send or publish control that would post text you typed is confirmed by the person first.',
     parameters: {
       type: 'object',
       properties: {
@@ -98,7 +97,7 @@ export const BROWSER_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'browser_press',
     tags: ['act'],
-    description: 'Press a key after typing, or focus an element first. Enter submits a search or sends a danmaku/comment on most sites; PageDown and ArrowDown move a feed. Supported: Enter, Escape, Tab, Space, Backspace, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, PageUp, PageDown.',
+    description: 'Press a key after typing, or focus an element first. Enter submits a search or sends a danmaku/comment on most sites; in read-only mode Enter and Space on write controls are refused; PageDown and ArrowDown move a feed. Text already in a box is a public post: the person is asked to confirm that exact text, and it is sent once. Enter and Space on delete/remove controls are refused. Supported: Enter, Escape, Tab, Space, Backspace, ArrowUp, ArrowDown, ArrowLeft, ArrowRight, PageUp, PageDown.',
     parameters: {
       type: 'object',
       properties: {
@@ -152,6 +151,42 @@ export const BROWSER_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
     tags: ['read', 'snapshot'],
     description: 'Take a screenshot of the current page, for layout, images or a player control the element tree does not show.',
     parameters: { type: 'object', properties: {}, required: [] },
+  },
+  {
+    name: 'browser_chatgpt_generate_image',
+    tags: ['act'],
+    interruptible: true,
+    description: 'Submit one image prompt through the visible composer on the signed-in ChatGPT website in this browser. This uses the ChatGPT webpage, not an API or Codex. If the result is unclear, read the page and do not send the prompt again.',
+    parameters: {
+      type: 'object',
+      properties: { prompt: { type: 'string', minLength: 1, maxLength: 2000, description: 'The image-generation prompt to send through ChatGPT.' } },
+      required: ['prompt'],
+    },
+  },
+  {
+    name: 'browser_save_chatgpt_image',
+    tags: ['act'],
+    interruptible: true,
+    description: 'Save the visible generated image using its Save or Download control on chatgpt.com. The image is checked and written to the video media folder; the result reports its filename. The target must be a visible image save control from the latest page read.',
+    parameters: {
+      type: 'object',
+      properties: { index: { type: 'integer', minimum: 0, description: 'The numbered Save or Download control beside the generated image.' } },
+      required: ['index'],
+    },
+  },
+  {
+    name: 'browser_upload_media',
+    tags: ['act'],
+    interruptible: true,
+    description: 'Place selected files from the video media folder into one file input on a Douyin page. Use fileId and accept/multiple values from the latest browser_read and file paths from video_list_media. Only relative files under the media folder are accepted; this prepares the page and does not publish the post.',
+    parameters: {
+      type: 'object',
+      properties: {
+        fileId: { type: 'integer', minimum: 0, description: 'The page-local fileId from browser_read, bound to the current page snapshot.' },
+        files: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'string' }, description: 'Relative paths returned by video_list_media, such as generated/cover.png or clip.mp4.' },
+      },
+      required: ['fileId', 'files'],
+    },
   },
   {
     name: 'browser_back',

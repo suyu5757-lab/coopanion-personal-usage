@@ -6,8 +6,10 @@
  *
  * The daemon is started on first use when it is not already running. Captures come back as PNG and
  * are converted to JPEG with `sips`; actions take screenshot-pixel coordinates from the latest
- * capture. `element_token` clicks are deliberately not used: Cua Driver 0.37.0 crashes on them on
- * macOS 26, while a window-local pixel click works.
+ * capture, and the driver refuses a capture it has already consumed (`capture_not_found`).
+ *
+ * Window captures include the accessibility tree. Element tokens are kept with their snapshot and
+ * are valid only until the next capture of that window.
  */
 import { execFile, spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -44,8 +46,18 @@ export interface DriverCapture {
   height: number;
   scale: number;
   captureId: string;
+  snapshotId: string;
+  elements: DriverElement[];
   bounds: { x: number; y: number; width: number; height: number } | null;
   jpeg: Buffer;
+}
+
+export interface DriverElement {
+  token: string;
+  role: string;
+  label: string;
+  value: string;
+  actions: string[];
 }
 
 export interface DriverZoom {
@@ -74,6 +86,7 @@ export interface CaptureOptions {
 
 export interface ActionOptions {
   signal?: AbortSignal;
+  deliveryMode?: 'background' | 'foreground';
 }
 
 /** A failure the driver worded itself; `code` is the driver's error code when it gave one. */
@@ -88,6 +101,7 @@ export interface CuaDriverLike {
   available(): boolean;
   capture(pid: number, windowId: number, opts: CaptureOptions): Promise<DriverCapture>;
   click(pid: number, windowId: number, x: number, y: number, captureId: string, opts?: ActionOptions & { button?: 'left' | 'right' | 'middle'; count?: number }): Promise<DriverAction>;
+  clickElement(pid: number, windowId: number, token: string, opts?: ActionOptions): Promise<DriverAction>;
   type(pid: number, windowId: number, text: string, opts?: ActionOptions): Promise<DriverAction>;
   key(pid: number, windowId: number, chords: DriverChord[], opts?: ActionOptions): Promise<DriverAction>;
   scroll(pid: number, windowId: number, x: number, y: number, down: number, right: number, opts?: ActionOptions): Promise<DriverAction>;
@@ -235,7 +249,7 @@ export class CuaDriver implements CuaDriverLike {
       const raw = await this.call<Record<string, unknown>>('get_window_state', {
         pid,
         window_id: windowId,
-        include_accessibility_tree: false,
+        include_accessibility_tree: true,
         include_screenshot: opts.screenshot,
         max_dimension: Math.max(320, Math.round(opts.maxDimension)),
       }, { signal: opts.signal, screenshotFile: opts.screenshot ? png : undefined });
@@ -260,6 +274,19 @@ export class CuaDriver implements CuaDriverLike {
         height,
         scale: Number(raw.screenshot_scale ?? 1),
         captureId: String(raw.capture_id ?? ''),
+        snapshotId: String(raw.snapshot_id ?? ''),
+        elements: (Array.isArray(raw.elements) ? raw.elements : []).flatMap((value): DriverElement[] => {
+          if (!value || typeof value !== 'object') return [];
+          const element = value as Record<string, unknown>;
+          if (typeof element.element_token !== 'string') return [];
+          return [{
+            token: element.element_token,
+            role: String(element.role ?? ''),
+            label: String(element.name ?? element.label ?? element.title ?? ''),
+            value: String(element.value ?? ''),
+            actions: Array.isArray(element.actions) ? element.actions.filter((action): action is string => typeof action === 'string') : [],
+          }];
+        }),
         bounds,
         jpeg: bytes,
       };
@@ -277,20 +304,24 @@ export class CuaDriver implements CuaDriverLike {
       capture_id: captureId,
       button: opts?.button ?? 'left',
       count: opts?.count ?? 1,
-      delivery_mode: 'background',
+      delivery_mode: opts?.deliveryMode ?? 'background',
     }, opts);
   }
 
+  clickElement(pid: number, windowId: number, token: string, opts?: ActionOptions): Promise<DriverAction> {
+    return this.action('click', { pid, window_id: windowId, element_token: token, action: 'press', delivery_mode: opts?.deliveryMode ?? 'background' }, opts);
+  }
+
   type(pid: number, windowId: number, text: string, opts?: ActionOptions): Promise<DriverAction> {
-    return this.action('type_text', { pid, window_id: windowId, text, delivery_mode: 'background' }, opts);
+    return this.action('type_text', { pid, window_id: windowId, text, delivery_mode: opts?.deliveryMode ?? 'background' }, opts);
   }
 
   async key(pid: number, windowId: number, chords: DriverChord[], opts?: ActionOptions): Promise<DriverAction> {
     let last: DriverAction | null = null;
     for (const chord of chords) {
       last = chord.modifiers.length
-        ? await this.action('hotkey', { pid, window_id: windowId, keys: [...chord.modifiers, chord.key], delivery_mode: 'background' }, opts)
-        : await this.action('press_key', { pid, window_id: windowId, key: chord.key, delivery_mode: 'background' }, opts);
+        ? await this.action('hotkey', { pid, window_id: windowId, keys: [...chord.modifiers, chord.key], delivery_mode: opts?.deliveryMode ?? 'background' }, opts)
+        : await this.action('press_key', { pid, window_id: windowId, key: chord.key, delivery_mode: opts?.deliveryMode ?? 'background' }, opts);
     }
     return last ?? { effect: 'unverifiable', summary: '' };
   }
@@ -310,7 +341,7 @@ export class CuaDriver implements CuaDriverLike {
       from_y: from[1],
       to_x: to[0],
       to_y: to[1],
-      delivery_mode: 'background',
+      delivery_mode: opts?.deliveryMode ?? 'background',
     }, opts);
   }
 

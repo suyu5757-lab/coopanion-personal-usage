@@ -19,7 +19,7 @@ const it: Translation<CoreText> = {
       minutes: 'min',
       sound: 'Audio del browser', soundDescription: 'Muto per impostazione predefinita. Attivo, i video che guarda si sentono.',
       topics: 'Argomenti web consentiti', topicsDescription: 'Un argomento per riga. Lascia vuoto per sospendere la navigazione. Ogni sessione dura al massimo 20 minuti e 80 chiamate browser; le pagine restano fonti esterne.',
-      actions: 'Consenti like, salvataggi, follow, danmaku, commenti e condivisioni', actionsDescription: 'Disattivato, può solo guardare. Accedi e inserisci i codici nella sua finestra tu stesso.',
+      actions: 'Consenti like, salvataggi, segui, condivisioni, danmaku, commenti, caricamento media e immagini con ChatGPT', actionsDescription: 'Disattivato, può solo navigare; like, segui, condivisioni, commenti, caricamento media e immagini con ChatGPT sono disattivati. Accedi e inserisci i codici nella sua finestra tu stesso.',
     },
     growth: {
       title: 'Crescere da sola',
@@ -47,6 +47,13 @@ const it: Translation<CoreText> = {
   quit: "Esci dall'app",
 
   noticeLabel: "Notifiche dell'app",
+
+  browserSend: {
+    question: (account: string, where: string, text: string) => `Pubblicare questo contenuto dall'account «${account}» in «${where}»?\n\n${text}\n\nViene inviato una sola volta.`,
+    yes: 'Pubblica',
+    no: 'Non pubblicare',
+    unresolved: (count: number) => `Non è stato possibile confermare l'invio di ${count} contenuti precedenti dal suo browser. Controlla la sua finestra prima di inviare di nuovo.`,
+  },
 
   status: {
     read: 'Legge', browse: 'Sfoglia', memory: 'memoria', find: 'Trova', search: 'Cerca', write: 'Scrive', edit: 'Modifica', append: 'Aggiunge a',

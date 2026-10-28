@@ -14,10 +14,14 @@ import type { ToolCallContext, ToolDef, ToolOutcome, World, WorldHost, WorldWebU
 import type { Language } from 'cortico/core/language.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import type { ModelLanguage } from '../language.ts';
+import { ActionGate, type Impact } from '../action-gate.ts';
+import { coreText } from '../i18n/index.ts';
+import { actionDigest, ActionJournal, APPROVAL_MINUTES, newAction, originOf, ReplyJournal, type ActionTarget, type PublicAction } from './actions.ts';
 import type { BrowserTransport } from './bridge.ts';
 import { CONTENT_MAX, SESSION_MAX_CALLS, TEXT_MAX, WATCH_FRAMES_DEFAULT, WATCH_FRAMES_MAX, WATCH_MAX, type SelfTimeConfig } from './config.ts';
-import { clickRefusal, isSearchField, isWriteAction, typeRefusal } from './guard.ts';
+import { clickRefusal, isFilePicker, isFinalPublishControl, isSearchField, isSendControl, isWriteAction, removesState, typeRefusal } from './guard.ts';
 import { BROWSER_TEXT, type AgentElement, type BrowserText, type PageState, type VideoState } from './model-text.ts';
+import { commentReplyConfirmed, submissionStatus } from './submission-status.ts';
 import { BROWSER_TOOL_DECLS } from './tools.ts';
 
 export const BROWSER_WORLD_ID = 'browser';
@@ -32,13 +36,28 @@ export interface BrowserWorldOptions {
   /** The live `companion.selfTime` settings. */
   selfTime: () => SelfTimeConfig;
   modelLanguage: () => ModelLanguage;
+  /** The app language, for the confirmation the person reads; Chinese when absent. */
+  language?: () => Language;
   /** The deployment's time zone, for event timestamps. */
   timezone: string;
+  /** Decides what may write to a site; the app hands in Core's one gate. Without it the gate reads `selfTime`. */
+  gate?: ActionGate;
+  /**
+   * Asks the person to confirm one public write, in the pet's bubble. Absent: a public write cannot
+   * be confirmed and is not sent.
+   */
+  ask?: (question: string, choices: [yes: string, no: string]) => Promise<ApprovalAnswer>;
+  /** The file of unresolved public writes; absent: the records live only in memory. */
+  journalFile?: string;
+  /** Durable duplicate guard for completed comment replies. */
+  replyJournalFile?: string;
   /** Transcribes one finished 16 kHz mono utterance from the page's audio; absent when speech recognition is unavailable. */
   transcribe?: (pcm: Int16Array) => Promise<{ text: string; error?: string | null }>;
   /** A browsing session ended (closed, timed out or out of calls); Coo's next heartbeat starts from now. */
   onSessionEnd?: () => void;
 }
+
+export type ApprovalAnswer = 'yes' | 'always' | 'no' | 'dismissed' | 'timeout' | 'unavailable';
 
 interface Shot { base64: string; width: number; height: number; state: PageState }
 interface ClickAnswer { success?: boolean; message?: string }
@@ -92,6 +111,61 @@ const asVideo = (value: unknown): VideoState | null => {
 const asState = (value: unknown): PageState | null => {
   const s = asRecord(value);
   if (!s || typeof s.url !== 'string' || typeof s.title !== 'string' || typeof s.content !== 'string') return null;
+  const elements = Array.isArray(s.elements)
+    ? s.elements.flatMap((raw) => {
+      const e = asRecord(raw);
+      return e && typeof e.id === 'number' ? [{ id: e.id, label: typeof e.label === 'string' ? e.label : '' }] : [];
+    })
+    : undefined;
+  const current = asRecord(s.current);
+  const account = asRecord(s.account);
+  const timestamps = Array.isArray(s.timestamps)
+    ? s.timestamps.flatMap((raw) => {
+      const value = asRecord(raw);
+      return value && typeof value.datetime === 'string'
+        ? [{
+          text: typeof value.text === 'string' ? value.text : '',
+          datetime: value.datetime,
+          context: typeof value.context === 'string' ? value.context : '',
+        }]
+        : [];
+    })
+    : undefined;
+  const fileInputs = Array.isArray(s.fileInputs)
+    ? s.fileInputs.flatMap((raw) => {
+      const value = asRecord(raw);
+      return value && typeof value.id === 'number'
+        ? [{
+          id: value.id,
+          label: typeof value.label === 'string' ? value.label : 'file input',
+          accept: typeof value.accept === 'string' ? value.accept : '',
+          multiple: value.multiple === true,
+          disabled: value.disabled === true,
+          visible: value.visible !== false,
+        }]
+        : [];
+    })
+    : undefined;
+  const statusMessages = Array.isArray(s.statusMessages)
+    ? s.statusMessages.filter((message): message is string => typeof message === 'string').slice(0, 20)
+    : undefined;
+  const replyTargets = Array.isArray(s.replyTargets)
+    ? s.replyTargets.flatMap((raw) => {
+      const value = asRecord(raw);
+      return value && typeof value.boxId === 'number' && typeof value.fingerprint === 'string' && /^[a-f0-9]{64}$/.test(value.fingerprint)
+        && typeof value.evidenceHash === 'string' && /^[a-f0-9]{64}$/.test(value.evidenceHash) && typeof value.author === 'string'
+        ? [{
+          boxId: value.boxId,
+          fingerprint: value.fingerprint,
+          evidenceHash: value.evidenceHash,
+          author: value.author,
+          context: typeof value.context === 'string' ? value.context : '',
+          timestamp: typeof value.timestamp === 'string' ? value.timestamp : '',
+          needsExpand: value.needsExpand === true,
+        }]
+        : [];
+    })
+    : undefined;
   return {
     url: s.url,
     title: s.title,
@@ -99,6 +173,16 @@ const asState = (value: unknown): PageState | null => {
     content: s.content,
     footer: typeof s.footer === 'string' ? s.footer : '',
     video: asVideo(s.video),
+    ...(elements ? { elements } : {}),
+    current: current && typeof current.url === 'string' ? { url: current.url, title: typeof current.title === 'string' ? current.title : '' } : null,
+    account: account && typeof account.ref === 'string' && typeof account.label === 'string'
+      ? { ref: account.ref, label: account.label }
+      : null,
+    ...(timestamps ? { timestamps } : {}),
+    ...(fileInputs ? { fileInputs } : {}),
+    ...(statusMessages ? { statusMessages } : {}),
+    ...(replyTargets ? { replyTargets } : {}),
+    ...(typeof s.snapshotId === 'string' ? { snapshotId: s.snapshotId } : {}),
   };
 };
 
@@ -119,10 +203,27 @@ const asElement = (value: unknown): AgentElement | null => {
     href: text('href'),
     disabled: e.disabled === true,
     visible: e.visible !== false,
+    filePicker: e.filePicker === true,
+    ...(typeof e.snapshotId === 'string' ? { snapshotId: e.snapshotId } : {}),
   };
 };
 
 const PRESS_KEYS = new Set(['Enter', 'Escape', 'Tab', 'Space', 'Backspace', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown']);
+
+/** A label without counts and case: a like count ticks up without the element becoming a different one. */
+const normalLabel = (value: string): string => value.toLowerCase().replace(/\d+/g, '').replace(/\s+/g, ' ').trim();
+
+/** The answer, or `dismissed` when the call is interrupted while the person is deciding. */
+function askUnlessAborted(answer: Promise<ApprovalAnswer>, signal?: AbortSignal): Promise<ApprovalAnswer> {
+  if (!signal) return answer;
+  if (signal.aborted) return Promise.resolve('dismissed');
+  return new Promise((resolve) => {
+    const stop = () => resolve('dismissed');
+    signal.addEventListener('abort', stop, { once: true });
+    const settle = (value: ApprovalAnswer) => { signal.removeEventListener('abort', stop); resolve(value); };
+    answer.then(settle, () => settle('dismissed'));
+  });
+}
 
 /** Public http(s) only: not this machine, the local network or the Core's own console. IPv6 literals are refused. */
 const PUBLIC = /^(?:10\.|127\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/;
@@ -139,6 +240,22 @@ const httpUrl = (value: string): boolean => {
   } catch { return false; }
 };
 
+const isChatGPTPage = (value: string): boolean => {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    return url.protocol === 'https:' && (host === 'chatgpt.com' || host.endsWith('.chatgpt.com') || host === 'chat.openai.com');
+  } catch { return false; }
+};
+
+const isDouyinPage = (value: string): boolean => {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
+    return url.protocol === 'https:' && host === 'creator.douyin.com';
+  } catch { return false; }
+};
+
 export class BrowserWorld implements World {
   readonly id = BROWSER_WORLD_ID;
   private host: WorldHost | null = null;
@@ -151,6 +268,23 @@ export class BrowserWorld implements World {
   private timer: NodeJS.Timeout | null = null;
   /** The World is stopping: do not re-arm a heartbeat for a session that ends now. */
   private stopping = false;
+  /** What each element number meant when the model last saw the page; a changed entry means it was renumbered. */
+  private shown = new Map<number, string>();
+  /** The page those numbers belong to; another address drops them. */
+  private shownUrl = '';
+  private shownSnapshotId = '';
+  /** The last page shown to the model: what a confirmation names as its target. */
+  private lastState: PageState | null = null;
+  /** The unresolved public writes; a resolved one leaves the file as soon as it is written. */
+  private actions: PublicAction[] = [];
+  private journal: ActionJournal | null = null;
+  private replyJournal: ReplyJournal | null = null;
+  /** One public write at a time: a second Enter while the first awaits an answer is refused. */
+  private publishing = false;
+  /** What Coo last typed, so a send control knows which text it would publish. */
+  private lastTyped: { index: number; text: string; label: string } | null = null;
+  private journalUnavailable = false;
+  private replyJournalUnavailable = true;
 
   constructor(private readonly opts: BrowserWorldOptions) {}
 
@@ -162,11 +296,66 @@ export class BrowserWorld implements World {
     return this.opts.selfTime();
   }
 
+  private fallbackGate: ActionGate | null = null;
+
+  /** Core's gate when the app lent one; otherwise a gate reading this World's own settings. */
+  private get gate(): ActionGate {
+    return this.opts.gate ?? (this.fallbackGate ??= new ActionGate({
+      platformWrites: () => this.self.actions,
+      computerInput: () => true,
+    }));
+  }
+
+  /** Whether an action of this weight may run now. */
+  private allowed(impact: Impact, tool: string, target?: string): boolean {
+    return this.gate.check({ surface: 'browser', tool, impact, ...(target ? { target } : {}) }).allow;
+  }
+
   async start(host: WorldHost): Promise<void> {
     this.host = host;
+    this.journal = this.opts.journalFile ? new ActionJournal(this.opts.journalFile) : null;
+    this.replyJournal = this.opts.replyJournalFile ? new ReplyJournal(this.opts.replyJournalFile) : null;
+    try {
+      this.actions = this.journal?.load() ?? [];
+      this.journalUnavailable = !this.journal;
+    } catch {
+      this.actions = [];
+      this.journalUnavailable = true;
+    }
+    try {
+      this.replyJournal?.load();
+      this.replyJournalUnavailable = !this.replyJournal;
+    } catch {
+      this.replyJournalUnavailable = true;
+    }
     this.unsubscribe = this.opts.bridge.onEvent((event) => {
       if (event === 'closed') void this.windowClosed();
     });
+    await this.recover();
+  }
+
+  /**
+   * A record left in `acting` by a crash has an unknown result: no input is re-sent, and Coo is told
+   * to check the page before trying again.
+   */
+  private async recover(): Promise<void> {
+    const stuck = this.actions.filter((action) => action.phase === 'acting' || action.phase === 'awaiting-approval' || action.phase === 'planned');
+    if (!stuck.length) return;
+    const now = Date.now();
+    for (const action of stuck) {
+      action.phase = 'unknown';
+      action.outcome = 'unknown';
+      action.note = 'the app stopped before the result was seen';
+      action.updatedAt = now;
+    }
+    try { this.journal?.save(this.actions); } catch { /* the record stays in memory and in the event */ }
+    await this.host?.pushEvent({
+      type: 'browser.unresolved',
+      source: this.id,
+      senderKey: 'browser.unresolved',
+      ts: nowIso(this.opts.timezone),
+      text: this.t.unresolved(stuck.length),
+    }, { trigger: 'debounce' }).catch(() => undefined);
   }
 
   async stop(): Promise<void> {
@@ -213,8 +402,8 @@ export class BrowserWorld implements World {
         ? (en ? 'has no time limit' : '不限时长')
         : (en ? `lasts at most ${st.sessionMinutes} minutes` : `最多 ${st.sessionMinutes} 分钟`),
       'browser.actions': st.actions
-        ? (en ? 'likes, favorites, follows, comments, danmaku and sharing are allowed' : '可以点赞、收藏、关注、评论、发弹幕和分享')
-        : (en ? 'read only: do not like, favorite, follow, comment, send danmaku or share' : '只允许看:不要点赞、收藏、关注、评论、发弹幕或分享'),
+        ? (en ? 'likes, favorites, follows, comments, danmaku, sharing, media uploads and image generation through the ChatGPT website are allowed' : '可以点赞、收藏、关注、评论、发弹幕、分享、上传素材,也可以通过 ChatGPT 网页生成图片')
+        : (en ? 'read only: do not like, favorite, follow, comment, send danmaku, share, upload media, submit image prompts to ChatGPT or save generated images' : '只允许看:不要点赞、收藏、关注、评论、发弹幕、分享、上传素材、向 ChatGPT 提交图片提示词或保存生成图片'),
       'browser.audio': st.sound ? (en ? 'sound on' : '有声音') : (en ? 'muted' : '静音'),
     };
   }
@@ -235,6 +424,9 @@ export class BrowserWorld implements World {
       browser_play: (args, ctx) => this.play(args, ctx),
       browser_watch: (args, ctx) => this.watch(args, ctx),
       browser_screenshot: (_args, ctx) => this.screenshot(ctx),
+      browser_chatgpt_generate_image: (args, ctx) => this.generateChatGPTImage(args, ctx),
+      browser_save_chatgpt_image: (args, ctx) => this.saveChatGPTImage(args, ctx),
+      browser_upload_media: (args, ctx) => this.uploadMedia(args, ctx),
       browser_back: (_args, ctx) => this.back(ctx),
       browser_close: (_args, _ctx) => this.close(),
     };
@@ -285,6 +477,10 @@ export class BrowserWorld implements World {
     this.started = null;
     this.ended = true;
     this.calls = 0;
+    this.lastTyped = null;
+    this.lastState = null;
+    this.shown.clear();
+    this.shownUrl = '';
     if (close) void this.opts.bridge.call('close').catch(() => undefined);
     if (active && !this.stopping) {
       try { this.opts.onSessionEnd?.(); } catch { /* arming the next heartbeat is a convenience */ }
@@ -396,15 +592,41 @@ export class BrowserWorld implements World {
       const blocked = this.begin('browser_click');
       if (blocked) return blocked;
       let label = text;
+      let targetSnapshotId: string | undefined;
       if (index !== null) {
         const element = asElement(await this.call('element', { index }, ctx.signal));
         if (!element) return this.toast(this.t.noElement(index), true);
+        if (this.renumbered(index, element)) return this.toast(this.t.stale(index), true);
+        if (isFilePicker(element)) return this.toast(this.t.fileChooserBlocked, true);
+        targetSnapshotId = element.snapshotId;
         label = this.labelOf(element);
+        if (!label && (element.tag === 'button' || element.role === 'button')) {
+          return this.toast(this.t.failed('browser_click', 'the button has no readable label'), true);
+        }
       }
+      if (isDouyinPage(this.lastState?.url ?? '') && isFinalPublishControl(label)) return this.toast(this.t.manualPublish, true);
+      if (index === null && isSendControl(label)) return this.toast(this.t.sendTargetNeedsIndex, true);
       const refused = clickRefusal(label);
-      if (refused) return this.toast(this.t.refusedClick(label, refused), true);
-      if (!this.self.actions && isWriteAction(label)) return this.toast(this.t.lookOnly(label), true);
-      const result = asRecord(await this.call('click', index !== null ? { index } : { text }, ctx.signal));
+      if (removesState(label)) return this.toast(this.t.alreadyDone(label), true);
+      if (!this.allowed(refused ? 'sensitive' : isWriteAction(label) ? 'platform-write' : 'read', 'browser_click', label)) {
+        return this.toast(refused ? this.t.refusedClick(label, refused) : this.t.lookOnly(label), true);
+      }
+      // A send control publishes the text Coo typed: the person confirms that exact text first.
+      if (index !== null && isSendControl(label)) {
+        const typed = this.lastTyped;
+        if (!typed) return this.toast(this.t.sendDraftMissing, true);
+        const box = typed.index;
+        const content = await this.draftAt(box, ctx.signal);
+        if (content === null) return this.toast(this.t.draftUnreadable, true);
+        if (content.trim()) {
+          return await this.publishText({ tool: 'browser_click', boxIndex: box, controlIndex: index, label, boxLabel: typed.label, content }, ctx, async () => {
+            const result = asRecord(await this.call('click', { index, snapshotId: targetSnapshotId }, ctx.signal));
+            return asState(result?.state);
+          });
+        }
+        return this.toast(this.t.sendDraftMissing, true);
+      }
+      const result = asRecord(await this.call('click', index !== null ? { index, snapshotId: targetSnapshotId } : { text }, ctx.signal));
       const state = asState(result?.state);
       if (!state) return this.toast(this.t.failed('browser_click', 'the page did not answer after the click'), true);
       const answer = asRecord(result?.answer) as ClickAnswer | null;
@@ -421,9 +643,11 @@ export class BrowserWorld implements World {
       if (blocked) return blocked;
       const element = asElement(await this.call('element', { index }, ctx.signal));
       if (!element) return this.toast(this.t.noElement(index), true);
+      if (this.renumbered(index, element)) return this.toast(this.t.stale(index), true);
+      if (isFilePicker(element)) return this.toast(this.t.fileChooserBlocked, true);
       const label = this.labelOf(element);
-      if (!this.self.actions && isWriteAction(label)) return this.toast(this.t.lookOnly(label), true);
-      const result = asRecord(await this.call('hover', { index }, ctx.signal));
+      if (!this.allowed(isWriteAction(label) ? 'platform-write' : 'read', 'browser_hover', label)) return this.toast(this.t.lookOnly(label), true);
+      const result = asRecord(await this.call('hover', { index, snapshotId: element.snapshotId }, ctx.signal));
       const state = asState(result?.state);
       if (!state) return this.toast(this.t.failed('browser_hover', 'the page did not answer after hovering'), true);
       return this.toast(this.full(state, this.t.hovered(label || `#${index}`)));
@@ -434,7 +658,7 @@ export class BrowserWorld implements World {
     return this.run('browser_share', ctx, async () => {
       const blocked = this.begin('browser_share');
       if (blocked) return blocked;
-      if (!this.self.actions) return this.toast(this.t.lookOnly('分享'), true);
+      if (!this.allowed('platform-write', 'browser_share', this.t.share)) return this.toast(this.t.lookOnly(this.t.share), true);
       const result = asRecord(await this.call('share', {}, ctx.signal));
       const state = asState(result?.state);
       if (!state) return this.toast(this.t.failed('browser_share', 'the page did not answer after opening the share panel'), true);
@@ -453,15 +677,21 @@ export class BrowserWorld implements World {
       if (blocked) return blocked;
       const element = asElement(await this.call('element', { index }, ctx.signal));
       if (!element) return this.toast(this.t.noElement(index), true);
+      if (this.renumbered(index, element)) return this.toast(this.t.stale(index), true);
+      if (isFilePicker(element)) return this.toast(this.t.fileChooserBlocked, true);
       const label = this.labelOf(element);
       const refused = typeRefusal(element);
-      if (refused) return this.toast(this.t.refusedType(label), true);
-      if (!this.self.actions && !isSearchField(element)) return this.toast(this.t.lookOnly(label), true);
-      const result = asRecord(await this.call('input', { index, text }, ctx.signal));
+      const actionRefusal = clickRefusal(label);
+      if (actionRefusal) return this.toast(this.t.refusedClick(label, actionRefusal), true);
+      if (!this.allowed(refused ? 'sensitive' : isSearchField(element) ? 'read' : 'platform-write', 'browser_type', label)) {
+        return this.toast(refused ? this.t.refusedType(label) : this.t.lookOnly(label), true);
+      }
+      const result = asRecord(await this.call('input', { index, text, snapshotId: element.snapshotId }, ctx.signal));
       const state = asState(result?.state);
       if (!state) return this.toast(this.t.failed('browser_type', 'the page did not answer after typing'), true);
       const answer = asRecord(result?.answer) as ClickAnswer | null;
       if (answer?.success === false) return this.toast(this.t.failed('browser_type', answer.message || 'typing failed'), true);
+      this.lastTyped = isSearchField(element) ? null : { index, text, label };
       return this.toast(this.full(state, this.t.typed(label || `#${index}`)));
     });
   }
@@ -474,20 +704,58 @@ export class BrowserWorld implements World {
       if (index === null) return this.toast(this.t.failed('browser_press', 'index must be a whole number of at least 0'), true);
       const blocked = this.begin('browser_press');
       if (blocked) return blocked;
+      let targetSnapshotId: string | undefined;
+      // Enter and Space can submit the focused control. Resolve it before the key reaches the page.
       if (key === 'Enter' || key === 'Space') {
         const element = asElement(await this.call(index === undefined ? 'active' : 'element', index === undefined ? {} : { index }, ctx.signal));
-        if (!element) {
-          if (!this.self.actions) return this.toast(this.t.lookOnly('unknown focused target'), true);
-        } else {
-          const label = this.labelOf(element);
-          const refused = clickRefusal(label);
-          if (refused) return this.toast(this.t.refusedClick(label, refused), true);
-          if (!this.self.actions && (isWriteAction(label) || !isSearchField(element))) {
-            return this.toast(this.t.lookOnly(label || 'unknown focused target'), true);
-          }
+        if (!element) return this.toast(this.t.failed('browser_press', 'the focused target could not be verified'), true);
+        if (isFilePicker(element)) return this.toast(this.t.fileChooserBlocked, true);
+        const label = this.labelOf(element);
+        targetSnapshotId = element.snapshotId;
+        if (isDouyinPage(this.lastState?.url ?? '') && isFinalPublishControl(label)) return this.toast(this.t.manualPublish, true);
+        const refusal = clickRefusal(label);
+        if (refusal) return this.toast(this.t.refusedClick(label, refusal), true);
+        if (element.id >= 0 && this.renumbered(element.id, element)) return this.toast(this.t.stale(element.id), true);
+        if (removesState(label)) return this.toast(this.t.alreadyDone(label), true);
+        const tag = String(element.tag ?? '').toLowerCase();
+        const textEntry = tag === 'input' || tag === 'textarea' || String(element.role ?? '').toLowerCase() === 'textbox';
+        const searchField = isSearchField(element);
+        if (!this.self.actions && !searchField) return this.toast(this.t.lookOnly(label || 'unknown focused target'), true);
+        if (element.id < 0 && !searchField && !textEntry) {
+          return this.toast(this.t.failed('browser_press', 'the focused target needs an element number'), true);
         }
+        if (isSendControl(label) && !textEntry) return this.toast(this.t.sendTargetNeedsIndex, true);
+        if (!textEntry && (tag === 'button' || tag === 'a' || ['button', 'link'].includes(String(element.role ?? '').toLowerCase()))) {
+          return this.toast(this.t.failed('browser_press', 'use browser_click with the numbered control'), true);
+        }
+        const refused = clickRefusal(label);
+        const impact = key === 'Enter' && textEntry && !searchField
+          ? 'platform-write'
+          : refused ? 'sensitive' : isWriteAction(label) ? 'platform-write' : 'read';
+        if (!this.allowed(impact, 'browser_press', label)) {
+          return this.toast(refused ? this.t.refusedClick(label, refused) : this.t.lookOnly(label), true);
+        }
+        if (key === 'Enter' && textEntry && !searchField) {
+          // Enter in a text box can publish its contents; approve the exact draft first.
+          const box = index ?? element.id;
+          const content = box >= 0 ? await this.draftAt(box, ctx.signal) : null;
+          if (content === null) return this.toast(this.t.draftUnreadable, true);
+          if (content.trim()) {
+            return await this.publishText({ tool: 'browser_press', boxIndex: box, controlIndex: box, label, boxLabel: label, content }, ctx, async () => {
+              const result = asRecord(await this.call('press', { key, snapshotId: targetSnapshotId, ...(index === undefined ? {} : { index }) }, ctx.signal));
+              return asState(result?.state);
+            });
+          }
+          return this.toast(this.t.sendDraftMissing, true);
+        }
+      } else if (index !== undefined) {
+        const element = asElement(await this.call('element', { index }, ctx.signal));
+        if (!element) return this.toast(this.t.noElement(index), true);
+        if (this.renumbered(index, element)) return this.toast(this.t.stale(index), true);
+        if (isFilePicker(element)) return this.toast(this.t.fileChooserBlocked, true);
+        targetSnapshotId = element.snapshotId;
       }
-      const result = asRecord(await this.call('press', { key, ...(index === undefined ? {} : { index }) }, ctx.signal));
+      const result = asRecord(await this.call('press', { key, snapshotId: targetSnapshotId, ...(index === undefined ? {} : { index }) }, ctx.signal));
       const state = asState(result?.state);
       if (!state) return this.toast(this.t.failed('browser_press', 'the page returned no state'), true);
       return this.toast(this.full(state, this.t.pressed(key)));
@@ -502,7 +770,13 @@ export class BrowserWorld implements World {
       if (index === null) return this.toast(this.t.failed('browser_scroll', 'index must be a whole number of at least 0'), true);
       const blocked = this.begin('browser_scroll');
       if (blocked) return blocked;
-      const result = asRecord(await this.call('scroll', { down, pages, ...(index === undefined ? {} : { index }) }, ctx.signal));
+      let snapshotId: string | undefined;
+      if (index !== undefined) {
+        const element = asElement(await this.call('element', { index }, ctx.signal));
+        if (!element || this.renumbered(index, element)) return this.toast(this.t.stale(index), true);
+        snapshotId = element.snapshotId;
+      }
+      const result = asRecord(await this.call('scroll', { down, pages, snapshotId, ...(index === undefined ? {} : { index }) }, ctx.signal));
       const state = asState(result?.state);
       if (!state) return this.toast(this.t.failed('browser_scroll', 'the page returned no state'), true);
       return this.toast(this.full(state, this.t.scrolled(down, pages)));
@@ -598,6 +872,77 @@ export class BrowserWorld implements World {
     });
   }
 
+  private async generateChatGPTImage(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.run('browser_chatgpt_generate_image', ctx, async () => {
+      const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
+      if (!prompt || prompt.length > 2000) return this.toast(this.t.failed('browser_chatgpt_generate_image', 'prompt must be 1 to 2000 characters'), true);
+      const blocked = this.begin('browser_chatgpt_generate_image');
+      if (blocked) return blocked;
+      if (!isChatGPTPage(this.lastState?.url ?? '')) return this.toast(this.t.failed('browser_chatgpt_generate_image', 'open the ChatGPT website in this browser first'), true);
+      if (!this.allowed('platform-write', 'browser_chatgpt_generate_image', 'ChatGPT image prompt')) return this.toast(this.t.lookOnly('ChatGPT image prompt'), true);
+      const result = asRecord(await this.call('chatgpt-generate-image', { prompt }, ctx.signal));
+      const state = asState(result?.state);
+      const submitted = result?.submitted === true;
+      const lead = submitted ? this.t.chatGPTImageSubmitted : this.t.chatGPTImageUnknown;
+      if (state && typeof result?.base64 === 'string') {
+        const shot = { base64: result.base64, width: Number(result.width) || 0, height: Number(result.height) || 0, state };
+        return submitted ? this.image(shot, lead) : { ...this.image(shot, lead), failed: true };
+      }
+      if (state) return submitted ? this.toast(this.full(state, lead)) : this.toast(this.full(state, lead), true);
+      return this.toast(lead, !submitted);
+    });
+  }
+
+  private async saveChatGPTImage(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.run('browser_save_chatgpt_image', ctx, async () => {
+      const index = this.indexArg(args.index);
+      if (index === null) return this.toast(this.t.failed('browser_save_chatgpt_image', 'index must be a whole number of at least 0'), true);
+      const blocked = this.begin('browser_save_chatgpt_image');
+      if (blocked) return blocked;
+      if (!isChatGPTPage(this.lastState?.url ?? '')) return this.toast(this.t.failed('browser_save_chatgpt_image', 'open the generated image on the ChatGPT website first'), true);
+      if (!this.allowed('platform-write', 'browser_save_chatgpt_image', 'save ChatGPT image')) return this.toast(this.t.lookOnly('save ChatGPT image'), true);
+      const element = asElement(await this.call('element', { index }, ctx.signal));
+      if (!element) return this.toast(this.t.noElement(index), true);
+      if (this.renumbered(index, element)) return this.toast(this.t.stale(index), true);
+      if (isFilePicker(element)) return this.toast(this.t.fileChooserBlocked, true);
+      const result = asRecord(await this.call('save-chatgpt-image', { index, snapshotId: element.snapshotId }, ctx.signal));
+      const state = asState(result?.state);
+      const file = typeof result?.file === 'string' ? result.file : '';
+      const bytes = Number(result?.bytes);
+      if (!file || !Number.isSafeInteger(bytes) || bytes <= 0) return this.toast(this.t.failed('browser_save_chatgpt_image', 'the download was not verified'), true);
+      if (state && typeof result?.base64 === 'string') {
+        return this.image({ base64: result.base64, width: Number(result.width) || 0, height: Number(result.height) || 0, state }, this.t.chatGPTImageSaved(file, bytes));
+      }
+      return this.toast(state ? this.full(state, this.t.chatGPTImageSaved(file, bytes)) : this.t.chatGPTImageSaved(file, bytes));
+    });
+  }
+
+  private async uploadMedia(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.run('browser_upload_media', ctx, async () => {
+      const fileId = this.indexArg(args.fileId);
+      const files = Array.isArray(args.files) ? args.files.filter((file): file is string => typeof file === 'string' && !!file.trim()) : [];
+      if (fileId === null) return this.toast(this.t.failed('browser_upload_media', 'fileId must be a non-negative page-local file input id'), true);
+      if (!files.length || files.length > 20 || files.length !== (Array.isArray(args.files) ? args.files.length : 0)) {
+        return this.toast(this.t.failed('browser_upload_media', 'choose 1 to 20 relative media paths'), true);
+      }
+      const blocked = this.begin('browser_upload_media');
+      if (blocked) return blocked;
+      const page = this.lastState;
+      if (!page || !isDouyinPage(page.url) || !page.snapshotId) return this.toast(this.t.failed('browser_upload_media', 'read the current Douyin page first'), true);
+      const input = page.fileInputs?.find((candidate) => candidate.id === fileId);
+      if (!input || input.disabled) return this.toast(this.t.failed('browser_upload_media', 'that file input is missing, disabled or from an older page read'), true);
+      if (!input.multiple && files.length > 1) return this.toast(this.t.failed('browser_upload_media', 'the page input accepts one file at a time'), true);
+      if (!this.allowed('platform-write', 'browser_upload_media', `${files.length} media file(s) into Douyin`)) return this.toast(this.t.lookOnly('Douyin media upload'), true);
+      const result = asRecord(await this.call('upload-media', { fileId, snapshotId: page.snapshotId, files }, ctx.signal));
+      const selected = Array.isArray(result?.files) ? result.files.filter((file): file is string => typeof file === 'string') : [];
+      if (selected.length !== files.length || selected.some((file, index) => file !== files[index])) {
+        return this.toast(this.t.failed('browser_upload_media', 'the browser did not confirm the selected media files'), true);
+      }
+      const state = asState(result?.state);
+      return this.toast(state ? this.full(state, this.t.uploadedMedia(selected)) : this.t.uploadedMedia(selected));
+    });
+  }
+
   private async back(ctx: ToolCallContext): Promise<ToolOutcome> {
     return this.run('browser_back', ctx, async () => {
       const blocked = this.begin('browser_back');
@@ -615,6 +960,197 @@ export class BrowserWorld implements World {
     return this.toast(this.t.closed);
   }
 
+  /* ---------- public writes ---------- */
+
+  /** The live contents of one text box, or null when the page cannot say. */
+  private async draftAt(index: number, signal?: AbortSignal): Promise<string | null> {
+    try {
+      const value = await this.call('draft', { index }, signal);
+      return typeof value === 'string' ? value : null;
+    } catch { return null; }
+  }
+
+  /**
+   * One public write, start to finish: the person confirms this page, target and text; the record
+   * reaches the disk before the input leaves; the box is re-read after the confirmation; and the
+   * receipt is `verified` only when the page itself shows the box cleared. A dispatch that fails
+   * after leaving is `unknown`, never a reason to press again.
+   */
+  private async publishText(
+    input: { tool: string; boxIndex: number; controlIndex: number | null; label: string; boxLabel: string; content: string },
+    ctx: ToolCallContext,
+    dispatch: () => Promise<PageState | null>,
+  ): Promise<ToolOutcome> {
+    if (this.publishing) return this.toast(this.t.sendBusy, true);
+    if (this.journalUnavailable || !this.journal) return this.toast(this.t.sendJournalUnavailable, true);
+    this.publishing = true;
+    let task: PublicAction | null = null;
+    try {
+      const targetRefusal = clickRefusal(input.boxLabel) ?? clickRefusal(input.label);
+      if (targetRefusal) return this.toast(this.t.refusedClick(input.boxLabel || input.label, targetRefusal), true);
+      const page = this.lastState;
+      const candidateReplies = page?.replyTargets?.filter((candidate) => candidate.boxId === input.boxIndex) ?? [];
+      const replyLabel = /\b(?:reply|respond)\b|回复|回覆|回应/i.test(input.boxLabel);
+      const isReply = replyLabel || candidateReplies.length > 0;
+      if (isReply && candidateReplies.length !== 1) return this.toast(this.t.sendReplyUnverified, true);
+      const replyTarget = isReply ? candidateReplies[0] : undefined;
+      if (replyTarget?.needsExpand) return this.toast(this.t.sendReplyNeedsExpand, true);
+      const previousReplyNotices = new Set((page?.statusMessages ?? [])
+        .filter((message) => commentReplyConfirmed([message]))
+        .map((message) => message.replace(/\s+/g, ' ').trim().toLowerCase()));
+      if (replyTarget) {
+        if (!this.replyJournal || this.replyJournalUnavailable) return this.toast(this.t.sendReplyJournalUnavailable, true);
+        try {
+          if (this.replyJournal.has(replyTarget.fingerprint)
+            || this.actions.some((action) => action.target.commentFingerprint === replyTarget.fingerprint)) {
+            return this.toast(this.t.sendReplyDuplicate, true);
+          }
+        } catch {
+          this.replyJournalUnavailable = true;
+          return this.toast(this.t.sendReplyJournalUnavailable, true);
+        }
+      }
+      const target: ActionTarget = {
+        surface: 'browser',
+        origin: originOf(page?.url ?? ''),
+        url: page?.url ?? '',
+        videoUrl: page?.current?.url ?? '',
+        videoTitle: page?.current?.title ?? page?.title ?? '',
+        snapshotId: page?.snapshotId ?? '',
+        accountRef: page?.account?.ref,
+        accountLabel: page?.account?.label,
+        ...(replyTarget ? { commentFingerprint: replyTarget.fingerprint } : {}),
+        control: input.label || `#${input.controlIndex ?? input.boxIndex}`,
+      };
+      if (!target.videoUrl || !target.snapshotId) return this.toast(this.t.sendTargetUnverified, true);
+      if (!target.accountRef || !target.accountLabel) return this.toast(this.t.sendAccountUnverified, true);
+      const where = [target.videoTitle, target.videoUrl].filter(Boolean).join(' — ');
+      const approvalWhere = replyTarget
+        ? `${where}\n回复对象：${replyTarget.author}\n原评论：${replyTarget.context}`
+        : where;
+      const targetStillBound = async (): Promise<boolean> => {
+        try {
+          const current = asState(await this.call('read', {}, ctx.signal));
+          if (!current || current.snapshotId !== target.snapshotId || !current.account || current.url !== target.url
+            || current.current?.url !== target.videoUrl || current.account.ref !== target.accountRef
+            || current.account.label !== target.accountLabel) return false;
+          if (replyTarget && JSON.stringify(current.statusMessages ?? []) !== JSON.stringify(page?.statusMessages ?? [])) return false;
+          const box = asElement(await this.call('element', { index: input.boxIndex }, ctx.signal));
+          if (!box || isFilePicker(box) || this.renumbered(input.boxIndex, box)) return false;
+          const currentReplies = current.replyTargets?.filter((candidate) => candidate.boxId === input.boxIndex) ?? [];
+          if (replyTarget) {
+            if (currentReplies.length !== 1 || currentReplies[0]?.fingerprint !== replyTarget.fingerprint
+              || currentReplies[0]?.evidenceHash !== replyTarget.evidenceHash || currentReplies[0]?.needsExpand) return false;
+          } else if (currentReplies.length || /\b(?:reply|respond)\b|回复|回覆|回应/i.test(input.boxLabel)) return false;
+          if (input.controlIndex !== null) {
+            const control = asElement(await this.call('element', { index: input.controlIndex }, ctx.signal));
+            if (!control || isFilePicker(control) || this.renumbered(input.controlIndex, control)) return false;
+            if (normalLabel(this.labelOf(control)) !== normalLabel(input.label)) return false;
+            if (input.tool === 'browser_click') {
+              const matches = current.elements?.filter((element) => normalLabel(element.label) === normalLabel(input.label)) ?? [];
+              if (matches.length !== 1 || matches[0]?.id !== input.controlIndex) return false;
+            }
+          }
+          return true;
+        } catch { return false; }
+      };
+      task = newAction(target, input.content, `the text appears on ${target.origin}`);
+      task.phase = 'awaiting-approval';
+      try { await this.record(task); } catch { return this.toast(this.t.sendUnsaved, true); }
+
+      const person = coreText(this.opts.language?.() ?? 'zh').browserSend;
+      const accountDisplay = `${target.accountLabel} (${target.accountRef})`;
+      const answer = this.opts.ask
+        ? await askUnlessAborted(this.opts.ask(person.question(accountDisplay, approvalWhere, input.content), [person.yes, person.no]), ctx.signal)
+        : 'unavailable';
+      if (answer !== 'yes' && answer !== 'always') {
+        task.phase = 'cancelled';
+        task.note = 'the person did not approve this action';
+        await this.record(task).catch(() => undefined);
+        return this.toast(answer === 'no' ? this.t.sendCancelled : this.t.sendNotAnswered, true);
+      }
+      if (!await targetStillBound() || await this.draftAt(input.boxIndex, ctx.signal) !== input.content) {
+        task.phase = 'cancelled';
+        task.note = 'the target or the text changed after the confirmation';
+        await this.record(task).catch(() => undefined);
+        return this.toast(this.t.sendChanged, true);
+      }
+
+      const now = Date.now();
+      task.approval = { digest: actionDigest(target, input.content), issuedAt: now, expiresAt: now + APPROVAL_MINUTES * 60_000, used: true };
+      task.phase = 'acting';
+      task.updatedAt = now;
+      try { await this.record(task); } catch { return this.toast(this.t.sendUnsaved, true); }
+
+      // Re-resolve the page, editor, control and text after the record reaches disk.
+      const nowDraft = await this.draftAt(input.boxIndex, ctx.signal);
+      if (!await targetStillBound() || nowDraft !== input.content || Date.now() > task.approval.expiresAt) {
+        task.phase = 'cancelled';
+        task.note = 'the target or the text changed after the confirmation';
+        await this.record(task).catch(() => undefined);
+        return this.toast(this.t.sendChanged, true);
+      }
+
+      let state: PageState | null = null;
+      try {
+        state = await dispatch();
+      } catch {
+        task.phase = 'unknown';
+        task.outcome = 'unknown';
+        task.note = 'the page did not answer after the input';
+        await this.record(task).catch(() => undefined);
+        return this.toast(this.t.sendUnknown, true);
+      }
+
+      const after = await this.draftAt(input.boxIndex);
+      if (state && state.url === target.url && state.current?.url === target.videoUrl && state.account?.ref === target.accountRef && after === '') {
+        const status = submissionStatus(state.statusMessages ?? []);
+        const newReplyNotice = (state.statusMessages ?? []).some((message) => commentReplyConfirmed([message])
+          && !previousReplyNotices.has(message.replace(/\s+/g, ' ').trim().toLowerCase()));
+        if (replyTarget && (status !== 'submitted' || !newReplyNotice)) {
+          task.phase = 'unknown';
+          task.outcome = 'unknown';
+          task.note = 'the reply box cleared without a page confirmation of the comment reply';
+          await this.record(task).catch(() => undefined);
+          return this.toast(this.t.sendUnknown, true);
+        }
+        if (replyTarget) {
+          try { this.replyJournal!.add(replyTarget.fingerprint); }
+          catch {
+            task.phase = 'unknown';
+            task.outcome = 'unknown';
+            task.note = 'the page confirmed the reply but the duplicate guard could not be saved';
+            await this.record(task).catch(() => undefined);
+            return this.toast(this.t.sendUnknown, true);
+          }
+        }
+        task.phase = 'verified';
+        task.outcome = 'ui-observed';
+        await this.record(task).catch(() => undefined);
+        this.lastTyped = null;
+        return this.toast(this.full(state, this.t.sent(approvalWhere, status)));
+      }
+      task.phase = 'unknown';
+      task.outcome = 'unknown';
+      task.note = 'the box still shows the text, or could not be read';
+      await this.record(task).catch(() => undefined);
+      return this.toast(this.t.sendUnknown, true);
+    } finally {
+      this.publishing = false;
+    }
+  }
+
+  /** Replaces this task's record and writes the unresolved ones out; throws when the disk refuses. */
+  private async record(task: PublicAction): Promise<void> {
+    if (!this.journal) throw new Error('the browser action journal is unavailable');
+    task.updatedAt = Date.now();
+    this.actions = [...this.actions.filter((action) => action.taskId !== task.taskId), task];
+    this.journal.save(this.actions);
+    if (task.phase === 'verified' || task.phase === 'cancelled' || task.phase === 'failed') {
+      this.actions = this.actions.filter((action) => action.taskId !== task.taskId);
+    }
+  }
+
   /* ---------- helpers ---------- */
 
   private async call(op: string, args: Record<string, unknown> = {}, signal?: AbortSignal): Promise<unknown> {
@@ -628,6 +1164,7 @@ export class BrowserWorld implements World {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (message === 'interrupted' || ctx.signal?.aborted) return this.toast(this.t.interrupted);
+      if (/ambiguous share target/.test(message)) return this.toast(this.t.ambiguous(this.t.share), true);
       if (/window is closed|not open/i.test(message)) return this.toast(this.t.noWindow, true);
       return this.toast(this.t.failed(tool, message), true);
     }
@@ -648,6 +1185,27 @@ export class BrowserWorld implements World {
     return [...new Set(parts)].join(' · ').slice(0, 160);
   }
 
+  /** Remembers what each number meant on the page the model is about to read. */
+  private seen(state: PageState): void {
+    this.lastState = state;
+    if (state.url !== this.shownUrl) {
+      this.shownUrl = state.url;
+      this.shown.clear();
+      this.shownSnapshotId = '';
+      this.lastTyped = null;
+    }
+    if (!state.elements) return;
+    this.shown = new Map(state.elements.map((element) => [element.id, normalLabel(element.label)]));
+    this.shownSnapshotId = state.snapshotId ?? '';
+  }
+
+  /** Whether this number is no longer the element the model read; act only after another read. */
+  private renumbered(index: number, element: AgentElement): boolean {
+    const before = this.shown.get(index);
+    if (this.shownSnapshotId && element.snapshotId && this.shownSnapshotId !== element.snapshotId) return true;
+    return before !== undefined && before !== normalLabel(element.label || element.text);
+  }
+
   private findLines(lines: string[], query: string): Array<{ line: number; text: string }> {
     const needle = query.toLowerCase();
     const hits: Array<{ line: number; text: string }> = [];
@@ -658,18 +1216,26 @@ export class BrowserWorld implements World {
   }
 
   private full(state: PageState, lead = ''): string {
+    this.seen(state);
     const content = state.content.replace(/^(\s*)\*\[/gm, '$1[');
     const body = content.length > CONTENT_MAX ? `${content.slice(0, CONTENT_MAX)}\n${this.t.truncated}` : content;
     const header = state.header.length > 1600 ? `${state.header.slice(0, 1600)}…` : state.header;
-    return [lead, header, body, state.footer.slice(0, 400), this.t.video(state.video)].filter(Boolean).join('\n');
+    return [lead, header, body, state.footer.slice(0, 400), this.currentVideo(state), this.t.timestamps(state.timestamps ?? []), this.t.fileInputs(state.fileInputs ?? []), this.t.replyTargets(state.replyTargets ?? []), state.statusMessages?.length ? `Page status: ${state.statusMessages.join(' · ')}` : '', this.t.video(state.video)].filter(Boolean).join('\n');
   }
 
   private brief(state: PageState, lead = ''): string {
-    return [lead, this.t.pageLine(state.title, state.url), this.t.video(state.video)].filter(Boolean).join('\n');
+    this.seen(state);
+    return [lead, this.t.pageLine(state.title, state.url), this.currentVideo(state), this.t.video(state.video)].filter(Boolean).join('\n');
+  }
+
+  /** The playing video's own address, when the page names one. */
+  private currentVideo(state: PageState): string {
+    return state.current ? this.t.currentVideo(state.current.title, state.current.url) : '';
   }
 
   private image(shot: Shot, lead: string): ToolOutcome {
-    const text = [lead, this.t.pageLine(shot.state.title, shot.state.url), this.t.video(shot.state.video)].filter(Boolean).join('\n');
+    this.seen(shot.state);
+    const text = [lead, this.t.pageLine(shot.state.title, shot.state.url), this.currentVideo(shot.state), this.t.video(shot.state.video)].filter(Boolean).join('\n');
     if (!(this.host?.modelFacts.accepts('image/jpeg') ?? true)) return this.toast(`${text}\n${this.t.noImage}`);
     return {
       text,
@@ -684,8 +1250,9 @@ export class BrowserWorld implements World {
 
   private frames(shots: Shot[], seconds: number, times: number[], audioNote = ''): ToolOutcome {
     const last = shots[shots.length - 1]!;
+    this.seen(last.state);
     const shown = times.slice(0, shots.length);
-    const text = [this.t.watched(seconds, shots.length, shown), this.t.pageLine(last.state.title, last.state.url), this.t.video(last.state.video), audioNote]
+    const text = [this.t.watched(seconds, shots.length, shown), this.t.pageLine(last.state.title, last.state.url), this.currentVideo(last.state), this.t.video(last.state.video), audioNote]
       .filter(Boolean).join('\n');
     if (!(this.host?.modelFacts.accepts('image/jpeg') ?? true)) return this.toast(`${text}\n${this.t.noImage}`);
     return {

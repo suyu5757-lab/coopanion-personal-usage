@@ -21,7 +21,7 @@ export default {
       minutes: '分钟',
       sound: '浏览器声音', soundDescription: '默认静音。打开后,她看的视频会外放。',
       topics: '允许探索的网页主题', topicsDescription: '每行填写一个主题；留空时暂停网页探索。每段最多 20 分钟、80 次浏览器工具调用；网页始终是外部来源。',
-      actions: '允许点赞、收藏、关注、发弹幕、评论和分享', actionsDescription: '关闭后她只能看网页和视频,不能互动。登录和验证码请在她的浏览器窗口里自己完成。',
+      actions: '允许点赞、收藏、关注、分享、发送弹幕、评论、上传素材和生成图片', actionsDescription: '关闭后她只能浏览；点赞、关注、分享、弹幕、评论、素材上传和 ChatGPT 生图都不可用。登录和验证码请在她的浏览器窗口里自己完成。',
     },
     growth: {
       title: '自我成长',
@@ -56,6 +56,13 @@ export default {
   /** 电脑操作征求同意时气泡里的两个按钮 */
 
   /** 状态气泡:Coo 正在用的工具 */
+  browserSend: {
+    question: (account: string, where: string, text: string) => `要让 Coo 从账号「${account}」在「${where}」发布这条内容吗？\n\n${text}\n\n只发送这一次。`,
+    yes: '发送',
+    no: '不发送',
+    unresolved: (count: number) => `上次有 ${count} 条内容没能确认有没有发出去。去她的浏览器窗口看一眼，再决定要不要重发。`,
+  },
+
   status: {
     read: '在查看', browse: '在翻阅', memory: '记忆', find: '在查找', search: '在搜索', write: '在写入', edit: '在修改', append: '在追加',
     delete: '在删除', save: '在保存', screen: '在查看屏幕', web: '在看网页', windows: '在查看打开的窗口', rightClick: '在右击', doubleClick: '在双击', click: '在点击',

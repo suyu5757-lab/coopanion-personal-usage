@@ -90,6 +90,8 @@ export interface DesktopPetAssembly {
   language?(): Language;
   /** Called with each answer to computer use's question in the pet's bubble. */
   onCuaAnswer?(answer: Answer): void;
+  /** Core's shared policy gate for computer input. */
+  authorizeInput?(tool: string): boolean;
 }
 
 /** The definition, with what an embedding app lends the World. */
@@ -122,6 +124,7 @@ export function desktopPetDefinition(assembly: DesktopPetAssembly = {}): WorldDe
         replyLanguage: () => assembly.replyLanguage?.() ?? null,
         language: () => assembly.language?.() ?? 'zh',
         onCuaAnswer: (answer) => assembly.onCuaAnswer?.(answer),
+        allowCuaInput: assembly.authorizeInput,
       });
       assembly.onCreate?.(world);
       return world;

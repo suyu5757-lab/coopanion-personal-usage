@@ -7,7 +7,7 @@ import { downscale, drawCursor, encodeJpeg, fit } from '../../src/cua/engine/ima
 import { displayAt, ordered, toLocal, toNative } from '../../src/cua/engine/display.ts';
 import { CUA_DEFAULTS, type CuaConfig } from '../../src/cua/config.ts';
 import { Cua } from '../../src/cua/cua.ts';
-import { DriverFailure, type ActionOptions, type CaptureOptions, type CuaDriverLike, type DriverAction, type DriverCapture, type DriverChord, type DriverZoom } from '../../src/cua/driver.ts';
+import { DriverFailure, type ActionOptions, type CaptureOptions, type CuaDriverLike, type DriverAction, type DriverCapture, type DriverChord, type DriverElement, type DriverZoom } from '../../src/cua/driver.ts';
 import { FakeHost } from '../helpers/fake-host.ts';
 
 describe('parseKeys', () => {
@@ -137,37 +137,37 @@ describe('computer use without the engine', () => {
     const see = (w: Cua) => call(w, 'pet_cua_screenshot', {});
     const act = (w: Cua) => call(w, 'pet_cua_click', { x: 1, y: 1 });
 
-    it('ask-each-turn asks before the first look of every turn', async () => {
-      const { w, asked } = levelWorld('ask-each-turn', ['yes', 'yes']);
+    it('ask-each-turn asks before the first look of every turn and exact action approvals remain separate', async () => {
+      const { w, asked } = levelWorld('ask-each-turn', ['yes', 'yes', 'yes']);
       expect([(await see(w)).failed, (await act(w)).failed]).toEqual([undefined, undefined]);
       w.onTurnEnded();
       await see(w);
-      expect(asked).toHaveLength(2);
+      expect(asked).toHaveLength(3);
     });
 
     it('ask-before-acting looks without asking and asks before the first input of every turn', async () => {
-      const { w, asked } = levelWorld('ask-before-acting', ['no', 'yes']);
+      const { w, asked } = levelWorld('ask-before-acting', ['no', 'yes', 'yes']);
       expect((await see(w)).failed).toBeUndefined();
       expect(asked).toHaveLength(0);
-      expect((await act(w)).text).toContain('没有允许动鼠标键盘');
+      expect((await act(w)).text).toContain('没有允许移动指针或滚动');
       expect((await see(w)).failed).toBeUndefined();
       w.onTurnEnded();
       expect((await act(w)).failed).toBeUndefined();
-      expect(asked).toHaveLength(2);
+      expect(asked).toHaveLength(3);
     });
 
     it('ask-once holds a yes across turns for grantMinutes, then asks again', async () => {
       vi.useFakeTimers({ toFake: ['Date'] });
       try {
-        const { w, asked } = levelWorld('ask-once', ['yes', 'yes']);
+        const { w, asked } = levelWorld('ask-once', ['yes', 'yes', 'yes', 'yes', 'yes']);
         await act(w);
         w.onTurnEnded();
         await act(w);
-        expect(asked).toHaveLength(1);
+        expect(asked).toHaveLength(3);
         expect(asked[0]).toContain('30 分钟');
         vi.setSystemTime(Date.now() + 31 * 60_000);
         await act(w);
-        expect(asked).toHaveLength(2);
+        expect(asked).toHaveLength(5);
       } finally {
         vi.useRealTimers();
       }
@@ -183,10 +183,13 @@ describe('computer use without the engine', () => {
       expect(asked).toHaveLength(1);
     });
 
-    it('never-ask never asks', async () => {
+    it('never-ask skips the general grant but still requires exact input approval', async () => {
       const { w, asked } = levelWorld('never-ask', []);
-      expect([(await see(w)).failed, (await act(w)).failed]).toEqual([undefined, undefined]);
-      expect(asked).toEqual([]);
+      expect((await see(w)).failed).toBeUndefined();
+      expect((await act(w)).failed).toBe(true);
+      expect(asked).toHaveLength(1);
+      expect(asked[0]).toContain('display 1');
+      expect(asked[0]).toContain('left click at (1, 1)');
     });
   });
 
@@ -194,7 +197,7 @@ describe('computer use without the engine', () => {
     /** A never-ask world whose engine answers a screenshot at once and holds `type` until a cancel for it arrives. */
     const interruptWorld = () => {
       const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
-      const w = new Cua({ cfg: () => cfg });
+      const w = new Cua({ cfg: () => cfg, askPermission: async () => 'yes' });
       const inner = w as unknown as { spawn: () => unknown; pending: Map<number, { done: (v: unknown) => void; timer: NodeJS.Timeout }> };
       const answer = (id: number, value: unknown) => {
         const p = inner.pending.get(id)!;
@@ -336,7 +339,7 @@ describe('displays', () => {
     const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
     cfg.screenshot.afterAction = false;
     cfg.screenshot.settleMs = 0;
-    const w = new Cua({ cfg: () => cfg });
+    const w = new Cua({ cfg: () => cfg, askPermission: async () => 'yes' });
     const two = { displays: [{ index: 1, primary: true, width: 2560, height: 1600 }, { index: 2, primary: false, width: 3840, height: 2160 }], layout: 'two', cursor: { display: 1, x: 5, y: 5 }, foreground: null, foregroundDisplay: 1 };
     const sent: Array<Record<string, unknown>> = [];
     const inner = w as unknown as { spawn: () => unknown; pending: Map<number, { done: (v: unknown) => void; timer: NodeJS.Timeout }> };
@@ -370,7 +373,7 @@ describe('displays', () => {
   it('after an input brings a window forward on another display, the screenshot shows that display', async () => {
     const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
     cfg.screenshot.settleMs = 0;
-    const w = new Cua({ cfg: () => cfg });
+    const w = new Cua({ cfg: () => cfg, askPermission: async () => 'yes' });
     const two = { displays: [{ index: 1, primary: true, width: 2560, height: 1600 }, { index: 2, primary: false, width: 2560, height: 1440 }], layout: 'two', cursor: null };
     // the Run box comes up on display 1 once the key has been pressed
     let pressed = false;
@@ -408,6 +411,9 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
     availableValue = true;
     captures = 0;
     clicks: Array<{ pid: number; windowId: number; x: number; y: number; captureId: string; button?: string; count?: number }> = [];
+    clickAttempts: Array<'background' | 'foreground'> = [];
+    elementClicks: Array<{ pid: number; windowId: number; token: string }> = [];
+    nextClickFailure: 'background_unavailable' | 'capture_not_found' | null = null;
     types: string[] = [];
     keys: DriverChord[][] = [];
     scrolls: Array<{ x: number; y: number; down: number; right: number }> = [];
@@ -420,11 +426,25 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
 
     async capture(pid: number, windowId: number, _opts: CaptureOptions): Promise<DriverCapture> {
       this.captures += 1;
-      return { pid, windowId, title: 'Calculator', width: 100, height: 80, scale: 2, captureId: `cap-${this.captures}`, bounds: null, jpeg: SMALL_JPEG };
+      const snapshotId = `snapshot-${this.captures}`;
+      const elements: DriverElement[] = [{ token: `${snapshotId}:1`, role: 'button', label: 'Run', value: 'private field value', actions: ['press'] }];
+      return { pid, windowId, title: 'Calculator', width: 100, height: 80, scale: 2, captureId: `cap-${this.captures}`, snapshotId, elements, bounds: null, jpeg: SMALL_JPEG };
     }
 
     async click(pid: number, windowId: number, x: number, y: number, captureId: string, opts?: ActionOptions & { button?: 'left' | 'right' | 'middle'; count?: number }): Promise<DriverAction> {
+      const mode = opts?.deliveryMode ?? 'background';
+      this.clickAttempts.push(mode);
+      if (this.nextClickFailure && mode === 'background') {
+        const code = this.nextClickFailure;
+        this.nextClickFailure = null;
+        throw new DriverFailure(code, code === 'capture_not_found' ? 'capture was already consumed' : 'background route unavailable');
+      }
       this.clicks.push({ pid, windowId, x, y, captureId, button: opts?.button, count: opts?.count });
+      return OK;
+    }
+
+    async clickElement(pid: number, windowId: number, token: string): Promise<DriverAction> {
+      this.elementClicks.push({ pid, windowId, token });
       return OK;
     }
 
@@ -461,7 +481,7 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
   const world = (driver: FakeDriver) => {
     const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
     cfg.screenshot.settleMs = 0;
-    return new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en' });
+    return new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'yes' });
   };
   const call = (w: Cua, name: string, args: Record<string, unknown>) =>
     w.tools().find((t) => t.name === name)!.handler(args, { role: 'main', log: new FakeHost().log }) as Promise<{ text: string; failed?: true; blobs?: unknown[] }>;
@@ -478,6 +498,87 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
     expect(driver.clicks).toEqual([{ pid: 123, windowId: 456, x: 10, y: 20, captureId: 'cap-1', button: 'left', count: 1 }]);
     expect(driver.captures).toBe(2);
     expect(click.text).toContain('Clicked');
+  });
+
+  it('lists pressable accessibility tokens and clicks one only after a one-action approval', async () => {
+    const driver = new FakeDriver();
+    const asked: string[] = [];
+    const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
+    cfg.screenshot.settleMs = 0;
+    const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async (q) => { asked.push(q); return 'yes'; } });
+    await call(w, 'pet_cua_window', { window: '123:456' });
+    const listed = await call(w, 'pet_cua_accessibility', {});
+    expect(listed.text).toContain('snapshot-2:1');
+    expect(listed.text).toContain('Run');
+    expect(listed.text).not.toContain('private field value');
+    const click = await call(w, 'pet_cua_click', { elementToken: 'snapshot-2:1' });
+    expect(click.failed).toBeUndefined();
+    expect(driver.elementClicks).toEqual([{ pid: 123, windowId: 456, token: 'snapshot-2:1' }]);
+    expect(driver.clicks).toEqual([]);
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toContain('Run');
+    expect(asked[0]).toContain('Calculator');
+  });
+
+  it('does not retry a stale pixel capture', async () => {
+    const driver = new FakeDriver();
+    driver.nextClickFailure = 'capture_not_found';
+    const w = world(driver);
+    await call(w, 'pet_cua_window', { window: '123:456' });
+    const out = await call(w, 'pet_cua_click', { x: 10, y: 20, screenshot: false });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('may or may not have landed');
+    expect(out.text).toContain('not retried');
+    expect(driver.clickAttempts).toEqual(['background']);
+    expect(driver.clicks).toEqual([]);
+    expect(driver.captures).toBe(2);
+  });
+
+  it('requires a second approval before retrying an unavailable background click in the foreground', async () => {
+    const driver = new FakeDriver();
+    driver.nextClickFailure = 'background_unavailable';
+    const asked: string[] = [];
+    const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
+    cfg.screenshot.afterAction = false;
+    const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', language: () => 'en', askPermission: async (q) => { asked.push(q); return 'yes'; } });
+    await call(w, 'pet_cua_window', { window: '123:456' });
+    expect((await call(w, 'pet_cua_click', { x: 10, y: 20 })).failed).toBeUndefined();
+    expect(driver.clickAttempts).toEqual(['background', 'foreground']);
+    expect(driver.clicks).toHaveLength(1);
+    expect(asked).toHaveLength(2);
+    expect(asked[1]).toContain('foreground');
+    expect(asked[1]).toContain('Calculator');
+  });
+
+  it('does not retry foreground when backgroundOnly is enabled', async () => {
+    const driver = new FakeDriver();
+    driver.nextClickFailure = 'background_unavailable';
+    const cfg = { ...structuredClone(CUA_DEFAULTS), backgroundOnly: true, permission: 'never-ask' as const };
+    cfg.screenshot.afterAction = false;
+    const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'yes' });
+    await call(w, 'pet_cua_window', { window: '123:456' });
+    const out = await call(w, 'pet_cua_click', { x: 10, y: 20 });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('backgroundOnly');
+    expect(driver.clickAttempts).toEqual(['background']);
+    expect(driver.clicks).toEqual([]);
+  });
+
+  it('refuses a denied exact action and does not let an old element token click a new snapshot', async () => {
+    const driver = new FakeDriver();
+    const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
+    cfg.screenshot.settleMs = 0;
+    const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'no' });
+    await call(w, 'pet_cua_window', { window: '123:456' });
+    const listed = await call(w, 'pet_cua_accessibility', {});
+    expect((await call(w, 'pet_cua_click', { elementToken: 'snapshot-2:1' })).failed).toBe(true);
+    expect(driver.elementClicks).toEqual([]);
+    const renewed = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'yes' });
+    await call(renewed, 'pet_cua_window', { window: '123:456' });
+    await call(renewed, 'pet_cua_accessibility', {});
+    const stale = await call(renewed, 'pet_cua_click', { elementToken: listed.text.match(/snapshot-\d+:1/)?.[0] ?? '' });
+    expect(stale.failed).toBe(true);
+    expect(driver.elementClicks).toEqual([]);
   });
 
   it('blocks every foreground input before starting an engine in background-only mode', async () => {
@@ -502,7 +603,7 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
     const driver = new FakeDriver();
     const cfg = { ...structuredClone(CUA_DEFAULTS), backgroundOnly: true, permission: 'never-ask' as const };
     cfg.screenshot.settleMs = 0;
-    const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en' });
+    const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'yes' });
     const engineOps: string[] = [];
     const inner = w as unknown as { call: (req: { op: string }) => Promise<unknown> };
     inner.call = async (req) => {

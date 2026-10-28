@@ -19,7 +19,7 @@ const ko: Translation<CoreText> = {
       minutes: '분',
       sound: '브라우저 소리', soundDescription: '기본은 음소거입니다. 켜면 보는 영상의 소리가 납니다.',
       topics: '허용된 웹 탐색 주제', topicsDescription: '한 줄에 주제 하나를 입력하세요. 비워 두면 웹 탐색을 멈춥니다. 세션은 최대 20분, 브라우저 도구 80회로 제한되며 웹 페이지는 외부 출처로 취급합니다.',
-      actions: '좋아요·저장·팔로우·탄막·댓글·공유 허용', actionsDescription: '끄면 보기만 할 수 있습니다. 로그인과 인증 코드는 브라우저 창에서 직접 해 주세요.',
+      actions: '좋아요·저장·팔로우·공유·탄막·댓글·미디어 업로드·ChatGPT 이미지 생성 허용', actionsDescription: '끄면 탐색만 할 수 있으며 좋아요, 팔로우, 공유, 댓글, 미디어 업로드, ChatGPT 이미지 생성을 사용할 수 없습니다. 로그인과 인증 코드는 브라우저 창에서 직접 해 주세요.',
     },
     growth: {
       title: '스스로 성장하기',
@@ -47,6 +47,13 @@ const ko: Translation<CoreText> = {
   quit: '앱 종료',
 
   noticeLabel: '앱 알림',
+
+  browserSend: {
+    question: (account: string, where: string, text: string) => `계정 「${account}」에서 「${where}」에 이 내용을 게시할까요?\n\n${text}\n\n한 번만 전송합니다.`,
+    yes: '게시',
+    no: '게시하지 않기',
+    unresolved: (count: number) => `지난번에 전송되었는지 확인되지 않은 내용이 ${count}건 있습니다. Coo의 브라우저 창에서 확인한 뒤 다시 보낼지 정하세요.`,
+  },
 
   status: {
     read: '읽는 중', browse: '둘러보는 중', memory: '기억', find: '찾는 중', search: '검색 중', write: '쓰는 중', edit: '고치는 중', append: '덧붙이는 중',

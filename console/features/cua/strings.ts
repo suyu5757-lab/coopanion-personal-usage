@@ -13,7 +13,7 @@ const zh = {
   title: '电脑操作',
   enabled: '让 Coo 操作这台电脑',
   control: '允许操作鼠标和键盘',
-  controlHint: '关闭时只能查看屏幕。',
+  controlHint: "当前集成候选仅允许查看屏幕和窗口，鼠标与键盘操作暂不可用。",
   permission: '询问时机',
   levels: { 'ask-each-turn': '每轮询问', 'ask-before-acting': '操作前询问', 'ask-once': '询问一次', 'never-ask': '从不询问' },
   levelHints: {
@@ -43,7 +43,7 @@ export const en: typeof zh = {
   title: 'Computer use',
   enabled: 'Let Coo use this computer',
   control: 'Allow the mouse and keyboard',
-  controlHint: 'When off, Coo can only look at the screen.',
+  controlHint: "This integration candidate permits screen and window observation. Mouse and keyboard input are temporarily unavailable.",
   permission: 'When to ask you',
   levels: { 'ask-each-turn': 'Every turn', 'ask-before-acting': 'Before acting', 'ask-once': 'Once', 'never-ask': 'Never' },
   levelHints: {

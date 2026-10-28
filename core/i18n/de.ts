@@ -19,7 +19,7 @@ const de: Translation<CoreText> = {
       minutes: 'Min.',
       sound: 'Browser-Ton', soundDescription: 'Standardmäßig stumm. Eingeschaltet hört man die Videos, die sie ansieht.',
       topics: 'Erlaubte Web-Themen', topicsDescription: 'Ein Thema pro Zeile. Leer lassen, um die Web-Erkundung zu pausieren. Pro Sitzung höchstens 20 Minuten und 80 Browser-Aufrufe; Webseiten bleiben externe Quellen.',
-      actions: 'Likes, Favoriten, Folgen, Danmaku, Kommentare und Teilen erlauben', actionsDescription: 'Aus: Sie darf nur zusehen. Anmeldung und Codes bitte selbst in ihrem Browserfenster eingeben.',
+      actions: 'Likes, Favoriten, Folgen, Teilen, Danmaku, Kommentare, Medien-Uploads und ChatGPT-Bilderstellung erlauben', actionsDescription: 'Aus: Sie kann nur browsen; Likes, Folgen, Teilen, Kommentare, Medien-Uploads und ChatGPT-Bilderstellung sind deaktiviert. Anmeldung und Codes bitte selbst in ihrem Browserfenster eingeben.',
     },
     growth: {
       title: 'Selbst wachsen',
@@ -47,6 +47,13 @@ const de: Translation<CoreText> = {
   quit: 'App beenden',
 
   noticeLabel: 'App-Benachrichtigungen',
+
+  browserSend: {
+    question: (account: string, where: string, text: string) => `Diesen Inhalt vom Konto „${account}“ in „${where}“ veröffentlichen?\n\n${text}\n\nEr wird nur einmal gesendet.`,
+    yes: 'Senden',
+    no: 'Nicht senden',
+    unresolved: (count: number) => `Bei ${count} früheren Inhalten aus ihrem Browser ließ sich der Versand nicht bestätigen. Prüfe ihr Browserfenster, bevor du erneut sendest.`,
+  },
 
   status: {
     read: 'Liest', browse: 'Stöbert', memory: 'Gedächtnis', find: 'Sucht', search: 'Durchsucht', write: 'Schreibt', edit: 'Bearbeitet', append: 'Ergänzt',

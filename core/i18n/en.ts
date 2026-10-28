@@ -24,7 +24,7 @@ const en: CoreText = {
       minutes: 'min',
       sound: 'Browser sound', soundDescription: 'Muted by default. With this on, the videos she watches play aloud.',
       topics: 'Allowed web topics', topicsDescription: 'One topic per line. Leave blank to pause web exploration. Each session is limited to 20 minutes and 80 browser tool calls; web pages remain untrusted sources.',
-      actions: 'Allow likes, saves, follows, danmaku, comments and sharing', actionsDescription: 'Off: she can only look, not interact. Sign in and solve CAPTCHAs in her browser window yourself.',
+      actions: 'Allow likes, saves, follows, sharing, danmaku, comments, media uploads and ChatGPT image generation', actionsDescription: 'Off: she can only browse; likes, follows, sharing, comments, media uploads and ChatGPT image generation are disabled. Sign in and solve CAPTCHAs in her browser window yourself.',
     },
     growth: {
       title: 'Growing on her own',
@@ -57,6 +57,13 @@ const en: CoreText = {
   /** The two buttons in the bubble when computer use asks for permission. */
 
   /** The status bubble: the tool Coo is using. */
+  browserSend: {
+    question: (account: string, where: string, text: string) => `Post this from account "${account}" to "${where}"?\n\n${text}\n\nIt is sent once.`,
+    yes: 'Post',
+    no: 'Do not post',
+    unresolved: (count: number) => `${count} earlier item${count === 1 ? '' : 's'} from her browser could not be confirmed as sent. Check her browser window before posting again.`,
+  },
+
   status: {
     read: 'Reading', browse: 'Browsing', memory: 'memory', find: 'Looking for', search: 'Searching', write: 'Writing', edit: 'Editing', append: 'Adding to',
     delete: 'Deleting', save: 'Saving', screen: 'Looking at the screen', web: 'On a web page', windows: 'Looking at the open windows', rightClick: 'Right-clicking', doubleClick: 'Double-clicking', click: 'Clicking',

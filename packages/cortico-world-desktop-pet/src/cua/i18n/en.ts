@@ -13,6 +13,8 @@ const en: CuaText = {
     once: (who: string, minutes: number) => `${who} wants to use your mouse and keyboard. OK for the next ${minutes} minutes?`,
     acting: (who: string) => `${who} wants to use your mouse and keyboard. OK this time?`,
     /** The two buttons, of the pet's bubble and of the system dialog; `caption` is the system dialog's title (shown while no pet page is there). */
+    action: (who: string, action: string, target: string, detail: string) => `${who} asks to use the computer: ${action}. Target: ${target}. Details: ${detail}. Allow this action once?`,
+    actions: { click: 'click', drag: 'drag', type: 'type text', key: 'press keys', focus: 'focus a window', foreground: 'retry in the foreground' },
     caption: 'Computer use',
     yes: 'Yes',
     no: 'Not this time',
@@ -42,7 +44,7 @@ const en: CuaText = {
     group: 'Computer use',
     enabled: { title: 'Turn on computer use' },
     control: { title: 'Allow the mouse and keyboard', description: 'When off, only screenshots and the window list.' },
-    permission: { title: 'When to ask you', description: 'ask-each-turn: before looking at the screen or acting, every turn; ask-before-acting: looking is free, asks before using the mouse and keyboard every turn; ask-once: looking is free, asks once before using the mouse and keyboard, and a yes holds for "A yes lasts"; never-ask: never asks.' },
+    permission: { title: 'When to ask you', description: 'ask-each-turn: before looking at the screen or acting, every turn; ask-before-acting: looking is free, asks before using the mouse and keyboard every turn; ask-once: looking is free, asks once before using the mouse and keyboard, and a yes holds for "A yes lasts"; never-ask: never asks. Input actions still show a separate confirmation with their exact target and details, including under never-ask.' },
     grantMinutes: { title: 'A yes lasts', suffix: 'min', description: 'For ask-once only.' },
     userIdleMs: { title: 'Stay out of the way for', description: 'After you use the mouse or keyboard, Coo waits until they have been still this long.' },
     maxYieldWaitMs: { title: 'Longest wait for you' },

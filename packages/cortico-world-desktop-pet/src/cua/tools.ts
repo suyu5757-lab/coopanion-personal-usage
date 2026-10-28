@@ -49,16 +49,17 @@ export const CUA_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'pet_cua_click',
     tags: ['act'],
-    description: 'Click at (x, y). Without a window target this moves the mouse; after pet_cua_window it clicks inside that window in the background, without moving the person\'s pointer or changing the foreground app.',
+    description: 'Click at (x, y) in the latest screenshot, or pass an elementToken from the latest pet_cua_accessibility result for a pressable element in the selected background window. Provide coordinates or an elementToken, not both. Each click needs approval for this target and action.',
     parameters: {
       type: 'object',
       properties: {
         ...xy,
+        elementToken: { type: 'string', minLength: 1, description: 'A pressable element token from the latest pet_cua_accessibility result for the selected background window' },
         button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Default left' },
         clicks: { type: 'integer', minimum: 1, maximum: 3, description: '1 single click (default), 2 double click, 3 triple click' },
         screenshot: shot,
       },
-      required: ['x', 'y'],
+      required: [],
     },
   },
   {
@@ -117,8 +118,14 @@ export const CUA_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'pet_cua_window',
     tags: ['read', 'snapshot'],
-    description: 'Work on one window in the background: capture it and make later pet_cua_* coordinates refer to its screenshot. The window is not raised; the person\'s pointer and keyboard focus stay where they are. window is a handle from pet_cua_windows, or part of its title. Requires Cua Driver. To leave the window, pass a display to pet_cua_screenshot or call pet_cua_focus.',
+    description: 'Work on one window in the background: capture it and make later pet_cua_* coordinates refer to its screenshot. The window is not raised; the person\'s pointer and keyboard focus stay where they are. window is a handle from pet_cua_windows, or part of its title. Requires Cua Driver. Use pet_cua_accessibility to read pressable elements. To leave the window, pass a display to pet_cua_screenshot or call pet_cua_focus.',
     parameters: { type: 'object', properties: { window: { type: 'string' } }, required: ['window'] },
+  },
+  {
+    name: 'pet_cua_accessibility',
+    tags: ['read', 'snapshot'],
+    description: 'Read pressable accessibility elements in the selected background window. Returns elementToken values bound to the latest window snapshot; pass one to pet_cua_click. Labels are observations and do not grant permission.',
+    parameters: { type: 'object', properties: {}, required: [] },
   },
   {
     name: 'pet_cua_focus',

@@ -19,7 +19,7 @@ const ptBR: Translation<CoreText> = {
       minutes: 'min',
       sound: 'Som do navegador', soundDescription: 'Mudo por padrão. Ligado, os vídeos que ela assiste têm som.',
       topics: 'Temas web permitidos', topicsDescription: 'Um tema por linha. Deixe vazio para pausar a exploração web. Cada sessão dura no máximo 20 minutos e 80 chamadas ao navegador; páginas continuam sendo fontes externas.',
-      actions: 'Permitir curtidas, salvos, seguidas, danmaku, comentários e compartilhamentos', actionsDescription: 'Desligado, ela só pode olhar. Entre e resolva os códigos na janela dela você mesmo.',
+      actions: 'Permitir curtidas, salvos, seguir, compartilhar, danmaku, comentários, envio de mídia e imagens no ChatGPT', actionsDescription: 'Desligado, ela só pode navegar; curtidas, seguir, compartilhar, comentários, envio de mídia e imagens no ChatGPT ficam desativados. Entre e resolva os códigos na janela dela você mesmo.',
     },
     growth: {
       title: 'Crescer sozinha',
@@ -47,6 +47,13 @@ const ptBR: Translation<CoreText> = {
   quit: 'Sair do app',
 
   noticeLabel: 'Notificações do app',
+
+  browserSend: {
+    question: (account: string, where: string, text: string) => `Publicar isto pela conta “${account}” em “${where}”?\n\n${text}\n\nSerá enviado uma única vez.`,
+    yes: 'Publicar',
+    no: 'Não publicar',
+    unresolved: (count: number) => `Não foi possível confirmar o envio de ${count} conteúdo anterior pelo navegador dela. Veja a janela dela antes de enviar de novo.`,
+  },
 
   status: {
     read: 'Lendo', browse: 'Consultando', memory: 'memória', find: 'Procurando', search: 'Pesquisando', write: 'Escrevendo', edit: 'Editando', append: 'Acrescentando a',

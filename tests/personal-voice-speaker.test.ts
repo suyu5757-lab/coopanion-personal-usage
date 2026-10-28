@@ -35,7 +35,7 @@ function wav(ms = 40, sampleRate = 32_000): Buffer {
 }
 
 function audioResponse(bytes = wav(), headers: Record<string, string> = {}): Response {
-  return new Response(bytes, { status: 200, headers: { 'content-type': 'audio/wav', ...headers } });
+  return new Response(new Uint8Array(bytes), { status: 200, headers: { 'content-type': 'audio/wav', ...headers } });
 }
 
 function trace(id: string): SpeechTraceV1 {

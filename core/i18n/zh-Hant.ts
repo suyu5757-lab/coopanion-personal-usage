@@ -19,7 +19,7 @@ const zhHant: Translation<CoreText> = {
       minutes: '分鐘',
       sound: '瀏覽器聲音', soundDescription: '預設靜音。打開後，她看的影片會外放。',
       topics: '允許探索的網頁主題', topicsDescription: '每行填寫一個主題；留白時暫停網頁探索。每段最多 20 分鐘、80 次瀏覽器工具呼叫；網頁始終是外部來源。',
-      actions: '允許按讚、收藏、關注、發送彈幕、評論和分享', actionsDescription: '關閉後她只能看網頁和影片，不能互動。登入和驗證碼請在她的瀏覽器視窗裡自己完成。',
+      actions: '允許按讚、收藏、關注、分享、發送彈幕、評論、上傳素材和生成圖片', actionsDescription: '關閉後她只能瀏覽；按讚、關注、分享、評論、素材上傳和 ChatGPT 生圖都無法使用。登入和驗證碼請在她的瀏覽器視窗裡自己完成。',
     },
     growth: {
       title: '自我成長',
@@ -47,6 +47,13 @@ const zhHant: Translation<CoreText> = {
   quit: '結束應用程式',
 
   noticeLabel: '應用程式通知',
+
+  browserSend: {
+    question: (account: string, where: string, text: string) => `要讓 Coo 從帳號「${account}」在「${where}」發布這則內容嗎？\n\n${text}\n\n只傳送這一次。`,
+    yes: '傳送',
+    no: '不要傳送',
+    unresolved: (count: number) => `上次有 ${count} 則內容無法確認有沒有送出去。到她的瀏覽器視窗看一眼，再決定要不要重送。`,
+  },
 
   status: {
     read: '在查看', browse: '在翻閱', memory: '記憶', find: '在尋找', search: '在搜尋', write: '在寫入', edit: '在修改', append: '在附加',

@@ -174,6 +174,9 @@ describe('browser guard', () => {
     expect(clickRefusal('发消息')).toBe('private');
     expect(clickRefusal('点赞')).toBeNull();
     expect(clickRefusal('收藏')).toBeNull();
+    expect(clickRefusal('删除')).toBe('destructive');
+    expect(clickRefusal('删除评论')).toBe('destructive');
+    expect(clickRefusal('Delete comment')).toBe('destructive');
   });
 
   it('refuses password and personal fields, and recognizes search fields', () => {
@@ -185,6 +188,24 @@ describe('browser guard', () => {
     expect(isWriteAction('点赞')).toBe(true);
     expect(isWriteAction('分享')).toBe(true);
     expect(isWriteAction('播放')).toBe(false);
+    expect(isWriteAction('删除评论')).toBe(true);
+  });
+
+  it('never clicks a delete control even while public actions are enabled', async () => {
+    const { world, bridge } = await make();
+    bridge.responses.open = {
+      ...page(),
+      snapshotId: 'snapshot-delete',
+      elements: [{ id: 3, label: '删除评论' }],
+    };
+    bridge.element = element({
+      id: 3, tag: 'button', text: '删除评论', label: '删除评论', title: '', snapshotId: 'snapshot-delete',
+    });
+    await run(world, 'browser_open', { url: 'https://www.douyin.com/creator-micro/comment/manage' });
+    const out = await run(world, 'browser_click', { index: 3 });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('删除或移除内容');
+    expect(bridge.calls.some((call) => call.op === 'click')).toBe(false);
   });
 });
 
@@ -228,6 +249,81 @@ describe('browser World', () => {
     expect(text.text).toContain('视频标题');
     const found = await run(world, 'browser_find', { query: '第三行' });
     expect(found.text).toContain('第三行');
+  });
+
+  it('submits one image prompt through the ChatGPT page and reports an unclear result without retrying', async () => {
+    const { world, bridge } = await make({ self: { actions: true } });
+    const chatgpt = page({ url: 'https://chatgpt.com/', title: 'ChatGPT', header: 'ChatGPT', content: 'Message' });
+    bridge.responses.open = chatgpt;
+    bridge.responses['chatgpt-generate-image'] = {
+      submitted: false,
+      state: chatgpt,
+      base64: Buffer.from('page').toString('base64'),
+      width: 640,
+      height: 480,
+    };
+    await run(world, 'browser_open', { url: 'https://chatgpt.com/' });
+    const out = await run(world, 'browser_chatgpt_generate_image', { prompt: 'A cozy little whale beside a window' });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('不要再次提交');
+    expect(bridge.calls.filter((call) => call.op === 'chatgpt-generate-image')).toHaveLength(1);
+  });
+
+  it('saves ChatGPT images only from the current ChatGPT page when browser actions are enabled', async () => {
+    const { world, bridge } = await make({ self: { actions: true } });
+    const state = {
+      ...page({ url: 'https://chatgpt.com/c/abc', title: 'ChatGPT', content: 'Generated image' }),
+      snapshotId: 'image-state',
+      elements: [{ id: 2, label: 'Download' }],
+    };
+    bridge.responses.open = state;
+    bridge.element = element({ id: 2, tag: 'button', label: 'Download', text: 'Download', snapshotId: 'image-state' });
+    bridge.responses['save-chatgpt-image'] = { file: 'chatgpt-image-1.png', bytes: 1024, state };
+    await run(world, 'browser_open', { url: 'https://chatgpt.com/c/abc' });
+    const out = await run(world, 'browser_save_chatgpt_image', { index: 2 });
+    expect(out.failed).toBeUndefined();
+    expect(out.text).toContain('chatgpt-image-1.png');
+    expect(bridge.calls.find((call) => call.op === 'save-chatgpt-image')?.args).toMatchObject({ index: 2, snapshotId: 'image-state' });
+  });
+
+  it('refuses ChatGPT image generation when Browser actions are turned off', async () => {
+    const { world, bridge } = await make({ self: { actions: false } });
+    bridge.responses.open = page({ url: 'https://chatgpt.com/', title: 'ChatGPT' });
+    await run(world, 'browser_open', { url: 'https://chatgpt.com/' });
+    const out = await run(world, 'browser_chatgpt_generate_image', { prompt: 'A blue whale' });
+    expect(out.failed).toBe(true);
+    expect(bridge.calls.some((call) => call.op === 'chatgpt-generate-image')).toBe(false);
+  });
+
+  it('places only listed media into a current Douyin file input without publishing the post', async () => {
+    const { world, bridge } = await make({ self: { actions: true } });
+    const state = {
+      ...page({ url: 'https://creator.douyin.com/creator-micro/upload', title: '发布作品' }),
+      snapshotId: 'upload-snapshot',
+      fileInputs: [{ id: 88, label: '上传视频', accept: 'video/mp4,image/png', multiple: true, disabled: false, visible: false }],
+    };
+    bridge.responses.open = state;
+    bridge.responses['upload-media'] = { files: ['generated/cover.png'], state };
+    await run(world, 'browser_open', { url: state.url });
+    const out = await run(world, 'browser_upload_media', { fileId: 88, files: ['generated/cover.png'] });
+    expect(out.failed).toBeUndefined();
+    expect(out.text).toContain('generated/cover.png');
+    expect(out.text).toContain('没有提交作品');
+    expect(bridge.calls.find((call) => call.op === 'upload-media')?.args)
+      .toMatchObject({ fileId: 88, snapshotId: 'upload-snapshot', files: ['generated/cover.png'] });
+  });
+
+  it('does not upload media when Browser actions are turned off', async () => {
+    const { world, bridge } = await make({ self: { actions: false } });
+    bridge.responses.open = {
+      ...page({ url: 'https://creator.douyin.com/creator-micro/upload', title: '发布作品' }),
+      snapshotId: 'upload-snapshot',
+      fileInputs: [{ id: 88, label: '上传视频', accept: 'video/mp4', multiple: false, disabled: false, visible: false }],
+    };
+    await run(world, 'browser_open', { url: 'https://creator.douyin.com/creator-micro/upload' });
+    const out = await run(world, 'browser_upload_media', { fileId: 88, files: ['preview.mp4'] });
+    expect(out.failed).toBe(true);
+    expect(bridge.calls.some((call) => call.op === 'upload-media')).toBe(false);
   });
 
   it('refuses a payment control before calling the page', async () => {
@@ -503,6 +599,8 @@ describe('browser World', () => {
     expect(world.envPromptVars()!['browser.actions']).toContain('只允许看');
     setSelf({ actions: true });
     expect(world.envPromptVars()!['browser.actions']).toContain('点赞');
+    expect(world.envPromptVars()!['browser.actions']).toContain('上传素材');
+    expect(world.envPromptVars()!['browser.actions']).toContain('ChatGPT 网页');
     const doc = world.webUi!('zh').promptDocs?.find((d) => d.role === 'envPrompt');
     expect(doc?.path).toBeTruthy();
     expect(existsSync(doc!.path)).toBe(true);
@@ -522,7 +620,10 @@ describe('browser World', () => {
     expect(text).not.toContain('{{browser.');
     setSelf({ actions: true });
     const { text: allowed } = await renderWorldEnvPrompt(world);
-    expect(allowed).toContain('可以点赞、收藏、关注、评论、发弹幕和分享');
+    expect(allowed).toContain('可以点赞、收藏、关注、评论、发弹幕、分享');
+    expect(allowed).toContain('通过 ChatGPT 网页生成图片');
+    expect(allowed).toContain('上传素材');
+    expect(allowed).toContain('browser_upload_media');
   });
 
   it('describes the tools and the closed event', () => {

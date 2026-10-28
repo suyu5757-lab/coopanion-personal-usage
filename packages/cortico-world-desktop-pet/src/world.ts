@@ -242,6 +242,8 @@ export interface DesktopPetWorldOptions {
   replyLanguage?: () => string | null;
   /** Called with each answer to computer use's question, asked in the pet's bubble. */
   onCuaAnswer?: (answer: Answer) => void;
+  /** Core's shared policy gate for computer input. */
+  allowCuaInput?: (tool: string) => boolean;
 }
 
 type SherpaEngine = Exclude<AsrEngine, 'system'>;
@@ -405,6 +407,7 @@ export class DesktopPetWorld implements World {
       botName: opts.botName,
       modelLanguage: () => this.language,
       language: () => this.appLanguage,
+      allowInput: opts.allowCuaInput,
       askPermission: async (question, choices) => {
         const answer = await this.confirm(question, choices);
         if (answer === 'unavailable') return null;

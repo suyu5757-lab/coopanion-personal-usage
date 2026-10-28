@@ -14,7 +14,7 @@ export interface SelfTimeConfig {
   sound: boolean;
   /** User-approved topics for web exploration; blank leaves the browser exploration idle. */
   topics: string;
-  /** Allow likes, favorites, follows, comments and danmaku; off by default, and makes the browser read-only. */
+  /** Allow browser writes, including social actions, media uploads and ChatGPT website image generation. Off by default. */
   actions: boolean;
 }
 

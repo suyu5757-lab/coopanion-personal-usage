@@ -5,11 +5,12 @@
  */
 import type { Language } from 'cortico/core/language.ts';
 import { describeTools, type WorldDefinition, type WorldSection } from 'cortico/world.ts';
+import type { ActionGate } from '../action-gate.ts';
 import type { ModelLanguage } from '../language.ts';
 import type { BrowserTransport } from './bridge.ts';
 import type { SelfTimeConfig } from './config.ts';
 import { BROWSER_TOOL_DECLS } from './tools.ts';
-import { BrowserWorld, BROWSER_WORLD_ID } from './world.ts';
+import { BrowserWorld, BROWSER_WORLD_ID, type ApprovalAnswer } from './world.ts';
 
 export const BROWSER_ID = BROWSER_WORLD_ID;
 
@@ -18,6 +19,14 @@ export interface BrowserAssembly {
   selfTime: () => SelfTimeConfig;
   modelLanguage: () => ModelLanguage;
   language?: () => Language;
+  /** Core's write gate, shared with the other Worlds that reach outside. */
+  gate?: ActionGate;
+  /** Asks the person to confirm one public write, in the pet's bubble; absent: no public write is sent. */
+  ask?: (question: string, choices: [yes: string, no: string]) => Promise<ApprovalAnswer>;
+  /** The file of unresolved public writes. */
+  journalFile?: string;
+  /** Durable duplicate guard for completed comment replies. */
+  replyJournalFile?: string;
   /** Transcribes one finished 16 kHz mono utterance from the page's audio; absent when speech recognition is unavailable. */
   transcribe?: (pcm: Int16Array) => Promise<{ text: string; error?: string | null }>;
   /** A browsing session ended; Coo's next heartbeat starts from now. */
@@ -39,6 +48,9 @@ const SUMMARIES = {
   browser_play: { zh: '播放或暂停页面上的视频。', en: 'Plays or pauses the page video.' },
   browser_watch: { zh: '看一会儿视频，截几帧并把声音转成文字。', en: 'Watches the video for a while, takes a few frames and transcribes its sound.' },
   browser_screenshot: { zh: '截当前页面。', en: 'Takes a screenshot of the page.' },
+  browser_chatgpt_generate_image: { zh: '通过已登录的 ChatGPT 网页提交一条图片生成提示。', en: 'Submits one image-generation prompt through the signed-in ChatGPT website.' },
+  browser_save_chatgpt_image: { zh: '把 ChatGPT 网页上的生成图片保存到视频素材目录。', en: 'Saves a generated image from the ChatGPT page into the video media folder.' },
+  browser_upload_media: { zh: '从视频素材目录选择文件，放进抖音页面的投稿控件。', en: 'Places selected files from the video media folder into a Douyin page upload control.' },
   browser_back: { zh: '回到上一页。', en: 'Goes back a page.' },
   browser_close: { zh: '关上她的浏览器窗口。', en: 'Closes her browser window.' },
 } as const;
@@ -56,6 +68,11 @@ export function browserDefinition(assembly: BrowserAssembly): WorldDefinition<Wo
       selfTime: assembly.selfTime,
       modelLanguage: assembly.modelLanguage,
       timezone: ctx.timezone,
+      ...(assembly.language ? { language: assembly.language } : {}),
+      ...(assembly.gate ? { gate: assembly.gate } : {}),
+      ...(assembly.ask ? { ask: assembly.ask } : {}),
+      ...(assembly.journalFile ? { journalFile: assembly.journalFile } : {}),
+      ...(assembly.replyJournalFile ? { replyJournalFile: assembly.replyJournalFile } : {}),
       ...(assembly.transcribe ? { transcribe: assembly.transcribe } : {}),
       ...(assembly.onSessionEnd ? { onSessionEnd: assembly.onSessionEnd } : {}),
     }),
@@ -64,6 +81,10 @@ export function browserDefinition(assembly: BrowserAssembly): WorldDefinition<Wo
       events: [{
         type: 'browser.closed',
         description: { zh: '她自己的浏览器窗口被关掉了。', en: 'Her own browser window was closed.' },
+        trigger: 'debounce',
+      }, {
+        type: 'browser.unresolved',
+        description: { zh: '上一次对外发的内容没能确认有没有发出去;先到网页上看一眼。', en: 'An earlier post could not be confirmed as sent; check the page before trying again.' },
         trigger: 'debounce',
       }],
     },

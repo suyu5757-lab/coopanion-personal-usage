@@ -4,7 +4,7 @@ export const S: Partial<typeof en> = {
   title: 'Uso de la computadora',
   enabled: 'Dejar que Coo use esta computadora',
   control: 'Permitir el mouse y el teclado',
-  controlHint: 'Si está desactivado, Coo solo puede mirar la pantalla.',
+  controlHint: "Esta versión candidata permite ver pantallas y ventanas. La entrada con mouse y teclado no está disponible por ahora.",
   permission: 'Cuándo preguntarte',
   levels: { 'ask-each-turn': 'Cada turno', 'ask-before-acting': 'Antes de actuar', 'ask-once': 'Una vez', 'never-ask': 'Nunca' },
   levelHints: {

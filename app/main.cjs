@@ -287,6 +287,7 @@ const browser = createBrowserHost({
   icon: WINDOW_ICON,
   log: console,
   send: (msg) => core.send(msg),
+  mediaDir: () => core.dataDir ? join(core.dataDir, 'video', 'media') : null,
 });
 core.on('browser', (msg) => void browser.handle(msg));
 

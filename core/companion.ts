@@ -58,6 +58,7 @@ import { loadExtensions, readInstalled, type ExtensionSet } from 'cortico/extens
 import { deploymentRoot, providersRoot, repoRoot } from 'cortico/paths.ts';
 import { providerModules, registerProviderModules } from 'cortico/providers/registry.ts';
 import { withWorlds, type WorldDefinition, type WorldSection } from 'cortico/world.ts';
+import { ActionGate } from './action-gate.ts';
 import { InstanceLockedError } from 'cortico/core/instance-lock.ts';
 import { CONSOLE } from 'cortico/worlds/console/definition.ts';
 import { desktopPetDefinition, figurePacks, type DesktopPetWorld } from 'cortico-world-desktop-pet';
@@ -73,6 +74,7 @@ import { BrowserBridge } from './browser/bridge.ts';
 import { readSelfTime, SELF_TIME_DEFAULTS } from './browser/config.ts';
 import { readResourcePressure } from './resource-pressure.ts';
 import { GROWTH_DEFAULTS, migrateLegacyGrowthConfig, readGrowth } from './growth/config.ts';
+import { videoConfigGroup, videoDefinition, VIDEO_ID } from './video/definition.ts';
 import { coreText } from './i18n/index.ts';
 import { petToolDescriber } from './pet-status.ts';
 import { appLanguage, modelLanguage, replyLanguage } from './language.ts';
@@ -435,6 +437,10 @@ export async function main(): Promise<void> {
   let telemetry: Telemetry | null = null;
   let config: CoreConfig | null = null;
   let notice: NoticeWorld | null = null;
+  const gate = new ActionGate({
+    platformWrites: () => readSelfTime(config).actions,
+    computerInput: () => getByPath((config ?? {}) as unknown as Record<string, unknown>, 'worlds.desktop-pet.cua.control') !== false,
+  });
   const browserBridge = new BrowserBridge();
   /** The introduction is running: the settings it makes are not told as changes. */
   let guiding = false;
@@ -475,6 +481,7 @@ export async function main(): Promise<void> {
       telemetry?.count('cuaAsked');
       if (answer === 'yes') telemetry?.count('cuaGranted');
     },
+    authorizeInput: (tool) => gate.check({ surface: 'desktop', tool, impact: 'computer-input' }).allow,
     onBotChange: () => (notice as NoticeWorld | null)?.acceptCurrent(),
     onSkin: (skin) => followPetLook(join(deploymentRoot(), DEPLOYMENT), skin, (pet as DesktopPetWorld | null)?.packs() ?? [], language()),
   });
@@ -499,6 +506,7 @@ export async function main(): Promise<void> {
   /** Coopanion's config group; the console reads this object, retitled in place when the app language changes. */
   const settingsGroup = companionGroup('zh');
   const hindsightGroup = hindsightConfigGroup('zh');
+  const videoGroup = videoConfigGroup('zh');
   const longTerm = new HindsightMemory();
   const journal = new RelationshipJournal();
   const affinitySync = new AffinitySync();
@@ -515,7 +523,7 @@ export async function main(): Promise<void> {
   let coo: CoopanionPersona | null = null;
   const definitionBase: BotDefinition<CorminiConfig> = {
     ...base.definition,
-    declares: [CONSOLE.id, DESKTOP_PET.id, NOTICE.id, BROWSER_ID],
+    declares: [CONSOLE.id, DESKTOP_PET.id, NOTICE.id, BROWSER_ID, VIDEO_ID],
     // Cormini's tools under the same names; the memory differs by PARTNER.md and the version history
     describe: {
       tools: [...(base.definition.describe?.tools ?? []), ...memoryToolDescribes({ memory: () => null })],
@@ -574,7 +582,7 @@ export async function main(): Promise<void> {
         onStart: () => persona.startRhythm(),
         onStop: () => { persona.stopRhythm(); persona.stopGrowth(); },
         webUi: {
-          configGroups: [base.contextGroup, settingsGroup, hindsightGroup],
+          configGroups: [base.contextGroup, settingsGroup, hindsightGroup, videoGroup],
           status: () => ({ context: { maxTokens: cfg.context.maxTokens, softRatio: cfg.context.softRatio } }),
           configOptions: (kind) => (kind === LANGUAGE_OPTIONS ? LANGUAGES.map((value) => ({ value, label: LANGUAGE_NAMES[value] })) : []),
         },
@@ -586,6 +594,10 @@ export async function main(): Promise<void> {
     selfTime: () => readSelfTime(config),
     modelLanguage: () => modelLanguage(config?.language),
     language: () => language(),
+    gate,
+    ask: (question, choices) => pet?.confirm(question, choices) ?? Promise.resolve('unavailable'),
+    journalFile: join(deployDir, 'browser', 'actions.json'),
+    replyJournalFile: join(deployDir, 'browser', 'replies.json'),
     transcribe: (pcm) => pet
       ? pet.transcribePcm(pcm)
       : Promise.resolve({ text: '', error: 'the desktop pet is not running' }),
@@ -596,7 +608,13 @@ export async function main(): Promise<void> {
     // the avatar beside the pet; the task itself does not depend on the page being connected
     onState: (state) => pet?.guest(state),
   });
-  const bundled = [CONSOLE, DESKTOP_PET, NOTICE, BROWSER, OPENCODE, CODEX] as WorldDefinition<WorldSection>[];
+  const VIDEO = videoDefinition({
+    modelLanguage: () => modelLanguage(config?.language),
+    language: () => language(),
+    ffmpegPath: () => String(getByPath(config as unknown as Record<string, unknown>, 'worlds.video.ffmpegPath') ?? ''),
+    ffprobePath: () => String(getByPath(config as unknown as Record<string, unknown>, 'worlds.video.ffprobePath') ?? ''),
+  });
+  const bundled = [CONSOLE, DESKTOP_PET, NOTICE, BROWSER, OPENCODE, CODEX, VIDEO] as WorldDefinition<WorldSection>[];
 
   // extension providers must be registered before endpoints are resolved
   const extensions = await loadExtensions(repoRoot(), {
@@ -617,9 +635,11 @@ export async function main(): Promise<void> {
   config = loaded.config;
   Object.assign(settingsGroup, companionGroup(language()));
   Object.assign(hindsightGroup, hindsightConfigGroup(language()));
+  Object.assign(videoGroup, videoConfigGroup(language()));
   watchLanguage(loaded.config, (next) => {
     Object.assign(settingsGroup, companionGroup(next));
     Object.assign(hindsightGroup, hindsightConfigGroup(next));
+    Object.assign(videoGroup, videoConfigGroup(next));
     followPersonaLanguage(loaded.memoryDir, next);
     process.send?.({ type: 'companion:language', language: next });
     (pet as DesktopPetWorld | null)?.refresh();
