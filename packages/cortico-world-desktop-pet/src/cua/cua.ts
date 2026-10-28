@@ -99,11 +99,15 @@ const screenOf = (r: ScreenInfo): ScreenInfo => ({ displays: r.displays, layout:
 interface WindowTarget {
   handle: string;
   pid: number;
+  ownerPid: number | null;
   windowId: number;
   title: string;
   captureId: string;
   snapshotId: string;
   elements: DriverElement[];
+  truncated: boolean;
+  truncationReason: string | null;
+  elementsComplete: boolean | null;
   width: number;
   height: number;
 }
@@ -166,7 +170,7 @@ export class Cua {
 
   /** The background window driver. */
   private get driver(): CuaDriverLike {
-    return this.driverClient ??= this.opts.driver?.() ?? new CuaDriver('coo');
+    return this.driverClient ??= this.opts.driver?.() ?? new CuaDriver();
   }
 
   /** Why a window cannot be selected for background work; null when it can. */
@@ -435,8 +439,15 @@ export class Cua {
   }
 
   /** The options for one driver capture. */
-  private captureOptions(screenshot: boolean, signal?: AbortSignal) {
-    return { screenshot, maxDimension: Math.max(this.cfg.screenshot.maxWidth, this.cfg.screenshot.maxHeight), quality: this.cfg.screenshot.quality, signal };
+  private captureOptions(screenshot: boolean, signal?: AbortSignal, query?: string, maxElements = 250) {
+    return {
+      screenshot,
+      maxDimension: Math.max(this.cfg.screenshot.maxWidth, this.cfg.screenshot.maxHeight),
+      quality: this.cfg.screenshot.quality,
+      maxElements: Math.min(2000, Math.max(1, Math.round(maxElements))),
+      query,
+      signal,
+    };
   }
 
   /** `pet_cua_window`: capture a window and make it the target of later actions. */
@@ -461,41 +472,64 @@ export class Cua {
     await this.permit('see', signal);
     try {
       const cap = await this.driver.capture(pid, windowId, this.captureOptions(true, signal));
-      this.target = { handle, pid, windowId, title: title || cap.title || handle, captureId: cap.captureId, snapshotId: cap.snapshotId, elements: cap.elements, width: cap.width, height: cap.height };
+      this.target = {
+        handle, pid, ownerPid: cap.ownerPid, windowId, title: title || cap.title || handle,
+        captureId: cap.captureId, snapshotId: cap.snapshotId, elements: cap.elements,
+        truncated: cap.truncated, truncationReason: cap.truncationReason, elementsComplete: cap.elementsComplete,
+        width: cap.width, height: cap.height,
+      };
       return this.windowOutcome('', cap);
     } catch (err) {
       return this.driverOutcome('pet_cua_window', err);
     }
   }
 
-  private async accessibility(signal?: AbortSignal): Promise<ToolOutcome> {
+  private async accessibility(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
     const target = this.target;
     if (!target) return { text: this.t.notRun('pet_cua_accessibility', this.t.accessibilityNoWindow), failed: true };
     await this.permit('see', signal);
     try {
-      await this.refreshWindow(false, signal);
+      const query = typeof args.query === 'string' ? args.query.trim().slice(0, 120) : '';
+      const maxElements = typeof args.maxElements === 'number' && Number.isFinite(args.maxElements) ? args.maxElements : 250;
+      await this.refreshWindow(false, signal, query || undefined, maxElements);
       const current = this.target!;
       const elements = current.elements.filter((element) => current.snapshotId
         && element.token.startsWith(`${current.snapshotId}:`)
         && element.actions.some((action) => action.toLowerCase() === 'press'));
-      if (!current.snapshotId || !elements.length) return { text: this.t.notRun('pet_cua_accessibility', this.t.accessibilityEmpty), failed: true };
+      if (!current.snapshotId) return { text: this.t.notRun('pet_cua_accessibility', this.t.accessibilityEmpty), failed: true };
+      if (!elements.length) {
+        const reason = current.truncated ? this.t.accessibilityTruncated(current.truncationReason) : this.t.accessibilityEmpty;
+        return { text: this.t.notRun('pet_cua_accessibility', reason), failed: true };
+      }
       const limit = 120;
       const lines = elements.slice(0, limit).map((element) => {
         const label = element.label ? ` "${element.label.slice(0, 160)}"` : '';
         return `- ${element.token} ${element.role || 'element'}${label}`;
       });
       if (elements.length > limit) lines.push(`… ${elements.length - limit} more`);
-      return { text: `${this.t.windowCurrent(current.title, current.handle)}\n${this.t.accessibilityList(current.snapshotId, elements.length, lines)}` };
+      return { text: `${this.t.windowCurrent(current.title, current.handle)}\n${this.t.accessibilityList(current.snapshotId, elements.length, lines, current.truncated, current.truncationReason)}` };
     } catch (err) {
       return this.driverOutcome('pet_cua_accessibility', err);
     }
   }
 
   /** A fresh capture of the current target, updating its coordinates and capture id. */
-  private async refreshWindow(screenshot: boolean, signal?: AbortSignal) {
+  private async refreshWindow(screenshot: boolean, signal?: AbortSignal, query?: string, maxElements = 250) {
     const target = this.target!;
-    const cap = await this.driver.capture(target.pid, target.windowId, this.captureOptions(screenshot, signal));
-    this.target = { ...target, title: target.title || cap.title, captureId: cap.captureId, snapshotId: cap.snapshotId, elements: cap.elements, width: cap.width, height: cap.height };
+    const cap = await this.driver.capture(target.pid, target.windowId, this.captureOptions(screenshot, signal, query, maxElements));
+    this.target = {
+      ...target,
+      ownerPid: cap.ownerPid,
+      title: target.title || cap.title,
+      captureId: screenshot ? cap.captureId : target.captureId,
+      snapshotId: cap.snapshotId,
+      elements: cap.elements,
+      truncated: cap.truncated,
+      truncationReason: cap.truncationReason,
+      elementsComplete: cap.elementsComplete,
+      width: screenshot ? cap.width : target.width,
+      height: screenshot ? cap.height : target.height,
+    };
     return cap;
   }
 
@@ -588,6 +622,7 @@ export class Cua {
   private driverOutcome(tool: string, err: unknown): ToolOutcome {
     if (err instanceof DriverFailure) {
       if (err.code === 'not_installed') return { text: this.t.notRun(tool, this.t.backgroundMissing), failed: true };
+      if (err.code === 'private_runtime_not_configured' || err.code === 'private_endpoint_unavailable') return { text: this.t.notRun(tool, this.t.backgroundMissing), failed: true };
       if (err.code === 'aborted') return { text: this.t.notRun(tool, this.t.interruptedBeforeAct), failed: true };
       if (err.code === 'stale_element_token') return { text: this.t.notRun(tool, this.t.elementStale), failed: true };
       if (windowGone(err)) this.target = null;
@@ -825,7 +860,7 @@ export class Cua {
       pet_cua_key: (a, s) => this.key(a, s),
       pet_cua_windows: (_, s) => this.windows(s),
       pet_cua_window: (a, s) => this.window(a, s),
-      pet_cua_accessibility: (_, s) => this.accessibility(s),
+      pet_cua_accessibility: (a, s) => this.accessibility(a, s),
       pet_cua_focus: (a, s) => this.focus(a, s),
       pet_cua_wait: (a, s) => this.wait(a, s),
     };

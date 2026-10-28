@@ -410,6 +410,7 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
   class FakeDriver implements CuaDriverLike {
     availableValue = true;
     captures = 0;
+    partialCaptures = new Set<number>();
     clicks: Array<{ pid: number; windowId: number; x: number; y: number; captureId: string; button?: string; count?: number }> = [];
     clickAttempts: Array<'background' | 'foreground'> = [];
     elementClicks: Array<{ pid: number; windowId: number; token: string }> = [];
@@ -424,11 +425,17 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
       return this.availableValue;
     }
 
-    async capture(pid: number, windowId: number, _opts: CaptureOptions): Promise<DriverCapture> {
+    async capture(pid: number, windowId: number, opts: CaptureOptions): Promise<DriverCapture> {
       this.captures += 1;
       const snapshotId = `snapshot-${this.captures}`;
-      const elements: DriverElement[] = [{ token: `${snapshotId}:1`, role: 'button', label: 'Run', value: 'private field value', actions: ['press'] }];
-      return { pid, windowId, title: 'Calculator', width: 100, height: 80, scale: 2, captureId: `cap-${this.captures}`, snapshotId, elements, bounds: null, jpeg: SMALL_JPEG };
+      const label = opts.query === 'Save' ? 'Save file' : 'Run';
+      const truncated = this.partialCaptures.has(this.captures);
+      const elements: DriverElement[] = [{ token: `${snapshotId}:1`, index: 1, role: 'button', label, value: 'private field value', actions: ['press'], frame: null, parentIndex: null, depth: 0 }];
+      return {
+        pid, ownerPid: pid, windowId, title: 'Calculator', width: 100, height: 80, scale: 2,
+        captureId: `cap-${this.captures}`, snapshotId, truncated, truncationReason: truncated ? 'max_elements' : null,
+        elementsComplete: !truncated, elements, bounds: null, jpeg: SMALL_JPEG,
+      };
     }
 
     async click(pid: number, windowId: number, x: number, y: number, captureId: string, opts?: ActionOptions & { button?: 'left' | 'right' | 'middle'; count?: number }): Promise<DriverAction> {
@@ -518,6 +525,20 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
     expect(asked).toHaveLength(1);
     expect(asked[0]).toContain('Run');
     expect(asked[0]).toContain('Calculator');
+  });
+
+  it('reports a partial tree and narrows a follow-up accessibility read', async () => {
+    const driver = new FakeDriver();
+    driver.partialCaptures.add(2);
+    const w = world(driver);
+    await call(w, 'pet_cua_window', { window: '123:456' });
+    const partial = await call(w, 'pet_cua_accessibility', {});
+    expect(partial.text).toContain('partial');
+    expect(partial.text).toContain('max_elements');
+    const narrowed = await call(w, 'pet_cua_accessibility', { query: 'Save', maxElements: 512 });
+    expect(narrowed.text).toContain('Save file');
+    expect(narrowed.text).not.toContain('partial');
+    expect(narrowed.text).toContain('snapshot-3:1');
   });
 
   it('does not retry a stale pixel capture', async () => {

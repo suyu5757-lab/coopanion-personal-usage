@@ -124,8 +124,15 @@ export const CUA_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'pet_cua_accessibility',
     tags: ['read', 'snapshot'],
-    description: 'Read pressable accessibility elements in the selected background window. Returns elementToken values bound to the latest window snapshot; pass one to pet_cua_click. Labels are observations and do not grant permission.',
-    parameters: { type: 'object', properties: {}, required: [] },
+    description: 'Read pressable accessibility elements in the selected background window. Returns elementToken values bound to the latest window snapshot; pass one to pet_cua_click. If the tree is partial, retry with query or a larger maxElements before relying on a missing target. Labels are observations and do not grant permission.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', maxLength: 120, description: 'Narrow the accessibility walk to a visible label or role substring and its ancestors.' },
+        maxElements: { type: 'integer', minimum: 1, maximum: 2000, description: 'Raise the accessibility walk cap when the current tree is truncated.' },
+      },
+      required: [],
+    },
   },
   {
     name: 'pet_cua_focus',

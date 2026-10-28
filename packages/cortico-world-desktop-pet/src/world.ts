@@ -28,6 +28,7 @@ import type {
 import { nowIso, shortTime } from 'cortico/core/util.ts';
 import type { Language } from 'cortico/core/language.ts';
 import type { DeepPartial } from 'cortico/world.ts';
+import { CuaDriver, type CuaDriverOptions } from './cua/driver.ts';
 import {
   DESKTOP_PET_ID, MAX_HOVER_BUTTONS, PET_ACTIONS, SELF_KEYS, TOUCH_KINDS, USER_MAX, asrEngineFor, desktopPetConfigGroups, directSettings,
   hoverButtonList, selfAdjustMode, speechFor, touchWakes,
@@ -244,6 +245,8 @@ export interface DesktopPetWorldOptions {
   onCuaAnswer?: (answer: Answer) => void;
   /** Core's shared policy gate for computer input. */
   allowCuaInput?: (tool: string) => boolean;
+  /** Exact app-managed Cua Driver endpoint and session. */
+  cuaDriver?: CuaDriverOptions;
 }
 
 type SherpaEngine = Exclude<AsrEngine, 'system'>;
@@ -404,6 +407,7 @@ export class DesktopPetWorld implements World {
     this.cfg = opts.cfg;
     this.cua = new Cua({
       cfg: () => this.cfg.cua,
+      driver: () => new CuaDriver(opts.cuaDriver),
       botName: opts.botName,
       modelLanguage: () => this.language,
       language: () => this.appLanguage,

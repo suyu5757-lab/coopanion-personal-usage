@@ -250,9 +250,11 @@ export const BUBBLE_SPEED_MIN = .5, BUBBLE_SPEED_MAX = 2;
 /** The halo's reach in pixels: 0 is off; past GLOW_MAX it reads as a gray cloud rather than an outline. */
 export const GLOW_MAX = 16, GLOW_DEFAULT = 7;
 
+const TEST_CHANNEL = process.env.CORTICO_TEST_CHANNEL === '1';
+
 export const DESKTOP_PET_DEFAULTS: DesktopPetConfigSection = {
-  enabled: false,
-  port: 7797,
+  enabled: TEST_CHANNEL,
+  port: TEST_CHANNEL ? 0 : 7797,
   user: '',
   window: { enabled: true, electronFile: '', scale: 1, bubbleSize: 1, fontSize: 1, bubbleSpeed: 1, glow: GLOW_DEFAULT, frameRate: 60, lockFrameRate: false, hideWhenFullscreen: false, exportOverlay: false },
   roam: 'calm',
@@ -273,10 +275,10 @@ export const DESKTOP_PET_DEFAULTS: DesktopPetConfigSection = {
     figure: 'coo', scheme: 'deepseek', palette: 'mint', head: 'none', side: 'none', glasses: 'none', neck: 'none',
     colors: { head: { main: 'body', acc: 'eye' }, side: { main: 'eye', acc: 'eye' }, glasses: { main: 'body', acc: 'eye' }, neck: { main: 'eye', acc: 'eye' } },
   },
-  cua: CUA_DEFAULTS,
+  cua: TEST_CHANNEL ? { ...CUA_DEFAULTS, enabled: false, control: false } : CUA_DEFAULTS,
   touch: { enabled: true, wakeOn: 'poke', wakeKinds: ['poke'] },
   asr: {
-    enabled: true,
+    enabled: !TEST_CHANNEL,
     engine: '',
     language: '',
     threads: 0,

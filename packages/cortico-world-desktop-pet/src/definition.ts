@@ -7,6 +7,7 @@ import { DesktopPetWorld, modelsDirFor, type PetBotControls } from './world.ts';
 import type { DescribeTool } from './status.ts';
 import type { ModelLanguage } from './model-text.ts';
 import type { Answer } from './cua/engine-ipc.ts';
+import type { CuaDriverOptions } from './cua/driver.ts';
 import { CUA_OFF_TOOL_DECLS, CUA_TOOL_DECLS } from './cua/tools.ts';
 import { petToolDecls } from './tools.ts';
 import { SELF_TYPE } from './chat.ts';
@@ -92,6 +93,8 @@ export interface DesktopPetAssembly {
   onCuaAnswer?(answer: Answer): void;
   /** Core's shared policy gate for computer input. */
   authorizeInput?(tool: string): boolean;
+  /** Exact app-managed Cua Driver endpoint and session. */
+  cuaDriver?: CuaDriverOptions;
 }
 
 /** The definition, with what an embedding app lends the World. */
@@ -124,6 +127,7 @@ export function desktopPetDefinition(assembly: DesktopPetAssembly = {}): WorldDe
         replyLanguage: () => assembly.replyLanguage?.() ?? null,
         language: () => assembly.language?.() ?? 'zh',
         onCuaAnswer: (answer) => assembly.onCuaAnswer?.(answer),
+        cuaDriver: assembly.cuaDriver,
         allowCuaInput: assembly.authorizeInput,
       });
       assembly.onCreate?.(world);

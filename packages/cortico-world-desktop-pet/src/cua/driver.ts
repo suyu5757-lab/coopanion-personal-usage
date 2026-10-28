@@ -1,30 +1,15 @@
 /**
- * Client for the Cua Driver daemon (trycua/cua): window-scoped screenshots and background input.
- * The daemon holds Accessibility and Screen Recording, draws its own cursor, and posts input to one
- * window without moving the person's pointer or changing the frontmost app. Calls go through the
- * installed `cua-driver` CLI, so a daemon crash takes down neither this process nor Core.
- *
- * The daemon is started on first use when it is not already running. Captures come back as PNG and
- * are converted to JPEG with `sips`; actions take screenshot-pixel coordinates from the latest
- * capture, and the driver refuses a capture it has already consumed (`capture_not_found`).
- *
- * Window captures include the accessibility tree. Element tokens are kept with their snapshot and
- * are valid only until the next capture of that window.
+ * Calls Cua Driver through the exact private runtime endpoint supplied by the app assembly.
+ * This client never starts or connects to a global daemon.
  */
-import { execFile, spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
-import { setTimeout as sleep } from 'node:timers/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import jpeg from 'jpeg-js';
 
 const DRIVER_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT = 20 * 1024 * 1024;
-const FIXED_BINARIES = [
-  '/Applications/CuaDriver.app/Contents/MacOS/cua-driver',
-  join(homedir(), '.local/bin/cua-driver'),
-  join(homedir(), '.cua-driver/bin/cua-driver'),
-];
 
 export type DriverEffect = 'confirmed' | 'unverifiable' | 'suspected_noop' | 'partial' | 'refused';
 
@@ -40,6 +25,8 @@ export interface DriverAction {
 /** One window capture; sizes and scale are the screenshot's, and coordinates later used are its pixels. */
 export interface DriverCapture {
   pid: number;
+  /** The owner returned by the driver, when the response contains it. */
+  ownerPid: number | null;
   windowId: number;
   title: string;
   width: number;
@@ -47,6 +34,9 @@ export interface DriverCapture {
   scale: number;
   captureId: string;
   snapshotId: string;
+  truncated: boolean;
+  truncationReason: string | null;
+  elementsComplete: boolean | null;
   elements: DriverElement[];
   bounds: { x: number; y: number; width: number; height: number } | null;
   jpeg: Buffer;
@@ -54,10 +44,14 @@ export interface DriverCapture {
 
 export interface DriverElement {
   token: string;
+  index: number | null;
   role: string;
   label: string;
   value: string;
   actions: string[];
+  frame: { x: number; y: number; width: number; height: number } | null;
+  parentIndex: number | null;
+  depth: number | null;
 }
 
 export interface DriverZoom {
@@ -81,6 +75,8 @@ export interface CaptureOptions {
   screenshot: boolean;
   maxDimension: number;
   quality: number;
+  maxElements?: number;
+  query?: string;
   signal?: AbortSignal;
 }
 
@@ -108,6 +104,14 @@ export interface CuaDriverLike {
   drag(pid: number, windowId: number, from: [number, number], to: [number, number], opts?: ActionOptions): Promise<DriverAction>;
   move(pid: number, windowId: number, x: number, y: number, opts?: ActionOptions): Promise<DriverAction>;
   zoom(pid: number, windowId: number, x: number, y: number, width: number, height: number, opts?: ActionOptions): Promise<DriverZoom>;
+}
+
+export interface CuaDriverOptions {
+  binaryPath: string;
+  endpoint: 'unix-socket';
+  socketPath: string;
+  session: string;
+  lifecycle: 'external-managed';
 }
 
 const MODIFIERS = new Set(['cmd', 'shift', 'option', 'ctrl', 'fn']);
@@ -146,18 +150,6 @@ export function driverKeyChords(spec: string): DriverChord[] | DriverKeyError {
     out.push({ modifiers, key: keys[0]! });
   }
   return out.length ? out : { error: 'empty' };
-}
-
-function findBin(): string | null {
-  const env = process.env.CUA_DRIVER_BIN;
-  if (env) return existsSync(env) ? env : null;
-  for (const path of FIXED_BINARIES) if (existsSync(path)) return path;
-  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
-    if (!dir) continue;
-    const path = join(dir, 'cua-driver');
-    if (existsSync(path)) return path;
-  }
-  return null;
 }
 
 interface RunOptions {
@@ -233,12 +225,20 @@ function actionFrom(raw: Record<string, unknown>): DriverAction {
 }
 
 export class CuaDriver implements CuaDriverLike {
-  private starting: Promise<void> | null = null;
+  private sessionStart: Promise<void> | null = null;
+  private sessionStarted = false;
 
-  constructor(private readonly session = 'coo') {}
+  constructor(private readonly options?: CuaDriverOptions) {}
 
   available(): boolean {
-    return process.platform === 'darwin' && findBin() !== null;
+    return process.platform === 'darwin'
+      && this.options?.endpoint === 'unix-socket'
+      && this.options?.lifecycle === 'external-managed'
+      && !!this.options.binaryPath
+      && !!this.options.socketPath
+      && !!this.options.session
+      && existsSync(this.options.binaryPath)
+      && existsSync(this.options.socketPath);
   }
 
   async capture(pid: number, windowId: number, opts: CaptureOptions): Promise<DriverCapture> {
@@ -251,6 +251,9 @@ export class CuaDriver implements CuaDriverLike {
         window_id: windowId,
         include_accessibility_tree: true,
         include_screenshot: opts.screenshot,
+        tree_format: 'elements',
+        max_elements: Math.max(1, Math.round(opts.maxElements ?? 250)),
+        ...(opts.query?.trim() ? { query: opts.query.trim() } : {}),
         max_dimension: Math.max(320, Math.round(opts.maxDimension)),
       }, { signal: opts.signal, screenshotFile: opts.screenshot ? png : undefined });
       let bytes = Buffer.alloc(0);
@@ -266,8 +269,10 @@ export class CuaDriver implements CuaDriverLike {
         }
       }
       const bounds = raw.window_bounds && typeof raw.window_bounds === 'object' ? raw.window_bounds as DriverCapture['bounds'] : null;
+      const ownerPid = Number.isInteger(raw.owner_pid) ? Number(raw.owner_pid) : null;
       return {
         pid,
+        ownerPid,
         windowId,
         title: String(raw.app_name ?? raw.window_title ?? ''),
         width,
@@ -275,16 +280,28 @@ export class CuaDriver implements CuaDriverLike {
         scale: Number(raw.screenshot_scale ?? 1),
         captureId: String(raw.capture_id ?? ''),
         snapshotId: String(raw.snapshot_id ?? ''),
+        truncated: raw.truncated === true,
+        truncationReason: typeof raw.truncation_reason === 'string' ? raw.truncation_reason : null,
+        elementsComplete: typeof raw.elements_complete === 'boolean' ? raw.elements_complete : null,
         elements: (Array.isArray(raw.elements) ? raw.elements : []).flatMap((value): DriverElement[] => {
           if (!value || typeof value !== 'object') return [];
           const element = value as Record<string, unknown>;
           if (typeof element.element_token !== 'string') return [];
+          const frameValue = element.frame && typeof element.frame === 'object' ? element.frame as Record<string, unknown> : null;
+          const frame = frameValue
+            && [frameValue.x, frameValue.y, frameValue.width, frameValue.height].every((part) => typeof part === 'number' && Number.isFinite(part))
+            ? { x: Number(frameValue.x), y: Number(frameValue.y), width: Number(frameValue.width), height: Number(frameValue.height) }
+            : null;
           return [{
             token: element.element_token,
+            index: Number.isInteger(element.element_index) ? Number(element.element_index) : null,
             role: String(element.role ?? ''),
             label: String(element.name ?? element.label ?? element.title ?? ''),
             value: String(element.value ?? ''),
             actions: Array.isArray(element.actions) ? element.actions.filter((action): action is string => typeof action === 'string') : [],
+            frame,
+            parentIndex: Number.isInteger(element.parent_index) ? Number(element.parent_index) : null,
+            depth: Number.isInteger(element.depth) ? Number(element.depth) : null,
           }];
         }),
         bounds,
@@ -376,9 +393,9 @@ export class CuaDriver implements CuaDriverLike {
   private async call<T>(tool: string, args: Record<string, unknown>, opts: { signal?: AbortSignal; screenshotFile?: string } = {}): Promise<T> {
     try {
       const bin = await this.ensure(opts.signal);
-      // CLI session labels expire after inactivity; ordinary actions cannot reopen them.
-      await runFile(bin, ['call', 'start_session', JSON.stringify({ session: this.session })], { timeout: DRIVER_TIMEOUT_MS, signal: opts.signal });
-      const argv = ['call', tool, JSON.stringify({ session: this.session, ...args })];
+      await this.startSession(bin, opts.signal);
+      const options = this.options!;
+      const argv = ['call', tool, JSON.stringify({ session: options.session, ...args }), '--socket', options.socketPath];
       if (opts.screenshotFile) argv.push('--screenshot-out-file', opts.screenshotFile);
       const { stdout } = await runFile(bin, argv, { timeout: DRIVER_TIMEOUT_MS, signal: opts.signal });
       return parseJson<T>(stdout);
@@ -387,31 +404,40 @@ export class CuaDriver implements CuaDriverLike {
     }
   }
 
+  private async startSession(bin: string, signal?: AbortSignal): Promise<void> {
+    if (this.sessionStarted) return;
+    if (!this.sessionStart) {
+      const options = this.options!;
+      this.sessionStart = runFile(bin, [
+        'call',
+        'start_session',
+        JSON.stringify({ session: options.session }),
+        '--socket',
+        options.socketPath,
+      ], { timeout: DRIVER_TIMEOUT_MS, signal }).then(() => {
+        this.sessionStarted = true;
+      }).finally(() => {
+        this.sessionStart = null;
+      });
+    }
+    await this.sessionStart;
+  }
+
   private async ensure(signal?: AbortSignal): Promise<string> {
-    const bin = findBin();
-    if (!bin) throw new DriverFailure('not_installed', 'cua-driver was not found');
-    if (await this.running(bin)) return bin;
-    if (!this.starting) this.starting = this.start(bin, signal).finally(() => { this.starting = null; });
-    await this.starting;
-    if (!(await this.running(bin))) throw new DriverFailure('daemon_start_failed', 'Cua Driver did not start');
-    return bin;
-  }
-
-  private async running(bin: string): Promise<boolean> {
+    const options = this.options;
+    if (signal?.aborted) throw new DriverFailure('aborted', 'The Cua Driver call was interrupted');
+    if (!options || options.endpoint !== 'unix-socket' || options.lifecycle !== 'external-managed' || !options.session || !options.socketPath) {
+      throw new DriverFailure('private_runtime_not_configured', 'Cua Driver requires an app-owned socket and session');
+    }
+    if (!existsSync(options.binaryPath)) throw new DriverFailure('not_installed', 'The configured Cua Driver binary was not found');
+    if (!existsSync(options.socketPath)) throw new DriverFailure('private_endpoint_unavailable', 'The app-owned Cua Driver socket is unavailable');
     try {
-      const { stdout } = await runFile(bin, ['status'], { timeout: 4_000 });
-      return /daemon is running/i.test(stdout);
-    } catch {
-      return false;
+      const { stdout } = await runFile(options.binaryPath, ['status', '--socket', options.socketPath], { timeout: 4_000, signal });
+      if (!/daemon is running/i.test(stdout)) throw new DriverFailure('private_endpoint_unavailable', 'The app-owned Cua Driver is not running');
+    } catch (err) {
+      if (err instanceof DriverFailure) throw err;
+      throw new DriverFailure('private_endpoint_unavailable', 'The app-owned Cua Driver is not running');
     }
-  }
-
-  private async start(bin: string, signal?: AbortSignal): Promise<void> {
-    spawn(bin, ['serve'], { detached: true, stdio: 'ignore' }).unref();
-    for (let i = 0; i < 20; i++) {
-      if (signal?.aborted) throw new DriverFailure('aborted', 'The Cua Driver call was interrupted');
-      await sleep(250, undefined, { signal });
-      if (await this.running(bin)) return;
-    }
+    return options.binaryPath;
   }
 }
