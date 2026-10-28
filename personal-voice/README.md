@@ -147,6 +147,23 @@ python3 patch-streamvoice.py --check
 python3 -m unittest discover -s personal-voice -p 'test_*.py'
 ```
 
+## 版本化测试 Runtime
+
+`runtime.py` 按 `plan → stage → check → start-test → stop-test → rollback` 管理一个隔离 Voice Runtime。它只接受 `~/Library/Application Support/Coopanion Test/<runId>/` 或 `scratch/<runId>/` 下的 Runtime 目录，不修改 `install-macos.sh`、生产配置或 LaunchAgent。
+
+Runtime 计划为每个待复制文件和只读资产记录 SHA-256、Python 完整版本、专用 engine/adapter 端口、loopback 健康检查和两个子进程的启动配置。只读资产须先放入本次 run 目录，使用只读权限且不是硬链接；工具只引用它们，不复制、改权或删除。计划不能包含 API Key、密钥字段或生产端口 `9880/9881`。
+
+```bash
+python3 personal-voice/runtime.py plan /path/to/runtime-spec.json
+python3 personal-voice/runtime.py stage /path/to/runtime-spec.json
+python3 personal-voice/runtime.py check /absolute/path/to/runtime --run-id r1-example-01
+python3 personal-voice/runtime.py start-test /absolute/path/to/runtime --run-id r1-example-01
+python3 personal-voice/runtime.py stop-test /absolute/path/to/runtime --run-id r1-example-01
+python3 personal-voice/runtime.py rollback /absolute/path/to/runtime --run-id r1-example-01
+```
+
+`plan` 只核对来源哈希、Python 版本和端口，不写文件。`rollback` 只移除仍与 manifest 哈希相符的 staged 文件；被修改的文件、参考资产、运行日志和 manifest 留在原处供检查。测试阶段不注册 LaunchAgent。
+
 ## 隐私与许可
 
 - 合成、播放、模型都在本机；只有首次安装会下载模型
