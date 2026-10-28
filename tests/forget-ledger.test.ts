@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ForgetLedger, VERIFY_DELAY_MS } from '../core/memory/forget-ledger.ts';
 import { MemoryOutbox, type RetainItem } from '../core/memory/outbox.ts';
 import { closeMemoryStateStores } from '../core/memory/state-store.ts';
@@ -38,7 +38,7 @@ interface FakeClient {
   recall?: (bankId: string, query: string) => Promise<{ results: Array<{ id: string; text: string; type: string; document_id?: string | null }> }>;
   getMentalModel?: (bankId: string, id: string) => Promise<{ content: string }>;
   clearMentalModel?: (bankId: string, id: string) => Promise<unknown>;
-  refreshMentalModel?: (bankId: string, id: string, options?: { mode?: 'full' }) => Promise<unknown>;
+  refreshMentalModel?: (bankId: string, id: string, options?: { mode?: 'full' }) => Promise<{ operation_id?: string }>;
   reflect?: (bankId: string, question: string) => Promise<{ text: string }>;
   listMemories?: (bankId: string) => Promise<{ items: Array<{ id: string; text: string; date: string; fact_type: string; document_id?: string | null }> }>;
 }
@@ -50,6 +50,7 @@ function memoryWith(outbox: MemoryOutbox, ledger: ForgetLedger, client: FakeClie
     outbox: MemoryOutbox;
     ledger: ForgetLedger;
     stateStore: MemoryOutbox['stateStore'];
+    opsClient: { get: (request: unknown) => Promise<unknown> };
     delivery: OutboxDelivery;
     ready: boolean;
     unavailableUntil: number;
@@ -57,6 +58,7 @@ function memoryWith(outbox: MemoryOutbox, ledger: ForgetLedger, client: FakeClie
     forget: (query: string) => Promise<{ local: number; deleted: number; pending: number; failed: number }>;
     forgetDocument: (documentId: string) => Promise<{ local: number; deleted: number; pending: number; failed: number }>;
     searchResults: (query: string) => Promise<Array<{ text: string; documentId: string | null; metadata?: Record<string, string> }>>;
+    searchResultsDetailed: (query: string) => Promise<unknown>;
     recent: () => Promise<Array<{ id: string; text: string; date: string; type: string; documentId: string | null }>>;
     sessionBriefing: () => Promise<{ text: string; source: string }>;
     reflect: (question: string) => Promise<string>;
@@ -74,7 +76,7 @@ function memoryWith(outbox: MemoryOutbox, ledger: ForgetLedger, client: FakeClie
   };
   memory.client = {
     clearMentalModel: async () => ({}),
-    refreshMentalModel: async () => ({}),
+    refreshMentalModel: async (_bankId: string, id: string) => ({ operation_id: `refresh-${id}` }),
     getMentalModel: async () => ({ content: '' }),
     recall: async () => ({ results: [] }),
     deleteDocument: async () => {},
@@ -83,6 +85,7 @@ function memoryWith(outbox: MemoryOutbox, ledger: ForgetLedger, client: FakeClie
   memory.outbox = outbox;
   memory.ledger = ledger;
   memory.stateStore = outbox.stateStore;
+  memory.opsClient = { get: async () => ({ data: { status: 'completed' }, response: { status: 200 } }) };
   memory.delivery = new OutboxDelivery(outbox, {
     retain: async (entry) => ({ async: true, operationId: entry.operationId }),
     status: async () => 'processing',
@@ -412,6 +415,22 @@ describe('the fence covers reads and writes', () => {
     expect(await memory.sessionBriefing()).toEqual({ text: '', source: 'none' });
   });
 
+  it('keeps source-less recall results fenced after a deletion settles', async () => {
+    const root = dir();
+    const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
+    const ledger = new ForgetLedger(join(root, 'forget.json'));
+    const memory = memoryWith(outbox, ledger, {
+      recall: async () => ({ results: [{ id: 'm1', text: 'synthetic observation', type: 'observation', document_id: null }] }),
+      deleteDocument: async () => {},
+    });
+
+    await memory.forgetDocument('remote-only');
+
+    expect(ledger.unresolved('bank-a', 'http://hindsight.test')).toBe(0);
+    expect(ledger.hasFencedSources('bank-a', 'http://hindsight.test')).toBe(true);
+    expect(await memory.searchResultsDetailed('anything')).toEqual({ results: [], status: 'fenced' });
+  });
+
   it('does not show source-less recent memories while a deletion is unresolved', async () => {
     const root = dir();
     const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
@@ -458,6 +477,73 @@ describe('the fence covers reads and writes', () => {
     expect(cleared).toBe(true);
     expect(await memory.sessionBriefing()).toEqual({ text: '', source: 'none' });
     expect(memory.settled()).toBe(true);
+  });
+
+  it('keeps one forget fence closed until concurrent derived refreshes reach a completed operation', async () => {
+    const root = dir();
+    const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
+    const ledger = new ForgetLedger(join(root, 'forget.json'));
+    const statuses = ['processing', 'completed', 'completed', 'completed', 'completed'];
+    let refreshId = 0;
+    const client: FakeClient = {
+      clearMentalModel: async () => ({}),
+      refreshMentalModel: async () => ({ operation_id: `refresh-${++refreshId}` }),
+    };
+    const memory = memoryWith(outbox, ledger, client);
+    const task = ledger.add({ bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: 'doc-a', reason: 'forget' });
+    expect(task).toBeTruthy();
+    expect(ledger.markDone(task!.id)).toBe(true);
+    expect(memory.settled()).toBe(false);
+
+    const typed = memory as unknown as {
+      clearDerived: () => Promise<void>;
+      opsClient: { get: (request: unknown) => Promise<unknown> };
+    };
+    typed.opsClient = {
+      get: vi.fn(async () => {
+        const status = statuses.shift() ?? 'completed';
+        if (status === 'processing') expect(ledger.stale('bank-a', 'http://hindsight.test')).toBe(true);
+        return { data: { status }, response: { status: 200 } };
+      }),
+    };
+
+    await Promise.all([typed.clearDerived(), typed.clearDerived()]);
+
+    expect(refreshId).toBe(4);
+    expect(ledger.stale('bank-a', 'http://hindsight.test')).toBe(false);
+    expect(memory.settled()).toBe(true);
+  });
+
+  it('does not resubmit a failed derived refresh for the same fence epoch', async () => {
+    const root = dir();
+    const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
+    const ledger = new ForgetLedger(join(root, 'forget.json'));
+    let refreshId = 0;
+    const client: FakeClient = {
+      clearMentalModel: async () => ({}),
+      refreshMentalModel: async () => ({ operation_id: `refresh-${++refreshId}` }),
+    };
+    const memory = memoryWith(outbox, ledger, client);
+    const task = ledger.add({ bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: 'doc-a', reason: 'forget' });
+    expect(task).toBeTruthy();
+    expect(ledger.markDone(task!.id)).toBe(true);
+
+    const typed = memory as unknown as {
+      clearDerived: () => Promise<void>;
+      opsClient: { get: (request: unknown) => Promise<unknown> };
+    };
+    typed.opsClient = {
+      get: vi.fn(async () => ({ data: { status: refreshId === 1 ? 'failed' : 'completed' }, response: { status: 200 } })),
+    };
+
+    await typed.clearDerived();
+    expect(refreshId).toBe(4);
+    expect(ledger.stale('bank-a', 'http://hindsight.test')).toBe(true);
+    expect(memory.settled()).toBe(false);
+
+    await typed.clearDerived();
+    expect(refreshId).toBe(4);
+    expect(ledger.stale('bank-a', 'http://hindsight.test')).toBe(true);
   });
 
   it('refuses a reflection that ran across a forget', async () => {

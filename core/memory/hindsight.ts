@@ -119,6 +119,9 @@ const MODEL_TITLES: Record<ModelId, string> = {
   [SELF_PORTRAIT_MODEL]: 'Me, lately',
 };
 
+const MENTAL_MODEL_REFRESH_TIMEOUT_MS = 240_000;
+const MENTAL_MODEL_REFRESH_POLL_MS = 500;
+
 const hash = (text: string) => createHash('sha256').update(text).digest('hex').slice(0, 16);
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -186,6 +189,9 @@ export class HindsightMemory {
   private forgetScanDepth = 0;
   /** Fence epoch whose portraits have already been cleared in this process. */
   private readonly clearedEpochs = new Map<string, number>();
+  /** A terminal refresh failure keeps its fence closed without silently re-submitting every tick. */
+  private readonly failedRefreshEpochs = new Map<string, number>();
+  private readonly derivedRefreshes = new Map<string, { epoch: number; promise: Promise<void> }>();
   private latestDelivery: { at: number; submitted: number; completed: number; verified: number; failed: number } | null = null;
   private rootDir: string | null = null;
   private autostartTried = false;
@@ -215,6 +221,7 @@ export class HindsightMemory {
     this.warnedFullAt = 0;
     this.recallCache.clear();
     this.clearedEpochs.clear();
+    this.failedRefreshEpochs.clear();
     this.recallStats = { fast: 0, standard: 0, deep: 0, measured: 0, totalMs: 0 };
     this.cacheEpoch += 1;
     this.latestDelivery = null;
@@ -665,11 +672,12 @@ export class HindsightMemory {
       if (epoch !== this.cacheEpoch) return { results: [], status: 'fenced' };
       // A ledger that cannot be read may be missing tombstones, so no source can be shown clear.
       if (this.ledger?.damaged()) return { results: [], status: 'fenced' };
-      // A fenced source stays out of every read even if the service still returns it. While a
-      // deletion is unresolved, a result with no source cannot be shown to be clear of it.
+      // A source-less result cannot be shown to exclude any source that has a durable forget fence.
       const unresolved = this.ledger?.unresolved(config.bankId, config.apiUrl) ?? 0;
+      const hasFencedSources = this.ledger?.hasFencedSources(config.bankId, config.apiUrl) ?? false;
       const visible = results.filter((result) =>
-        (result.documentId !== null || unresolved === 0) && !this.forgottenSource(result.documentId));
+        (result.documentId !== null || (unresolved === 0 && !hasFencedSources))
+        && !this.forgottenSource(result.documentId));
       if (visible.length > 0) return { results: visible, status: 'found' };
       if (results.length > 0 || unresolved > 0) return { results: [], status: 'fenced' };
       return { results: [], status: 'absent' };
@@ -774,16 +782,40 @@ export class HindsightMemory {
 
   /**
    * Clear every portrait so the next refresh is built from what is left in the bank. Clearing the
-   * content is what ends the leak. The bank is released only once every deletion is confirmed and
-   * a full refresh has been submitted against the bank that no longer holds the source.
+   * content is what ends the leak. The bank is released only after every deletion and replacement
+   * refresh reaches a successful terminal state.
    */
   private async clearDerived(): Promise<void> {
     const config = this.config;
     const ledger = this.ledger;
-    if (!config || !ledger || !this.client || !this.ready) return;
+    const client = this.client;
+    if (!config || !ledger || !client || !this.ready) return;
     if (!ledger.damaged() && ledger.unresolved(config.bankId, config.apiUrl) === 0 && !ledger.stale(config.bankId, config.apiUrl)) return;
     const target = JSON.stringify([config.bankId, config.apiUrl]);
     const epoch = ledger.epoch(config.bankId, config.apiUrl);
+    const existing = this.derivedRefreshes.get(target);
+    if (existing) {
+      await existing.promise.catch(() => {});
+      if (ledger.epoch(config.bankId, config.apiUrl) !== epoch) await this.clearDerived();
+      return;
+    }
+    const promise = this.clearDerivedForEpoch(config, ledger, client, target, epoch);
+    this.derivedRefreshes.set(target, { epoch, promise });
+    try {
+      await promise;
+    } finally {
+      if (this.derivedRefreshes.get(target)?.promise === promise) this.derivedRefreshes.delete(target);
+    }
+  }
+
+  private async clearDerivedForEpoch(
+    config: HindsightConfig,
+    ledger: ForgetLedger,
+    client: HindsightClient,
+    target: string,
+    epoch: number,
+  ): Promise<void> {
+    if (this.failedRefreshEpochs.get(target) === epoch) return;
     // One clear per fence: the drain runs every fifteen seconds, and the content only has to go once.
     if (this.clearedEpochs.get(target) === epoch) {
       if (ledger.unresolved(config.bankId, config.apiUrl) > 0) return;
@@ -791,7 +823,7 @@ export class HindsightMemory {
       let cleared = true;
       for (const id of MODEL_IDS) {
         try {
-          await this.client.clearMentalModel(config.bankId, id, { signal: AbortSignal.timeout(8_000) });
+          await client.clearMentalModel(config.bankId, id, { signal: AbortSignal.timeout(8_000) });
         } catch (err) {
           if (!isMissing(err)) cleared = false;
         }
@@ -802,17 +834,50 @@ export class HindsightMemory {
       if (ledger.unresolved(config.bankId, config.apiUrl) > 0) return;
     }
     let refreshed = true;
+    const deadline = Date.now() + MENTAL_MODEL_REFRESH_TIMEOUT_MS;
     for (const id of MODEL_IDS) {
       try {
-        await this.client.refreshMentalModel(config.bankId, id, { mode: 'full', signal: AbortSignal.timeout(15_000) });
+        const submission = await client.refreshMentalModel(config.bankId, id, { mode: 'full', signal: AbortSignal.timeout(15_000) });
+        if (!submission.operation_id || !await this.waitForMentalModelRefresh(config, submission.operation_id, deadline)) {
+          refreshed = false;
+        }
       } catch (err) {
         if (!isMissing(err)) refreshed = false;
       }
     }
-    if (refreshed) {
-      ledger.markFresh(config.bankId, config.apiUrl);
-      this.clearedEpochs.delete(target);
+    if (!refreshed) {
+      this.failedRefreshEpochs.set(target, epoch);
+      return;
     }
+    if (ledger.epoch(config.bankId, config.apiUrl) !== epoch || ledger.unresolved(config.bankId, config.apiUrl) > 0) return;
+    if (!ledger.markFresh(config.bankId, config.apiUrl)) {
+      this.failedRefreshEpochs.set(target, epoch);
+      return;
+    }
+    this.clearedEpochs.delete(target);
+    this.failedRefreshEpochs.delete(target);
+  }
+
+  /** Keep portraits blocked until every submitted refresh reaches a successful terminal state. */
+  private async waitForMentalModelRefresh(config: HindsightConfig, operationId: string, deadline: number): Promise<boolean> {
+    const client = this.opsClient;
+    if (!config || !client) return false;
+    while (Date.now() < deadline) {
+      try {
+        const response = await sdk.getOperationStatus({
+          client,
+          path: { bank_id: config.bankId, operation_id: operationId },
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (!response.error && response.data?.status === 'completed') return true;
+        if (!response.error && ['failed', 'cancelled', 'not_found'].includes(response.data?.status ?? '')) return false;
+        if ([400, 401, 403, 404, 409, 422].includes(response.response?.status ?? 0)) return false;
+      } catch {
+        // A status read is safe to repeat; the refresh operation itself is never retried here.
+      }
+      await sleep(MENTAL_MODEL_REFRESH_POLL_MS);
+    }
+    return false;
   }
 
   /** Is this source fenced out of this bank's reads? */

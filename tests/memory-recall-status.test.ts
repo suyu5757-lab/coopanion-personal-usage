@@ -27,6 +27,7 @@ function memoryFor(recall: () => Promise<{ results: ReturnType<typeof result>[] 
       damaged: () => false,
       unresolved: () => options.unresolved ?? 0,
       forgotten: (_bank: string, _endpoint: string, id: string) => options.forgotten?.(id) ?? false,
+      hasFencedSources: () => Boolean(options.forgotten),
     },
     enabled: () => true,
     canTry: () => true,

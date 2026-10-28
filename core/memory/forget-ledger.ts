@@ -270,6 +270,12 @@ export class ForgetLedger {
       entry.bankId === bankId && entry.endpoint === endpoint && entry.documentId === documentId);
   }
 
+  /** Whether any source in this bank has a durable forget fence. */
+  hasFencedSources(bankId: string, endpoint: string): boolean {
+    this.load();
+    return this.file.tombstones.some((entry) => entry.bankId === bankId && entry.endpoint === endpoint);
+  }
+
   /** The file exists but could not be read, so its tombstones are unknown. */
   damaged(): boolean {
     this.load();
