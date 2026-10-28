@@ -118,6 +118,52 @@ describe('action gate', () => {
     expect(g.consumeStepTicket(nextTicket!.id, step, 2_005)).toBe(false);
   });
 
+  it('holds a desktop ticket until dispatch and binds it to the approved snapshot and change', async () => {
+    const g = new ActionGate({
+      platformWrites: () => false,
+      imageGeneration: () => false,
+      imageSaving: () => false,
+      mediaUpload: () => false,
+      computerInput: () => true,
+      desktopTargetAllowed: (target) => target.bundleId === 'com.example.Editor',
+    });
+    const target = {
+      surface: 'desktop' as const,
+      instanceId: 'run-test',
+      bundleId: 'com.example.Editor',
+      executablePath: '/Applications/Editor.app/Contents/MacOS/Editor',
+      pid: 11,
+      ownerPid: 11,
+      processStart: '2026-10-28T00:00:00Z',
+      windowId: 3,
+      bounds: { x: 0, y: 0, width: 600, height: 400 },
+      display: null,
+      space: null,
+      snapshotId: 'snapshot-1',
+      captureId: 'capture-1',
+      route: 'background-ax' as const,
+      source: 'cua-driver' as const,
+    };
+    const request = {
+      taskId: 'desktop:edit-once',
+      taskText: 'Type the approved sentence in the editor.',
+      expectedChange: 'type the approved sentence',
+      target,
+      expiresInMs: 30_000,
+      maxSteps: 1 as const,
+    };
+
+    await expect(g.requestDesktopStep(request, async () => false)).resolves.toBeNull();
+    const stale = await g.requestDesktopStep(request, async () => true);
+    expect(stale).not.toBeNull();
+    expect(stale!.consume({ ...target, captureId: 'capture-2' }, request.expectedChange)).toBe(false);
+    expect(stale!.consume(target, request.expectedChange)).toBe(false);
+
+    const current = await g.requestDesktopStep({ ...request, taskId: 'desktop:edit-current' }, async () => true);
+    expect(current!.consume(target, request.expectedChange)).toBe(true);
+    expect(current!.consume(target, request.expectedChange)).toBe(false);
+  });
+
   it('rejects an unsupported desktop app before asking for a task grant', async () => {
     let confirmed = 0;
     const g = new ActionGate({

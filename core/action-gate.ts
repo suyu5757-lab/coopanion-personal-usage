@@ -30,6 +30,31 @@ export type Verdict =
   | { allow: true }
   | { allow: false; refusal: Refusal; detail: string };
 
+export interface DesktopStepAuthorization {
+  /** Consumes one ticket only when the dispatch evidence still matches the approved snapshot. */
+  consume(target: DesktopTargetEvidence | null, expectedChange: string): boolean;
+  /** Revokes a grant when the caller cannot dispatch the approved step. */
+  revoke(): void;
+}
+
+export interface DesktopStepGrantRequest {
+  taskId: string;
+  taskText: string;
+  expectedChange: string;
+  target: DesktopTargetEvidence;
+  expiresInMs: number;
+  maxSteps: 1;
+}
+
+const desktopEvidenceKey = (target: DesktopTargetEvidence): string => JSON.stringify([
+  target.instanceId, target.bundleId, target.executablePath, target.pid, target.ownerPid,
+  target.processStart, target.windowId,
+  [target.bounds.x, target.bounds.y, target.bounds.width, target.bounds.height],
+  target.display, target.space, target.snapshotId, target.captureId,
+  target.element ? [target.element.role, target.element.label, target.element.token] : null,
+  target.route, target.source,
+]);
+
 /** What the person's settings currently allow; read at each check, never cached. */
 export interface GatePolicy {
   /** `companion.selfTime.actions`: likes, favorites, follows, comments, danmaku and sharing. */
@@ -100,6 +125,46 @@ export class ActionGate {
       return generation === this.permissionGeneration()
         && request.actions.every((action) => this.capabilityAllows(request.target.surface, action as Impact, request.target));
     });
+  }
+
+  /** Creates a one-step desktop grant and delays ticket consumption until the dispatch boundary. */
+  async requestDesktopStep(
+    request: DesktopStepGrantRequest,
+    confirmInCoreUi: () => Promise<boolean>,
+  ): Promise<DesktopStepAuthorization | null> {
+    const approvedEvidence = desktopEvidenceKey(request.target);
+    const grant = await this.requestTaskGrant({
+      taskId: request.taskId,
+      taskText: request.taskText,
+      target: request.target,
+      actions: ['computer-input'],
+      expiresInMs: request.expiresInMs,
+      maxSteps: request.maxSteps,
+    }, confirmInCoreUi);
+    if (!grant) return null;
+
+    let finished = false;
+    const revoke = () => {
+      if (finished) return;
+      finished = true;
+      this.revokeTask(request.taskId);
+    };
+    return {
+      consume: (target, expectedChange) => {
+        if (finished) return false;
+        finished = true;
+        if (!target || expectedChange !== request.expectedChange || desktopEvidenceKey(target) !== approvedEvidence) {
+          this.revokeTask(request.taskId);
+          return false;
+        }
+        const step: StepRequest = { action: 'computer-input', target, expectedChange };
+        const ticket = this.issueStepTicket(grant.id, step);
+        const consumed = !!ticket && this.consumeStepTicket(ticket.id, step);
+        this.revokeTask(request.taskId);
+        return consumed;
+      },
+      revoke,
+    };
   }
 
   /** Mints a one-use ticket from fresh evidence for one action inside a task grant. */

@@ -41,6 +41,7 @@
  * `{ type: 'companion:ports-busy', from, to }` when every console port Cortico tried could not be listened on.
  */
 import { readdirSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { delimiter, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { BotDefinition } from 'cortico/bot.ts';
@@ -449,6 +450,7 @@ export async function main(): Promise<void> {
     computerInput: () => getByPath((config ?? {}) as unknown as Record<string, unknown>, 'worlds.desktop-pet.cua.control') === true,
     desktopTargetAllowed: isSupportedCuaTarget,
   });
+  const desktopInputInstanceId = randomUUID();
   const browserBridge = new BrowserBridge();
   /** The introduction is running: the settings it makes are not told as changes. */
   let guiding = false;
@@ -496,7 +498,15 @@ export async function main(): Promise<void> {
       telemetry?.count('cuaAsked');
       if (answer === 'yes') telemetry?.count('cuaGranted');
     },
-    authorizeInput: (tool) => gate.check({ surface: 'desktop', tool, impact: 'computer-input' }).allow,
+    cuaInstanceId: desktopInputInstanceId,
+    authorizeCuaInput: (request) => gate.requestDesktopStep({
+      taskId: request.taskId,
+      taskText: request.taskText,
+      expectedChange: request.expectedChange,
+      target: request.target,
+      expiresInMs: request.expiresInMs,
+      maxSteps: request.maxSteps,
+    }, request.confirmInCoreUi),
     onBotChange: () => (notice as NoticeWorld | null)?.acceptCurrent(),
     onSkin: (skin) => followPetLook(join(deploymentRoot(), DEPLOYMENT), skin, (pet as DesktopPetWorld | null)?.packs() ?? [], language()),
   });

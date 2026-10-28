@@ -45,7 +45,7 @@ Coopanion is a desktop pet. **Coo** lives on the bottom edge of your screen: it 
 - **Chat**: hold the talk key and speak, or type; Coo answers in a bubble. Speech is recognized on your machine with FunASR or Whisper, picked by the app language.
 - **Memory**: Coo remembers what you talked about, and knows when you poke it or pat its head. What it knows about you goes in `PARTNER.md` in its workspace, which its prompt includes whole. Long-term writes, source fences and deletion work are committed to a private SQLite database. Older queue and forget files are imported on first start and kept. Use `memory_correct` to link an explicit correction to the earlier source while keeping that source for history. A forgotten source is excluded from historical reads; portraits stay hidden until remote deletion and rebuilding finish. The Hindsight panel separates queued writes, running remote operations, completed operations, readable source documents, unresolved failures, deletions and source fences. Content already present in an active conversation cannot be revoked from that conversation.
 - **Growing on her own**: scheduled reviews remain gated until the review can be cancelled safely. Proposals can be reviewed in the advanced Hindsight panel; applying them to Persona files is disabled. User-reviewed experience policies can be approved or revoked there, and their source records are checked again before each session injection.
-- **Computer use**: this integration candidate permits screenshots and window observation. CUA mouse, keyboard, drag and accessibility input stay disabled until browser windows can be identified through a trusted source.
+- **Computer use**: screenshots and window observation are available. Core-authorized CUA input is limited to a verified macOS TextEdit background window; each move, click, drag, scroll, text entry and key press needs its own approval. Whole-screen input, foreground switching and CUA browser input are unavailable.
 - **Codex**: an optional local assistant for read-only review, background work, result inspection, cancellation and continuation. Enable it in the advanced World settings and configure allowed directories. See [Codex World](packages/cortico-world-codex/README.md).
 - **opencode**: hand coding work — writing code, fixing bugs, running tests — to opencode on your machine. Coo relays the task and the result; opencode reads, edits and runs commands only in the directories you allow, and asks in a bubble before every change. Off by default; turn it on on the Worlds page in advanced mode.
 - **Time of her own**: off by default while a daily API cost cap is unavailable. When enabled, she can browse only topics you enter in Habits; leaving the topic list blank disables web search. A session lasts up to 20 minutes and 80 browser calls. Browser writes are off by default. Memory pressure pauses background exploration. Turn it off or change its topics in Habits.
@@ -230,19 +230,18 @@ Enable the Video World in advanced mode to use `video_list_media` and `video_ren
 
 Computer use is off by default. Tick **Let Coo use this computer** in the Computer use section of the Habits page, read the risks it shows and click **Turn on**; it takes effect at once. When you ask Coo to look at the screen or help with the computer, it may also offer to turn it on and take the settings window to that section.
 
-Mouse and keyboard input has a separate switch and is off by default. This integration candidate is view-only while verified-window input is under evaluation.
+Mouse and keyboard input has a separate switch and is off by default. When enabled, Core accepts input only in a verified macOS TextEdit background window. Each move, click, drag, scroll, text entry and key press shows its target and contents in Coo's bubble for separate approval. Whole-screen input, foreground switching and browser input through CUA remain unavailable.
 
-While it is on, **When to ask you** controls whether Coo asks before looking at the screen or windows. Mouse and keyboard input stays unavailable in this candidate until the verified-window route is accepted.
+**When to ask you** controls the broad permission question before looking or acting. Exact approval is still required for every input step.
 
 - Change this under **When to ask you** in the Computer use section of the Habits page, from strictest to loosest:
   - `ask-each-turn`: ask each turn before looking or moving or scrolling;
   - `ask-before-acting`: looking is not asked; ask each turn before moving or scrolling;
   - `ask-once` (default): looking is not asked; one yes allows moving or scrolling for the time set in **A yes lasts** (30 minutes by default);
-  - `never-ask`: skip the broad permission question; exact-action approval is still required for clicks, drags, text entry, key presses and foreground switches.
+  - `never-ask`: skip the broad permission question; exact-action approval is still required for every supported background input step.
 - With several displays, Coo looks at one at a time and moves to another when it needs to.
-- When you touch the mouse or keyboard, whole-screen input stops and waits for you.
-- With [Cua Driver](https://github.com/trycua/cua) installed and allowed Accessibility and Screen Recording, Coo can also work on one window in the background: it captures that window and clicks or types in it without moving your pointer or taking focus, so you can keep using the computer. Background window input does not wait for you to stop.
-- Set `worlds.desktop-pet.cua.backgroundOnly` to `true` in `config.json` to require background window input. Whole-screen input and `pet_cua_focus` are refused; select a window with `pet_cua_window` first. If the driver is unavailable or a window closes, input stays blocked. The default is `false`.
+- With [Cua Driver](https://github.com/trycua/cua) installed and allowed Accessibility and Screen Recording, select the TextEdit window with `pet_cua_window` before an input step. The window stays in the background and Coo does not move your pointer or take focus. If the driver or process identity is unavailable, input stays blocked.
+- `worlds.desktop-pet.cua.backgroundOnly` can further restrict generic CUA routes. Setting it to `false` does not widen Coopanion Core's TextEdit allowlist.
 - Logins, passwords and payments are left to you.
 - One wake makes at most 40 model requests; at the limit the turn ends and you can tell Coo to continue. The limit is on the Cormini page in advanced mode and applies after a restart.
 
