@@ -1187,7 +1187,27 @@ export class Cua {
   }
 
   private async listWindows(signal: AbortSignal | undefined): Promise<WindowEntry[]> {
-    return this.call<WindowEntry[]>({ op: 'windows' }, signal);
+    const windows = await this.call<WindowEntry[]>({ op: 'windows' }, signal);
+    if (!this.cfg.backgroundOnly) return windows;
+    if (process.platform !== 'darwin' || !this.driver.available()) return [];
+
+    const identities = new Map<number, Promise<Awaited<ReturnType<CuaDriverLike['identifyProcess']>>>>();
+    const visible = await Promise.all(windows.map(async (window) => {
+      if (!Number.isSafeInteger(window.pid) || window.pid <= 0) return null;
+      let identity = identities.get(window.pid);
+      if (!identity) {
+        identity = this.driver.identifyProcess(window.pid, signal).catch(() => null);
+        identities.set(window.pid, identity);
+      }
+      const processIdentity = await identity;
+      if (!processIdentity || !isSupportedCuaTarget({
+        ...processIdentity,
+        route: 'background-window-pixel',
+        source: 'cua-driver',
+      })) return null;
+      return window;
+    }));
+    return visible.filter((window): window is WindowEntry => window !== null);
   }
 
   private async windows(signal?: AbortSignal): Promise<ToolOutcome> {

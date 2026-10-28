@@ -98,6 +98,7 @@ export class DriverFailure extends Error {
 
 export interface CuaDriverLike {
   available(): boolean;
+  identifyProcess(pid: number, signal?: AbortSignal): Promise<DarwinProcessIdentity | null>;
   capture(pid: number, windowId: number, opts: CaptureOptions): Promise<DriverCapture>;
   click(pid: number, windowId: number, x: number, y: number, captureId: string, opts?: ActionOptions & { button?: 'left' | 'right' | 'middle'; count?: number }): Promise<DriverAction>;
   clickElement(pid: number, windowId: number, token: string, opts?: ActionOptions): Promise<DriverAction>;
@@ -246,6 +247,11 @@ export class CuaDriver implements CuaDriverLike {
       && existsSync(this.options.socketPath);
   }
 
+  identifyProcess(pid: number, signal?: AbortSignal): Promise<DarwinProcessIdentity | null> {
+    return (this.options?.resolveProcessIdentity
+      ?? ((targetPid: number, abortSignal?: AbortSignal) => resolveDarwinProcessIdentity(targetPid, { signal: abortSignal })))(pid, signal);
+  }
+
   async capture(pid: number, windowId: number, opts: CaptureOptions): Promise<DriverCapture> {
     const dir = mkdtempSync(join(tmpdir(), 'coo-window-'));
     const png = join(dir, 'window.png');
@@ -275,10 +281,7 @@ export class CuaDriver implements CuaDriverLike {
       }
       const bounds = raw.window_bounds && typeof raw.window_bounds === 'object' ? raw.window_bounds as DriverCapture['bounds'] : null;
       const ownerPid = Number.isInteger(raw.owner_pid) ? Number(raw.owner_pid) : null;
-      const processIdentity = ownerPid === pid
-        ? await (this.options?.resolveProcessIdentity
-          ?? ((targetPid: number, signal?: AbortSignal) => resolveDarwinProcessIdentity(targetPid, { signal })))(pid, opts.signal)
-        : null;
+      const processIdentity = ownerPid === pid ? await this.identifyProcess(pid, opts.signal) : null;
       return {
         pid,
         ownerPid,

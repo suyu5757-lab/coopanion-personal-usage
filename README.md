@@ -241,7 +241,7 @@ Mouse and keyboard input has a separate switch and is off by default. When enabl
   - `never-ask`: skip the broad permission question; exact-action approval is still required for every supported background input step.
 - With several displays, Coo looks at one at a time and moves to another when it needs to.
 - With [Cua Driver](https://github.com/trycua/cua) installed and allowed Accessibility and Screen Recording, select the TextEdit window with `pet_cua_window` before an input step. The window stays in the background and Coo does not move your pointer or take focus. If the driver or process identity is unavailable, input stays blocked.
-- `worlds.desktop-pet.cua.backgroundOnly` can further restrict generic CUA routes. Setting it to `false` does not widen Coopanion Core's TextEdit allowlist.
+- `worlds.desktop-pet.cua.backgroundOnly` can further restrict generic CUA routes. When it is `true`, the window list includes only processes verified against the supported-app allowlist; unknown processes are omitted. Setting it to `false` does not widen Coopanion Core's TextEdit allowlist.
 - Logins, passwords and payments are left to you.
 - One wake makes at most 40 model requests; at the limit the turn ends and you can tell Coo to continue. The limit is on the Cormini page in advanced mode and applies after a restart.
 

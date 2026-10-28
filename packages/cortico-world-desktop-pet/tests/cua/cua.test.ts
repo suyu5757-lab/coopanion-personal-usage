@@ -411,6 +411,8 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
   class FakeDriver implements CuaDriverLike {
     availableValue = true;
     captures = 0;
+    identities = new Map<number, { bundleId: string; executablePath: string; processStart: string }>();
+    identifiedPids: number[] = [];
     partialCaptures = new Set<number>();
     clicks: Array<{ pid: number; windowId: number; x: number; y: number; captureId: string; button?: string; count?: number }> = [];
     clickAttempts: Array<'background' | 'foreground'> = [];
@@ -424,6 +426,11 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
 
     available(): boolean {
       return this.availableValue;
+    }
+
+    async identifyProcess(pid: number) {
+      this.identifiedPids.push(pid);
+      return this.identities.get(pid) ?? null;
     }
 
     async capture(pid: number, windowId: number, opts: CaptureOptions): Promise<DriverCapture> {
@@ -506,6 +513,39 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
     expect(driver.clicks).toEqual([{ pid: 123, windowId: 456, x: 10, y: 20, captureId: 'cap-1', button: 'left', count: 1 }]);
     expect(driver.captures).toBe(2);
     expect(click.text).toContain('Clicked');
+  });
+
+  it('shows only verified supported app windows in background-only mode', async () => {
+    const driver = new FakeDriver();
+    driver.identities.set(123, {
+      bundleId: 'com.apple.TextEdit',
+      executablePath: '/System/Applications/TextEdit.app/Contents/MacOS/TextEdit',
+      processStart: 'Tue Oct 27 12:00:00 2026',
+    });
+    driver.identities.set(456, {
+      bundleId: 'com.apple.Safari',
+      executablePath: '/Applications/Safari.app/Contents/MacOS/Safari',
+      processStart: 'Tue Oct 27 12:01:00 2026',
+    });
+    const cfg = { ...allowedConfig(), backgroundOnly: true, permission: 'never-ask' as const };
+    const w = new Cua({ cfg: () => cfg, driver: () => driver, askPermission: async () => 'yes' });
+    const windows = [
+      { handle: '123:1', title: 'Coopanion CUA verification.txt', pid: 123, display: 1, rect: { x: 0, y: 0, width: 500, height: 300 }, minimized: false, foreground: false },
+      { handle: '123:2', title: 'Coopanion CUA decoy.txt', pid: 123, display: 1, rect: { x: 20, y: 20, width: 500, height: 300 }, minimized: false, foreground: false },
+      { handle: '456:1', title: 'Private browser window title', pid: 456, display: 1, rect: { x: 40, y: 40, width: 700, height: 500 }, minimized: false, foreground: true },
+      { handle: '789:1', title: 'Unknown process title', pid: 789, display: 1, rect: { x: 60, y: 60, width: 300, height: 200 }, minimized: false, foreground: false },
+    ];
+    const inner = w as unknown as { call: (req: { op: string }) => Promise<unknown>; screen: typeof ONE_DISPLAY };
+    inner.screen = ONE_DISPLAY;
+    inner.call = async (req) => req.op === 'windows' ? windows : ONE_DISPLAY;
+
+    const out = await call(w, 'pet_cua_windows', {});
+
+    expect(out.text).toContain('Coopanion CUA verification.txt');
+    expect(out.text).toContain('Coopanion CUA decoy.txt');
+    expect(out.text).not.toContain('Private browser window title');
+    expect(out.text).not.toContain('Unknown process title');
+    expect(driver.identifiedPids).toEqual([123, 456, 789]);
   });
 
   it('lists pressable accessibility tokens and clicks one only after a one-action approval', async () => {
