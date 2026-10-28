@@ -9,7 +9,8 @@
  * when the selected FFmpeg has the `drawtext` filter.
  */
 import { execFile } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { delimiter, dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { srt, type ResolvedManifest } from './manifest.ts';
@@ -32,7 +33,9 @@ export interface Probe {
 }
 
 export interface RenderResult {
+  renderId: string;
   output: string;
+  sha256: string;
   /** The first frame, as JPEG, for the tool receipt. */
   poster: Buffer;
   probe: Probe;
@@ -125,7 +128,7 @@ function filterGraph(manifest: ResolvedManifest, opts: { captionTextFiles?: stri
 
 /** The argv after the binary: inputs, graph, encoder, output. */
 export function renderArgs(manifest: ResolvedManifest, opts: { captionTextFiles?: string[]; fontPath?: string } = {}): string[] {
-  const args = ['-y', '-hide_banner', '-loglevel', 'error'];
+  const args = ['-n', '-hide_banner', '-loglevel', 'error'];
   for (const clip of manifest.clips) args.push('-i', clip.file);
   if (manifest.music?.loop) args.push('-stream_loop', '-1');
   if (manifest.music) args.push('-i', manifest.music.file);
@@ -169,6 +172,21 @@ async function probe(tools: Tools, file: string): Promise<Probe> {
   return probeOf(String(stdout));
 }
 
+export async function inspectVideo(tools: Tools, file: string): Promise<Probe> {
+  return probe(tools, file);
+}
+
+export async function sha256File(file: string): Promise<string> {
+  const hash = createHash('sha256');
+  await new Promise<void>((resolveHash, reject) => {
+    const stream = createReadStream(file);
+    stream.on('data', (chunk: string | Buffer) => { hash.update(chunk); });
+    stream.once('error', reject);
+    stream.once('end', resolveHash);
+  });
+  return hash.digest('hex');
+}
+
 /** Seconds covered by ffmpeg's blackdetect on the finished file. */
 async function blackSeconds(tools: Tools, file: string): Promise<number> {
   try {
@@ -188,7 +206,7 @@ async function poster(tools: Tools, file: string, at: number, dir: string): Prom
 }
 
 /** Renders, checks and reports; throws `RenderFailure` with a reason the receipt can show. */
-export async function render(manifest: ResolvedManifest, opts: { ffmpegPath?: string; ffprobePath?: string; captionFontPath?: string; workDir: string }, signal?: AbortSignal): Promise<RenderResult> {
+export async function render(manifest: ResolvedManifest, opts: { ffmpegPath?: string; ffprobePath?: string; captionFontPath?: string; workDir: string; renderId: string }, signal?: AbortSignal): Promise<RenderResult> {
   const tools = await discoverTools(opts.ffmpegPath, opts.ffprobePath);
   const supportsDrawText = manifest.captionsBurnIn ? await canDrawText(tools) : false;
   if (manifest.captionsBurnIn && !supportsDrawText) throw new RenderFailure('captionsBurnIn needs an FFmpeg build with the drawtext filter');
@@ -225,6 +243,7 @@ export async function render(manifest: ResolvedManifest, opts: { ffmpegPath?: st
       throw new RenderFailure(`the output unexpectedly contains ${facts.audioCodec} audio`);
     }
     if (facts.sizeBytes < 1) throw new RenderFailure('the output file is empty');
+    const sha256 = await sha256File(manifest.output);
     const posterFrame = await poster(tools, manifest.output, Math.min(1, manifest.totalSec / 2), scratch);
     if (!posterFrame.length) throw new RenderFailure('the output poster frame is empty');
     const blackSec = await blackSeconds(tools, manifest.output);
@@ -239,7 +258,9 @@ export async function render(manifest: ResolvedManifest, opts: { ffmpegPath?: st
       writeFileSync(captionsFile, srt(manifest.captions), 'utf8');
     }
     return {
+      renderId: opts.renderId,
       output: manifest.output,
+      sha256,
       poster: posterFrame,
       probe: facts,
       blackSec,

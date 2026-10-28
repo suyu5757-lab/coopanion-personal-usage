@@ -59,6 +59,10 @@ const SUMMARIES = {
     zh: '按编辑清单把授权素材剪成一段竖屏预览 MP4,并检查分辨率、时长、编码和黑屏。',
     en: 'Renders an authorized edit manifest into a vertical preview MP4 and checks its size, duration, codecs and black stretches.',
   },
+  video_prepare_upload: {
+    zh: '重新核对本次 Core 会话生成的视频，再复制到隔离的待上传素材目录；不会打开浏览器或提交作品。',
+    en: 'Rechecks a render from this Core session and copies it into the prepared media folder; it does not open a browser or submit a post.',
+  },
 } as const;
 
 export function videoDefinition(assembly: VideoAssembly): WorldDefinition<WorldSection> {

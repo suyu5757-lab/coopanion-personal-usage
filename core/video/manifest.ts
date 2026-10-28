@@ -204,10 +204,20 @@ const problemsOf = (raw: unknown, dirs: ManifestDirs): string[] => {
   if (root.captionsBurnIn !== undefined && typeof root.captionsBurnIn !== 'boolean') problems.push('captionsBurnIn must be true or false');
   if (root.captionsBurnIn === true && (!Array.isArray(rawCaptions) || rawCaptions.length === 0)) problems.push('captionsBurnIn needs at least one caption');
 
-  const outputPath = text(record(root.output)?.path) || 'renders/preview.mp4';
+  const outputConfig = record(root.output);
+  if (root.output !== undefined && !outputConfig) problems.push('output must be an object');
+  const outputValue = outputConfig?.path;
+  const outputPath = outputConfig && outputValue !== undefined ? text(outputValue) : 'renders/preview.mp4';
+  if (outputConfig && outputValue !== undefined && (typeof outputValue !== 'string' || !outputPath)) {
+    problems.push('output.path must be a non-empty relative path');
+  }
   const outputRel = outputRelative(outputPath);
   const output = outputRel ? resolveOutputInside(dirs.rendersDir, outputRel) : null;
   if (!output || !output.toLowerCase().endsWith('.mp4')) problems.push('output.path must be an .mp4 under the renders folder');
+  else {
+    try { lstatSync(output); problems.push('output.path must be new; existing files are preserved'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') problems.push('output.path could not be checked safely'); }
+  }
   if (output && [...sources.values()].some((source) => source.file === output)) problems.push('output.path must not be one of the sources');
 
   return problems;
