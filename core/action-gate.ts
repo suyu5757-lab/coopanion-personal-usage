@@ -1,4 +1,4 @@
-import { TaskGrantRegistry, type StepRequest, type StepTicket, type TaskGrant, type TaskGrantRequest } from './task-grants.ts';
+import { TaskGrantRegistry, type ActionTargetEvidence, type DesktopTargetEvidence, type StepRequest, type StepTicket, type TaskGrant, type TaskGrantRequest } from './task-grants.ts';
 
 /**
  * The one place that decides whether a tool may change something outside Coo's own state.
@@ -42,6 +42,8 @@ export interface GatePolicy {
   mediaUpload: () => boolean;
   /** `worlds.desktop-pet.cua.control`: the mouse and keyboard on the person's screen. */
   computerInput: () => boolean;
+  /** The desktop World owns the supported native app and input-route rules. */
+  desktopTargetAllowed: (target: DesktopTargetEvidence) => boolean;
 }
 
 const describeTarget = (request: ActionRequest): string => request.target ? `「${request.target}」` : '';
@@ -82,8 +84,8 @@ export class ActionGate {
       if (!this.policy.computerInput()) {
         return { allow: false, refusal: 'not-armed', detail: `${request.tool}${describeTarget(request)} uses the mouse or keyboard while computer input is off` };
       }
-      // CUA has no trusted window-origin contract. Its inputs could bypass Browser's manual publish boundary.
-      return { allow: false, refusal: 'unverified-target', detail: `${request.tool} is unavailable until desktop targets can be verified as outside browser windows; use Browser tools and leave final publication to the person` };
+      // A generic CUA request carries no typed window evidence; desktop input must use a task grant.
+      return { allow: false, refusal: 'unverified-target', detail: `${request.tool} needs a Core task grant bound to an allowed native window; use Browser tools for browser work and leave final publication to the person` };
     }
     return { allow: false, refusal: 'not-armed', detail: `${request.tool} is not a ${request.surface}/${request.impact} action this gate allows` };
   }
@@ -91,26 +93,26 @@ export class ActionGate {
   /** Issues a short grant only after Core's own approval UI confirms the proposed task. */
   async requestTaskGrant(request: TaskGrantRequest, confirmInCoreUi: () => Promise<boolean>, now = Date.now()): Promise<TaskGrant | null> {
     this.synchronizeGeneration();
-    if (request.actions.some((action) => !this.capabilityAllows(request.target.surface, action as Impact))) return null;
+    if (request.actions.some((action) => !this.capabilityAllows(request.target.surface, action as Impact, request.target))) return null;
     const generation = this.permissionGeneration();
     return this.grants.requestGrant(request, confirmInCoreUi, now, () => {
       this.synchronizeGeneration();
       return generation === this.permissionGeneration()
-        && request.actions.every((action) => this.capabilityAllows(request.target.surface, action as Impact));
+        && request.actions.every((action) => this.capabilityAllows(request.target.surface, action as Impact, request.target));
     });
   }
 
   /** Mints a one-use ticket from fresh evidence for one action inside a task grant. */
   issueStepTicket(grantId: string, request: StepRequest, now = Date.now()): StepTicket | null {
     this.synchronizeGeneration();
-    if (!this.capabilityAllows(request.target.surface, request.action as Impact)) return null;
+    if (!this.capabilityAllows(request.target.surface, request.action as Impact, request.target)) return null;
     return this.grants.issueStepTicket(grantId, request, now);
   }
 
   /** Consumes a ticket before dispatch; the same ticket can never authorize a second step. */
   consumeStepTicket(ticketId: string, request: StepRequest, now = Date.now()): boolean {
     this.synchronizeGeneration();
-    if (!this.capabilityAllows(request.target.surface, request.action as Impact)) return false;
+    if (!this.capabilityAllows(request.target.surface, request.action as Impact, request.target)) return false;
     return this.grants.consumeStepTicket(ticketId, request, now);
   }
 
@@ -123,7 +125,7 @@ export class ActionGate {
     this.grants.revokeAll();
   }
 
-  private capabilityAllows(surface: Surface, impact: Impact): boolean {
+  private capabilityAllows(surface: Surface, impact: Impact, target?: ActionTargetEvidence): boolean {
     if (surface === 'browser') {
       if (impact === 'platform-write') return this.policy.platformWrites();
       if (impact === 'image-generation') return this.policy.imageGeneration();
@@ -131,7 +133,8 @@ export class ActionGate {
       if (impact === 'media-upload') return this.policy.mediaUpload();
       return false;
     }
-    return impact === 'computer-input' && this.policy.computerInput();
+    return impact === 'computer-input' && this.policy.computerInput()
+      && target?.surface === 'desktop' && this.policy.desktopTargetAllowed(target);
   }
 
   private permissionGeneration(): string {

@@ -7,6 +7,7 @@ const gate = (policy: { writes: boolean; imageGeneration?: boolean; imageSaving?
   imageSaving: () => policy.imageSaving ?? false,
   mediaUpload: () => policy.mediaUpload ?? false,
   computerInput: () => policy.input ?? true,
+  desktopTargetAllowed: () => false,
 });
 
 describe('action gate', () => {
@@ -46,7 +47,7 @@ describe('action gate', () => {
 
   it('reads the live settings at each check instead of caching the first answer', () => {
     let writes = false;
-    const g = new ActionGate({ platformWrites: () => writes, imageGeneration: () => false, imageSaving: () => false, mediaUpload: () => false, computerInput: () => true });
+    const g = new ActionGate({ platformWrites: () => writes, imageGeneration: () => false, imageSaving: () => false, mediaUpload: () => false, computerInput: () => true, desktopTargetAllowed: () => false });
     expect(g.check({ surface: 'browser', tool: 'browser_share', impact: 'platform-write' }).allow).toBe(false);
     writes = true;
     expect(g.check({ surface: 'browser', tool: 'browser_share', impact: 'platform-write' }).allow).toBe(true);
@@ -75,6 +76,7 @@ describe('action gate', () => {
       imageSaving: () => false,
       mediaUpload: () => false,
       computerInput: () => input,
+      desktopTargetAllowed: (candidate) => candidate.bundleId === 'com.example.Editor',
     });
     const target = {
       surface: 'desktop' as const,
@@ -116,6 +118,41 @@ describe('action gate', () => {
     expect(g.consumeStepTicket(nextTicket!.id, step, 2_005)).toBe(false);
   });
 
+  it('rejects an unsupported desktop app before asking for a task grant', async () => {
+    let confirmed = 0;
+    const g = new ActionGate({
+      platformWrites: () => false,
+      imageGeneration: () => false,
+      imageSaving: () => false,
+      mediaUpload: () => false,
+      computerInput: () => true,
+      desktopTargetAllowed: (target) => target.bundleId === 'com.example.Editor',
+    });
+    const target = {
+      surface: 'desktop' as const,
+      instanceId: 'run-test',
+      bundleId: 'com.apple.Safari',
+      executablePath: '/Applications/Safari.app/Contents/MacOS/Safari',
+      pid: 11,
+      ownerPid: 11,
+      processStart: '2026-10-28T00:00:00Z',
+      windowId: 3,
+      bounds: { x: 0, y: 0, width: 600, height: 400 },
+      display: null,
+      space: null,
+      snapshotId: 'snapshot-1',
+      captureId: 'capture-1',
+      route: 'background-ax' as const,
+      source: 'cua-driver' as const,
+    };
+
+    await expect(g.requestTaskGrant({
+      taskId: 'desktop:browser-window', taskText: 'Click this browser window.', target,
+      actions: ['computer-input'], expiresInMs: 30_000, maxSteps: 1,
+    }, async () => { confirmed++; return true; }, 1_000)).resolves.toBeNull();
+    expect(confirmed).toBe(0);
+  });
+
   it('does not let image generation permission grant an upload action', async () => {
     const g = new ActionGate({
       platformWrites: () => false,
@@ -123,6 +160,7 @@ describe('action gate', () => {
       imageSaving: () => false,
       mediaUpload: () => false,
       computerInput: () => false,
+      desktopTargetAllowed: () => false,
     });
     const target = {
       surface: 'browser' as const,
@@ -147,6 +185,7 @@ describe('action gate', () => {
       imageSaving: () => true,
       mediaUpload: () => true,
       computerInput: () => true,
+      desktopTargetAllowed: (candidate) => candidate.bundleId === 'com.example.Editor',
     });
     const browserTarget = {
       surface: 'browser' as const,
@@ -204,6 +243,7 @@ describe('action gate', () => {
       imageSaving: () => imageSaving,
       mediaUpload: () => false,
       computerInput: () => false,
+      desktopTargetAllowed: () => false,
     });
     const target = {
       surface: 'browser' as const,

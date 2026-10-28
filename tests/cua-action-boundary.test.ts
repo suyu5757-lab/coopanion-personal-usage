@@ -22,7 +22,7 @@ const attempts: Array<[string, Record<string, unknown>]> = [
 
 describe('CUA input through the shared action gate', () => {
   it.each(attempts)('refuses %s before approval or driver dispatch', async (tool, args) => {
-    const gate = new ActionGate({ platformWrites: () => true, imageGeneration: () => false, imageSaving: () => false, mediaUpload: () => false, computerInput: () => true });
+    const gate = new ActionGate({ platformWrites: () => true, imageGeneration: () => false, imageSaving: () => false, mediaUpload: () => false, computerInput: () => true, desktopTargetAllowed: () => false });
     let dispatched = 0;
     let questions = 0;
     const driver = new Proxy({} as CuaDriverLike, {
@@ -46,7 +46,7 @@ describe('CUA input through the shared action gate', () => {
   });
 
   it('keeps browser and desktop reads available while desktop input is closed', () => {
-    const gate = new ActionGate({ platformWrites: () => true, imageGeneration: () => false, imageSaving: () => false, mediaUpload: () => false, computerInput: () => true });
+    const gate = new ActionGate({ platformWrites: () => true, imageGeneration: () => false, imageSaving: () => false, mediaUpload: () => false, computerInput: () => true, desktopTargetAllowed: () => false });
     expect(gate.check({ surface: 'desktop', tool: 'pet_cua_screenshot', impact: 'read' }).allow).toBe(true);
     expect(gate.check({ surface: 'browser', tool: 'browser_read', impact: 'read' }).allow).toBe(true);
     expect(gate.check({ surface: 'browser', tool: 'browser_type', impact: 'platform-write' }).allow).toBe(true);

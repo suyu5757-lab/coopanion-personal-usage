@@ -61,7 +61,7 @@ import { withWorlds, type WorldDefinition, type WorldSection } from 'cortico/wor
 import { ActionGate } from './action-gate.ts';
 import { InstanceLockedError } from 'cortico/core/instance-lock.ts';
 import { CONSOLE } from 'cortico/worlds/console/definition.ts';
-import { desktopPetDefinition, figurePacks, type DesktopPetWorld } from 'cortico-world-desktop-pet';
+import { desktopPetDefinition, figurePacks, isSupportedCuaTarget, type DesktopPetWorld } from 'cortico-world-desktop-pet';
 import CODEX from 'cortico-world-codex';
 import { opencodeDefinition } from 'cortico-world-opencode';
 import COO, { CHATGPT, CHATGPT_PROVIDER, signedIn, usageLimited, vendorOf } from 'cortico-provider-coo';
@@ -447,6 +447,7 @@ export async function main(): Promise<void> {
     imageSaving: () => readSelfTime(config).imageSaving,
     mediaUpload: () => readSelfTime(config).mediaUpload,
     computerInput: () => getByPath((config ?? {}) as unknown as Record<string, unknown>, 'worlds.desktop-pet.cua.control') === true,
+    desktopTargetAllowed: isSupportedCuaTarget,
   });
   const browserBridge = new BrowserBridge();
   /** The introduction is running: the settings it makes are not told as changes. */

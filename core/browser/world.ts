@@ -326,6 +326,7 @@ export class BrowserWorld implements World {
       imageSaving: () => this.self.imageSaving,
       mediaUpload: () => this.self.mediaUpload,
       computerInput: () => true,
+      desktopTargetAllowed: () => false,
     }));
   }
 
