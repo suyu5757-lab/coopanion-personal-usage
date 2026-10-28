@@ -127,7 +127,7 @@ await esbuild.build({
   jsx: 'automatic',
   define: {
     COOPANION_VERSION: JSON.stringify(version),
-    COOPANION_CHANNEL: JSON.stringify(process.env.COOPANION_CHANNEL === 'steam' ? 'steam' : 'github'),
+    COOPANION_CHANNEL: JSON.stringify(process.env.COOPANION_CHANNEL === 'test' ? 'test' : process.env.COOPANION_CHANNEL === 'steam' ? 'steam' : 'github'),
     'process.env.NODE_ENV': '"production"',
   },
   logLevel: 'warning',
