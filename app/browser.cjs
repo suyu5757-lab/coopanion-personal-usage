@@ -79,7 +79,7 @@ function within(work, ms, what) {
   ]).finally(() => clearTimeout(timer));
 }
 
-function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () => null }) {
+function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () => null, partition = PARTITION }) {
   /** @type {import('electron').BrowserWindow | null} */
   let win = null;
   /** Whether the page script is present in the current document. */
@@ -263,7 +263,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     const area = screen.getPrimaryDisplay().workArea;
     const width = Math.min(WINDOW_WIDTH, Math.max(680, area.width - 160));
     const height = Math.min(WINDOW_HEIGHT, Math.max(520, area.height - 200));
-    const ses = session.fromPartition(PARTITION);
+    const ses = session.fromPartition(partition);
     ses.setSpellCheckerEnabled(false);
     // only the page script's own recording may ask for display media; everything else stays denied
     const capturePermission = (permission, details) => {
@@ -297,7 +297,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       autoHideMenuBar: true,
       backgroundColor: '#0f1115',
       webPreferences: {
-        partition: PARTITION,
+        partition,
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: true,

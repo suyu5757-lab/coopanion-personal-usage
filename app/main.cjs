@@ -42,9 +42,11 @@
 const { app, BrowserWindow, Menu, Notification, Tray, dialog, ipcMain, nativeImage, screen, session, shell } = require('electron');
 const http = require('node:http');
 const { Readable } = require('node:stream');
+const { randomUUID } = require('node:crypto');
 const { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, rmSync, symlinkSync, writeFileSync } = require('node:fs');
 const { delimiter, dirname, extname, join, resolve, sep } = require('node:path');
 const { dataDirIn, locateData, readRecord, writeRecord } = require('./data-dir.cjs');
+const { testChannelConfig } = require('./test-channel.cjs');
 
 const MAC = process.platform === 'darwin';
 const LINUX = process.platform === 'linux';
@@ -59,19 +61,28 @@ const APP_ROOT = app.getAppPath();
 const ICONS = join(__dirname, 'icons');
 /** Window icon: on Windows the .ico, so the taskbar picks the size it draws instead of scaling a 512 px PNG. */
 const WINDOW_ICON = join(ICONS, process.platform === 'win32' ? 'icon.ico' : 'icon.png');
-const APP_ID = 'ai.pal.coopanion';
 /** The build's channel and, for `steam`, its Steam app id (see the module header). */
 const BUILD = JSON.parse(readFileSync(join(APP_ROOT, 'package.json'), 'utf8')).coopanion ?? {};
+const TEST_APP = testChannelConfig(BUILD, app.getPath('appData'));
+const TEST = TEST_APP !== null;
+const RUN_ID = TEST_APP?.runId ?? `app-${process.pid}`;
+const APP_NAME = TEST_APP?.appName ?? 'Coopanion';
+const APP_ID = TEST_APP?.appId ?? 'ai.pal.coopanion';
+const CUA_DRIVER_BIN = TEST
+  ? (MAC && existsSync('/Applications/CuaDriver.app/Contents/MacOS/cua-driver') ? '/Applications/CuaDriver.app/Contents/MacOS/cua-driver' : '')
+  : process.env.CORTICO_CUA_DRIVER_BIN || (MAC && existsSync('/Applications/CuaDriver.app/Contents/MacOS/cua-driver') ? '/Applications/CuaDriver.app/Contents/MacOS/cua-driver' : '');
+const CUA_DRIVER_SOCKET = TEST ? join('/tmp', `cua-${RUN_ID}.sock`) : process.env.CORTICO_CUA_DRIVER_SOCKET || join('/tmp', `cua-${RUN_ID}.sock`);
+const CUA_DRIVER_SESSION = TEST ? `r-${RUN_ID.slice(0, 24)}-${randomUUID().slice(0, 6)}` : process.env.CORTICO_CUA_DRIVER_SESSION || `r-${RUN_ID.slice(0, 24)}-${randomUUID().slice(0, 6)}`;
 const STEAM = BUILD.channel === 'steam';
 const PORTABLE = BUILD.channel === 'portable';
 const PET_HOST = process.argv.includes('--pet-host');
 /** The Windows installed build, whose data directory data-dir.cjs finds from the program's directory. */
-const INSTALLED = app.isPackaged && process.platform === 'win32' && !STEAM && !PORTABLE && !process.env.CORTICO_COMPANION_DATA;
+const INSTALLED = app.isPackaged && process.platform === 'win32' && !TEST && !STEAM && !PORTABLE && !process.env.CORTICO_COMPANION_DATA;
 const PROGRAM_DIR = dirname(process.execPath);
 const BESIDE = join(PROGRAM_DIR, 'data');
-const DATA_RECORD = process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Coopanion', 'data-location.json') : null;
+const DATA_RECORD = !TEST && process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Coopanion', 'data-location.json') : null;
 const located = INSTALLED && DATA_RECORD ? locateData({ programDir: PROGRAM_DIR, record: readRecord(DATA_RECORD) }) : null;
-const DATA = process.env.CORTICO_COMPANION_DATA
+const DATA = TEST_APP ? TEST_APP.dataDir : process.env.CORTICO_COMPANION_DATA
   || (!app.isPackaged ? join(APP_ROOT, 'build', 'data')
     : MAC || LINUX || STEAM ? join(app.getPath('appData'), 'Coopanion') : located?.use ?? BESIDE);
 
@@ -223,7 +234,7 @@ const { createBrowserHost } = require('./browser.cjs');
 const { configuredLanguage, systemLanguage, textOf } = require('./i18n/index.cjs');
 const { RELEASES_URL, canUpdate, startUpdater } = require('./updater.cjs');
 /** Steam updates its build, and the portable one is updated by hand: only the others run the updater. */
-const SELF_UPDATE = !STEAM && !PORTABLE && canUpdate();
+const SELF_UPDATE = !TEST && !STEAM && !PORTABLE && canUpdate();
 
 const userData = app.getPath('userData');
 const shimDir = join(__dirname, 'shims');
@@ -248,7 +259,7 @@ function dataHoldsLinks() {
   return true;
 }
 const LINKS = dataHoldsLinks();
-const PNPM_DIR = LINKS ? join(DATA, 'pnpm') : join(process.env.LOCALAPPDATA ?? app.getPath('temp'), 'Coopanion', 'pnpm');
+const PNPM_DIR = TEST || LINKS ? join(DATA, 'pnpm') : join(process.env.LOCALAPPDATA ?? app.getPath('temp'), 'Coopanion', 'pnpm');
 
 const core = new CoreHost({
   appRoot: APP_ROOT,
@@ -259,6 +270,10 @@ const core = new CoreHost({
     ...process.env,
     CORTICO_HOME: join(userData, 'home'),
     CORTICO_EXTENSIONS_DIR: join(userData, 'extensions'),
+    CORTICO_TEST_CHANNEL: TEST ? '1' : '0',
+    CORTICO_CUA_DRIVER_BIN: CUA_DRIVER_BIN,
+    CORTICO_CUA_DRIVER_SOCKET: CUA_DRIVER_SOCKET,
+    CORTICO_CUA_DRIVER_SESSION: CUA_DRIVER_SESSION,
     CORTICO_SUPERVISED: '1',
     CORTICO_START_PAUSED: '0',
     CORTICO_DESKTOP_PET_HOST: JSON.stringify(petHost),
@@ -274,10 +289,11 @@ const core = new CoreHost({
     PATH: [shimDir, ...existsSync(MINGIT) ? [MINGIT] : [], process.env.PATH ?? ''].join(delimiter),
     CORTICO_NODE_EXE: process.execPath,
     CORTICO_PNPM_CJS: join(APP_ROOT, 'node_modules', 'pnpm', 'bin', 'pnpm.cjs'),
+    ...(TEST_APP?.coreEnvironment ?? {}),
     // reported with the usage statistics (core/telemetry.ts)
     COOPANION_VERSION: app.getVersion(),
     // the introduction offers the whale's persona outside Steam (core/guide.ts)
-    COOPANION_CHANNEL: STEAM ? 'steam' : 'github',
+    COOPANION_CHANNEL: TEST ? 'test' : STEAM ? 'steam' : 'github',
   },
 });
 
@@ -285,6 +301,7 @@ const core = new CoreHost({
 const browser = createBrowserHost({
   appRoot: APP_ROOT,
   icon: WINDOW_ICON,
+  partition: TEST_APP?.browserPartition,
   log: console,
   send: (msg) => core.send(msg),
   mediaDir: () => core.dataDir ? join(core.dataDir, 'video', 'media') : null,
@@ -334,7 +351,7 @@ const settingsUrl = (path = '') => consoleUrl(`coopanion/${path}`);
  * is, unfollowed. WebSockets do not pass through here; keepRemoteOut keeps the session's other traffic on
  * this machine, apart from the release check and the extension market's images, and its frames too.
  */
-const SETTINGS_PARTITION = 'persist:coopanion-settings';
+const SETTINGS_PARTITION = TEST_APP?.settingsPartition ?? 'persist:coopanion-settings';
 const WINDOW_DIR = join(APP_ROOT, 'build', 'console');
 const WINDOW_PREFIX = '/coopanion/';
 const WINDOW_TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.map': 'application/json' };
@@ -473,14 +490,14 @@ function openSettings(path = '') {
   const area = screen.getPrimaryDisplay().workAreaSize;
   settings = new BrowserWindow({
     width: Math.min(1200, area.width), height: Math.min(800, area.height), minWidth: 880, minHeight: 600,
-    title: 'Coopanion', icon: WINDOW_ICON, autoHideMenuBar: true, show: false,
+    title: APP_NAME, icon: WINDOW_ICON, autoHideMenuBar: true, show: false,
     backgroundColor: '#f4f5f4',
     webPreferences: { partition: SETTINGS_PARTITION, preload: join(__dirname, 'settings-preload.cjs'), contextIsolation: true, sandbox: true, spellcheck: false },
   });
   // the taskbar button takes its icon and relaunch target from the running program, not from a pinned
   // shortcut to the same app id whose program has moved (a reinstall elsewhere, a new portable folder)
   if (process.platform === 'win32' && app.isPackaged) {
-    settings.setAppDetails({ appId: APP_ID, appIconPath: process.execPath, appIconIndex: 0, relaunchCommand: `"${process.execPath}"`, relaunchDisplayName: 'Coopanion' });
+    settings.setAppDetails({ appId: APP_ID, appIconPath: process.execPath, appIconIndex: 0, relaunchCommand: `"${process.execPath}"`, relaunchDisplayName: APP_NAME });
   }
   settings.once('ready-to-show', () => bringForward(settings));
   settings.on('page-title-updated', (e) => e.preventDefault());
@@ -534,14 +551,15 @@ async function ensurePet() {
  * Windows reads `openAtLogin` back only for the value named after the app's id and with the same arguments;
  * the portable build names its value after its folder, so each copy has its own, and reads it from `launchItems`.
  */
-const AUTOSTART = join(app.getPath('home'), '.config', 'autostart', 'coopanion.desktop');
+const AUTOSTART = join(app.getPath('home'), '.config', 'autostart', TEST ? `coopanion-test-${RUN_ID}.desktop` : 'coopanion.desktop');
 const LOGIN_ARGS = ['--background'];
 const LOGIN_NAME = PORTABLE ? `Coopanion ${PROGRAM_DIR}` : undefined;
 const loginItem = {
-  get: () => (LINUX ? existsSync(AUTOSTART)
+  get: () => TEST ? false : (LINUX ? existsSync(AUTOSTART)
     : LOGIN_NAME ? app.getLoginItemSettings().launchItems.some((item) => item.name === LOGIN_NAME)
       : app.getLoginItemSettings({ args: LOGIN_ARGS }).openAtLogin),
   set(on) {
+    if (TEST) return;
     if (!LINUX) { app.setLoginItemSettings({ openAtLogin: on, args: LOGIN_ARGS, ...LOGIN_NAME ? { name: LOGIN_NAME } : {} }); return; }
     if (!on) { rmSync(AUTOSTART, { force: true }); return; }
     const exe = process.env.APPIMAGE || process.execPath;
@@ -562,7 +580,7 @@ function refreshTray() {
     { label: t.trayOpenSettings, click: () => openSettings() },
     { label: t.trayShowPet, enabled: core.state === 'running', click: () => void showPet().catch(() => { /* Core went away meanwhile */ }) },
     { type: 'separator' },
-    { label: t.trayLaunchAtLogin, type: 'checkbox', checked: login, enabled: app.isPackaged, click: (item) => { loginItem.set(item.checked); noteAutostart(); refreshTray(); } },
+    { label: t.trayLaunchAtLogin, type: 'checkbox', checked: login, enabled: app.isPackaged && !TEST, click: (item) => { loginItem.set(item.checked); noteAutostart(); refreshTray(); } },
     { label: t.trayRestart, click: () => void core.restart() },
     { label: t.trayQuit, click: () => app.quit() },
   ]));
@@ -583,7 +601,7 @@ function buildTray() {
   icon.addRepresentation({ scaleFactor: 2, buffer: nativeImage.createFromPath(join(ICONS, `${name}@2x.png`)).toPNG() });
   if (MAC) icon.setTemplateImage(true);
   tray = new Tray(icon);
-  tray.setToolTip('Coopanion');
+  tray.setToolTip(APP_NAME);
   refreshTray();
   core.on('state', refreshTray);
   // on macOS a click opens the menu, as every menu-bar icon does
@@ -611,8 +629,8 @@ core.on('state', (state, exit) => {
   const detail = exit.kind === 'locked' ? T().coreLocked(exit.pid, exit.file)
     : exit.kind === 'ports-busy' ? T().corePortsBusy(exit.from, exit.to)
       : exit.kind === 'failed' ? T().coreFailed(exit.times, exit.code, exit.logFile) : T().coreRestarting(exit.code);
-  if (Notification.isSupported()) new Notification({ title: 'Coopanion', body: detail, icon: WINDOW_ICON }).show();
-  if (state === 'failed') dialog.showErrorBox('Coopanion', detail);
+  if (Notification.isSupported()) new Notification({ title: APP_NAME, body: detail, icon: WINDOW_ICON }).show();
+  if (state === 'failed') dialog.showErrorBox(APP_NAME, detail);
 });
 
 core.on('open', (path) => openSettings(path));
