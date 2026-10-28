@@ -103,6 +103,7 @@ function hasKey(config: CoreConfig): boolean {
 
 /** The app's version, as the Electron main process passes it; `dev` in a development run. */
 const APP_VERSION = process.env.COOPANION_VERSION ?? 'dev';
+const TEST_CHANNEL = process.env.CORTICO_TEST_CHANNEL === '1';
 /** The program directory; crash reports name files relative to it. */
 const APP_ROOT = fileURLToPath(new URL('../', import.meta.url));
 /** How long the pet page gets to show up on a first start before the settings window opens instead. */
@@ -453,6 +454,13 @@ export async function main(): Promise<void> {
   /** Figure pack directories besides the data directory's `figures/`, from the main process (the Steam Workshop's, app/steam.cjs). */
   const packRoots = (process.env.COOPANION_PACK_ROOTS ?? '').split(delimiter).filter(Boolean);
   const DESKTOP_PET = desktopPetDefinition({
+    cuaDriver: {
+      binaryPath: process.env.CORTICO_CUA_DRIVER_BIN ?? '',
+      endpoint: 'unix-socket',
+      socketPath: process.env.CORTICO_CUA_DRIVER_SOCKET ?? '',
+      session: process.env.CORTICO_CUA_DRIVER_SESSION ?? '',
+      lifecycle: 'external-managed',
+    },
     // `displayName` of the live config: a rename reaches the menu header, the chat page and computer use's question without a restart
     botName: () => config?.displayName ?? DISPLAY_NAME,
     packRoots: () => packRoots,
@@ -537,12 +545,17 @@ export async function main(): Promise<void> {
     defaults: () => ({
       ...base.definition.defaults(),
       displayName: DISPLAY_NAME,
-      web: { port: CONSOLE_PORT, theme: 'mint' },
+      web: { port: TEST_CHANNEL ? 0 : CONSOLE_PORT, theme: 'mint' },
       // Cormini's 6/12 end a computer-use task partway through; 20/40 are the caps the desktop-pet
       // e2e harnesses give their persona
       rounds: { soft: 20, hard: 40 },
       context: { ...base.definition.defaults().context, maxTokens: 128_000, keepRatio: 0.25 },
-      companion: { telemetry: true, contextRing: false, selfTime: { ...SELF_TIME_DEFAULTS }, growth: { ...GROWTH_DEFAULTS } },
+      companion: {
+        telemetry: !TEST_CHANNEL,
+        contextRing: false,
+        selfTime: { ...SELF_TIME_DEFAULTS, enabled: false, actions: false },
+        growth: { ...GROWTH_DEFAULTS, enabled: false },
+      },
     }),
     // Cormini's own build with Coo's Persona class; the workspace is snapshotted before Coo can write to it
     build: (loaded, worlds) => {

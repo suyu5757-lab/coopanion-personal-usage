@@ -19,6 +19,7 @@ const OLD_MODULE = 'deepseek';
 /** When computer use asks first (`worlds.desktop-pet.cua.permission`): new installs get it written out, so a config without it is from before and keeps the default it had. */
 const CUA_ASK = 'ask-once';
 const OLD_CUA_ASK = 'ask-each-turn';
+const TEST_CHANNEL = process.env.CORTICO_TEST_CHANNEL === '1';
 const SEED_DIR = fileURLToPath(new URL('./seed/', import.meta.url));
 /**
  * The self-descriptions Coo can start from, in the order the introduction offers them: Coo as it ships, four
@@ -70,7 +71,7 @@ export function seed(home: string, language: Language): void {
       language,
       activeProvider: endpointName(vendor, region),
       providerSchemaVersion: 3,
-      web: { port: CONSOLE_PORT },
+      web: { port: TEST_CHANNEL ? 0 : CONSOLE_PORT },
       worlds: { 'desktop-pet': { cua: { permission: CUA_ASK } } },
     });
   }
