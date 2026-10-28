@@ -1,5 +1,5 @@
 const path = require('node:path');
-const { cpSync, mkdirSync, readFileSync } = require('node:fs');
+const { cpSync, existsSync, mkdirSync, readFileSync } = require('node:fs');
 const { testIdentity } = require('./app/test-channel.cjs');
 
 const root = __dirname;
@@ -17,6 +17,7 @@ module.exports = {
   productName: identity.productName,
   directories: {
     app,
+    buildResources: path.join(root, 'app', 'icons'),
     output: path.join(root, 'dist', 'test', runId),
   },
   publish: null,
@@ -37,6 +38,16 @@ module.exports = {
     const packagedApp = electronPlatformName === 'darwin'
       ? path.join(appOutDir, `${identity.productName}.app`, 'Contents', 'Resources', 'app')
       : path.join(appOutDir, 'resources', 'app');
+    for (const file of [
+      'build/cortico/package.json',
+      'build/console/index.html',
+      'build/browser-agent.js',
+      'build/panels/coopanion/webui.js',
+    ]) {
+      if (!existsSync(path.join(packagedApp, file))) {
+        throw new Error(`The packaged Test App is missing ${file}`);
+      }
+    }
     const source = path.join(app, 'node_modules', 'pnpm', 'dist', 'node_modules');
     const destination = path.join(packagedApp, 'node_modules', 'pnpm', 'dist', 'node_modules');
     mkdirSync(destination, { recursive: true });
