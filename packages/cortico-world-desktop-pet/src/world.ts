@@ -52,7 +52,7 @@ import { ActivityGroup, ChatSockets, SELF_TYPE, chatHistory, chatItem, chatRefs,
 import { ASK_OPTION_MAX, petToolDecls } from './tools.ts';
 import { COO, figurePacks, lookOf, modelName, nameIn, packFor, type FigurePack, type MoveTarget, type PackScan } from './packs.ts';
 import { moveChange, moveTable, readMove } from './moves.ts';
-import { Cua } from './cua/cua.ts';
+import { Cua, type CuaInputAuthorization, type CuaInputGrantRequest } from './cua/cua.ts';
 import { CUA_OFF_TOOL_DECLS } from './cua/tools.ts';
 import type { Answer } from './cua/engine-ipc.ts';
 import { PackImporter } from './pack-import.ts';
@@ -243,8 +243,12 @@ export interface DesktopPetWorldOptions {
   replyLanguage?: () => string | null;
   /** Called with each answer to computer use's question, asked in the pet's bubble. */
   onCuaAnswer?: (answer: Answer) => void;
-  /** Core's shared policy gate for computer input. */
+  /** Core's fail-closed check for every input tool while no task-grant bridge is configured. */
   allowCuaInput?: (tool: string) => boolean;
+  /** Identifies this Core run in native-window evidence. */
+  cuaInstanceId?: string;
+  /** Core confirms and issues a one-step grant for a supported native target. */
+  authorizeCuaInput?: (request: CuaInputGrantRequest) => Promise<CuaInputAuthorization | null>;
   /** Exact app-managed Cua Driver endpoint and session. */
   cuaDriver?: CuaDriverOptions;
 }
@@ -412,6 +416,8 @@ export class DesktopPetWorld implements World {
       modelLanguage: () => this.language,
       language: () => this.appLanguage,
       allowInput: opts.allowCuaInput,
+      instanceId: opts.cuaInstanceId,
+      authorizeInput: opts.authorizeCuaInput,
       askPermission: async (question, choices) => {
         const answer = await this.confirm(question, choices);
         if (answer === 'unavailable') return null;

@@ -7,7 +7,7 @@ const ko: Translation<CuaText> = {
     once: (who: string, minutes: number) => `${who}에서 마우스와 키보드를 사용하려고 합니다. 앞으로 ${minutes}분 동안 허용하시겠습니까?`,
     acting: (who: string) => `${who}에서 마우스와 키보드를 사용하려고 합니다. 이번에 허용하시겠습니까?`,
     action: (who: string, action: string, target: string, detail: string) => `${who}이(가) 컴퓨터에서 다음 작업을 하려고 합니다: ${action}. 대상: ${target}. 내용: ${detail}. 이 작업 한 번만 허용할까요?`,
-    actions: { click: '클릭', drag: '드래그', type: '텍스트 입력', key: '키 누르기', focus: '창을 앞으로 가져오기', foreground: '앞쪽 창에서 다시 시도' },
+    actions: { click: '클릭', move: '포인터 이동', drag: '드래그', scroll: '스크롤', type: '텍스트 입력', key: '키 누르기', focus: '창을 앞으로 가져오기', foreground: '앞쪽 창에서 다시 시도' },
     caption: '컴퓨터 사용',
     yes: '예',
     no: '이번에는 아니요',

@@ -11,7 +11,7 @@ export default {
     acting: (who: string) => `${who} 想操作你的鼠标和键盘。这一次可以吗？`,
     /** 两个按钮:桌宠气泡和系统对话框共用;caption 是系统对话框的标题(桌宠页不在时才弹) */
     action: (who: string, action: string, target: string, detail: string) => `${who}申请执行电脑操作：${action}。目标：${target}。内容：${detail}。只批准这一次吗？`,
-    actions: { click: '点击', drag: '拖拽', type: '输入文字', key: '按键', focus: '切换窗口到前台', foreground: '改为前台操作' },
+    actions: { click: '点击', move: '移动指针', drag: '拖拽', scroll: '滚动', type: '输入文字', key: '按键', focus: '切换窗口到前台', foreground: '改为前台操作' },
     caption: '电脑操作',
     yes: '可以',
     no: '这次不行',

@@ -49,7 +49,7 @@ export const CUA_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'pet_cua_click',
     tags: ['act'],
-    description: 'Click at (x, y) in the latest screenshot, or pass an elementToken from the latest pet_cua_accessibility result for a pressable element in the selected background window. Provide coordinates or an elementToken, not both. Each click needs approval for this target and action.',
+    description: 'In a supported native background window, click at (x, y) in its latest screenshot, or pass an elementToken from its latest pet_cua_accessibility result. Provide coordinates or an elementToken, not both. Core confirms the exact target and click before dispatch.',
     parameters: {
       type: 'object',
       properties: {
@@ -65,13 +65,13 @@ export const CUA_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'pet_cua_move',
     tags: ['act'],
-    description: 'Only move the pointer to (x, y), without clicking; for hovering to bring up a tooltip or a menu. After pet_cua_window this moves only the agent cursor; most apps do not show hover in the background.',
+    description: 'In a supported native background window, move the pointer to (x, y) without clicking. Core confirms the exact target and movement before dispatch.',
     parameters: { type: 'object', properties: { ...xy, screenshot: shot }, required: ['x', 'y'] },
   },
   {
     name: 'pet_cua_drag',
     tags: ['act'],
-    description: 'Hold the left button down, drag from `from` to `to`, and release. Both points are in pixels of the latest screenshot; after pet_cua_window the drag runs inside that window in the background.',
+    description: 'In a supported native background window, hold the left button down, drag from `from` to `to`, and release. Both points are pixels of the latest window screenshot. Core confirms this exact target and drag before dispatch.',
     parameters: {
       type: 'object',
       properties: {
@@ -85,7 +85,7 @@ export const CUA_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'pet_cua_scroll',
     tags: ['act'],
-    description: 'Scroll at (x, y). Positive down scrolls down, negative up; positive right scrolls right. Units are wheel notches. After pet_cua_window this scrolls inside that window in the background.',
+    description: 'In a supported native background window, scroll at (x, y). Positive down scrolls down, negative up; positive right scrolls right. Units are wheel notches. Core confirms the exact target and scroll before dispatch.',
     parameters: {
       type: 'object',
       properties: {
@@ -100,13 +100,13 @@ export const CUA_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'pet_cua_type',
     tags: ['act'],
-    description: 'Type text at the current input focus (any language, whatever state the input method is in); \\n presses Enter once. Click where the text goes first. After pet_cua_window the text goes to that window without raising it.',
+    description: 'In a supported native background window, type the supplied text; \\n presses Enter once. Core confirms the exact target and text before dispatch.',
     parameters: { type: 'object', properties: { text: { type: 'string', maxLength: 2000 }, screenshot: shot }, required: ['text'] },
   },
   {
     name: 'pet_cua_key',
     tags: ['act'],
-    description: 'Press a key or a key combination. Join keys pressed together with +, and separate keys pressed one after another with spaces: "ctrl+s", "alt+f4", "ctrl+a delete", "enter", "win". After pet_cua_window the keys go to that window without raising it.',
+    description: 'In a supported native background window, press one or more keys. Join keys pressed together with +, and separate keys pressed one after another with spaces: "ctrl+s", "ctrl+a delete", "enter". Core confirms the exact target and keys before dispatch.',
     parameters: { type: 'object', properties: { keys: { type: 'string' }, screenshot: shot }, required: ['keys'] },
   },
   {
@@ -118,7 +118,7 @@ export const CUA_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'pet_cua_window',
     tags: ['read', 'snapshot'],
-    description: 'Work on one window in the background: capture it and make later pet_cua_* coordinates refer to its screenshot. The window is not raised; the person\'s pointer and keyboard focus stay where they are. window is a handle from pet_cua_windows, or part of its title. Requires Cua Driver. Use pet_cua_accessibility to read pressable elements. To leave the window, pass a display to pet_cua_screenshot or call pet_cua_focus.',
+    description: 'Capture one background window and make later pet_cua_* coordinates refer to its screenshot. The window is not raised; the person\'s pointer and keyboard focus stay where they are. window is a handle from pet_cua_windows, or part of its title. Requires Cua Driver and a supported native app for input. Use pet_cua_accessibility to read pressable elements. Foreground switching is unavailable.',
     parameters: { type: 'object', properties: { window: { type: 'string' } }, required: ['window'] },
   },
   {
@@ -137,7 +137,7 @@ export const CUA_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'pet_cua_focus',
     tags: ['act'],
-    description: 'Bring a window to the foreground (restoring it first if minimized) and leave any background window target. window is a handle from pet_cua_windows, or part of its title.',
+    description: 'Foreground switching is unavailable through Core-authorized computer use. Use only a supported background native window; this tool refuses to raise a window.',
     parameters: { type: 'object', properties: { window: { type: 'string' }, screenshot: shot }, required: ['window'] },
   },
   {

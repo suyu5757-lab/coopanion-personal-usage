@@ -63,7 +63,7 @@ const zh = {
   listSep: '、',
   actionApprovalRequired: '点击、拖拽、输入、按键和切换前台可能改变外部状态;当前没有绑定本次操作的授权,所以没有执行。可以截图、移动指针或滚动。',
   actionDenied: '你没有批准这次输入,没有执行。',
-  gateDenied: 'Core 拒绝了这次输入。当前集成候选无法可信地区分浏览器窗口，CUA 输入暂不可用；网页操作请使用 Browser 工具，最终发布由用户亲自完成。',
+  gateDenied: 'Core 无法核验受支持的原生窗口和单步授权，没有发送输入。浏览器操作请使用 Browser 工具，最终发布由使用者操作。',
   elementStale: '这个 elementToken 已经过期。重新读取 pet_cua_accessibility 后再选择元素。',
   accessibilityNoWindow: '先用 pet_cua_window 选择一个后台窗口。',
   accessibilityEmpty: '这个窗口没有可用的 press 元素。',
@@ -114,10 +114,10 @@ const zh = {
   focusedElsewhere: (n: number) => `它在显示器 ${n},要看它就截那块显示器。`,
   focusRefused: (title: string, foreground: string | null) => `尝试切换到「${title}」,系统没有让它到前台;现在前台是「${foreground ?? '无'}」。`,
   backgroundOnly: BACKGROUND_ONLY,
-  backgroundAvailable: '先用 `pet_cua_windows` 列出窗口,再用 `pet_cua_window` 选择一个。用 `pet_cua_accessibility` 查看可按的元素,用 `elementToken` 精确点击。要回到整块屏幕,用 `pet_cua_screenshot` 带 display。',
-  backgroundMissing: 'The app-owned Cua Driver runtime is unavailable, so background windows and accessibility elements are unavailable. Whole-screen screenshots, pointer movement and scrolling remain available.',
-  backgroundUnsupported: '后台窗口操作只在这台 Mac 上可用;整屏截图、移动指针和滚动仍可用。',
-  backgroundViewOnly: '电脑操作现在只允许截图和列窗口(worlds.desktop-pet.cua.control 关着),所以后台也只能截取窗口,不能点击或打字。',
+  backgroundAvailable: '先用 `pet_cua_windows` 列出窗口,再用 `pet_cua_window` 选择受支持的原生窗口。用 `pet_cua_accessibility` 查看可按的元素,用 `elementToken` 精确点击。每个输入步骤都需要针对本次动作获得批准。不能切换到前台;没有受支持的窗口时就停止。',
+  backgroundMissing: '私有 Cua Driver 运行环境不可用,电脑操作现在只读。仍可截图、列出窗口和读取辅助功能元素。',
+  backgroundUnsupported: '这台 Mac 仅允许对受支持原生 App 的后台窗口输入。其他目标保持只读。',
+  backgroundViewOnly: '电脑操作现在只允许查看(worlds.desktop-pet.cua.control 关闭),因此可以读取后台窗口,不能修改窗口内容。',
   windowShot: (lead: string, title: string, handle: string, w: number, h: number, seen: boolean) =>
     `${lead}窗口「${title}」(${handle})的截图 ${w}×${h};坐标是这张窗口截图的像素。没有移动使用者的鼠标,也没有改变前台窗口。` + (seen ? '' : '\n当前模型不接收图片,只能读到这段文字。'),
   windowShotFallback: (w: number, h: number) => `窗口截图 ${w}×${h}`,
@@ -143,7 +143,7 @@ const zh = {
     'ask-each-turn': '每一轮第一次截图、列窗口或导航操作之前,使用者会被问一次。使用者没同意,这一轮的电脑操作工具都不执行;不要换别的工具绕过去,等使用者开口。',
     'ask-before-acting': '截图和列窗口不用先问。每一轮第一次移动指针或滚动之前,使用者会被问一次;使用者没同意,这一轮的导航输入工具都不执行,截图照常;不要换别的工具绕过去,等使用者开口。',
     'ask-once': `截图和列窗口不用先问。移动指针或滚动之前会问使用者一次,同意后 ${grantMinutes} 分钟内不再问;使用者没同意,这一轮的导航输入工具都不执行,截图照常;不要换别的工具绕过去,等使用者开口。`,
-    'never-ask': '查看屏幕、移动指针和滚动都不用先问使用者。点击、拖拽、输入、按键和切换前台仍需逐次确认具体动作。',
+    'never-ask': '跳过本轮通用授权。Core 仍要求在受支持的原生后台窗口中对每个输入步骤逐次确认;不允许前台输入或切换窗口。',
   })[level],
 };
 
@@ -193,7 +193,7 @@ const en: typeof zh = {
   listSep: ', ',
   actionApprovalRequired: 'This input needs approval for its exact target and contents, so it was not run.',
   actionDenied: 'You did not approve this input, so it was not run.',
-  gateDenied: 'Core refused this input. This integration candidate cannot verify browser window origins, so CUA input is unavailable. Use Browser tools and leave final publication to the person.',
+  gateDenied: 'Core could not verify a supported native window and one-step grant, so no input was sent. Use Browser tools for browser work and leave final publication to the person.',
   elementStale: 'This elementToken is stale. Read pet_cua_accessibility again and choose a current element.',
   accessibilityNoWindow: 'Select a background window with pet_cua_window first.',
   accessibilityEmpty: 'This window has no pressable accessibility elements.',
@@ -244,10 +244,10 @@ const en: typeof zh = {
   focusedElsewhere: (n) => ` It is on display ${n}; take a screenshot of that display to see it.`,
   focusRefused: (title, foreground) => `Tried to switch to "${title}", but the system did not bring it to the foreground; the foreground window is "${foreground ?? 'none'}".`,
   backgroundOnly: BACKGROUND_ONLY,
-  backgroundAvailable: 'List windows with `pet_cua_windows`, then select one with `pet_cua_window`. Use `pet_cua_accessibility` to read pressable elements and `elementToken` to click one. To return to the whole screen, pass a display to `pet_cua_screenshot`.',
-  backgroundMissing: 'The app-owned Cua Driver runtime is unavailable, so background windows and accessibility elements are unavailable. Whole-screen screenshots, pointer movement and scrolling remain available.',
-  backgroundUnsupported: 'Background windows are available only on this Mac; whole-screen screenshots, pointer movement and scrolling remain available.',
-  backgroundViewOnly: 'Computer use is view-only right now (worlds.desktop-pet.cua.control is off), so a background window can be captured but not clicked or typed into.',
+  backgroundAvailable: 'List windows with `pet_cua_windows`, then select a supported native window with `pet_cua_window`. Use `pet_cua_accessibility` to read pressable elements and `elementToken` to click one. Each input step needs exact approval. Foreground switching is unavailable; if no supported window is listed, stop.',
+  backgroundMissing: 'The private Cua Driver runtime is unavailable, so computer use is read-only. Screenshots, window lists and accessibility reads remain available.',
+  backgroundUnsupported: 'Background window input is available only on this Mac for a supported native app. Unsupported targets remain read-only.',
+  backgroundViewOnly: 'Computer use is view-only right now (worlds.desktop-pet.cua.control is off), so background windows can be read but not changed.',
   windowShot: (lead, title, handle, w, h, seen) =>
     `${lead}Screenshot of window "${title}" (${handle}) ${w}×${h}; coordinates are pixels of this window screenshot. The person's pointer and foreground window did not change.` + (seen ? '' : '\nThe current model does not take images; this text is all it gets.'),
   windowShotFallback: (w, h) => `window screenshot ${w}×${h}`,
@@ -267,12 +267,12 @@ const en: typeof zh = {
   waitNoLook: (seconds) => `Waited ${seconds} seconds. The person has not allowed looking at the screen this turn, so there is no screenshot; pet_cua_screenshot asks them first.`,
 
   displays: (n, list) => ` This computer has ${n} displays: ${list}. A screenshot shows one display: \`pet_cua_screenshot\` without display shows the one looked at last, at first the one holding the foreground window; give its number to see another. A newly opened window may appear on another display; \`pet_cua_windows\` says which display each window is on.`,
-  control: (allowed) => (allowed ? 'pointer movement and scrolling use the configured turn permission; clicks, drags, typing, keys and focus changes each need approval for that exact action' : 'only screenshots and window lists are allowed, no mouse or keyboard input'),
+  control: (allowed) => (allowed ? 'in a supported native background window, every pointer move, click, drag, scroll, text entry and key press needs exact approval; foreground input and focus changes are unavailable' : 'only screenshots and window lists are allowed, no mouse or keyboard input'),
   permission: (level, grantMinutes) => ({
     'ask-each-turn': 'Before the first screenshot, window list or navigation input of each turn, the person is asked once. If they do not agree, none of the computer-use tools run this turn; do not route around it with other tools, wait for the person to speak.',
     'ask-before-acting': 'Screenshots and window lists need no asking. Before the first pointer movement or scroll of each turn, the person is asked once; if they do not agree, navigation input does not run this turn, while screenshots still work; do not route around it with other tools, wait for the person to speak.',
     'ask-once': `Screenshots and window lists need no asking. Before pointer movement or scrolling the person is asked once, and after a yes not again for ${grantMinutes} minutes; if they do not agree, navigation input does not run this turn, while screenshots still work; do not route around it with other tools, wait for the person to speak.`,
-    'never-ask': 'Looking at the screen, moving the pointer and scrolling need no asking. Clicks, drags, typing, keys and focus changes still need approval for each exact action.',
+    'never-ask': 'The turn-level permission is skipped. Core still requires exact approval for every input step in a supported native background window; foreground input and focus changes are unavailable.',
   })[level],
 };
 

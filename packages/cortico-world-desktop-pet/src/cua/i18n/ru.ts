@@ -13,7 +13,7 @@ const ru: Translation<CuaText> = {
     once: (who: string, minutes: number) => `${who} хочет управлять вашей мышью и клавиатурой. Можно на ${minutes} ${plural(minutes, 'минуту', 'минуты', 'минут')}?`,
     acting: (who: string) => `${who} хочет управлять вашей мышью и клавиатурой. Можно в этот раз?`,
     action: (who: string, action: string, target: string, detail: string) => `${who} просит разрешить действие за компьютером: ${action}. Цель: ${target}. Подробности: ${detail}. Разрешить только это действие?`,
-    actions: { click: 'нажать', drag: 'перетащить', type: 'ввести текст', key: 'нажать клавиши', focus: 'перевести окно на передний план', foreground: 'повторить на переднем плане' },
+    actions: { click: 'нажать', move: 'переместить указатель', drag: 'перетащить', scroll: 'прокрутить', type: 'ввести текст', key: 'нажать клавиши', focus: 'перевести окно на передний план', foreground: 'повторить на переднем плане' },
     caption: 'Управление компьютером',
     yes: 'Да',
     no: 'В этот раз нет',

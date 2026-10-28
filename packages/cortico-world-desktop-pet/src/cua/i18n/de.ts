@@ -7,7 +7,7 @@ const de: Translation<CuaText> = {
     once: (who: string, minutes: number) => `${who} möchte deine Maus und Tastatur benutzen. Okay für die nächsten ${minutes} Minuten?`,
     acting: (who: string) => `${who} möchte deine Maus und Tastatur benutzen. Ist das diesmal okay?`,
     action: (who: string, action: string, target: string, detail: string) => `${who} bittet um Erlaubnis für diese Computeraktion: ${action}. Ziel: ${target}. Details: ${detail}. Diese Aktion einmal erlauben?`,
-    actions: { click: 'klicken', drag: 'ziehen', type: 'Text eingeben', key: 'Tasten drücken', focus: 'ein Fenster in den Vordergrund holen', foreground: 'im Vordergrund erneut versuchen' },
+    actions: { click: 'klicken', move: 'Zeiger bewegen', drag: 'ziehen', scroll: 'scrollen', type: 'Text eingeben', key: 'Tasten drücken', focus: 'ein Fenster in den Vordergrund holen', foreground: 'im Vordergrund erneut versuchen' },
     caption: 'Computersteuerung',
     yes: 'Ja',
     no: 'Diesmal nicht',

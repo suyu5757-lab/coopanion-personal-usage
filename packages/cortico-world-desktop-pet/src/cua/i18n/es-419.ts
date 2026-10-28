@@ -7,7 +7,7 @@ const es419: Translation<CuaText> = {
     once: (who: string, minutes: number) => `${who} quiere usar tu mouse y tu teclado. ¿Está bien durante los próximos ${minutes} minutos?`,
     acting: (who: string) => `${who} quiere usar tu mouse y tu teclado. ¿Está bien esta vez?`,
     action: (who: string, action: string, target: string, detail: string) => `${who} pide permiso para usar la computadora: ${action}. Destino: ${target}. Detalles: ${detail}. ¿Permitir solo esta acción?`,
-    actions: { click: 'hacer clic', drag: 'arrastrar', type: 'escribir texto', key: 'presionar teclas', focus: 'poner una ventana al frente', foreground: 'volver a intentar en primer plano' },
+    actions: { click: 'hacer clic', move: 'mover el puntero', drag: 'arrastrar', scroll: 'desplazarse', type: 'escribir texto', key: 'presionar teclas', focus: 'poner una ventana al frente', foreground: 'volver a intentar en primer plano' },
     caption: 'Uso de la computadora',
     yes: 'Sí',
     no: 'Esta vez no',

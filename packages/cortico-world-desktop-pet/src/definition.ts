@@ -8,6 +8,7 @@ import type { DescribeTool } from './status.ts';
 import type { ModelLanguage } from './model-text.ts';
 import type { Answer } from './cua/engine-ipc.ts';
 import type { CuaDriverOptions } from './cua/driver.ts';
+import type { CuaInputAuthorization, CuaInputGrantRequest } from './cua/cua.ts';
 import { CUA_OFF_TOOL_DECLS, CUA_TOOL_DECLS } from './cua/tools.ts';
 import { petToolDecls } from './tools.ts';
 import { SELF_TYPE } from './chat.ts';
@@ -91,8 +92,12 @@ export interface DesktopPetAssembly {
   language?(): Language;
   /** Called with each answer to computer use's question in the pet's bubble. */
   onCuaAnswer?(answer: Answer): void;
-  /** Core's shared policy gate for computer input. */
+  /** Core's fail-closed policy check for each computer input tool. */
   authorizeInput?(tool: string): boolean;
+  /** Identifies this Core run in native-window evidence. */
+  cuaInstanceId?: string;
+  /** Core confirms and issues a one-step grant for a supported native target. */
+  authorizeCuaInput?(request: CuaInputGrantRequest): Promise<CuaInputAuthorization | null>;
   /** Exact app-managed Cua Driver endpoint and session. */
   cuaDriver?: CuaDriverOptions;
 }
@@ -129,6 +134,8 @@ export function desktopPetDefinition(assembly: DesktopPetAssembly = {}): WorldDe
         onCuaAnswer: (answer) => assembly.onCuaAnswer?.(answer),
         cuaDriver: assembly.cuaDriver,
         allowCuaInput: assembly.authorizeInput,
+        cuaInstanceId: assembly.cuaInstanceId,
+        authorizeCuaInput: assembly.authorizeCuaInput,
       });
       assembly.onCreate?.(world);
       return world;

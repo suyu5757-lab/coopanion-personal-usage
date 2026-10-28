@@ -7,7 +7,7 @@ const zhHant: Translation<CuaText> = {
     once: (who: string, minutes: number) => `${who} 想操作你的滑鼠和鍵盤。接下來 ${minutes} 分鐘內都可以嗎？`,
     acting: (who: string) => `${who} 想操作你的滑鼠和鍵盤。這一次可以嗎？`,
     action: (who: string, action: string, target: string, detail: string) => `${who} 申請執行電腦操作：${action}。目標：${target}。內容：${detail}。只允許這一次嗎？`,
-    actions: { click: '點擊', drag: '拖曳', type: '輸入文字', key: '按鍵', focus: '切換視窗至前景', foreground: '改在前景操作' },
+    actions: { click: '點擊', move: '移動指標', drag: '拖曳', scroll: '捲動', type: '輸入文字', key: '按鍵', focus: '切換視窗至前景', foreground: '改在前景操作' },
     caption: '電腦操作',
     yes: '可以',
     no: '這次不行',

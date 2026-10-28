@@ -14,7 +14,7 @@ const en: CuaText = {
     acting: (who: string) => `${who} wants to use your mouse and keyboard. OK this time?`,
     /** The two buttons, of the pet's bubble and of the system dialog; `caption` is the system dialog's title (shown while no pet page is there). */
     action: (who: string, action: string, target: string, detail: string) => `${who} asks to use the computer: ${action}. Target: ${target}. Details: ${detail}. Allow this action once?`,
-    actions: { click: 'click', drag: 'drag', type: 'type text', key: 'press keys', focus: 'focus a window', foreground: 'retry in the foreground' },
+    actions: { click: 'click', move: 'move the pointer', drag: 'drag', scroll: 'scroll', type: 'type text', key: 'press keys', focus: 'focus a window', foreground: 'retry in the foreground' },
     caption: 'Computer use',
     yes: 'Yes',
     no: 'Not this time',

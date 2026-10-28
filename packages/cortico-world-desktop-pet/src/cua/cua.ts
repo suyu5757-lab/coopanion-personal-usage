@@ -30,7 +30,7 @@
  */
 import { fork, type ChildProcess } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import type { Logger, ToolCallContext, ToolDef, ToolOutcome, WorldHost, WorldLamp } from 'cortico/core/types.ts';
@@ -41,6 +41,7 @@ import type { CuaConfig, PermissionLevel } from './config.ts';
 import { cuaText, type CuaText } from './i18n/index.ts';
 import { CUA_TOOL_DECLS } from './tools.ts';
 import { CuaDriver, driverKeyChords, DriverFailure, type CuaDriverLike, type DriverAction, type DriverCapture, type DriverElement } from './driver.ts';
+import { isSupportedCuaTarget } from './target-policy.ts';
 import { fit } from './engine/image.ts';
 import { parseKeys } from './engine/keys.ts';
 import { MODEL_TEXT, type ModelLanguage, type ModelText } from './model-text.ts';
@@ -72,8 +73,49 @@ export interface CuaOptions {
   language?: () => Language;
   /** The background window driver; tests pass a fake. Default: Cua Driver through the installed CLI. */
   driver?: () => CuaDriverLike;
-  /** Core's shared policy gate for every computer input. */
+  /** Distinguishes windows belonging to separate app data roots and driver sessions. */
+  instanceId?: string;
+  /** Core's fail-closed check for every input tool while no task-grant bridge is configured. */
   allowInput?: (tool: string) => boolean;
+  /** Core verifies the native target, obtains approval and consumes a one-use step ticket. */
+  authorizeInput?: (request: CuaInputGrantRequest) => Promise<CuaInputAuthorization | null>;
+}
+
+export interface CuaDesktopTargetEvidence {
+  surface: 'desktop';
+  instanceId: string;
+  bundleId: string;
+  executablePath: string;
+  pid: number;
+  ownerPid: number;
+  processStart: string;
+  windowId: number;
+  bounds: { x: number; y: number; width: number; height: number };
+  display: string | null;
+  space: string | null;
+  snapshotId: string;
+  captureId: string;
+  element?: { role: string; label: string; token: string };
+  route: 'background-ax' | 'background-window-pixel';
+  source: 'cua-driver';
+}
+
+/** The app assembly turns one exact user approval into a Core grant and one-use step ticket. */
+export interface CuaInputGrantRequest {
+  tool: string;
+  taskId: string;
+  taskText: string;
+  expectedChange: string;
+  target: CuaDesktopTargetEvidence;
+  expiresInMs: number;
+  maxSteps: 1;
+  confirmInCoreUi: () => Promise<boolean>;
+}
+
+/** Core holds this capability until CUA reaches the input dispatch boundary. */
+export interface CuaInputAuthorization {
+  consume(target: CuaDesktopTargetEvidence | null, expectedChange: string): boolean;
+  revoke(): void;
 }
 
 /** The person did not allow this turn's computer use. */
@@ -125,6 +167,7 @@ interface ApprovedInput {
   digest: string;
   frame: string;
   used: boolean;
+  authorization?: CuaInputAuthorization;
 }
 
 /** `p`'s value, or null when `signal` aborts first. */
@@ -362,27 +405,90 @@ export class Cua {
     return `display ${view.display}, ${view.width}×${view.height}`;
   }
 
-  private async approveInput(tool: string, operation: keyof CuaText['ask']['actions'], detail: string, signal?: AbortSignal, targetOverride?: string): Promise<ApprovedInput | null> {
-    if (!this.opts.askPermission) return null;
+  private desktopTargetEvidence(element?: DriverElement): CuaDesktopTargetEvidence | null {
+    const target = this.target;
+    const identity = target?.processIdentity;
+    const bounds = target?.bounds;
+    if (!target || !identity || !bounds || !target.ownerPid || !target.snapshotId || !target.captureId) return null;
+    const evidence: CuaDesktopTargetEvidence = {
+      surface: 'desktop',
+      instanceId: this.opts.instanceId ?? '',
+      bundleId: identity.bundleId,
+      executablePath: identity.executablePath,
+      pid: target.pid,
+      ownerPid: target.ownerPid,
+      processStart: identity.processStart,
+      windowId: target.windowId,
+      bounds,
+      display: null,
+      space: null,
+      snapshotId: target.snapshotId,
+      captureId: target.captureId,
+      route: element ? 'background-ax' : 'background-window-pixel',
+      source: 'cua-driver',
+      ...(element ? { element: { role: element.role, label: element.label, token: element.token } } : {}),
+    };
+    return evidence.instanceId && isSupportedCuaTarget(evidence) ? evidence : null;
+  }
+
+  private async approveInput(tool: string, operation: keyof CuaText['ask']['actions'], detail: string, signal?: AbortSignal, targetOverride?: string, element?: DriverElement): Promise<ApprovedInput | null> {
+    if (!this.opts.askPermission && !this.opts.authorizeInput) return null;
+    if (this.opts.authorizeInput && (operation === 'focus' || operation === 'foreground')) return null;
     await this.permit('act', signal);
     const frame = this.inputFrame();
     const target = targetOverride ?? this.inputTarget();
     const digest = createHash('sha256').update(JSON.stringify([tool, operation, target, detail, frame])).digest('hex');
     const who = this.opts.botName?.() || 'bot';
     const question = this.ui.ask.action(who, this.ui.ask.actions[operation], target, `${detail} (${digest.slice(0, 12)})`);
-    const answer = await untilAborted(this.askQuestion(question, signal), signal);
-    if (answer !== 'yes') return null;
-    return frame === this.inputFrame() ? { digest, frame, used: false } : null;
+    let authorization: CuaInputAuthorization | null = null;
+    if (this.opts.authorizeInput) {
+      const evidence = this.desktopTargetEvidence(element);
+      if (!evidence) return null;
+      authorization = await this.opts.authorizeInput({
+        tool,
+        taskId: randomUUID(),
+        taskText: `${tool}: ${detail}`,
+        expectedChange: detail,
+        target: evidence,
+        expiresInMs: 30_000,
+        maxSteps: 1,
+        confirmInCoreUi: async () => {
+          if (!this.opts.askPermission) return false;
+          const answer = await untilAborted(this.opts.askPermission(question, [this.ui.ask.yes, this.ui.ask.no]), signal);
+          return answer === 'yes' && frame === this.inputFrame();
+        },
+      });
+      if (!authorization) return null;
+    } else {
+      const answer = await untilAborted(this.askQuestion(question, signal), signal);
+      if (answer !== 'yes') return null;
+    }
+    if (signal?.aborted || frame !== this.inputFrame()) {
+      authorization?.revoke();
+      return null;
+    }
+    return { digest, frame, used: false, ...(authorization ? { authorization } : {}) };
   }
 
   private inputApprovalRefusal(): string {
     return this.opts.askPermission ? this.t.actionDenied : this.t.actionApprovalRequired;
   }
 
-  private consumeApproval(approval: ApprovedInput | null, tool: string, operation: keyof CuaText['ask']['actions'], detail: string, targetOverride?: string): boolean {
-    if (!approval || approval.used || approval.frame !== this.inputFrame()) return false;
+  private consumeApproval(approval: ApprovedInput | null, tool: string, operation: keyof CuaText['ask']['actions'], detail: string, targetOverride?: string, element?: DriverElement): boolean {
+    if (!approval) return false;
+    if (approval.used || approval.frame !== this.inputFrame()) {
+      approval.authorization?.revoke();
+      return false;
+    }
     const digest = createHash('sha256').update(JSON.stringify([tool, operation, targetOverride ?? this.inputTarget(), detail, approval.frame])).digest('hex');
-    if (digest !== approval.digest) return false;
+    if (digest !== approval.digest) {
+      approval.authorization?.revoke();
+      return false;
+    }
+    if (approval.authorization && !approval.authorization.consume(this.desktopTargetEvidence(element), detail)) {
+      approval.authorization.revoke();
+      return false;
+    }
     approval.used = true;
     return true;
   }
@@ -661,8 +767,8 @@ export class Cua {
     const detail = element
       ? `elementToken ${token}, ${element.role} "${element.label}"`
       : `${button} click at (${args.x}, ${args.y}), ${count} time${count === 1 ? '' : 's'}`;
-    const approval = await this.approveInput('pet_cua_click', 'click', detail, signal);
-    if (!this.consumeApproval(approval, 'pet_cua_click', 'click', detail)) return { text: this.t.notRun('pet_cua_click', this.inputApprovalRefusal()), failed: true };
+    const approval = await this.approveInput('pet_cua_click', 'click', detail, signal, undefined, element);
+    if (!this.consumeApproval(approval, 'pet_cua_click', 'click', detail, undefined, element)) return { text: this.t.notRun('pet_cua_click', this.inputApprovalRefusal()), failed: true };
     try {
       let action: DriverAction | null;
       if (element) {
@@ -705,7 +811,9 @@ export class Cua {
   private async backgroundMove(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
     const p = this.targetPoint(args.x, args.y);
     if (typeof p === 'string') return { text: this.t.notRun('pet_cua_move', p), failed: true };
-    await this.permit('act', signal);
+    const detail = `move pointer to (${args.x}, ${args.y})`;
+    const approval = await this.approveInput('pet_cua_move', 'move', detail, signal);
+    if (!this.consumeApproval(approval, 'pet_cua_move', 'move', detail)) return { text: this.t.notRun('pet_cua_move', this.inputApprovalRefusal()), failed: true };
     try {
       const action = await this.driver.move(this.target!.pid, this.target!.windowId, p.x, p.y, { signal });
       return this.afterWindow('pet_cua_move', this.t.movedWindow(args.x, args.y), args, signal, action);
@@ -749,7 +857,9 @@ export class Cua {
     const clampN = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? Math.max(-30, Math.min(30, Math.round(v))) : 0);
     const down = clampN(args.down), right = clampN(args.right);
     if (!down && !right) return { text: this.t.notRun('pet_cua_scroll', this.t.scrollNone), failed: true };
-    await this.permit('act', signal);
+    const detail = `scroll at (${args.x}, ${args.y}), down ${down}, right ${right}`;
+    const approval = await this.approveInput('pet_cua_scroll', 'scroll', detail, signal);
+    if (!this.consumeApproval(approval, 'pet_cua_scroll', 'scroll', detail)) return { text: this.t.notRun('pet_cua_scroll', this.inputApprovalRefusal()), failed: true };
     try {
       const action = await this.driver.scroll(this.target!.pid, this.target!.windowId, p.x, p.y, down, right, { signal });
       return this.afterWindow('pet_cua_scroll', this.t.scrolled(args.x, args.y, down, right), args, signal, action);
@@ -949,6 +1059,7 @@ export class Cua {
   private refuseControl(tool: string): ToolOutcome | null {
     if (!this.cfg.control) return { text: this.t.notRun(tool, this.t.viewOnly), failed: true };
     if (this.opts.allowInput && !this.opts.allowInput(tool)) return { text: this.t.notRun(tool, this.t.gateDenied), failed: true };
+    if (this.opts.authorizeInput && (tool === 'pet_cua_focus' || !this.desktopTargetEvidence())) return { text: this.t.notRun(tool, this.t.gateDenied), failed: true };
     if (this.cfg.backgroundOnly && (!this.target || tool === 'pet_cua_focus')) {
       return { text: this.t.notRun(tool, this.t.backgroundOnly), failed: true };
     }
@@ -956,7 +1067,8 @@ export class Cua {
   }
 
   private get controlAllowed(): boolean {
-    return this.cfg.control && (this.opts.allowInput?.('pet_cua_click') ?? true);
+    return this.cfg.control && (this.opts.allowInput?.('pet_cua_click') ?? true)
+      && (!this.opts.authorizeInput || !!this.desktopTargetEvidence());
   }
 
   /**

@@ -7,7 +7,7 @@ const fr: Translation<CuaText> = {
     once: (who: string, minutes: number) => `${who} veut utiliser votre souris et votre clavier. D'accord pour les ${minutes} prochaines minutes ?`,
     acting: (who: string) => `${who} veut utiliser votre souris et votre clavier. D'accord pour cette fois ?`,
     action: (who: string, action: string, target: string, detail: string) => `${who} demande l’autorisation d’utiliser l’ordinateur : ${action}. Cible : ${target}. Détails : ${detail}. Autoriser cette action une fois ?`,
-    actions: { click: 'cliquer', drag: 'faire glisser', type: 'saisir du texte', key: 'appuyer sur des touches', focus: 'mettre une fenêtre au premier plan', foreground: 'réessayer au premier plan' },
+    actions: { click: 'cliquer', move: 'déplacer le pointeur', drag: 'faire glisser', scroll: 'faire défiler', type: 'saisir du texte', key: 'appuyer sur des touches', focus: 'mettre une fenêtre au premier plan', foreground: 'réessayer au premier plan' },
     caption: "Contrôle de l'ordinateur",
     yes: 'Oui',
     no: 'Pas cette fois',

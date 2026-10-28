@@ -7,7 +7,7 @@ const ptBR: Translation<CuaText> = {
     once: (who: string, minutes: number) => `${who} quer usar seu mouse e seu teclado. Pode pelos próximos ${minutes} minutos?`,
     acting: (who: string) => `${who} quer usar seu mouse e seu teclado. Pode desta vez?`,
     action: (who: string, action: string, target: string, detail: string) => `${who} pede permissão para usar o computador: ${action}. Alvo: ${target}. Detalhes: ${detail}. Permitir somente esta ação?`,
-    actions: { click: 'clicar', drag: 'arrastar', type: 'digitar texto', key: 'pressionar teclas', focus: 'trazer uma janela para frente', foreground: 'tentar novamente em primeiro plano' },
+    actions: { click: 'clicar', move: 'mover o ponteiro', drag: 'arrastar', scroll: 'rolar', type: 'digitar texto', key: 'pressionar teclas', focus: 'trazer uma janela para frente', foreground: 'tentar novamente em primeiro plano' },
     caption: 'Uso do computador',
     yes: 'Sim',
     no: 'Desta vez não',
