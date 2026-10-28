@@ -19,7 +19,10 @@ const fr: Translation<CoreText> = {
       minutes: "min",
       sound: "Son du navigateur", soundDescription: "Muet par défaut. Activé, les vidéos qu'elle regarde sont audibles.",
       topics: 'Sujets web autorisés', topicsDescription: 'Un sujet par ligne. Laissez vide pour suspendre la navigation. Chaque session dure au plus 20 minutes et 80 appels navigateur ; les pages restent des sources externes.',
-      actions: "Autoriser likes, favoris, abonnements, partages, danmaku, commentaires, envoi de médias et création d’images avec ChatGPT", actionsDescription: "Désactivé, elle peut seulement naviguer ; les likes, abonnements, partages, commentaires, envois de médias et génération d’images avec ChatGPT sont désactivés. Connectez-vous et saisissez les codes dans sa fenêtre vous-même.",
+      actions: 'Autoriser les actions sociales', actionsDescription: 'Contrôle les likes, favoris, abonnements, commentaires, danmaku et partages. La génération, l’enregistrement et l’envoi de médias ont des réglages séparés ci-dessous.',
+      imageGeneration: 'Autoriser la génération d’images sur le Web', imageGenerationDescription: 'Permet d’envoyer des prompts d’image depuis le site ChatGPT.',
+      imageSaving: 'Autoriser l’enregistrement des images générées', imageSavingDescription: 'Permet d’enregistrer une image générée depuis la page ChatGPT actuelle dans le dossier média local.',
+      mediaUpload: 'Autoriser l’envoi de médias', mediaUploadDescription: 'Permet de placer des fichiers média éligibles dans un champ de téléversement ; cela ne publie pas la vidéo.',
     },
     growth: {
       title: 'Grandir par elle-même',
@@ -53,6 +56,15 @@ const fr: Translation<CoreText> = {
     yes: 'Publier',
     no: 'Ne pas publier',
     unresolved: (count: number) => `${count} contenu${count === 1 ? '' : 's'} envoyé${count === 1 ? '' : 's'} depuis son navigateur n'ont pas pu être confirmés. Vérifiez sa fenêtre avant de renvoyer.`,
+  },
+
+  browserAction: {
+    platformWrite: 'aimer, ajouter aux favoris ou suivre', imageGeneration: 'générer une image', imageSaving: 'enregistrer une image générée',
+    imageStaging: 'mettre temporairement une image générée en attente de vérification',
+    imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `Fichier : ${file}\nTaille : ${bytes} octets\nType : ${mime}\nSHA-256 : ${digest}\nEnregistrer dans : dossier média local`,
+    mediaUpload: 'envoyer des médias',
+    question: (action: string, target: string, details: string) => 'Autorisez-vous Coo à ' + action + ' une fois sur « ' + target + ' » ?\n\n' + details + '\n\nCela concerne uniquement la page actuelle et le contenu indiqué.',
+    yes: 'Autoriser une fois', no: 'Annuler',
   },
 
   status: {

@@ -16,8 +16,8 @@
  * or the pet's server.
  */
 const { BrowserWindow, screen, session } = require('electron');
-const { existsSync, readFileSync, unlinkSync } = require('node:fs');
-const { join } = require('node:path');
+const { constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync } = require('node:fs');
+const { dirname, join } = require('node:path');
 const { MAX_IMAGE_BYTES, generatedImagePath, isChatGPTImageDownloadUrl, isChatGPTPageUrl, verifyGeneratedImage } = require('./browser-image-download.cjs');
 const { acceptsUpload, isDouyinPageUrl, resolveUploadFiles } = require('./browser-upload.cjs');
 const { setFileInputFiles } = require('./browser-cdp-upload.cjs');
@@ -93,6 +93,21 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
   let agent = null;
   /** One verified ChatGPT image download requested by Coo's image-save tool. */
   let pendingImageDownload = null;
+  /** Images downloaded for hash review but not yet approved for the media folder. */
+  const stagedChatGPTImages = new Map();
+  const clearStagedChatGPTImages = () => {
+    for (const staged of stagedChatGPTImages.values()) {
+      try { unlinkSync(staged.stagedPath); } catch { /* a staged image may already be gone */ }
+    }
+    stagedChatGPTImages.clear();
+  };
+  const clearOrphanedChatGPTImages = (directory) => {
+    for (const name of readdirSync(directory)) {
+      if (!/^chatgpt-image-\d+-[0-9a-f-]{36}\.(png|jpg|webp)$/i.test(name)) continue;
+      const file = join(directory, name);
+      try { if (lstatSync(file).isFile()) unlinkSync(file); } catch { /* a staging file may already be gone */ }
+    }
+  };
 
   const finishImageDownload = (pending, error, value) => {
     if (pendingImageDownload !== pending) return;
@@ -253,6 +268,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
 
   const closeWindow = () => {
     if (pendingImageDownload) finishImageDownload(pendingImageDownload, new Error('browser window closed'));
+    clearStagedChatGPTImages();
     if (win && !win.isDestroyed()) win.destroy();
     win = null;
     injected = false;
@@ -347,6 +363,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     });
     win.once('ready-to-show', () => win?.showInactive());
     win.on('closed', () => {
+      clearStagedChatGPTImages();
       win = null;
       injected = false;
       navigating = false;
@@ -374,6 +391,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     await ensureAgent();
     const target = await agentCall('chatGPTComposer');
     if (!target?.ok) throw new Error(target?.reason || 'the ChatGPT message box could not be identified');
+    if ((message.composerId && target.id !== message.composerId)
+      || (message.snapshotId && target.snapshotId !== message.snapshotId)) throw new Error('the ChatGPT composer changed after approval');
     const before = await agentCall('draft', [target.id, target.snapshotId]);
     if (typeof before !== 'string' || before.trim()) throw new Error('the ChatGPT message box already contains text; read it before continuing');
     if (!await agentCall('prepareInput', [target.id, target.snapshotId])) throw new Error('the ChatGPT message box changed before typing');
@@ -401,7 +420,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     };
   };
 
-  const saveChatGPTImage = async (message) => {
+  const stageChatGPTImage = async (message) => {
     if (!win || !isChatGPTPageUrl(win.webContents.getURL())) throw new Error('the current page is not ChatGPT');
     const index = Number.isInteger(message.index) && message.index >= 0 ? message.index : null;
     if (index === null) throw new Error('image save target needs a page element number');
@@ -409,7 +428,11 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     if (!await agentCall('chatGPTImageSaveTarget', [index, message.snapshotId])) throw new Error('the selected control is not a visible ChatGPT image save button');
     const dir = mediaDir();
     if (typeof dir !== 'string' || !dir.trim()) throw new Error('the video media directory is unavailable');
-    const transfer = waitForImageDownload(dir);
+    const stageDir = join(dirname(dir), 'work', 'browser-image-staging');
+    mkdirSync(stageDir, { recursive: true });
+    if (!stagedChatGPTImages.size) clearOrphanedChatGPTImages(stageDir);
+    const transfer = waitForImageDownload(stageDir);
+    let stagedPath = '';
     try {
       await agentCall('setAgentAction', [true]);
       try {
@@ -419,13 +442,90 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
         await agentCall('setAgentAction', [false]).catch(() => undefined);
       }
       const saved = await transfer.promise;
-      const page = await settle().catch(() => null);
+      stagedPath = join(stageDir, saved.file);
+      const verified = verifyGeneratedImage(stagedPath, saved.mime);
+      const destination = generatedImagePath(dir, saved.mime);
+      const stageToken = randomUUID();
+      const page = await settle();
+      const pageUrl = win.webContents.getURL();
+      if (!page?.snapshotId || page.url !== pageUrl || !isChatGPTPageUrl(pageUrl)) throw new Error('the ChatGPT page changed while the image was staged');
+      stagedChatGPTImages.set(stageToken, {
+        stagedPath,
+        destinationPath: destination.file,
+        file: destination.name,
+        mime: saved.mime,
+        bytes: verified.bytes,
+        digest: verified.digest,
+        pageUrl,
+        snapshotId: page.snapshotId,
+        expiresAt: Date.now() + 5 * 60_000,
+      });
       const screenshot = await capture().catch(() => null);
-      return { ...saved, ...(screenshot ?? {}), ...(page ? { state: page } : {}) };
+      return {
+        stageToken,
+        file: destination.name,
+        bytes: verified.bytes,
+        mime: saved.mime,
+        digest: verified.digest,
+        ...(screenshot ?? {}),
+        ...(page ? { state: page } : {}),
+      };
     } catch (error) {
       transfer.cancel(error);
+      if (stagedPath) { try { unlinkSync(stagedPath); } catch { /* the failed transfer may already have removed it */ } }
       throw error;
     }
+  };
+
+  const commitStagedChatGPTImage = async (message) => {
+    const stageToken = typeof message.stageToken === 'string' ? message.stageToken : '';
+    const staged = stagedChatGPTImages.get(stageToken);
+    if (!staged) throw new Error('the staged ChatGPT image is unavailable');
+    stagedChatGPTImages.delete(stageToken);
+    if (Date.now() > staged.expiresAt) {
+      try { unlinkSync(staged.stagedPath); } catch { /* expired file may already be gone */ }
+      throw new Error('the staged ChatGPT image expired; inspect the page and start again');
+    }
+    if (!win || win.isDestroyed() || win.webContents.getURL() !== staged.pageUrl || !isChatGPTPageUrl(staged.pageUrl)) {
+      try { unlinkSync(staged.stagedPath); } catch { /* a staged image may already be gone */ }
+      throw new Error('the ChatGPT page changed after the image approval');
+    }
+    if (message.file !== staged.file || message.bytes !== staged.bytes || message.digest !== staged.digest
+      || message.mime !== staged.mime || message.snapshotId !== staged.snapshotId) {
+      try { unlinkSync(staged.stagedPath); } catch { /* a staged image may already be gone */ }
+      throw new Error('the staged image does not match the approved file');
+    }
+    try {
+      await ensureAgent();
+      if (await agentCall('snapshot') !== staged.snapshotId) throw new Error('the ChatGPT page changed after the image approval');
+      const current = verifyGeneratedImage(staged.stagedPath, staged.mime);
+      if (current.bytes !== staged.bytes || current.digest !== staged.digest) throw new Error('the staged image changed after approval');
+    } catch (error) {
+      try { unlinkSync(staged.stagedPath); } catch { /* a staged image may already be gone */ }
+      throw error;
+    }
+    let copied = false;
+    try {
+      copyFileSync(staged.stagedPath, staged.destinationPath, constants.COPYFILE_EXCL);
+      copied = true;
+      const saved = verifyGeneratedImage(staged.destinationPath, staged.mime);
+      if (saved.bytes !== staged.bytes || saved.digest !== staged.digest) throw new Error('the saved image does not match the approved file');
+      unlinkSync(staged.stagedPath);
+      return { file: staged.file, bytes: saved.bytes, mime: staged.mime, digest: saved.digest };
+    } catch (error) {
+      if (copied) { try { unlinkSync(staged.destinationPath); } catch { /* remove only the file copied above */ } }
+      try { unlinkSync(staged.stagedPath); } catch { /* a staged image may already be gone */ }
+      throw error;
+    }
+  };
+
+  const discardStagedChatGPTImage = (message) => {
+    const stageToken = typeof message.stageToken === 'string' ? message.stageToken : '';
+    const staged = stagedChatGPTImages.get(stageToken);
+    if (!staged) return { discarded: false };
+    stagedChatGPTImages.delete(stageToken);
+    try { unlinkSync(staged.stagedPath); } catch { /* staged file may already be gone */ }
+    return { discarded: true };
   };
 
   const uploadMedia = async (message) => {
@@ -433,7 +533,12 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     if (!Number.isInteger(message.fileId) || message.fileId < 0) throw new Error('a current file input id is required');
     const dir = mediaDir();
     if (typeof dir !== 'string' || !dir.trim()) throw new Error('the video media directory is unavailable');
-    const files = resolveUploadFiles(dir, message.files);
+    const files = await resolveUploadFiles(dir, message.files);
+    const expectedFiles = Array.isArray(message.expectedFiles) ? message.expectedFiles : [];
+    if (expectedFiles.length !== files.length || expectedFiles.some((item, index) => !item || item.path !== files[index]?.name
+      || item.bytes !== files[index]?.bytes || item.digest !== files[index]?.digest || item.mime !== files[index]?.mime)) {
+      throw new Error('the selected media changed after approval');
+    }
     await ensureAgent();
     const target = await agentCall('fileInputTarget', [message.fileId, message.snapshotId]);
     if (!target?.ok) throw new Error(target?.reason || 'the file input changed; read the page again');
@@ -461,11 +566,49 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     return { files: files.map((file) => file.name), ...(page ? { state: page } : {}), ...(screenshot ?? {}) };
   };
 
+  const inspectUpload = async (message) => {
+    if (!win || !isDouyinPageUrl(win.webContents.getURL())) throw new Error('open a Douyin upload page first');
+    if (!Number.isInteger(message.fileId) || message.fileId < 0) throw new Error('a current file input id is required');
+    const dir = mediaDir();
+    if (typeof dir !== 'string' || !dir.trim()) throw new Error('the video media directory is unavailable');
+    const files = await resolveUploadFiles(dir, message.files);
+    await ensureAgent();
+    const target = await agentCall('fileInputTarget', [message.fileId, message.snapshotId]);
+    if (!target?.ok) throw new Error(target?.reason || 'the file input changed; read the page again');
+    if (!target.multiple && files.length > 1) throw new Error('the page input accepts one file at a time');
+    const refused = files.find((file) => !acceptsUpload(target.accept, file));
+    if (refused) throw new Error(`${refused.name} does not match the page input accept value`);
+    const existing = await agentCall('fileInputSelection', [message.fileId]);
+    if (existing?.names?.length) throw new Error('the page input already has files selected; read the preview before changing it');
+    if (!isDouyinPageUrl(win.webContents.getURL()) || await agentCall('snapshot') !== target.snapshotId) throw new Error('the upload page changed; read it again');
+    const state = await agentCall('state');
+    return {
+      url: win.webContents.getURL(),
+      snapshotId: target.snapshotId,
+      accept: target.accept,
+      multiple: target.multiple,
+      account: state?.account ?? null,
+      files: files.map((file) => ({ path: file.name, bytes: file.bytes, digest: file.digest, mime: file.mime })),
+    };
+  };
+
   const result = async (message) => {
     const op = message.op;
     if (op === 'open') return open(message);
+    if (op === 'chatgpt-composer') {
+      if (!win || !isChatGPTPageUrl(win.webContents.getURL())) throw new Error('open chatgpt.com in this browser first');
+      await ensureAgent();
+      const target = await agentCall('chatGPTComposer');
+      if (!target?.ok || typeof target.id !== 'string' || typeof target.snapshotId !== 'string') {
+        throw new Error(target?.reason || 'the ChatGPT message box could not be identified');
+      }
+      return { id: target.id, snapshotId: target.snapshotId };
+    }
     if (op === 'chatgpt-generate-image') return generateChatGPTImage(message);
-    if (op === 'save-chatgpt-image') return saveChatGPTImage(message);
+    if (op === 'stage-chatgpt-image') return stageChatGPTImage(message);
+    if (op === 'commit-staged-chatgpt-image') return commitStagedChatGPTImage(message);
+    if (op === 'discard-staged-chatgpt-image') return discardStagedChatGPTImage(message);
+    if (op === 'inspect-upload') return inspectUpload(message);
     if (op === 'upload-media') return uploadMedia(message);
     if (op === 'close') { closeWindow(); return { closed: true }; }
     if (op === 'state') return { open: !!win && !win.isDestroyed(), url: win?.webContents.getURL() ?? '', title: win?.getTitle() ?? '' };

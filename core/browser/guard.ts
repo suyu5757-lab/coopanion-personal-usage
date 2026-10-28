@@ -69,7 +69,7 @@ export function isWriteAction(label: string): boolean {
  * Clicking it takes something back, so the World reports the state and leaves it alone.
  */
 const UNDO = [
-  /取消(?:点赞|收藏|关注|订阅)/, /已(?:点赞|收藏|关注)/,
+  /取消(?:点赞|收藏|关注|订阅)/, /已(?:赞|点赞|收藏|关注)/,
   /\bunlike\b/, /\bunliked\b/, /\bunfollow\b/, /\bunsave\b/, /\bunfavorite\b/,
   /\bliked\b/, /\bsaved\b/, /\bfavorited\b/, /\bfavourited\b/, /\bfollowing\b/,
   /remove from (?:favorites|saved|collection)/,

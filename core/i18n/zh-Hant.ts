@@ -19,7 +19,10 @@ const zhHant: Translation<CoreText> = {
       minutes: '分鐘',
       sound: '瀏覽器聲音', soundDescription: '預設靜音。打開後，她看的影片會外放。',
       topics: '允許探索的網頁主題', topicsDescription: '每行填寫一個主題；留白時暫停網頁探索。每段最多 20 分鐘、80 次瀏覽器工具呼叫；網頁始終是外部來源。',
-      actions: '允許按讚、收藏、關注、分享、發送彈幕、評論、上傳素材和生成圖片', actionsDescription: '關閉後她只能瀏覽；按讚、關注、分享、評論、素材上傳和 ChatGPT 生圖都無法使用。登入和驗證碼請在她的瀏覽器視窗裡自己完成。',
+      actions: '允許社群互動', actionsDescription: '控制按讚、收藏、關注、評論、彈幕和分享。圖片生成、圖片儲存和素材上傳由下方獨立設定控制。',
+      imageGeneration: '允許網頁生圖', imageGenerationDescription: '允許透過 ChatGPT 網站提交圖片提示詞。',
+      imageSaving: '允許儲存生成圖片', imageSavingDescription: '允許將目前 ChatGPT 頁面的生成圖片儲存到本機素材目錄。',
+      mediaUpload: '允許素材上傳', mediaUploadDescription: '允許將符合條件的素材放入網頁上傳欄位；這一步不會發布作品。',
     },
     growth: {
       title: '自我成長',
@@ -53,6 +56,15 @@ const zhHant: Translation<CoreText> = {
     yes: '傳送',
     no: '不要傳送',
     unresolved: (count: number) => `上次有 ${count} 則內容無法確認有沒有送出去。到她的瀏覽器視窗看一眼，再決定要不要重送。`,
+  },
+
+  browserAction: {
+    platformWrite: '按讚、收藏或追蹤', imageGeneration: '網頁生圖', imageSaving: '儲存生成圖片',
+    imageStaging: '暫存生成圖片並核驗',
+    imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `檔案：${file}\n大小：${bytes} 位元組\n類型：${mime}\nSHA-256：${digest}\n儲存至：本機素材目錄`,
+    mediaUpload: '上傳素材',
+    question: (action: string, target: string, details: string) => '允許 Coo 在「' + target + '」執行一次' + action + '嗎？\n\n' + details + '\n\n僅適用於目前頁面和列出的內容。',
+    yes: '允許一次', no: '取消',
   },
 
   status: {

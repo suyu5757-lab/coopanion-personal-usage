@@ -19,7 +19,10 @@ const es419: Translation<CoreText> = {
       minutes: 'min',
       sound: 'Sonido del navegador', soundDescription: 'Silenciado por defecto. Al activarlo, se oyen los videos que mira.',
       topics: 'Temas web permitidos', topicsDescription: 'Un tema por línea. Déjalo vacío para pausar la exploración web. Cada sesión dura como máximo 20 minutos y 80 llamadas al navegador; las páginas son fuentes externas.',
-      actions: 'Permitir me gusta, guardados, seguir, compartir, danmaku, comentarios, subir medios e imágenes con ChatGPT', actionsDescription: 'Desactivado, solo puede navegar; no puede dar me gusta, seguir, compartir, comentar, subir medios ni generar imágenes con ChatGPT. Inicia sesión y resuelve los códigos en su ventana tú mismo.',
+      actions: 'Permitir acciones sociales', actionsDescription: 'Controla los me gusta, guardados, seguimientos, comentarios, danmaku y compartir. La generación de imágenes, guardar imágenes y subir medios tienen controles independientes abajo.',
+      imageGeneration: 'Permitir generar imágenes en la web', imageGenerationDescription: 'Permite enviar indicaciones de imagen desde el sitio web de ChatGPT.',
+      imageSaving: 'Permitir guardar imágenes generadas', imageSavingDescription: 'Permite guardar una imagen generada desde la página actual de ChatGPT en la carpeta local de medios.',
+      mediaUpload: 'Permitir subir medios', mediaUploadDescription: 'Permite colocar medios aptos en un control de carga; esto no publica la obra.',
     },
     growth: {
       title: 'Crecer por su cuenta',
@@ -53,6 +56,15 @@ const es419: Translation<CoreText> = {
     yes: 'Publicar',
     no: 'No publicar',
     unresolved: (count: number) => `No se pudo confirmar el envío de ${count} contenido anterior desde su navegador. Revisa su ventana antes de volver a enviar.`,
+  },
+
+  browserAction: {
+    platformWrite: 'dar me gusta, guardar o seguir', imageGeneration: 'generar una imagen', imageSaving: 'guardar una imagen generada',
+    imageStaging: 'preparar temporalmente una imagen generada para revisarla',
+    imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `Archivo: ${file}\nTamaño: ${bytes} bytes\nTipo: ${mime}\nSHA-256: ${digest}\nGuardar en: carpeta local de medios`,
+    mediaUpload: 'subir medios',
+    question: (action: string, target: string, details: string) => '¿Permites que Coo realice una vez la acción «' + action + '» en «' + target + '»?\n\n' + details + '\n\nEsto solo se aplica a la página actual y al contenido indicado.',
+    yes: 'Permitir una vez', no: 'Cancelar',
   },
 
   status: {

@@ -19,7 +19,10 @@ const ja: Translation<CoreText> = {
       minutes: '分',
       sound: 'ブラウザの音', soundDescription: '既定はミュートです。オンにすると、見ている動画の音が出ます。',
       topics: '許可するウェブ探索テーマ', topicsDescription: '1 行に 1 テーマ。空欄ならウェブ探索を停止します。1 回 20 分、ブラウザー操作は最大 80 回です。ウェブページは外部情報源として扱います。',
-      actions: 'いいね・保存・フォロー・共有・弾幕・コメント・メディアのアップロード・ChatGPT画像生成を許可', actionsDescription: 'オフにすると閲覧のみになり、いいね、フォロー、共有、コメント、メディアのアップロード、ChatGPT画像生成は使えません。ログインと認証コードはブラウザウィンドウで本人が行ってください。',
+      actions: 'ソーシャル操作を許可', actionsDescription: 'いいね、保存、フォロー、コメント、弾幕、共有を制御します。画像生成、画像保存、メディアアップロードは下の個別設定で制御します。',
+      imageGeneration: 'Web画像生成を許可', imageGenerationDescription: 'ChatGPTウェブサイトから画像プロンプトを送信できます。',
+      imageSaving: '生成画像の保存を許可', imageSavingDescription: '現在のChatGPTページにある生成画像をローカルのメディアフォルダに保存できます。',
+      mediaUpload: 'メディアアップロードを許可', mediaUploadDescription: '対象のメディアをページのアップロード欄に入れられます。この操作で投稿は公開されません。',
     },
     growth: {
       title: '自分で育つ',
@@ -53,6 +56,15 @@ const ja: Translation<CoreText> = {
     yes: '投稿',
     no: '投稿しない',
     unresolved: (count: number) => `前回、送信されたか確認できなかった内容が ${count} 件あります。Coo のブラウザーウィンドウで確認してから、再送するか決めてください。`,
+  },
+
+  browserAction: {
+    platformWrite: 'いいね、保存、またはフォロー', imageGeneration: '画像を生成する', imageSaving: '生成画像を保存する',
+    imageStaging: '生成画像を一時保存して確認する',
+    imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `ファイル：${file}\nサイズ：${bytes} バイト\n種類：${mime}\nSHA-256：${digest}\n保存先：ローカルメディアフォルダ`,
+    mediaUpload: 'メディアをアップロードする',
+    question: (action: string, target: string, details: string) => 'Coo が「' + target + '」で ' + action + ' することを一度だけ許可しますか？\n\n' + details + '\n\n現在のページと記載された内容だけに適用されます。',
+    yes: '一度だけ許可', no: 'キャンセル',
   },
 
   status: {

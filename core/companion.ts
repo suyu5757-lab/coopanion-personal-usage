@@ -164,6 +164,9 @@ function companionGroup(language: Language): ConfigGroup {
         'companion.selfTime.topics': { type: 'string', title: s.selfTime.topics, description: s.selfTime.topicsDescription, 'x-hot': true },
         'companion.selfTime.sound': { type: 'boolean', title: s.selfTime.sound, description: s.selfTime.soundDescription, 'x-hot': true },
         'companion.selfTime.actions': { type: 'boolean', title: s.selfTime.actions, description: s.selfTime.actionsDescription, 'x-hot': true },
+        'companion.selfTime.imageGeneration': { type: 'boolean', title: s.selfTime.imageGeneration, description: s.selfTime.imageGenerationDescription, 'x-hot': true },
+        'companion.selfTime.imageSaving': { type: 'boolean', title: s.selfTime.imageSaving, description: s.selfTime.imageSavingDescription, 'x-hot': true },
+        'companion.selfTime.mediaUpload': { type: 'boolean', title: s.selfTime.mediaUpload, description: s.selfTime.mediaUploadDescription, 'x-hot': true },
         'companion.growth.enabled': { type: 'boolean', title: s.growth.title, description: s.growth.description, 'x-hot': true },
         'companion.growth.everyDays': { type: 'integer', title: s.growth.every, minimum: 1, maximum: 60, 'x-suffix': s.growth.days, description: s.growth.everyDescription, 'x-hot': true },
       },
@@ -440,7 +443,10 @@ export async function main(): Promise<void> {
   let notice: NoticeWorld | null = null;
   const gate = new ActionGate({
     platformWrites: () => readSelfTime(config).actions,
-    computerInput: () => getByPath((config ?? {}) as unknown as Record<string, unknown>, 'worlds.desktop-pet.cua.control') !== false,
+    imageGeneration: () => readSelfTime(config).imageGeneration,
+    imageSaving: () => readSelfTime(config).imageSaving,
+    mediaUpload: () => readSelfTime(config).mediaUpload,
+    computerInput: () => getByPath((config ?? {}) as unknown as Record<string, unknown>, 'worlds.desktop-pet.cua.control') === true,
   });
   const browserBridge = new BrowserBridge();
   /** The introduction is running: the settings it makes are not told as changes. */
@@ -611,6 +617,7 @@ export async function main(): Promise<void> {
     ask: (question, choices) => pet?.confirm(question, choices) ?? Promise.resolve('unavailable'),
     journalFile: join(deployDir, 'browser', 'actions.json'),
     replyJournalFile: join(deployDir, 'browser', 'replies.json'),
+    taskJournalFile: join(deployDir, 'browser', 'task-actions.json'),
     transcribe: (pcm) => pet
       ? pet.transcribePcm(pcm)
       : Promise.resolve({ text: '', error: 'the desktop pet is not running' }),

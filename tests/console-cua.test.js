@@ -6,15 +6,23 @@ import { transferableAbortController } from 'node:util';
 import { petPage } from '../console/features/pet/index.ts';
 import { CUA_GROUP } from '../console/features/cua/index.ts';
 import { S } from '../console/features/cua/strings.ts';
+import { S as PetS } from '../console/features/pet/strings.ts';
 import { createConsoleUi } from '../console/base/ui/index.ts';
 import { Lifecycle } from '../console/base/lifecycle.ts';
 
 const key = (name) => `worlds.desktop-pet.cua.${name}`;
 const nativeFetch = globalThis.fetch;
-let server, life, values, available, rejectWrites;
+let server, life, values, companionValues, available, rejectWrites;
 
 beforeEach(async () => {
   values = { [key('enabled')]: true, [key('control')]: true, [key('permission')]: 'ask-once', [key('grantMinutes')]: 30 };
+  companionValues = {
+    'companion.selfTime.enabled': true,
+    'companion.selfTime.actions': true,
+    'companion.selfTime.imageGeneration': false,
+    'companion.selfTime.imageSaving': false,
+    'companion.selfTime.mediaUpload': false,
+  };
   available = true;
   rejectWrites = false;
   localStorage.clear();
@@ -28,10 +36,14 @@ beforeEach(async () => {
       let body = '';
       for await (const chunk of req) body += chunk;
       if (rejectWrites) { res.writeHead(500); res.end(JSON.stringify({ error: 'write failed' })); return; }
-      Object.assign(values, JSON.parse(body).values);
+      const request = JSON.parse(body);
+      Object.assign(request.group === 'companion' ? companionValues : values, request.values);
       res.end(JSON.stringify({ result: 'saved' }));
     } else if (req.url === '/api/config') {
-      res.end(JSON.stringify({ groups: [{ group: { id: CUA_GROUP }, values }] }));
+      res.end(JSON.stringify({ groups: [
+        { group: { id: CUA_GROUP }, values },
+        { group: { id: 'companion' }, values: companionValues },
+      ] }));
     } else if (req.url.startsWith('/api/config/options/')) res.end(JSON.stringify({ options: [] }));
     else if (req.url.endsWith('/panels/pet/state')) res.end('{}');
     else { res.writeHead(404); res.end(JSON.stringify({ error: req.url })); }
@@ -73,8 +85,26 @@ async function mount(loaded = true) {
   const grant = section.querySelector('input[type="number"]');
   const level = (name) => [...section.querySelectorAll('button.seg')].find((el) => el.textContent === S.levels[name]);
   if (loaded) await vi.waitFor(() => expect(grant.value).toBe(String(values[key('grantMinutes')])));
-  return { section, enabled, control, grant, level };
+  return { root, section, enabled, control, grant, level };
 }
+
+it('saves image and upload preferences independently from the legacy social-actions preference', async () => {
+  const { root } = await mount();
+  const inputFor = (label) => [...root.querySelectorAll('label')].find((el) => el.textContent.includes(label)).querySelector('input');
+  const imageGeneration = inputFor(PetS.selfTimeImageGeneration);
+  const imageSaving = inputFor(PetS.selfTimeImageSaving);
+  const mediaUpload = inputFor(PetS.selfTimeMediaUpload);
+  expect(companionValues['companion.selfTime.actions']).toBe(true);
+  expect(imageGeneration.checked).toBe(false);
+  expect(imageSaving.checked).toBe(false);
+  expect(mediaUpload.checked).toBe(false);
+  imageGeneration.click();
+  await vi.waitFor(() => expect(companionValues['companion.selfTime.imageGeneration']).toBe(true));
+  expect(companionValues['companion.selfTime.actions']).toBe(true);
+  imageSaving.click();
+  await vi.waitFor(() => expect(companionValues['companion.selfTime.imageSaving']).toBe(true));
+  expect(companionValues['companion.selfTime.mediaUpload']).toBe(false);
+});
 
 it('restores the last saved switches and permission after a rejected write', async () => {
   const { section, enabled, control, level } = await mount();

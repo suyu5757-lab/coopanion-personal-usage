@@ -56,10 +56,11 @@ describe('image', () => {
 const ONE_DISPLAY = { displays: [{ index: 1, primary: true, width: 1920, height: 1080 }], layout: 'one', cursor: { display: 1, x: 0, y: 0 }, foreground: null, foregroundDisplay: 1 };
 /** A 10×10 screenshot of that display. */
 const SHOT = { ...ONE_DISPLAY, display: 1, jpeg: new Uint8Array(1), width: 10, height: 10, scale: 10 / 1920 };
+const allowedConfig = (): CuaConfig => ({ ...structuredClone(CUA_DEFAULTS), control: true });
 
 describe('computer use without the engine', () => {
   const world = () => {
-    const cfg = structuredClone(CUA_DEFAULTS);
+    const cfg = allowedConfig();
     return { cfg, world: new Cua({ cfg: () => cfg }) };
   };
   const call = (w: Cua, name: string, args: Record<string, unknown>) =>
@@ -91,7 +92,7 @@ describe('computer use without the engine', () => {
     const asked: string[] = [];
     let answer: 'no' | 'timeout' = 'no';
     let name = 'Bot';
-    const w = new Cua({ cfg: () => ({ ...structuredClone(CUA_DEFAULTS), permission: 'ask-each-turn' }), botName: () => name, askPermission: async (q) => { asked.push(q); return answer; } });
+    const w = new Cua({ cfg: () => ({ ...allowedConfig(), permission: 'ask-each-turn' }), botName: () => name, askPermission: async (q) => { asked.push(q); return answer; } });
     const shot = await call(w, 'pet_cua_screenshot', {});
     const click = await call(w, 'pet_cua_click', { x: 1, y: 1 });
     expect([shot.failed, click.failed]).toEqual([true, true]);
@@ -108,7 +109,7 @@ describe('computer use without the engine', () => {
 
   it('checks arguments before asking', async () => {
     const asked: string[] = [];
-    const w = new Cua({ cfg: () => structuredClone(CUA_DEFAULTS), askPermission: async (q) => { asked.push(q); return 'no'; } });
+    const w = new Cua({ cfg: allowedConfig, askPermission: async (q) => { asked.push(q); return 'no'; } });
     expect((await call(w, 'pet_cua_click', { x: 5000, y: 10 })).text).toContain('不在截图范围内');
     expect(asked).toEqual([]);
   });
@@ -116,7 +117,7 @@ describe('computer use without the engine', () => {
   describe('permission levels', () => {
     /** A world whose engine answers every request at once without touching the screen; `asked` collects the questions. */
     const levelWorld = (permission: CuaConfig['permission'], answers: Array<'yes' | 'no'>) => {
-      const cfg = { ...structuredClone(CUA_DEFAULTS), permission, grantMinutes: 30 };
+      const cfg = { ...allowedConfig(), permission, grantMinutes: 30 };
       cfg.screenshot.afterAction = false;
       const asked: string[] = [];
       const w = new Cua({ cfg: () => cfg, askPermission: async (q) => { asked.push(q); return answers.shift() ?? 'no'; } });
@@ -196,7 +197,7 @@ describe('computer use without the engine', () => {
   describe('interrupt', () => {
     /** A never-ask world whose engine answers a screenshot at once and holds `type` until a cancel for it arrives. */
     const interruptWorld = () => {
-      const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
+      const cfg = { ...allowedConfig(), permission: 'never-ask' as const };
       const w = new Cua({ cfg: () => cfg, askPermission: async () => 'yes' });
       const inner = w as unknown as { spawn: () => unknown; pending: Map<number, { done: (v: unknown) => void; timer: NodeJS.Timeout }> };
       const answer = (id: number, value: unknown) => {
@@ -237,7 +238,7 @@ describe('computer use without the engine', () => {
   });
 
   it('gives the bot no Chinese of its own when the model text is English: environment prompt, tool declarations, receipts', async () => {
-    const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
+    const cfg = { ...allowedConfig(), permission: 'never-ask' as const };
     const w = new Cua({ cfg: () => cfg, modelLanguage: () => 'en' });
     // stands in for the engine child: a screenshot, an empty window list, input sent after a short wait
     const inner = w as unknown as { spawn: () => unknown; pending: Map<number, { done: (v: unknown) => void; timer: NodeJS.Timeout }> };
@@ -336,7 +337,7 @@ describe('displays', () => {
   });
 
   it('aims input at the display the latest screenshot showed, in its physical pixels and arrangement', async () => {
-    const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
+    const cfg = { ...allowedConfig(), permission: 'never-ask' as const };
     cfg.screenshot.afterAction = false;
     cfg.screenshot.settleMs = 0;
     const w = new Cua({ cfg: () => cfg, askPermission: async () => 'yes' });
@@ -371,7 +372,7 @@ describe('displays', () => {
   });
 
   it('after an input brings a window forward on another display, the screenshot shows that display', async () => {
-    const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
+    const cfg = { ...allowedConfig(), permission: 'never-ask' as const };
     cfg.screenshot.settleMs = 0;
     const w = new Cua({ cfg: () => cfg, askPermission: async () => 'yes' });
     const two = { displays: [{ index: 1, primary: true, width: 2560, height: 1600 }, { index: 2, primary: false, width: 2560, height: 1440 }], layout: 'two', cursor: null };
@@ -486,7 +487,7 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
   }
 
   const world = (driver: FakeDriver) => {
-    const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
+    const cfg = { ...allowedConfig(), permission: 'never-ask' as const };
     cfg.screenshot.settleMs = 0;
     return new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'yes' });
   };
@@ -510,7 +511,7 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
   it('lists pressable accessibility tokens and clicks one only after a one-action approval', async () => {
     const driver = new FakeDriver();
     const asked: string[] = [];
-    const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
+    const cfg = { ...allowedConfig(), permission: 'never-ask' as const };
     cfg.screenshot.settleMs = 0;
     const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async (q) => { asked.push(q); return 'yes'; } });
     await call(w, 'pet_cua_window', { window: '123:456' });
@@ -559,7 +560,7 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
     const driver = new FakeDriver();
     driver.nextClickFailure = 'background_unavailable';
     const asked: string[] = [];
-    const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
+    const cfg = { ...allowedConfig(), permission: 'never-ask' as const };
     cfg.screenshot.afterAction = false;
     const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', language: () => 'en', askPermission: async (q) => { asked.push(q); return 'yes'; } });
     await call(w, 'pet_cua_window', { window: '123:456' });
@@ -574,7 +575,7 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
   it('does not retry foreground when backgroundOnly is enabled', async () => {
     const driver = new FakeDriver();
     driver.nextClickFailure = 'background_unavailable';
-    const cfg = { ...structuredClone(CUA_DEFAULTS), backgroundOnly: true, permission: 'never-ask' as const };
+    const cfg = { ...allowedConfig(), backgroundOnly: true, permission: 'never-ask' as const };
     cfg.screenshot.afterAction = false;
     const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'yes' });
     await call(w, 'pet_cua_window', { window: '123:456' });
@@ -587,7 +588,7 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
 
   it('refuses a denied exact action and does not let an old element token click a new snapshot', async () => {
     const driver = new FakeDriver();
-    const cfg = { ...structuredClone(CUA_DEFAULTS), permission: 'never-ask' as const };
+    const cfg = { ...allowedConfig(), permission: 'never-ask' as const };
     cfg.screenshot.settleMs = 0;
     const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'no' });
     await call(w, 'pet_cua_window', { window: '123:456' });
@@ -603,7 +604,7 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
   });
 
   it('blocks every foreground input before starting an engine in background-only mode', async () => {
-    const cfg = { ...structuredClone(CUA_DEFAULTS), backgroundOnly: true };
+    const cfg = { ...allowedConfig(), backgroundOnly: true };
     const w = new Cua({ cfg: () => cfg, modelLanguage: () => 'en' });
     const inner = w as unknown as { call: (...args: unknown[]) => Promise<never> };
     inner.call = async () => { throw new Error('foreground engine must not run'); };
@@ -622,7 +623,7 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
 
   it('keeps background input working while refusing focus and foreground fallback after a lost window', async () => {
     const driver = new FakeDriver();
-    const cfg = { ...structuredClone(CUA_DEFAULTS), backgroundOnly: true, permission: 'never-ask' as const };
+    const cfg = { ...allowedConfig(), backgroundOnly: true, permission: 'never-ask' as const };
     cfg.screenshot.settleMs = 0;
     const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'yes' });
     const engineOps: string[] = [];

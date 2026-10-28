@@ -1,6 +1,6 @@
 const { closeSync, existsSync, mkdirSync, openSync, readSync, realpathSync, statSync } = require('node:fs');
 const { basename, join } = require('node:path');
-const { randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 
 const MAX_IMAGE_BYTES = 40 * 1024 * 1024;
 const MIME_FORMATS = new Map([
@@ -51,10 +51,19 @@ function verifyGeneratedImage(file, mime) {
   if (!info.isFile() || info.size <= 0 || info.size > MAX_IMAGE_BYTES) throw new Error('ChatGPT image download is empty or larger than 40 MB');
   const fd = openSync(file, 'r');
   const header = Buffer.alloc(12);
-  let bytesRead;
-  try { bytesRead = readSync(fd, header, 0, header.length, 0); } finally { closeSync(fd); }
-  if (imageFormat(header.subarray(0, bytesRead)) !== expected.format) throw new Error('downloaded file contents do not match the image type');
-  return { bytes: info.size, format: expected.format };
+  const digest = createHash('sha256');
+  const chunk = Buffer.alloc(64 * 1024);
+  try {
+    const headerBytes = readSync(fd, header, 0, header.length, 0);
+    if (imageFormat(header.subarray(0, headerBytes)) !== expected.format) throw new Error('downloaded file contents do not match the image type');
+    for (let offset = 0; offset < info.size;) {
+      const read = readSync(fd, chunk, 0, Math.min(chunk.length, info.size - offset), offset);
+      if (read <= 0) throw new Error('downloaded image changed while it was being checked');
+      digest.update(chunk.subarray(0, read));
+      offset += read;
+    }
+  } finally { closeSync(fd); }
+  return { bytes: info.size, format: expected.format, digest: digest.digest('hex') };
 }
 
 module.exports = { MAX_IMAGE_BYTES, generatedImagePath, imageFormat, isChatGPTImageDownloadUrl, isChatGPTPageUrl, verifyGeneratedImage };

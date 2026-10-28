@@ -27,6 +27,8 @@ export interface BrowserAssembly {
   journalFile?: string;
   /** Durable duplicate guard for completed comment replies. */
   replyJournalFile?: string;
+  /** Durable transaction log for scoped image and media actions. */
+  taskJournalFile?: string;
   /** Transcribes one finished 16 kHz mono utterance from the page's audio; absent when speech recognition is unavailable. */
   transcribe?: (pcm: Int16Array) => Promise<{ text: string; error?: string | null }>;
   /** A browsing session ended; Coo's next heartbeat starts from now. */
@@ -49,7 +51,7 @@ const SUMMARIES = {
   browser_watch: { zh: '看一会儿视频，截几帧并把声音转成文字。', en: 'Watches the video for a while, takes a few frames and transcribes its sound.' },
   browser_screenshot: { zh: '截当前页面。', en: 'Takes a screenshot of the page.' },
   browser_chatgpt_generate_image: { zh: '通过已登录的 ChatGPT 网页提交一条图片生成提示。', en: 'Submits one image-generation prompt through the signed-in ChatGPT website.' },
-  browser_save_chatgpt_image: { zh: '把 ChatGPT 网页上的生成图片保存到视频素材目录。', en: 'Saves a generated image from the ChatGPT page into the video media folder.' },
+  browser_save_chatgpt_image: { zh: '把 ChatGPT 网页上的生成图片保存到视频素材目录。确认框会先暂存图片，再显示文件哈希供最终确认。', en: 'Saves a generated image from the ChatGPT page into the video media folder after showing its verified file hash for final approval.' },
   browser_upload_media: { zh: '从视频素材目录选择文件，放进抖音页面的投稿控件。', en: 'Places selected files from the video media folder into a Douyin page upload control.' },
   browser_back: { zh: '回到上一页。', en: 'Goes back a page.' },
   browser_close: { zh: '关上她的浏览器窗口。', en: 'Closes her browser window.' },
@@ -73,6 +75,7 @@ export function browserDefinition(assembly: BrowserAssembly): WorldDefinition<Wo
       ...(assembly.ask ? { ask: assembly.ask } : {}),
       ...(assembly.journalFile ? { journalFile: assembly.journalFile } : {}),
       ...(assembly.replyJournalFile ? { replyJournalFile: assembly.replyJournalFile } : {}),
+      ...(assembly.taskJournalFile ? { taskJournalFile: assembly.taskJournalFile } : {}),
       ...(assembly.transcribe ? { transcribe: assembly.transcribe } : {}),
       ...(assembly.onSessionEnd ? { onSessionEnd: assembly.onSessionEnd } : {}),
     }),

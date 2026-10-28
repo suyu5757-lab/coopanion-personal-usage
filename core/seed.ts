@@ -1,13 +1,14 @@
 /** First-run files of the app's deployment. */
 import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaultRegion, endpointName, firstVendor, vendorEntry } from 'cortico-provider-coo/src/vendors.ts';
 import { LANGUAGES, type Language } from 'cortico/core/language.ts';
 import { appLanguage } from './language.ts';
 import { EARLIER_PERSONAS } from './seed-history.ts';
 import { loadHindsightConfig } from './memory/config.ts';
+import { asRecord, InvalidState, readState, writeState } from './state-file.ts';
 
 export const DEPLOYMENT = 'companion';
 export const CONSOLE_PORT = 17788;
@@ -50,8 +51,8 @@ export const personaFile = (id: PersonaId, language: Language) => join(SEED_DIR,
  * (`followLanguage`), endpoints of the old `deepseek` module, which now belong
  * to `coo`, a config of computer use as its own World (`worlds.cua`), whose section, whether it was on
  * included, moves to `worlds.desktop-pet.cua`, a config without a computer-use `permission`, which
- * keeps the `ask-each-turn` it had before new installs got `ask-once`, and the keys Cortico 0.2.0 renamed
- * (`moveTerminalToConsole`).
+ * keeps the `ask-each-turn` it had before new installs got `ask-once`, action permissions added after
+ * the old social-actions switch, and the keys Cortico 0.2.0 renamed (`moveTerminalToConsole`).
  */
 export function seed(home: string, language: Language): void {
   const deploy = join(home, DEPLOYMENT);
@@ -72,7 +73,8 @@ export function seed(home: string, language: Language): void {
       activeProvider: endpointName(vendor, region),
       providerSchemaVersion: 3,
       web: { port: TEST_CHANNEL ? 0 : CONSOLE_PORT },
-      worlds: { 'desktop-pet': { cua: { permission: CUA_ASK } } },
+      worlds: { 'desktop-pet': { cua: { control: false, permission: CUA_ASK } } },
+      companion: { selfTime: { actions: false, imageGeneration: false, imageSaving: false, mediaUpload: false } },
     });
   }
   const configured = appLanguage((JSON.parse(readFileSync(config, 'utf8')) as { language?: unknown }).language);
@@ -88,6 +90,65 @@ export function seed(home: string, language: Language): void {
     keepCuaAsking(config);
     moveTerminalToConsole(deploy, config);
   }
+  migrateActionPermissions(config);
+}
+
+/** Keep legacy social actions while explicitly closing newer browser and desktop capabilities. */
+function migrateActionPermissions(file: string): void {
+  const marker = join(dirname(file), 'action-permissions-v1.json');
+  const applied = readState(marker, (value) => {
+    const record = asRecord(value);
+    if (record.v !== 1 || record.applied !== true) throw new InvalidState('unknown action permissions migration');
+    return true;
+  });
+  if (applied) return;
+
+  const config = asRecord(JSON.parse(readFileSync(file, 'utf8')));
+  const companionValue = config.companion;
+  if (companionValue !== undefined && (typeof companionValue !== 'object' || companionValue === null || Array.isArray(companionValue))) {
+    throw new InvalidState('companion config is not an object');
+  }
+  const companion = companionValue as Record<string, unknown> | undefined ?? {};
+  const selfTimeValue = companion.selfTime;
+  if (selfTimeValue !== undefined && (typeof selfTimeValue !== 'object' || selfTimeValue === null || Array.isArray(selfTimeValue))) {
+    throw new InvalidState('selfTime config is not an object');
+  }
+  const selfTime = { ...(selfTimeValue as Record<string, unknown> | undefined) };
+  let changed = false;
+  for (const permission of ['actions', 'imageGeneration', 'imageSaving', 'mediaUpload']) {
+    if (typeof selfTime[permission] === 'boolean') continue;
+    selfTime[permission] = false;
+    changed = true;
+  }
+
+  const worldsValue = config.worlds;
+  if (worldsValue !== undefined && (typeof worldsValue !== 'object' || worldsValue === null || Array.isArray(worldsValue))) {
+    throw new InvalidState('worlds config is not an object');
+  }
+  const worlds = worldsValue as Record<string, unknown> | undefined ?? {};
+  const petValue = worlds['desktop-pet'];
+  if (petValue !== undefined && (typeof petValue !== 'object' || petValue === null || Array.isArray(petValue))) {
+    throw new InvalidState('desktop-pet config is not an object');
+  }
+  const pet = petValue as Record<string, unknown> | undefined ?? {};
+  const cuaValue = pet.cua;
+  if (cuaValue !== undefined && (typeof cuaValue !== 'object' || cuaValue === null || Array.isArray(cuaValue))) {
+    throw new InvalidState('desktop-pet.cua config is not an object');
+  }
+  const cua = { ...(cuaValue as Record<string, unknown> | undefined) };
+  if (typeof cua.control !== 'boolean') {
+    cua.control = false;
+    changed = true;
+  }
+
+  if (changed) {
+    const backup = `${file}.pre-action-permissions-v1`;
+    if (existsSync(file) && !existsSync(backup)) copyFileSync(file, backup);
+    config.companion = { ...companion, selfTime };
+    config.worlds = { ...worlds, 'desktop-pet': { ...pet, cua } };
+    writeState(file, `${JSON.stringify(config, null, 2)}\n`);
+  }
+  writeState(marker, `${JSON.stringify({ v: 1, applied: true })}\n`);
 }
 
 /** Writes the Coo-specific operating rules, and moves a pre-Hindsight file to the current memory section. */

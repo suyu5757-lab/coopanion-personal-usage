@@ -1,7 +1,7 @@
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import type { ToolCallContext, ToolOutcome, WorldHost } from 'cortico/core/types.ts';
 import { renderWorldEnvPrompt } from 'cortico/core/prefix.ts';
 import type { BrowserTransport } from '../core/browser/bridge.ts';
@@ -16,6 +16,10 @@ import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 type Page = {
   url: string; title: string; header: string; content: string; footer: string;
   video: null | { current: number; duration: number; paused: boolean; muted: boolean; volume: number; width: number; height: number; src: string };
+  snapshotId?: string;
+  current?: { url: string; title: string } | null;
+  account?: { ref: string; label: string } | null;
+  elements?: Array<{ id: number; label: string }>;
 };
 
 const page = (overrides: Partial<Page> = {}): Page => ({
@@ -77,6 +81,11 @@ const host = (pushed: Array<Record<string, unknown>>, sees = true) => ({
   },
 } as unknown as WorldHost);
 
+const taskJournalDirs: string[] = [];
+afterEach(() => {
+  for (const directory of taskJournalDirs.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
+
 const run = async (world: BrowserWorld, name: string, args: Record<string, unknown>): Promise<ToolOutcome> => {
   const tool = world.tools().find((t) => t.name === name);
   if (!tool) throw new Error(`no tool ${name}`);
@@ -89,21 +98,27 @@ const make = async (opts: {
   bridge?: FakeBridge;
   pushed?: Array<Record<string, unknown>>;
   sees?: boolean;
+  ask?: (question: string, choices: [yes: string, no: string]) => Promise<'yes' | 'always' | 'no' | 'dismissed' | 'timeout' | 'unavailable'>;
   transcribe?: (pcm: Int16Array) => Promise<{ text: string; error?: string | null }>;
 } = {}) => {
   const bridge = opts.bridge ?? new FakeBridge();
   const pushed = opts.pushed ?? [];
   let self = { ...SELF_TIME_DEFAULTS, enabled: true, ...opts.self };
+  const taskJournalDir = mkdtempSync(join(tmpdir(), 'coo-browser-task-journal-'));
+  taskJournalDirs.push(taskJournalDir);
+  const taskJournalFile = join(taskJournalDir, 'task-actions.json');
   const world = new BrowserWorld({
     bridge,
     selfTime: () => self,
     modelLanguage: () => 'zh',
     timezone: 'Asia/Shanghai',
+    taskJournalFile,
+    ...(opts.ask ? { ask: opts.ask } : {}),
     ...(opts.transcribe ? { transcribe: opts.transcribe } : {}),
   });
   await world.start(host(pushed, opts.sees ?? true));
   return {
-    world, bridge, pushed,
+    world, bridge, pushed, taskJournalFile,
     setSelf: (patch: Partial<typeof self>) => { self = { ...self, ...patch }; },
   };
 };
@@ -113,8 +128,11 @@ describe('selfTime settings', () => {
     expect(readSelfTime(undefined)).toEqual(SELF_TIME_DEFAULTS);
     expect(SELF_TIME_DEFAULTS.enabled).toBe(false);
     expect(SELF_TIME_DEFAULTS.actions).toBe(false);
+    expect(SELF_TIME_DEFAULTS.imageGeneration).toBe(false);
+    expect(SELF_TIME_DEFAULTS.imageSaving).toBe(false);
+    expect(SELF_TIME_DEFAULTS.mediaUpload).toBe(false);
     expect(readSelfTime({ companion: { selfTime: { enabled: true, afterMinutes: 999, sessionMinutes: 1, sessionUnlimited: true, sound: true, actions: false } } }))
-      .toEqual({ enabled: true, afterMinutes: 240, sessionMinutes: 5, sessionUnlimited: true, sound: true, topics: '', actions: false });
+      .toEqual({ enabled: true, afterMinutes: 240, sessionMinutes: 5, sessionUnlimited: true, sound: true, topics: '', actions: false, imageGeneration: false, imageSaving: false, mediaUpload: false });
     expect(readSelfTime({ companion: { selfTime: { afterMinutes: 0, sessionMinutes: 999 } } }))
       .toEqual({ ...SELF_TIME_DEFAULTS, afterMinutes: 1, sessionMinutes: 60 });
     expect(readSelfTime({ companion: { selfTime: { enabled: true } }, worlds: { browser: { enabled: false } } }).enabled).toBe(false);
@@ -252,9 +270,11 @@ describe('browser World', () => {
   });
 
   it('submits one image prompt through the ChatGPT page and reports an unclear result without retrying', async () => {
-    const { world, bridge } = await make({ self: { actions: true } });
-    const chatgpt = page({ url: 'https://chatgpt.com/', title: 'ChatGPT', header: 'ChatGPT', content: 'Message' });
+    const { world, bridge } = await make({ self: { actions: true, imageGeneration: true }, ask: async () => 'yes' });
+    const chatgpt = { ...page({ url: 'https://chatgpt.com/', title: 'ChatGPT', header: 'ChatGPT', content: 'Message' }), snapshotId: 'chatgpt-snapshot' };
     bridge.responses.open = chatgpt;
+    bridge.responses.read = chatgpt;
+    bridge.responses['chatgpt-composer'] = { id: 'composer-1', snapshotId: 'chatgpt-snapshot' };
     bridge.responses['chatgpt-generate-image'] = {
       submitted: false,
       state: chatgpt,
@@ -269,25 +289,122 @@ describe('browser World', () => {
     expect(bridge.calls.filter((call) => call.op === 'chatgpt-generate-image')).toHaveLength(1);
   });
 
-  it('saves ChatGPT images only from the current ChatGPT page when browser actions are enabled', async () => {
-    const { world, bridge } = await make({ self: { actions: true } });
+  it('requires the Core approval bubble to submit an image prompt', async () => {
+    const { world, bridge } = await make({ self: { imageGeneration: true } });
+    const chatgpt = { ...page({ url: 'https://chatgpt.com/', title: 'ChatGPT' }), snapshotId: 'chatgpt-snapshot' };
+    bridge.responses.open = chatgpt;
+    bridge.responses.read = chatgpt;
+    bridge.responses['chatgpt-composer'] = { id: 'composer-1', snapshotId: 'chatgpt-snapshot' };
+    await run(world, 'browser_open', { url: 'https://chatgpt.com/' });
+    const out = await run(world, 'browser_chatgpt_generate_image', { prompt: 'A blue whale' });
+    expect(out.failed).toBe(true);
+    expect(bridge.calls.some((call) => call.op === 'chatgpt-generate-image')).toBe(false);
+  });
+
+  it('stages a ChatGPT image, shows its hash, then saves only after a second Core approval', async () => {
+    const questions: string[] = [];
+    const { world, bridge, taskJournalFile } = await make({
+      self: { actions: false, imageSaving: true },
+      ask: async (question) => { questions.push(question); return 'yes'; },
+    });
     const state = {
       ...page({ url: 'https://chatgpt.com/c/abc', title: 'ChatGPT', content: 'Generated image' }),
       snapshotId: 'image-state',
       elements: [{ id: 2, label: 'Download' }],
     };
     bridge.responses.open = state;
+    bridge.responses.read = state;
     bridge.element = element({ id: 2, tag: 'button', label: 'Download', text: 'Download', snapshotId: 'image-state' });
-    bridge.responses['save-chatgpt-image'] = { file: 'chatgpt-image-1.png', bytes: 1024, state };
+    const stagedFile = 'chatgpt-image-1730000000000-123e4567-e89b-12d3-a456-426614174000.png';
+    const stageToken = '223e4567-e89b-12d3-a456-426614174000';
+    const digest = 'a'.repeat(64);
+    bridge.responses['stage-chatgpt-image'] = {
+      stageToken, file: stagedFile, bytes: 1024, mime: 'image/png', digest, state,
+    };
+    bridge.responses['commit-staged-chatgpt-image'] = {
+      file: stagedFile, bytes: 1024, mime: 'image/png', digest,
+    };
     await run(world, 'browser_open', { url: 'https://chatgpt.com/c/abc' });
     const out = await run(world, 'browser_save_chatgpt_image', { index: 2 });
     expect(out.failed).toBeUndefined();
-    expect(out.text).toContain('chatgpt-image-1.png');
-    expect(bridge.calls.find((call) => call.op === 'save-chatgpt-image')?.args).toMatchObject({ index: 2, snapshotId: 'image-state' });
+    expect(out.text).toContain(stagedFile);
+    expect(questions).toHaveLength(2);
+    expect(questions[0]).toContain('暂存');
+    expect(questions[1]).toContain(stagedFile);
+    expect(questions[1]).toContain('1024 字节');
+    expect(questions[1]).toContain(digest);
+    expect(bridge.calls.find((call) => call.op === 'stage-chatgpt-image')?.args).toMatchObject({ index: 2, snapshotId: 'image-state' });
+    expect(bridge.calls.find((call) => call.op === 'commit-staged-chatgpt-image')?.args)
+      .toMatchObject({ stageToken, file: stagedFile, bytes: 1024, mime: 'image/png', digest, snapshotId: 'image-state' });
+    const journal = JSON.parse(readFileSync(taskJournalFile, 'utf8'));
+    expect(journal).toHaveLength(2);
+    expect(journal.map((action: { phase: string }) => action.phase)).toEqual(['verified', 'verified']);
   });
 
-  it('refuses ChatGPT image generation when Browser actions are turned off', async () => {
-    const { world, bridge } = await make({ self: { actions: false } });
+  it('discards a staged image when the final media save is declined', async () => {
+    let prompts = 0;
+    const { world, bridge } = await make({
+      self: { imageSaving: true },
+      ask: async () => (++prompts === 1 ? 'yes' : 'no'),
+    });
+    const state = {
+      ...page({ url: 'https://chatgpt.com/c/abc', title: 'ChatGPT' }),
+      snapshotId: 'image-state',
+    };
+    bridge.responses.open = state;
+    bridge.responses.read = state;
+    bridge.element = element({ label: 'Download', text: 'Download', snapshotId: 'image-state' });
+    bridge.responses['stage-chatgpt-image'] = {
+      stageToken: '223e4567-e89b-12d3-a456-426614174000',
+      file: 'chatgpt-image-1730000000000-123e4567-e89b-12d3-a456-426614174000.png',
+      bytes: 1024, mime: 'image/png', digest: 'b'.repeat(64), state,
+    };
+    await run(world, 'browser_open', { url: state.url });
+    const out = await run(world, 'browser_save_chatgpt_image', { index: 2 });
+    expect(out.failed).toBe(true);
+    expect(bridge.calls.some((call) => call.op === 'discard-staged-chatgpt-image')).toBe(true);
+    expect(bridge.calls.some((call) => call.op === 'commit-staged-chatgpt-image')).toBe(false);
+  });
+
+  it('does not retry an image save after the final commit result is unknown', async () => {
+    let prompts = 0;
+    let stages = 0;
+    const { world, bridge, taskJournalFile } = await make({
+      self: { imageSaving: true },
+      ask: async () => { prompts++; return 'yes'; },
+    });
+    const state = {
+      ...page({ url: 'https://chatgpt.com/c/abc', title: 'ChatGPT' }),
+      snapshotId: 'image-state',
+    };
+    bridge.responses.open = state;
+    bridge.responses.read = state;
+    bridge.element = element({ label: 'Download', text: 'Download', snapshotId: 'image-state' });
+    bridge.responses['stage-chatgpt-image'] = () => {
+      stages++;
+      return {
+        stageToken: `223e4567-e89b-12d3-a456-42661417400${stages}`,
+        file: `chatgpt-image-173000000000${stages}-123e4567-e89b-12d3-a456-426614174000.png`,
+        bytes: 1024, mime: 'image/png', digest: 'c'.repeat(64), state,
+      };
+    };
+    bridge.responses['commit-staged-chatgpt-image'] = new Error('bridge timeout');
+    await run(world, 'browser_open', { url: state.url });
+    const first = await run(world, 'browser_save_chatgpt_image', { index: 2 });
+    const second = await run(world, 'browser_save_chatgpt_image', { index: 2 });
+    expect(first.failed).toBe(true);
+    expect(second.failed).toBe(true);
+    expect(stages).toBe(2);
+    expect(prompts).toBe(3);
+    expect(bridge.calls.filter((call) => call.op === 'commit-staged-chatgpt-image')).toHaveLength(1);
+    expect(bridge.calls.filter((call) => call.op === 'discard-staged-chatgpt-image')).toHaveLength(2);
+    const journal = JSON.parse(readFileSync(taskJournalFile, 'utf8')) as Array<{ phase: string; duplicateKey: string }>;
+    expect(journal.some((action) => action.phase === 'unknown')).toBe(true);
+    expect(new Set(journal.filter((action) => action.phase === 'unknown').map((action) => action.duplicateKey)).size).toBe(1);
+  });
+
+  it('refuses ChatGPT image generation when its separate permission is off', async () => {
+    const { world, bridge } = await make({ self: { actions: true, imageGeneration: false } });
     bridge.responses.open = page({ url: 'https://chatgpt.com/', title: 'ChatGPT' });
     await run(world, 'browser_open', { url: 'https://chatgpt.com/' });
     const out = await run(world, 'browser_chatgpt_generate_image', { prompt: 'A blue whale' });
@@ -296,25 +413,45 @@ describe('browser World', () => {
   });
 
   it('places only listed media into a current Douyin file input without publishing the post', async () => {
-    const { world, bridge } = await make({ self: { actions: true } });
+    let approvalQuestion = '';
+    const { world, bridge } = await make({
+      self: { actions: false, mediaUpload: true },
+      ask: async (question) => { approvalQuestion = question; return 'yes'; },
+    });
     const state = {
       ...page({ url: 'https://creator.douyin.com/creator-micro/upload', title: '发布作品' }),
       snapshotId: 'upload-snapshot',
+      account: { ref: 'creator-1', label: '测试账号' },
       fileInputs: [{ id: 88, label: '上传视频', accept: 'video/mp4,image/png', multiple: true, disabled: false, visible: false }],
     };
     bridge.responses.open = state;
+    bridge.responses.read = state;
+    const approvedFiles = [{
+      path: 'generated/cover.png', bytes: 321, digest: 'a'.repeat(64), mime: 'image/png',
+    }];
+    const inspection = {
+      url: state.url,
+      snapshotId: 'upload-snapshot',
+      accept: 'video/mp4,image/png',
+      multiple: true,
+      account: state.account,
+      files: approvedFiles,
+    };
+    bridge.responses['inspect-upload'] = inspection;
     bridge.responses['upload-media'] = { files: ['generated/cover.png'], state };
     await run(world, 'browser_open', { url: state.url });
     const out = await run(world, 'browser_upload_media', { fileId: 88, files: ['generated/cover.png'] });
     expect(out.failed).toBeUndefined();
     expect(out.text).toContain('generated/cover.png');
     expect(out.text).toContain('没有提交作品');
+    expect(approvalQuestion).toContain('测试账号 (creator-1)');
+    expect(approvalQuestion).toContain('sha256 ' + 'a'.repeat(64));
     expect(bridge.calls.find((call) => call.op === 'upload-media')?.args)
-      .toMatchObject({ fileId: 88, snapshotId: 'upload-snapshot', files: ['generated/cover.png'] });
+      .toMatchObject({ fileId: 88, snapshotId: 'upload-snapshot', files: ['generated/cover.png'], expectedFiles: approvedFiles });
   });
 
-  it('does not upload media when Browser actions are turned off', async () => {
-    const { world, bridge } = await make({ self: { actions: false } });
+  it('does not upload media when its separate permission is off, even if social actions are on', async () => {
+    const { world, bridge } = await make({ self: { actions: true, mediaUpload: false } });
     bridge.responses.open = {
       ...page({ url: 'https://creator.douyin.com/creator-micro/upload', title: '发布作品' }),
       snapshotId: 'upload-snapshot',
@@ -359,15 +496,60 @@ describe('browser World', () => {
   });
 
   it('clicks a like and returns the page after it', async () => {
-    const { world, bridge } = await make({ self: { actions: true } });
-    bridge.responses.open = page();
-    bridge.responses.click = { answer: { success: true }, state: page({ content: '[2]<div title=点赞>13 />' }) };
-    await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
-    bridge.element = element();
+    let approvalQuestion = '';
+    const { world, bridge, taskJournalFile } = await make({
+      self: { actions: true },
+      ask: async (question) => { approvalQuestion = question; return 'yes'; },
+    });
+    const video = { url: 'https://www.bilibili.com/video/BV1test', title: '测试视频' };
+    const account = { ref: 'https://www.bilibili.com/user/1', label: '测试账号' };
+    const before = page({
+      snapshotId: 'like-snapshot', current: video, account,
+      elements: [{ id: 2, label: '点赞 12' }],
+    });
+    const after = page({
+      snapshotId: 'like-snapshot-2', current: video, account,
+      elements: [{ id: 2, label: '已点赞' }],
+      content: '[2]<div title=已点赞>13 />',
+    });
+    bridge.responses.open = before;
+    bridge.responses.read = before;
+    bridge.responses.click = { answer: { success: true }, state: after };
+    await run(world, 'browser_open', { url: before.url });
+    bridge.element = element({ snapshotId: 'like-snapshot' });
     const out = await run(world, 'browser_click', { index: 2 });
     expect(out.failed).toBeUndefined();
     expect(out.text).toContain('点了「点赞 12');
     expect(out.text).toContain('13');
+    expect(approvalQuestion).toContain('测试账号');
+    expect(approvalQuestion).toContain('BV1test');
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))[0].phase).toBe('verified');
+  });
+
+  it('does not retry an approved toggle whose changed state could not be confirmed', async () => {
+    let prompts = 0;
+    const { world, bridge, taskJournalFile } = await make({
+      self: { actions: true },
+      ask: async () => { prompts++; return 'yes'; },
+    });
+    const video = { url: 'https://www.bilibili.com/video/BV1test', title: '测试视频' };
+    const account = { ref: 'https://www.bilibili.com/user/1', label: '测试账号' };
+    const state = page({
+      snapshotId: 'like-snapshot', current: video, account,
+      elements: [{ id: 2, label: '点赞 12' }],
+    });
+    bridge.responses.open = state;
+    bridge.responses.read = state;
+    bridge.responses.click = { answer: { success: true }, state };
+    await run(world, 'browser_open', { url: state.url });
+    bridge.element = element({ snapshotId: 'like-snapshot' });
+    const first = await run(world, 'browser_click', { index: 2 });
+    const second = await run(world, 'browser_click', { index: 2 });
+    expect(first.failed).toBe(true);
+    expect(second.failed).toBe(true);
+    expect(prompts).toBe(1);
+    expect(bridge.calls.filter((call) => call.op === 'click')).toHaveLength(1);
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))[0].phase).toBe('unknown');
   });
 
   it('hovers an element and returns the controls it reveals', async () => {
@@ -400,7 +582,7 @@ describe('browser World', () => {
     await run(world, 'browser_open', { url: 'https://www.douyin.com/' });
     const out = await run(world, 'browser_share', {});
     expect(out.failed).toBe(true);
-    expect(out.text).toContain('只允许看');
+    expect(out.text).toContain('没有执行');
     expect(bridge.calls.some((c) => c.op === 'share')).toBe(false);
   });
 
@@ -427,10 +609,10 @@ describe('browser World', () => {
     bridge.element = element();
     const liked = await run(world, 'browser_click', { index: 2 });
     expect(liked.failed).toBe(true);
-    expect(liked.text).toContain('只允许看');
+    expect(liked.text).toContain('没有执行');
     const hovered = await run(world, 'browser_hover', { index: 2 });
     expect(hovered.failed).toBe(true);
-    expect(hovered.text).toContain('只允许看');
+    expect(hovered.text).toContain('没有执行');
     bridge.element = element({ type: 'search', placeholder: '搜索', text: '', label: '' });
     const searched = await run(world, 'browser_type', { index: 2, text: '猫' });
     expect(searched.failed).toBeUndefined();
@@ -596,11 +778,14 @@ describe('browser World', () => {
     setSelf({ sessionUnlimited: true });
     expect(world.envPromptVars()).toMatchObject({ 'browser.session': '不限时长' });
     setSelf({ sessionUnlimited: false });
-    expect(world.envPromptVars()!['browser.actions']).toContain('只允许看');
+    expect(world.envPromptVars()!['browser.actions']).toContain('常规互动已关闭');
     setSelf({ actions: true });
-    expect(world.envPromptVars()!['browser.actions']).toContain('点赞');
-    expect(world.envPromptVars()!['browser.actions']).toContain('上传素材');
-    expect(world.envPromptVars()!['browser.actions']).toContain('ChatGPT 网页');
+    expect(world.envPromptVars()!['browser.actions']).toContain('常规互动已开启');
+    expect(world.envPromptVars()!['browser.actions']).toContain('网页生图已关闭');
+    setSelf({ imageGeneration: true, imageSaving: true, mediaUpload: true });
+    expect(world.envPromptVars()!['browser.actions']).toContain('网页生图已开启');
+    expect(world.envPromptVars()!['browser.actions']).toContain('保存生成图片已开启');
+    expect(world.envPromptVars()!['browser.actions']).toContain('素材上传已开启');
     const doc = world.webUi!('zh').promptDocs?.find((d) => d.role === 'envPrompt');
     expect(doc?.path).toBeTruthy();
     expect(existsSync(doc!.path)).toBe(true);
@@ -615,14 +800,14 @@ describe('browser World', () => {
     const { text } = await renderWorldEnvPrompt(world);
     expect(text).toContain('## 你自己的浏览器');
     expect(text).toContain('最多 20 分钟');
-    expect(text).toContain('只允许看');
+    expect(text).toContain('常规互动已关闭');
     expect(text).toContain('静音');
     expect(text).not.toContain('{{browser.');
     setSelf({ actions: true });
     const { text: allowed } = await renderWorldEnvPrompt(world);
-    expect(allowed).toContain('可以点赞、收藏、关注、评论、发弹幕、分享');
-    expect(allowed).toContain('通过 ChatGPT 网页生成图片');
-    expect(allowed).toContain('上传素材');
+    expect(allowed).toContain('常规互动已开启');
+    expect(allowed).toContain('网页生图已关闭');
+    expect(allowed).toContain('素材上传已关闭');
     expect(allowed).toContain('browser_upload_media');
   });
 

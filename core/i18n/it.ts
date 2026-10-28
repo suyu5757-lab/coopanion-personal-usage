@@ -19,7 +19,10 @@ const it: Translation<CoreText> = {
       minutes: 'min',
       sound: 'Audio del browser', soundDescription: 'Muto per impostazione predefinita. Attivo, i video che guarda si sentono.',
       topics: 'Argomenti web consentiti', topicsDescription: 'Un argomento per riga. Lascia vuoto per sospendere la navigazione. Ogni sessione dura al massimo 20 minuti e 80 chiamate browser; le pagine restano fonti esterne.',
-      actions: 'Consenti like, salvataggi, segui, condivisioni, danmaku, commenti, caricamento media e immagini con ChatGPT', actionsDescription: 'Disattivato, può solo navigare; like, segui, condivisioni, commenti, caricamento media e immagini con ChatGPT sono disattivati. Accedi e inserisci i codici nella sua finestra tu stesso.',
+      actions: 'Consenti azioni sociali', actionsDescription: 'Controlla like, salvataggi, segui, commenti, danmaku e condivisioni. Generazione, salvataggio e caricamento di immagini hanno impostazioni separate qui sotto.',
+      imageGeneration: 'Consenti generazione di immagini sul Web', imageGenerationDescription: 'Consente di inviare prompt per immagini dal sito ChatGPT.',
+      imageSaving: 'Consenti salvataggio delle immagini generate', imageSavingDescription: 'Consente di salvare un’immagine generata dalla pagina ChatGPT corrente nella cartella media locale.',
+      mediaUpload: 'Consenti caricamento media', mediaUploadDescription: 'Consente di inserire file media idonei in un controllo di caricamento; non pubblica il contenuto.',
     },
     growth: {
       title: 'Crescere da sola',
@@ -53,6 +56,15 @@ const it: Translation<CoreText> = {
     yes: 'Pubblica',
     no: 'Non pubblicare',
     unresolved: (count: number) => `Non è stato possibile confermare l'invio di ${count} contenuti precedenti dal suo browser. Controlla la sua finestra prima di inviare di nuovo.`,
+  },
+
+  browserAction: {
+    platformWrite: 'mettere Mi piace, salvare o seguire', imageGeneration: 'generare un’immagine', imageSaving: 'salvare un’immagine generata',
+    imageStaging: 'preparare temporaneamente un’immagine generata per la verifica',
+    imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `File: ${file}\nDimensione: ${bytes} byte\nTipo: ${mime}\nSHA-256: ${digest}\nSalva in: cartella media locale`,
+    mediaUpload: 'caricare contenuti multimediali',
+    question: (action: string, target: string, details: string) => 'Consenti a Coo di ' + action + ' una volta su “' + target + '”?\n\n' + details + '\n\nL’autorizzazione vale solo per la pagina corrente e i contenuti elencati.',
+    yes: 'Consenti una volta', no: 'Annulla',
   },
 
   status: {

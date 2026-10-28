@@ -19,7 +19,10 @@ const ko: Translation<CoreText> = {
       minutes: '분',
       sound: '브라우저 소리', soundDescription: '기본은 음소거입니다. 켜면 보는 영상의 소리가 납니다.',
       topics: '허용된 웹 탐색 주제', topicsDescription: '한 줄에 주제 하나를 입력하세요. 비워 두면 웹 탐색을 멈춥니다. 세션은 최대 20분, 브라우저 도구 80회로 제한되며 웹 페이지는 외부 출처로 취급합니다.',
-      actions: '좋아요·저장·팔로우·공유·탄막·댓글·미디어 업로드·ChatGPT 이미지 생성 허용', actionsDescription: '끄면 탐색만 할 수 있으며 좋아요, 팔로우, 공유, 댓글, 미디어 업로드, ChatGPT 이미지 생성을 사용할 수 없습니다. 로그인과 인증 코드는 브라우저 창에서 직접 해 주세요.',
+      actions: '소셜 작업 허용', actionsDescription: '좋아요, 저장, 팔로우, 댓글, 탄막, 공유를 제어합니다. 이미지 생성, 이미지 저장, 미디어 업로드는 아래의 별도 설정으로 제어합니다.',
+      imageGeneration: '웹 이미지 생성 허용', imageGenerationDescription: 'ChatGPT 웹사이트에서 이미지 프롬프트를 제출할 수 있습니다.',
+      imageSaving: '생성 이미지 저장 허용', imageSavingDescription: '현재 ChatGPT 페이지의 생성 이미지를 로컬 미디어 폴더에 저장할 수 있습니다.',
+      mediaUpload: '미디어 업로드 허용', mediaUploadDescription: '조건에 맞는 미디어 파일을 페이지의 업로드 입력란에 넣을 수 있습니다. 이 단계에서 게시되지는 않습니다.',
     },
     growth: {
       title: '스스로 성장하기',
@@ -53,6 +56,15 @@ const ko: Translation<CoreText> = {
     yes: '게시',
     no: '게시하지 않기',
     unresolved: (count: number) => `지난번에 전송되었는지 확인되지 않은 내용이 ${count}건 있습니다. Coo의 브라우저 창에서 확인한 뒤 다시 보낼지 정하세요.`,
+  },
+
+  browserAction: {
+    platformWrite: '좋아요, 저장 또는 팔로우', imageGeneration: '이미지 생성', imageSaving: '생성된 이미지 저장',
+    imageStaging: '생성 이미지를 임시 보관해 확인',
+    imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `파일: ${file}\n크기: ${bytes}바이트\n형식: ${mime}\nSHA-256: ${digest}\n저장 위치: 로컬 미디어 폴더`,
+    mediaUpload: '미디어 업로드',
+    question: (action: string, target: string, details: string) => 'Coo가 "' + target + '"에서 ' + action + '하는 것을 한 번 허용할까요?\n\n' + details + '\n\n현재 페이지와 표시된 콘텐츠에만 적용됩니다.',
+    yes: '한 번 허용', no: '취소',
   },
 
   status: {

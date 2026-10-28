@@ -10,13 +10,16 @@
  */
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import type { ToolCallContext, ToolDef, ToolOutcome, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 import type { Language } from 'cortico/core/language.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import type { ModelLanguage } from '../language.ts';
 import { ActionGate, type Impact } from '../action-gate.ts';
 import { coreText } from '../i18n/index.ts';
-import { actionDigest, ActionJournal, APPROVAL_MINUTES, newAction, originOf, ReplyJournal, type ActionTarget, type PublicAction } from './actions.ts';
+import { actionDigest, ActionJournal, APPROVAL_MINUTES, hashContent, newAction, originOf, ReplyJournal, type ActionTarget, type PublicAction } from './actions.ts';
+import { BrowserTaskActionJournal } from './task-actions.ts';
+import type { BrowserTargetEvidence, StepRequest } from '../task-grants.ts';
 import type { BrowserTransport } from './bridge.ts';
 import { CONTENT_MAX, SESSION_MAX_CALLS, TEXT_MAX, WATCH_FRAMES_DEFAULT, WATCH_FRAMES_MAX, WATCH_MAX, type SelfTimeConfig } from './config.ts';
 import { clickRefusal, isFilePicker, isFinalPublishControl, isSearchField, isSendControl, isWriteAction, removesState, typeRefusal } from './guard.ts';
@@ -51,6 +54,8 @@ export interface BrowserWorldOptions {
   journalFile?: string;
   /** Durable duplicate guard for completed comment replies. */
   replyJournalFile?: string;
+  /** Durable transaction log for scoped image and media actions. */
+  taskJournalFile?: string;
   /** Transcribes one finished 16 kHz mono utterance from the page's audio; absent when speech recognition is unavailable. */
   transcribe?: (pcm: Int16Array) => Promise<{ text: string; error?: string | null }>;
   /** A browsing session ended (closed, timed out or out of calls); Coo's next heartbeat starts from now. */
@@ -60,6 +65,8 @@ export interface BrowserWorldOptions {
 export type ApprovalAnswer = 'yes' | 'always' | 'no' | 'dismissed' | 'timeout' | 'unavailable';
 
 interface Shot { base64: string; width: number; height: number; state: PageState }
+interface BrowserActionAuthorization { journalId: string; grantDigest: string; approvedAt: number; expiresAt: number }
+type BrowserActionApproval = { approved: true; authorization: BrowserActionAuthorization } | { approved: false; reason: 'unavailable' | 'not-approved' | 'changed' | 'unknown' };
 interface ClickAnswer { success?: boolean; message?: string }
 interface PlayAnswer { ok?: boolean; error?: string; video?: VideoState | null }
 
@@ -258,6 +265,7 @@ const isDouyinPage = (value: string): boolean => {
 
 export class BrowserWorld implements World {
   readonly id = BROWSER_WORLD_ID;
+  private readonly instanceId = randomUUID();
   private host: WorldHost | null = null;
   private unsubscribe: (() => void) | null = null;
   /** Epoch ms the current browsing session started; null when there is none. */
@@ -279,6 +287,7 @@ export class BrowserWorld implements World {
   private actions: PublicAction[] = [];
   private journal: ActionJournal | null = null;
   private replyJournal: ReplyJournal | null = null;
+  private taskJournal: BrowserTaskActionJournal | null = null;
   /** One public write at a time: a second Enter while the first awaits an answer is refused. */
   private publishing = false;
   /** What Coo last typed, so a send control knows which text it would publish. */
@@ -298,10 +307,24 @@ export class BrowserWorld implements World {
 
   private fallbackGate: ActionGate | null = null;
 
+  private ensureTaskJournal(): boolean {
+    if (this.taskJournal) return true;
+    if (!this.opts.taskJournalFile) return false;
+    try {
+      this.taskJournal = new BrowserTaskActionJournal(this.opts.taskJournalFile);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Core's gate when the app lent one; otherwise a gate reading this World's own settings. */
   private get gate(): ActionGate {
     return this.opts.gate ?? (this.fallbackGate ??= new ActionGate({
       platformWrites: () => this.self.actions,
+      imageGeneration: () => this.self.imageGeneration,
+      imageSaving: () => this.self.imageSaving,
+      mediaUpload: () => this.self.mediaUpload,
       computerInput: () => true,
     }));
   }
@@ -309,6 +332,104 @@ export class BrowserWorld implements World {
   /** Whether an action of this weight may run now. */
   private allowed(impact: Impact, tool: string, target?: string): boolean {
     return this.gate.check({ surface: 'browser', tool, impact, ...(target ? { target } : {}) }).allow;
+  }
+
+  /** A Core UI grant binds one browser action to its current page, account or profile, and control. */
+  private async approveBrowserAction(
+    impact: Extract<Impact, 'platform-write' | 'image-generation' | 'image-saving' | 'media-upload'>,
+    taskText: string,
+    page: PageState,
+    formId: string,
+    control: string,
+    details: string,
+    ctx: ToolCallContext,
+    scope: {
+      accountRef?: string;
+      files?: Array<{ path: string; digest: string; bytes: number; mime: string }>;
+      dedupeKey?: string;
+      actionLabel?: string;
+    } = {},
+  ): Promise<BrowserActionApproval> {
+    if (!this.ensureTaskJournal() || !this.taskJournal) return { approved: false, reason: 'unavailable' };
+    const url = page.url;
+    const target: BrowserTargetEvidence = {
+      surface: 'browser',
+      instanceId: this.instanceId,
+      origin: originOf(url),
+      url,
+      accountRef: scope.accountRef ?? page.account?.ref ?? this.instanceId,
+      snapshotId: page.snapshotId ?? '',
+      formId,
+      control,
+    };
+    const text = coreText(this.opts.language?.() ?? 'zh').browserAction;
+    const taskId = ctx.callId ? `${ctx.role}:${ctx.callId}` : `${ctx.role}:${ctx.round ?? 'direct'}:${randomUUID()}`;
+    const files = scope.files ?? [];
+    const payloadDigest = hashContent(taskText);
+    const duplicateKey = hashContent(JSON.stringify([
+      impact, target.origin, target.accountRef, target.formId, payloadDigest,
+      scope.dedupeKey ?? files,
+    ]));
+    if (this.taskJournal.hasUnresolved(duplicateKey)) return { approved: false, reason: 'unknown' };
+    let action: ReturnType<BrowserTaskActionJournal['begin']>;
+    try {
+      action = this.taskJournal.begin({
+        taskId,
+        intent: impact,
+        target,
+        payloadDigest,
+        files,
+        duplicateKey,
+      });
+      this.taskJournal.awaitingApproval(action.id);
+    } catch {
+      return { approved: false, reason: 'unavailable' };
+    }
+    const finishCancelled = () => this.taskJournal?.finish(action.id, 'cancelled');
+    let grant;
+    try {
+      grant = await this.gate.requestTaskGrant({
+        taskId,
+        taskText,
+        target,
+        actions: [impact],
+        ...(scope.files ? { files: scope.files } : {}),
+        expiresInMs: 30_000,
+        maxSteps: 1,
+      }, async () => {
+        if (!this.opts.ask) return false;
+        const answer = await askUnlessAborted(
+        this.opts.ask(text.question(scope.actionLabel ?? text[impact === 'platform-write' ? 'platformWrite' : impact === 'image-generation' ? 'imageGeneration' : impact === 'image-saving' ? 'imageSaving' : 'mediaUpload'], `${page.title} (${target.origin})`, details), [text.yes, text.no]),
+          ctx.signal,
+        );
+        return answer === 'yes';
+      });
+    } catch {
+      finishCancelled();
+      return { approved: false, reason: 'not-approved' };
+    }
+    if (!grant || !target.origin || !target.snapshotId) {
+      finishCancelled();
+      return { approved: false, reason: 'not-approved' };
+    }
+
+    const current = asState(await this.call('read', {}, ctx.signal));
+    if (!current || current.snapshotId !== target.snapshotId || current.url !== target.url
+      || (current.account?.ref ?? this.instanceId) !== target.accountRef) {
+      finishCancelled();
+      return { approved: false, reason: 'changed' };
+    }
+    const step: StepRequest = { action: impact, target, expectedChange: taskText, ...(scope.files ? { files: scope.files } : {}) };
+    const ticket = this.gate.issueStepTicket(grant.id, step);
+    this.taskJournal.acting(action.id, grant.digest, grant.approvedAt, grant.expiresAt);
+    if (!ticket || !this.gate.consumeStepTicket(ticket.id, step)) {
+      finishCancelled();
+      return { approved: false, reason: 'changed' };
+    }
+    return {
+      approved: true,
+      authorization: { journalId: action.id, grantDigest: grant.digest, approvedAt: grant.approvedAt, expiresAt: grant.expiresAt },
+    };
   }
 
   async start(host: WorldHost): Promise<void> {
@@ -397,13 +518,22 @@ export class BrowserWorld implements World {
   envPromptVars(): Record<string, string> {
     const st = this.self;
     const en = this.opts.modelLanguage() === 'en';
+    const permissions = en ? [
+      st.actions ? 'social actions are enabled' : 'social actions are disabled',
+      st.imageGeneration ? 'ChatGPT image prompt submission is enabled' : 'ChatGPT image prompt submission is disabled',
+      st.imageSaving ? 'saving generated ChatGPT images is enabled' : 'saving generated ChatGPT images is disabled',
+      st.mediaUpload ? 'placing eligible media into upload controls is enabled' : 'placing media into upload controls is disabled',
+    ] : [
+      st.actions ? '常规互动已开启' : '常规互动已关闭',
+      st.imageGeneration ? '网页生图已开启' : '网页生图已关闭',
+      st.imageSaving ? '保存生成图片已开启' : '保存生成图片已关闭',
+      st.mediaUpload ? '素材上传已开启' : '素材上传已关闭',
+    ];
     return {
       'browser.session': st.sessionUnlimited
         ? (en ? 'has no time limit' : '不限时长')
         : (en ? `lasts at most ${st.sessionMinutes} minutes` : `最多 ${st.sessionMinutes} 分钟`),
-      'browser.actions': st.actions
-        ? (en ? 'likes, favorites, follows, comments, danmaku, sharing, media uploads and image generation through the ChatGPT website are allowed' : '可以点赞、收藏、关注、评论、发弹幕、分享、上传素材,也可以通过 ChatGPT 网页生成图片')
-        : (en ? 'read only: do not like, favorite, follow, comment, send danmaku, share, upload media, submit image prompts to ChatGPT or save generated images' : '只允许看:不要点赞、收藏、关注、评论、发弹幕、分享、上传素材、向 ChatGPT 提交图片提示词或保存生成图片'),
+      'browser.actions': permissions.join(en ? '; ' : '；'),
       'browser.audio': st.sound ? (en ? 'sound on' : '有声音') : (en ? 'muted' : '静音'),
     };
   }
@@ -626,11 +756,56 @@ export class BrowserWorld implements World {
         }
         return this.toast(this.t.sendDraftMissing, true);
       }
-      const result = asRecord(await this.call('click', index !== null ? { index, snapshotId: targetSnapshotId } : { text }, ctx.signal));
+      let authorization: BrowserActionAuthorization | null = null;
+      const page = this.lastState;
+      if (isWriteAction(label)) {
+        const currentVideo = page?.current;
+        const currentAccount = page?.account;
+        if (index === null || !page?.snapshotId || !currentVideo?.url || !currentAccount?.ref || !currentAccount.label
+          || targetSnapshotId !== page.snapshotId) return this.toast(this.t.sendTargetUnverified, true);
+        const decision = await this.approveBrowserAction(
+          'platform-write',
+          `Perform “${label}” once on ${currentVideo.title || page.title} (${currentVideo.url}).`,
+          page,
+          `video:${currentVideo.url}`,
+          label,
+          `Account: ${currentAccount.label} (${currentAccount.ref})\nContent: ${currentVideo.title || currentVideo.url} (${currentVideo.url})\nAction: ${label}`,
+          ctx,
+          { accountRef: currentAccount.ref },
+        );
+        if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
+          : decision.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly(label), true);
+        authorization = decision.authorization;
+      }
+      let result: Record<string, unknown> | null;
+      try {
+        result = asRecord(await this.call('click', index !== null ? { index, snapshotId: targetSnapshotId } : { text }, ctx.signal));
+      } catch (error) {
+        if (authorization) this.taskJournal?.finish(authorization.journalId, 'unknown', 'the click result was not received');
+        throw error;
+      }
       const state = asState(result?.state);
-      if (!state) return this.toast(this.t.failed('browser_click', 'the page did not answer after the click'), true);
       const answer = asRecord(result?.answer) as ClickAnswer | null;
-      if (answer?.success === false) return this.toast(this.t.failed('browser_click', answer.message || 'the click failed'), true);
+      if (answer?.success === false) {
+        if (authorization) this.taskJournal?.finish(authorization.journalId, 'cancelled', answer.message || 'the click was refused');
+        return this.toast(this.t.failed('browser_click', answer.message || 'the click failed'), true);
+      }
+      if (!state) {
+        if (authorization) this.taskJournal?.finish(authorization.journalId, 'unknown', 'the page did not answer after the click');
+        return this.toast(this.t.failed('browser_click', 'the page did not answer after the click'), true);
+      }
+      if (authorization) {
+        const after = state.elements?.find((candidate) => candidate.id === index)?.label ?? '';
+        const currentVideo = page?.current;
+        const currentAccount = page?.account;
+        const verified = !!page && !!currentVideo && !!currentAccount && state.url === page.url
+          && state.current?.url === currentVideo.url && state.account?.ref === currentAccount.ref
+          && !!after && !removesState(label) && removesState(after);
+        this.taskJournal?.finish(authorization.journalId, verified ? 'verified' : 'unknown', verified
+          ? `the page changed the control to ${after}`
+          : 'the page did not confirm the requested toggle state');
+        if (!verified) return this.toast(this.t.sendUnknown, true);
+      }
       return this.toast(this.full(state, this.t.clicked(label || `#${index}`)));
     });
   }
@@ -879,10 +1054,36 @@ export class BrowserWorld implements World {
       const blocked = this.begin('browser_chatgpt_generate_image');
       if (blocked) return blocked;
       if (!isChatGPTPage(this.lastState?.url ?? '')) return this.toast(this.t.failed('browser_chatgpt_generate_image', 'open the ChatGPT website in this browser first'), true);
-      if (!this.allowed('platform-write', 'browser_chatgpt_generate_image', 'ChatGPT image prompt')) return this.toast(this.t.lookOnly('ChatGPT image prompt'), true);
-      const result = asRecord(await this.call('chatgpt-generate-image', { prompt }, ctx.signal));
+      if (!this.allowed('image-generation', 'browser_chatgpt_generate_image', 'ChatGPT image prompt')) return this.toast(this.t.lookOnly('ChatGPT image prompt'), true);
+      const page = this.lastState!;
+      const composer = asRecord(await this.call('chatgpt-composer', {}, ctx.signal));
+      const composerId = typeof composer?.id === 'string' ? composer.id : '';
+      const composerSnapshot = typeof composer?.snapshotId === 'string' ? composer.snapshotId : '';
+      if (!composerId || !composerSnapshot || composerSnapshot !== page.snapshotId) {
+        return this.toast(this.t.failed('browser_chatgpt_generate_image', 'the current image composer does not match the page read'), true);
+      }
+      const decision = await this.approveBrowserAction(
+        'image-generation',
+        `Submit this image prompt once through ChatGPT:\n${prompt}`,
+        page,
+        composerId,
+        'ChatGPT image prompt composer',
+        prompt,
+        ctx,
+      );
+      if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
+        : decision.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly('ChatGPT image prompt'), true);
+      const approval = decision.authorization;
+      let result: Record<string, unknown> | null;
+      try {
+        result = asRecord(await this.call('chatgpt-generate-image', { prompt, composerId, snapshotId: composerSnapshot }, ctx.signal));
+      } catch (error) {
+        this.taskJournal?.finish(approval.journalId, 'unknown', 'the ChatGPT page did not answer after the approved prompt');
+        throw error;
+      }
       const state = asState(result?.state);
       const submitted = result?.submitted === true;
+      this.taskJournal?.finish(approval.journalId, submitted ? 'verified' : 'unknown', submitted ? 'the ChatGPT page confirmed the submitted prompt' : 'the page did not confirm whether the prompt was submitted');
       const lead = submitted ? this.t.chatGPTImageSubmitted : this.t.chatGPTImageUnknown;
       if (state && typeof result?.base64 === 'string') {
         const shot = { base64: result.base64, width: Number(result.width) || 0, height: Number(result.height) || 0, state };
@@ -900,18 +1101,85 @@ export class BrowserWorld implements World {
       const blocked = this.begin('browser_save_chatgpt_image');
       if (blocked) return blocked;
       if (!isChatGPTPage(this.lastState?.url ?? '')) return this.toast(this.t.failed('browser_save_chatgpt_image', 'open the generated image on the ChatGPT website first'), true);
-      if (!this.allowed('platform-write', 'browser_save_chatgpt_image', 'save ChatGPT image')) return this.toast(this.t.lookOnly('save ChatGPT image'), true);
+      if (!this.allowed('image-saving', 'browser_save_chatgpt_image', 'save ChatGPT image')) return this.toast(this.t.lookOnly('save ChatGPT image'), true);
+      const page = this.lastState!;
       const element = asElement(await this.call('element', { index }, ctx.signal));
       if (!element) return this.toast(this.t.noElement(index), true);
       if (this.renumbered(index, element)) return this.toast(this.t.stale(index), true);
       if (isFilePicker(element)) return this.toast(this.t.fileChooserBlocked, true);
-      const result = asRecord(await this.call('save-chatgpt-image', { index, snapshotId: element.snapshotId }, ctx.signal));
-      const state = asState(result?.state);
-      const file = typeof result?.file === 'string' ? result.file : '';
-      const bytes = Number(result?.bytes);
-      if (!file || !Number.isSafeInteger(bytes) || bytes <= 0) return this.toast(this.t.failed('browser_save_chatgpt_image', 'the download was not verified'), true);
-      if (state && typeof result?.base64 === 'string') {
-        return this.image({ base64: result.base64, width: Number(result.width) || 0, height: Number(result.height) || 0, state }, this.t.chatGPTImageSaved(file, bytes));
+      const decision = await this.approveBrowserAction(
+        'image-saving',
+        `Download the visible ChatGPT image at element ${index} to temporary staging for verification; do not save it to the video media folder yet.`,
+        page,
+        `image-save:${index}`,
+        element.label || `image save control ${index}`,
+        `${element.role}: ${element.label}`,
+        ctx,
+        { actionLabel: coreText(this.opts.language?.() ?? 'zh').browserAction.imageStaging },
+      );
+      if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
+        : decision.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly('save ChatGPT image'), true);
+      const stageApproval = decision.authorization;
+      let staged: Record<string, unknown> | null;
+      try {
+        staged = asRecord(await this.call('stage-chatgpt-image', { index, snapshotId: element.snapshotId }, ctx.signal));
+      } catch (error) {
+        this.taskJournal?.finish(stageApproval.journalId, 'unknown', 'the staged image download result was not received');
+        throw error;
+      }
+      const stageToken = typeof staged?.stageToken === 'string' ? staged.stageToken : '';
+      const state = asState(staged?.state);
+      const file = typeof staged?.file === 'string' ? staged.file : '';
+      const bytes = Number(staged?.bytes);
+      const mime = typeof staged?.mime === 'string' ? staged.mime : '';
+      const digest = typeof staged?.digest === 'string' ? staged.digest : '';
+      const stageIsValid = /^[0-9a-f-]{36}$/i.test(stageToken)
+        && /^chatgpt-image-\d+-[0-9a-f-]{36}\.(png|jpg|webp)$/i.test(file)
+        && Number.isSafeInteger(bytes) && bytes > 0 && bytes <= 40 * 1024 * 1024
+        && ['image/png', 'image/jpeg', 'image/webp'].includes(mime)
+        && /^[a-f0-9]{64}$/.test(digest)
+        && !!state?.snapshotId && isChatGPTPage(state.url);
+      if (!staged || !stageIsValid || !state) {
+        if (stageToken) await this.call('discard-staged-chatgpt-image', { stageToken }, undefined).catch(() => undefined);
+        this.taskJournal?.finish(stageApproval.journalId, 'unknown', 'the staged image metadata or page could not be verified');
+        return this.toast(this.t.failed('browser_save_chatgpt_image', 'the staged image could not be verified'), true);
+      }
+      const fileBinding = [{ path: file, digest, bytes, mime }];
+      this.taskJournal?.finish(stageApproval.journalId, 'verified', `staged ${file} (${bytes} bytes, sha256 ${digest})`);
+      const imageApprovalText = coreText(this.opts.language?.() ?? 'zh').browserAction;
+      const approval = await this.approveBrowserAction(
+        'image-saving',
+        `Save the verified generated image with SHA-256 ${digest} to the video media folder.`,
+        state,
+        'video-media-folder',
+        `save image sha256:${digest}`,
+        imageApprovalText.imageSaveDetails(file, bytes, mime, digest),
+        ctx,
+        { files: fileBinding, dedupeKey: `${digest}:${bytes}:${mime}` },
+      );
+      if (!approval.approved) {
+        await this.call('discard-staged-chatgpt-image', { stageToken }, undefined).catch(() => undefined);
+        return this.toast(approval.reason === 'unknown' ? this.t.sendUnknown
+          : approval.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly('save ChatGPT image'), true);
+      }
+      let committed: Record<string, unknown> | null;
+      try {
+        committed = asRecord(await this.call('commit-staged-chatgpt-image', {
+          stageToken, file, bytes, mime, digest, snapshotId: state.snapshotId,
+        }, ctx.signal));
+      } catch (error) {
+        this.taskJournal?.finish(approval.authorization.journalId, 'unknown', 'the final image save result was not received');
+        await this.call('discard-staged-chatgpt-image', { stageToken }, undefined).catch(() => undefined);
+        throw error;
+      }
+      const saved = committed?.file === file && committed.bytes === bytes
+        && committed.mime === mime && committed.digest === digest;
+      this.taskJournal?.finish(approval.authorization.journalId, saved ? 'verified' : 'unknown', saved
+        ? `saved ${file} (${bytes} bytes, sha256 ${digest})`
+        : 'the saved image did not match the approved file');
+      if (!saved) return this.toast(this.t.failed('browser_save_chatgpt_image', 'the final file did not match the approved image'), true);
+      if (typeof staged.base64 === 'string') {
+        return this.image({ base64: staged.base64, width: Number(staged.width) || 0, height: Number(staged.height) || 0, state }, this.t.chatGPTImageSaved(file, bytes));
       }
       return this.toast(state ? this.full(state, this.t.chatGPTImageSaved(file, bytes)) : this.t.chatGPTImageSaved(file, bytes));
     });
@@ -932,12 +1200,71 @@ export class BrowserWorld implements World {
       const input = page.fileInputs?.find((candidate) => candidate.id === fileId);
       if (!input || input.disabled) return this.toast(this.t.failed('browser_upload_media', 'that file input is missing, disabled or from an older page read'), true);
       if (!input.multiple && files.length > 1) return this.toast(this.t.failed('browser_upload_media', 'the page input accepts one file at a time'), true);
-      if (!this.allowed('platform-write', 'browser_upload_media', `${files.length} media file(s) into Douyin`)) return this.toast(this.t.lookOnly('Douyin media upload'), true);
-      const result = asRecord(await this.call('upload-media', { fileId, snapshotId: page.snapshotId, files }, ctx.signal));
+      if (!this.allowed('media-upload', 'browser_upload_media', `${files.length} media file(s) into Douyin`)) return this.toast(this.t.lookOnly('Douyin media upload'), true);
+      const inspected = asRecord(await this.call('inspect-upload', { fileId, snapshotId: page.snapshotId, files }, ctx.signal));
+      const account = asRecord(inspected?.account);
+      const approvedFiles = Array.isArray(inspected?.files)
+        ? inspected.files.flatMap((value) => {
+          const file = asRecord(value);
+          return file && typeof file.path === 'string' && Number.isSafeInteger(file.bytes) && Number(file.bytes) > 0
+            && typeof file.digest === 'string' && /^[a-f0-9]{64}$/.test(file.digest)
+            && typeof file.mime === 'string' && file.mime.includes('/')
+            ? [{ path: file.path, bytes: Number(file.bytes), digest: file.digest, mime: file.mime }]
+            : [];
+        })
+        : [];
+      if (!inspected || inspected.url !== page.url || inspected.snapshotId !== page.snapshotId
+        || inspected.accept !== input.accept || inspected.multiple !== input.multiple
+        || typeof account?.ref !== 'string' || !account.ref || typeof account.label !== 'string' || !account.label
+        || approvedFiles.length !== files.length || approvedFiles.some((file, index) => file.path !== files[index])) {
+        return this.toast(this.t.failed('browser_upload_media', 'the current account, form or media list could not be verified'), true);
+      }
+      const form = `${input.label} (accept=${input.accept || '*'}, multiple=${input.multiple})`;
+      const listed = approvedFiles.map((file) => `${file.path} — ${file.bytes} bytes — ${file.mime} — sha256 ${file.digest}`).join('\n');
+      const taskText = `Select these ${approvedFiles.length} media file(s) in the Douyin upload form; do not submit the post.`;
+      const decision = await this.approveBrowserAction(
+        'media-upload',
+        taskText,
+        page,
+        `file:${fileId}`,
+        form,
+        `Account: ${account.label} (${account.ref})\nOrigin: ${originOf(page.url)}\nForm: ${form}\nFiles (${approvedFiles.length}):\n${listed}`,
+        ctx,
+        { accountRef: account.ref, files: approvedFiles },
+      );
+      if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
+        : decision.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly('Douyin media upload'), true);
+      const approval = decision.authorization;
+      let currentInspection: Record<string, unknown> | null;
+      try {
+        currentInspection = asRecord(await this.call('inspect-upload', { fileId, snapshotId: page.snapshotId, files }, ctx.signal));
+      } catch (error) {
+        this.taskJournal?.finish(approval.journalId, 'cancelled', 'the pre-dispatch media read failed');
+        throw error;
+      }
+      if (!currentInspection || JSON.stringify(currentInspection.files) !== JSON.stringify(approvedFiles)
+        || currentInspection.snapshotId !== page.snapshotId || currentInspection.url !== page.url) {
+        this.taskJournal?.finish(approval.journalId, 'cancelled', 'the page or media changed before upload');
+        return this.toast(this.t.failed('browser_upload_media', 'the page or media changed after approval'), true);
+      }
+      let result: Record<string, unknown> | null;
+      try {
+        result = asRecord(await this.call('upload-media', {
+          fileId,
+          snapshotId: page.snapshotId,
+          files,
+          expectedFiles: approvedFiles,
+        }, ctx.signal));
+      } catch (error) {
+        this.taskJournal?.finish(approval.journalId, 'unknown', 'the page did not confirm the file selection');
+        throw error;
+      }
       const selected = Array.isArray(result?.files) ? result.files.filter((file): file is string => typeof file === 'string') : [];
       if (selected.length !== files.length || selected.some((file, index) => file !== files[index])) {
+        this.taskJournal?.finish(approval.journalId, 'unknown', 'the selected files did not match the approved file list');
         return this.toast(this.t.failed('browser_upload_media', 'the browser did not confirm the selected media files'), true);
       }
+      this.taskJournal?.finish(approval.journalId, 'verified', 'the page confirmed the approved file list in its upload control');
       const state = asState(result?.state);
       return this.toast(state ? this.full(state, this.t.uploadedMedia(selected)) : this.t.uploadedMedia(selected));
     });

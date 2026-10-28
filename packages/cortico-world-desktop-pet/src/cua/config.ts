@@ -44,7 +44,7 @@ export interface CuaConfig {
 
 export const CUA_DEFAULTS: CuaConfig = {
   enabled: false,
-  control: true,
+  control: false,
   backgroundOnly: false,
   permission: 'ask-once',
   grantMinutes: 30,

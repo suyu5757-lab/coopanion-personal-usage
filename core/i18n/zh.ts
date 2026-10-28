@@ -21,7 +21,10 @@ export default {
       minutes: '分钟',
       sound: '浏览器声音', soundDescription: '默认静音。打开后,她看的视频会外放。',
       topics: '允许探索的网页主题', topicsDescription: '每行填写一个主题；留空时暂停网页探索。每段最多 20 分钟、80 次浏览器工具调用；网页始终是外部来源。',
-      actions: '允许点赞、收藏、关注、分享、发送弹幕、评论、上传素材和生成图片', actionsDescription: '关闭后她只能浏览；点赞、关注、分享、弹幕、评论、素材上传和 ChatGPT 生图都不可用。登录和验证码请在她的浏览器窗口里自己完成。',
+      actions: '允许常规互动', actionsDescription: '控制点赞、收藏、关注、评论、弹幕和分享。关闭后这些互动不可用；网页生图、保存图片和素材上传由下方的独立设置控制。',
+      imageGeneration: '允许网页生图', imageGenerationDescription: '允许通过 ChatGPT 网页提交图片提示词。',
+      imageSaving: '允许保存生成图片', imageSavingDescription: '允许把当前 ChatGPT 页面上的生成图片保存到本地素材目录。',
+      mediaUpload: '允许素材上传', mediaUploadDescription: '允许把符合媒体目录规则的素材放入网页上传控件；这一步不会发布作品。',
     },
     growth: {
       title: '自我成长',
@@ -61,6 +64,15 @@ export default {
     yes: '发送',
     no: '不发送',
     unresolved: (count: number) => `上次有 ${count} 条内容没能确认有没有发出去。去她的浏览器窗口看一眼，再决定要不要重发。`,
+  },
+
+  browserAction: {
+    platformWrite: '点赞、收藏或关注', imageGeneration: '网页生图', imageSaving: '保存生成图片',
+    imageStaging: '暂存生成图片并核验',
+    imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `文件：${file}\n大小：${bytes} 字节\n类型：${mime}\nSHA-256：${digest}\n保存到：本地素材目录`,
+    mediaUpload: '上传素材',
+    question: (action: string, target: string, details: string) => '允许 Coo 在「' + target + '」执行一次' + action + '吗？\n\n' + details + '\n\n只适用于当前页面和列出的内容。',
+    yes: '允许一次', no: '取消',
   },
 
   status: {

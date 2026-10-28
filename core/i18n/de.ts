@@ -19,7 +19,10 @@ const de: Translation<CoreText> = {
       minutes: 'Min.',
       sound: 'Browser-Ton', soundDescription: 'Standardmäßig stumm. Eingeschaltet hört man die Videos, die sie ansieht.',
       topics: 'Erlaubte Web-Themen', topicsDescription: 'Ein Thema pro Zeile. Leer lassen, um die Web-Erkundung zu pausieren. Pro Sitzung höchstens 20 Minuten und 80 Browser-Aufrufe; Webseiten bleiben externe Quellen.',
-      actions: 'Likes, Favoriten, Folgen, Teilen, Danmaku, Kommentare, Medien-Uploads und ChatGPT-Bilderstellung erlauben', actionsDescription: 'Aus: Sie kann nur browsen; Likes, Folgen, Teilen, Kommentare, Medien-Uploads und ChatGPT-Bilderstellung sind deaktiviert. Anmeldung und Codes bitte selbst in ihrem Browserfenster eingeben.',
+      actions: 'Soziale Aktionen erlauben', actionsDescription: 'Steuert Likes, Favoriten, Folgen, Kommentare, Danmaku und Teilen. Ausgeschaltete Aktionen bleiben gesperrt; Bildgenerierung, Speichern und Uploads haben eigene Schalter unten.',
+      imageGeneration: 'Bilder im Web generieren', imageGenerationDescription: 'Erlaubt das Absenden von Bildprompts über die ChatGPT-Website.',
+      imageSaving: 'Generierte Bilder speichern', imageSavingDescription: 'Erlaubt, ein generiertes Bild von der aktuellen ChatGPT-Seite im lokalen Medienordner zu speichern.',
+      mediaUpload: 'Medien hochladen', mediaUploadDescription: 'Erlaubt geeignete Mediendateien in ein Upload-Feld zu legen; der Beitrag wird dadurch nicht veröffentlicht.',
     },
     growth: {
       title: 'Selbst wachsen',
@@ -53,6 +56,15 @@ const de: Translation<CoreText> = {
     yes: 'Senden',
     no: 'Nicht senden',
     unresolved: (count: number) => `Bei ${count} früheren Inhalten aus ihrem Browser ließ sich der Versand nicht bestätigen. Prüfe ihr Browserfenster, bevor du erneut sendest.`,
+  },
+
+  browserAction: {
+    platformWrite: 'liken, favorisieren oder folgen', imageGeneration: 'ein Bild erzeugen', imageSaving: 'ein erzeugtes Bild speichern',
+    imageStaging: 'ein erzeugtes Bild vorübergehend zur Prüfung ablegen',
+    imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `Datei: ${file}\nGröße: ${bytes} Byte\nTyp: ${mime}\nSHA-256: ${digest}\nSpeicherort: lokaler Medienordner`,
+    mediaUpload: 'Medien hochladen',
+    question: (action: string, target: string, details: string) => 'Darf Coo einmal ' + action + ' auf „' + target + '“?\n\n' + details + '\n\nDas gilt nur für die aktuelle Seite und die aufgeführten Inhalte.',
+    yes: 'Einmal erlauben', no: 'Abbrechen',
   },
 
   status: {

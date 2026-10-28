@@ -14,8 +14,14 @@ export interface SelfTimeConfig {
   sound: boolean;
   /** User-approved topics for web exploration; blank leaves the browser exploration idle. */
   topics: string;
-  /** Allow browser writes, including social actions, media uploads and ChatGPT website image generation. Off by default. */
+  /** Allow ordinary browser social actions. Image generation, saving and media upload have separate switches. */
   actions: boolean;
+  /** Allow prompt submission to ChatGPT image generation. Off by default. */
+  imageGeneration: boolean;
+  /** Allow saving a generated image from the current ChatGPT page. Off by default. */
+  imageSaving: boolean;
+  /** Allow placing approved media into a page's upload control. Off by default. */
+  mediaUpload: boolean;
 }
 
 export const SELF_TIME_DEFAULTS: SelfTimeConfig = {
@@ -26,6 +32,9 @@ export const SELF_TIME_DEFAULTS: SelfTimeConfig = {
   sound: false,
   topics: '',
   actions: false,
+  imageGeneration: false,
+  imageSaving: false,
+  mediaUpload: false,
 };
 
 /** The settings as the live config has them, with a hand-edited value outside its range clamped to it. */
@@ -46,6 +55,9 @@ export function readSelfTime(config: unknown): SelfTimeConfig {
       ? raw.topics.split(/\r?\n/).map((topic) => topic.trim().slice(0, 80)).filter(Boolean).slice(0, 8).join('\n')
       : SELF_TIME_DEFAULTS.topics,
     actions: bool(raw?.actions, SELF_TIME_DEFAULTS.actions),
+    imageGeneration: bool(raw?.imageGeneration, SELF_TIME_DEFAULTS.imageGeneration),
+    imageSaving: bool(raw?.imageSaving, SELF_TIME_DEFAULTS.imageSaving),
+    mediaUpload: bool(raw?.mediaUpload, SELF_TIME_DEFAULTS.mediaUpload),
   };
 }
 

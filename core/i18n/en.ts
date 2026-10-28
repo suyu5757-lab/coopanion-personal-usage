@@ -24,7 +24,10 @@ const en: CoreText = {
       minutes: 'min',
       sound: 'Browser sound', soundDescription: 'Muted by default. With this on, the videos she watches play aloud.',
       topics: 'Allowed web topics', topicsDescription: 'One topic per line. Leave blank to pause web exploration. Each session is limited to 20 minutes and 80 browser tool calls; web pages remain untrusted sources.',
-      actions: 'Allow likes, saves, follows, sharing, danmaku, comments, media uploads and ChatGPT image generation', actionsDescription: 'Off: she can only browse; likes, follows, sharing, comments, media uploads and ChatGPT image generation are disabled. Sign in and solve CAPTCHAs in her browser window yourself.',
+      actions: 'Allow social actions', actionsDescription: 'Controls likes, saves, follows, comments, danmaku and sharing. Off disables those actions; image generation, image saving and media upload have separate settings below.',
+      imageGeneration: 'Allow web image generation', imageGenerationDescription: 'Allows submitting image prompts through the ChatGPT website.',
+      imageSaving: 'Allow saving generated images', imageSavingDescription: 'Allows saving a generated image from the current ChatGPT page to the local media folder.',
+      mediaUpload: 'Allow media upload', mediaUploadDescription: 'Allows eligible media files to be placed into a page upload control; this does not publish a post.',
     },
     growth: {
       title: 'Growing on her own',
@@ -62,6 +65,15 @@ const en: CoreText = {
     yes: 'Post',
     no: 'Do not post',
     unresolved: (count: number) => `${count} earlier item${count === 1 ? '' : 's'} from her browser could not be confirmed as sent. Check her browser window before posting again.`,
+  },
+
+  browserAction: {
+    platformWrite: 'like, favorite or follow', imageGeneration: 'generate an image', imageSaving: 'save a generated image',
+    imageStaging: 'temporarily stage a generated image for review',
+    imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `File: ${file}\nSize: ${bytes} bytes\nType: ${mime}\nSHA-256: ${digest}\nSave to: local media folder`,
+    mediaUpload: 'upload media',
+    question: (action: string, target: string, details: string) => 'Allow Coo to ' + action + ' on "' + target + '" once?\n\n' + details + '\n\nThis applies only to the current page and listed content.',
+    yes: 'Allow once', no: 'Cancel',
   },
 
   status: {

@@ -1,5 +1,6 @@
-const { realpathSync, statSync } = require('node:fs');
+const { createReadStream, realpathSync, statSync } = require('node:fs');
 const { basename, extname, isAbsolute, relative, resolve, sep } = require('node:path');
+const { createHash } = require('node:crypto');
 
 const UPLOAD_TYPES = new Map([
   ['.mp4', 'video/mp4'], ['.mov', 'video/quicktime'], ['.m4v', 'video/x-m4v'], ['.webm', 'video/webm'], ['.mkv', 'video/x-matroska'],
@@ -20,14 +21,26 @@ function inside(root, file) {
   return !!path && path !== '..' && !path.startsWith(`..${sep}`) && !isAbsolute(path);
 }
 
-function resolveUploadFiles(mediaDir, values) {
+async function digestFile(file) {
+  const digest = createHash('sha256');
+  await new Promise((resolveDigest, reject) => {
+    const stream = createReadStream(file);
+    stream.on('data', (chunk) => digest.update(chunk));
+    stream.once('error', reject);
+    stream.once('end', resolveDigest);
+  });
+  return digest.digest('hex');
+}
+
+async function resolveUploadFiles(mediaDir, values) {
   if (!Array.isArray(values) || values.length < 1 || values.length > MAX_FILES || values.some((value) => typeof value !== 'string' || !value.trim())) {
     throw new Error(`choose 1 to ${MAX_FILES} relative paths from the video media folder`);
   }
   const root = realpathSync(mediaDir);
   const seen = new Set();
   const visibleNames = new Set();
-  return values.map((value) => {
+  const files = [];
+  for (const value of values) {
     const input = value.trim();
     if (input.includes('\\') || input.split('/').some((part) => !part || part === '.' || part === '..' || part.startsWith('.')) || isAbsolute(input)) {
       throw new Error('media paths must stay inside the video media folder');
@@ -46,8 +59,9 @@ function resolveUploadFiles(mediaDir, values) {
     if (visibleNames.has(visibleName)) throw new Error('selected media filenames must be unique for page verification');
     seen.add(file);
     visibleNames.add(visibleName);
-    return { path: file, name: relative(root, file).split(sep).join('/'), visibleName, extension, mime, bytes: stats.size };
-  });
+    files.push({ path: file, name: relative(root, file).split(sep).join('/'), visibleName, extension, mime, bytes: stats.size, digest: await digestFile(file) });
+  }
+  return files;
 }
 
 function acceptsUpload(accept, file) {

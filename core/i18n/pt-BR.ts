@@ -19,7 +19,10 @@ const ptBR: Translation<CoreText> = {
       minutes: 'min',
       sound: 'Som do navegador', soundDescription: 'Mudo por padrão. Ligado, os vídeos que ela assiste têm som.',
       topics: 'Temas web permitidos', topicsDescription: 'Um tema por linha. Deixe vazio para pausar a exploração web. Cada sessão dura no máximo 20 minutos e 80 chamadas ao navegador; páginas continuam sendo fontes externas.',
-      actions: 'Permitir curtidas, salvos, seguir, compartilhar, danmaku, comentários, envio de mídia e imagens no ChatGPT', actionsDescription: 'Desligado, ela só pode navegar; curtidas, seguir, compartilhar, comentários, envio de mídia e imagens no ChatGPT ficam desativados. Entre e resolva os códigos na janela dela você mesmo.',
+      actions: 'Permitir ações sociais', actionsDescription: 'Controla curtidas, salvos, seguir, comentários, danmaku e compartilhamento. Geração de imagens, salvamento de imagens e envio de mídia têm controles separados abaixo.',
+      imageGeneration: 'Permitir gerar imagens na web', imageGenerationDescription: 'Permite enviar prompts de imagem pelo site do ChatGPT.',
+      imageSaving: 'Permitir salvar imagens geradas', imageSavingDescription: 'Permite salvar uma imagem gerada da página atual do ChatGPT na pasta local de mídia.',
+      mediaUpload: 'Permitir envio de mídia', mediaUploadDescription: 'Permite colocar arquivos de mídia aceitos em um campo de envio da página; isso não publica a postagem.',
     },
     growth: {
       title: 'Crescer sozinha',
@@ -53,6 +56,15 @@ const ptBR: Translation<CoreText> = {
     yes: 'Publicar',
     no: 'Não publicar',
     unresolved: (count: number) => `Não foi possível confirmar o envio de ${count} conteúdo anterior pelo navegador dela. Veja a janela dela antes de enviar de novo.`,
+  },
+
+  browserAction: {
+    platformWrite: 'curtir, favoritar ou seguir', imageGeneration: 'gerar uma imagem', imageSaving: 'salvar uma imagem gerada',
+    imageStaging: 'preparar temporariamente uma imagem gerada para revisão',
+    imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `Arquivo: ${file}\nTamanho: ${bytes} bytes\nTipo: ${mime}\nSHA-256: ${digest}\nSalvar em: pasta local de mídia`,
+    mediaUpload: 'enviar mídia',
+    question: (action: string, target: string, details: string) => 'Você permite que Coo faça ' + action + ' uma vez em “' + target + '”?\n\n' + details + '\n\nA autorização vale apenas para a página atual e o conteúdo listado.',
+    yes: 'Permitir uma vez', no: 'Cancelar',
   },
 
   status: {

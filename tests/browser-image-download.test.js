@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import {
   generatedImagePath,
   imageFormat,
@@ -39,7 +40,8 @@ describe('ChatGPT image download boundary', () => {
     const target = generatedImagePath(join(tempDir, 'video', 'media'), 'image/png');
     expect(target.name).toMatch(/^chatgpt-image-\d+-[\da-f-]+\.png$/);
     writeFileSync(target.file, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]));
-    expect(verifyGeneratedImage(target.file, 'image/png')).toEqual({ bytes: 9, format: 'png' });
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+    expect(verifyGeneratedImage(target.file, 'image/png')).toEqual({ bytes: 9, format: 'png', digest: createHash('sha256').update(bytes).digest('hex') });
     expect(() => verifyGeneratedImage(target.file, 'image/jpeg')).toThrow(/contents do not match/);
   });
 
