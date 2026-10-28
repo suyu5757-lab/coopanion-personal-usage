@@ -125,8 +125,11 @@ say "写入推理与适配器配置"
 cp "$HERE/tts_infer.example.yaml" "$GS/tts_infer.yaml"
 cp "$HERE/adapter.py" "$VOICE/adapter.py"
 cp "$HERE/doctor.sh" "$VOICE/doctor.sh"
+cp "$HERE/patch-streamvoice.py" "$VOICE/patch-streamvoice.py"
+cp "$HERE/patch-manifest.json" "$VOICE/patch-manifest.json"
 cp "$HERE/speaker.gptsovits.ts" "$VOICE/speaker.gptsovits.ts"
 cp "$HERE/speaker.original.ts" "$VOICE/speaker.original.ts"
+cp "$HERE/speech-plan.ts" "$VOICE/speech-plan.ts"
 chmod +x "$VOICE/doctor.sh"
 python3 - "$HERE/adapter-config.example.json" "$VOICE/adapter-config.json" "$VOICE" <<'PY'
 import json, sys
@@ -145,7 +148,7 @@ for name in ai.coopanion.gpt-sovits ai.coopanion.tts-adapter ai.coopanion.voice-
 done
 
 say "给 streamvoice 打本地 GPT-SoVITS 补丁"
-python3 "$HERE/patch-streamvoice.py" || true
+python3 "$VOICE/patch-streamvoice.py" || true
 
 say "更新 worlds 配置"
 CFG="$SUPPORT/home/companion/config.json"
