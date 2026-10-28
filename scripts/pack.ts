@@ -21,11 +21,12 @@
  */
 import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { unzipSync } from 'fflate';
+import { fileInventory, writeFinalPackageManifest } from './package-manifest.ts';
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url));
 const run = (cmd: string, args: string[], cwd: string) => {
@@ -147,18 +148,6 @@ function sha256(file: string): string {
   return createHash('sha256').update(readFileSync(file)).digest('hex');
 }
 
-function fileInventory(root: string, rel = ''): Array<Record<string, string | number>> {
-  const abs = join(root, rel);
-  return readdirSync(abs).sort().flatMap((name) => {
-    const child = join(rel, name);
-    const path = join(root, child);
-    const stat = lstatSync(path);
-    if (stat.isSymbolicLink()) return [{ path: child.split(sep).join('/'), link: readlinkSync(path) }];
-    if (stat.isDirectory()) return fileInventory(root, child);
-    return [{ path: child.split(sep).join('/'), size: stat.size, sha256: sha256(path) }];
-  });
-}
-
 function packageInventory(root: string, rel = ''): Array<{ path: string; name: string; version: string }> {
   const abs = join(root, rel);
   return readdirSync(abs).sort().flatMap((name) => {
@@ -243,6 +232,7 @@ const buildManifest = {
   installedPackages: packageInventory(join(OUT, 'node_modules')).sort((a, b) => a.path.localeCompare(b.path)),
   externalRuntimes: existsSync(driverBinary) ? [{ name: 'Cua Driver', path: driverBinary, sha256: sha256(driverBinary) }] : [],
   content: {
+    scope: 'staged-app-directory-before-electron-builder',
     files: fileManifest,
     filesSha256: createHash('sha256').update(JSON.stringify(fileManifest)).digest('hex'),
   },
@@ -252,6 +242,25 @@ console.log(`app directory ready: ${relative(ROOT, OUT)}`);
 
 const target = process.platform === 'darwin' ? '--mac' : process.platform === 'linux' ? '--linux' : '--win';
 run(join(ROOT, 'node_modules', '.bin', process.platform === 'win32' ? 'electron-builder.cmd' : 'electron-builder'), [target, ...PORTABLE ? ['zip'] : [], `--${ARCH}`, ...STEAM ? ['--dir'] : [], ...(TEST ? ['--projectDir', OUT, '--config', join(ROOT, 'electron-builder.test.cjs')] : []), '--publish', 'never', ...process.argv.slice(2)], TEST ? OUT : ROOT);
+
+if (TEST && process.platform === 'darwin') {
+  const appOutDir = join(TEST_OUTPUT!, `mac-${ARCH}`);
+  const appPath = join(appOutDir, `${TEST_IDENTITY!.productName}.app`);
+  const verified = spawnSync('codesign', ['--verify', '--deep', '--strict', appPath], { encoding: 'utf8' });
+  if (verified.status !== 0) throw new Error(`Test App signature verification failed: ${verified.stderr || verified.stdout}`);
+  const artifactPaths = readdirSync(TEST_OUTPUT!)
+    .filter((name) => name.endsWith('.dmg') || name.endsWith('.zip'))
+    .sort()
+    .map((name) => join(TEST_OUTPUT!, name));
+  const manifestPath = join(TEST_OUTPUT!, 'final-package-manifest.json');
+  const finalManifest = writeFinalPackageManifest(manifestPath, {
+    appPath,
+    artifactPaths,
+    signatureVerified: true,
+  });
+  const inventory = finalManifest.appInventory as { fileCount: number; filesSha256: string };
+  console.log(`Final Test App manifest: ${relative(ROOT, manifestPath)} (${inventory.fileCount} files, ${inventory.filesSha256})`);
+}
 
 if (STEAM) {
   // electron-builder takes node_modules from the pnpm workspace's dependency graph, which has no steamworks.js and
