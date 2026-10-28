@@ -66,10 +66,10 @@ if(!state.sessions.includes(payload.session))process.exit(44)
 if(args[1]==='get_window_state'){
  if(payload.tree_format!=='elements'||payload.max_elements!==512||payload.query!=='Save')process.exit(45)
  state.captures++;fs.writeFileSync(file,JSON.stringify(state));
- console.log(JSON.stringify({app_name:'Test window',owner_pid:12,window_bounds:{x:5,y:6,width:100,height:80},screenshot_width:100,screenshot_height:80,capture_id:'cap-1',snapshot_id:'snap-1',truncated:true,truncation_reason:'max_elements',elements_complete:false,elements:[{element_index:7,element_token:'snap-1:7',role:'button',label:'Save file',value:'draft.txt',actions:['press'],frame:{x:1,y:2,width:30,height:10},parent_index:2,depth:3}]}));process.exit(0)
+ console.log(JSON.stringify({app_name:'Test window',owner_pid:12,window_bounds:{x:5,y:6,width:100,height:80},screenshot_width:100,screenshot_height:80,capture_id:'cap-1',snapshot_id:'s0000002a',truncated:true,truncation_reason:'max_elements',elements_complete:false,elements:[{element_index:7,element_token:'s0000002a:7',role:'button',label:'Save file',value:'draft.txt',actions:['press'],frame:{x:1,y:2,width:30,height:10},parent_index:2,depth:3}]}));process.exit(0)
 }
 if(args[1]==='click'){
- if(payload.element_token!=='snap-1:7'||payload.action!=='press')process.exit(46)
+ if(payload.element_token!=='s0000002a:7'||payload.action!=='press')process.exit(46)
  state.actions++;fs.writeFileSync(file,JSON.stringify(state));
  console.log(JSON.stringify({effect:'confirmed',summary:'pressed',route:'accessibility'}));process.exit(0)
 }
@@ -88,11 +88,13 @@ process.exit(2);
       const capture = await driver.capture(12, 34, { screenshot: false, maxDimension: 1280, quality: 75, maxElements: 512, query: 'Save' });
       expect(capture).toMatchObject({
         title: 'Test window', pid: 12, ownerPid: 12, windowId: 34,
-        captureId: 'cap-1', snapshotId: 'snap-1', truncated: true,
+        captureId: 'cap-1', snapshotId: 's0000002a', truncated: true,
         truncationReason: 'max_elements', elementsComplete: false,
-        elements: [{ token: 'snap-1:7', index: 7, role: 'button', label: 'Save file', value: 'draft.txt', actions: ['press'], parentIndex: 2, depth: 3 }],
+        elements: [{ token: 's0000002a:7', index: 7, role: 'button', label: 'Save file', value: 'draft.txt', actions: ['press'], parentIndex: 2, depth: 3 }],
       });
-      expect(await driver.clickElement(12, 34, 'snap-1:7')).toMatchObject({ effect: 'confirmed', route: 'accessibility' });
+      expect(capture.snapshotId).toMatch(/^s[0-9a-f]{8}$/);
+      expect(capture.elements[0]?.token).toMatch(new RegExp(`^${capture.snapshotId}:[0-9]+$`));
+      expect(await driver.clickElement(12, 34, 's0000002a:7')).toMatchObject({ effect: 'confirmed', route: 'accessibility' });
       expect(JSON.parse(readFileSync(f.state, 'utf8'))).toMatchObject({ starts: 1, captures: 1, actions: 1, serves: 0 });
     } finally {
       rmSync(f.dir, { recursive: true, force: true });
