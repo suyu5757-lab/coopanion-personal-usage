@@ -566,13 +566,20 @@ export class Cua {
     if (!key) return { text: this.t.notRun('pet_cua_window', this.t.focusEmpty), failed: true };
     let handle = key.toLowerCase();
     let title = '';
-    if (!/^\d+:\d+$/.test(handle)) {
-      const list = await this.listWindows(signal);
-      const hit = list.find((w) => w.handle === handle) ?? list.find((w) => w.title.includes(key)) ?? list.find((w) => w.title.toLowerCase().includes(handle));
-      if (!hit) return { text: this.t.notRun('pet_cua_window', this.t.windowMissing(key)), failed: true };
-      handle = hit.handle;
-      title = hit.title;
-    }
+    const list = await this.listWindows(signal);
+    const exactHandles = list.filter((w) => w.handle.toLowerCase() === handle);
+    const isHandle = /^\d+:\d+$/.test(handle);
+    const exactTitles = isHandle ? [] : list.filter((w) => w.title.toLowerCase() === handle);
+    let matches: WindowEntry[];
+    if (exactHandles.length) matches = exactHandles;
+    else if (isHandle) matches = [];
+    else if (exactTitles.length) matches = exactTitles;
+    else matches = list.filter((w) => w.title.toLowerCase().includes(handle));
+    if (matches.length > 1) return { text: this.t.notRun('pet_cua_window', this.t.focusAmbiguous(key)), failed: true };
+    const hit = matches[0];
+    if (!hit) return { text: this.t.notRun('pet_cua_window', this.t.windowMissing(key)), failed: true };
+    handle = hit.handle;
+    title = hit.title;
     const [pid, windowId] = handle.split(':').map(Number);
     if (!Number.isInteger(pid) || !Number.isInteger(windowId) || pid <= 0 || windowId <= 0) {
       return { text: this.t.notRun('pet_cua_window', this.t.windowMissing(key)), failed: true };

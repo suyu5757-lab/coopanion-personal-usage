@@ -23,6 +23,53 @@ const attempts: Array<[string, Record<string, unknown>]> = [
 ];
 
 describe('CUA input through the shared action gate', () => {
+  it('refuses ambiguous window titles and allows an exact handle or unique title', async () => {
+    const captures: string[] = [];
+    const windows = [
+      { handle: '101:11', title: 'Coopanion CUA verification.txt', pid: 101 },
+      { handle: '101:12', title: 'Coopanion CUA verification.txt — decoy', pid: 101 },
+      { handle: '101:13', title: 'Coopanion CUA verification.txt', pid: 101 },
+    ];
+    const driver = new Proxy({ available: () => true } as CuaDriverLike, {
+      get(target, key) {
+        if (key === 'available') return target.available;
+        if (key === 'capture') return async (pid: number, windowId: number) => {
+          captures.push(`${pid}:${windowId}`);
+          return {};
+        };
+        return () => { throw new Error(`unexpected Cua Driver call: ${String(key)}`); };
+      },
+    });
+    const cua = new Cua({
+      cfg: () => ({ ...CUA_DEFAULTS, enabled: true, control: true, permission: 'never-ask' }),
+      driver: () => driver,
+      modelLanguage: () => 'en',
+    });
+    const internal = cua as unknown as {
+      call: (request: { op: string }) => Promise<unknown>;
+      windowOutcome: (...args: unknown[]) => Promise<ToolOutcome>;
+    };
+    internal.call = async (request) => request.op === 'windows' ? windows : [];
+    internal.windowOutcome = async () => ({ text: 'synthetic capture' });
+    const call = (window: string) => cua.tools().find((tool) => tool.name === 'pet_cua_window')!.handler(
+      { window }, {} as ToolCallContext,
+    ) as Promise<ToolOutcome>;
+
+    const ambiguousSubstring = await call('verification.txt');
+    const ambiguousExactTitle = await call('Coopanion CUA verification.txt');
+    expect(ambiguousSubstring.failed).toBe(true);
+    expect(ambiguousExactTitle.failed).toBe(true);
+    expect(ambiguousSubstring.text).toContain('exact handle');
+    expect(captures).toEqual([]);
+
+    expect(await call('101:13')).toMatchObject({ text: 'synthetic capture' });
+    expect(await call('decoy')).toMatchObject({ text: 'synthetic capture' });
+    const unknownHandle = await call('999:99');
+    expect(unknownHandle.failed).toBe(true);
+    expect(captures).toEqual(['101:13', '101:12']);
+    await cua.stop();
+  });
+
   it.each(attempts)('refuses %s before approval or driver dispatch', async (tool, args) => {
     let dispatched = 0;
     let questions = 0;
@@ -114,6 +161,10 @@ describe('CUA input through the shared action gate', () => {
         };
       },
     });
+    const inner = cua as unknown as { call: (request: { op: string }) => Promise<unknown> };
+    inner.call = async (request) => request.op === 'windows'
+      ? [{ handle: '123:456', title: 'Untitled — TextEdit', pid: 123 }]
+      : [];
     const call = (name: string, args: Record<string, unknown>) =>
       cua.tools().find((tool) => tool.name === name)!.handler(args, { role: 'main', log: { info() {}, warn() {}, error() {}, debug() {} } } as unknown as ToolCallContext) as Promise<ToolOutcome>;
 
@@ -160,6 +211,10 @@ describe('CUA input through the shared action gate', () => {
         target: request.target as CuaDesktopTargetEvidence, expiresInMs: request.expiresInMs, maxSteps: request.maxSteps,
       }, request.confirmInCoreUi); },
     });
+    const inner = cua as unknown as { call: (request: { op: string }) => Promise<unknown> };
+    inner.call = async (request) => request.op === 'windows'
+      ? [{ handle: '123:456', title: 'Safari', pid: 123 }]
+      : [];
     const call = (name: string, args: Record<string, unknown>) =>
       cua.tools().find((tool) => tool.name === name)!.handler(args, { role: 'main', log: { info() {}, warn() {}, error() {}, debug() {} } } as unknown as ToolCallContext) as Promise<ToolOutcome>;
 

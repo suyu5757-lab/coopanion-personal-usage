@@ -493,10 +493,18 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
     }
   }
 
+  const withCalculatorWindow = (w: Cua) => {
+    const inner = w as unknown as { call: (req: { op: string }, ...args: unknown[]) => Promise<unknown> };
+    const call = inner.call.bind(w);
+    inner.call = (req, ...args) => req.op === 'windows'
+      ? Promise.resolve([{ handle: '123:456', title: 'Calculator', pid: 123, display: 1, rect: { x: 0, y: 0, width: 500, height: 300 }, minimized: false, foreground: false }])
+      : call(req, ...args);
+    return w;
+  };
   const world = (driver: FakeDriver) => {
     const cfg = { ...allowedConfig(), permission: 'never-ask' as const };
     cfg.screenshot.settleMs = 0;
-    return new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'yes' });
+    return withCalculatorWindow(new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'yes' }));
   };
   const call = (w: Cua, name: string, args: Record<string, unknown>) =>
     w.tools().find((t) => t.name === name)!.handler(args, { role: 'main', log: new FakeHost().log }) as Promise<{ text: string; failed?: true; blobs?: unknown[] }>;
@@ -553,7 +561,7 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
     const asked: string[] = [];
     const cfg = { ...allowedConfig(), permission: 'never-ask' as const };
     cfg.screenshot.settleMs = 0;
-    const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async (q) => { asked.push(q); return 'yes'; } });
+    const w = withCalculatorWindow(new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async (q) => { asked.push(q); return 'yes'; } }));
     await call(w, 'pet_cua_window', { window: '123:456' });
     const listed = await call(w, 'pet_cua_accessibility', {});
     expect(listed.text).toContain('snapshot-2:1');
@@ -602,7 +610,7 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
     const asked: string[] = [];
     const cfg = { ...allowedConfig(), permission: 'never-ask' as const };
     cfg.screenshot.afterAction = false;
-    const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', language: () => 'en', askPermission: async (q) => { asked.push(q); return 'yes'; } });
+    const w = withCalculatorWindow(new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', language: () => 'en', askPermission: async (q) => { asked.push(q); return 'yes'; } }));
     await call(w, 'pet_cua_window', { window: '123:456' });
     expect((await call(w, 'pet_cua_click', { x: 10, y: 20 })).failed).toBeUndefined();
     expect(driver.clickAttempts).toEqual(['background', 'foreground']);
@@ -617,7 +625,12 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
     driver.nextClickFailure = 'background_unavailable';
     const cfg = { ...allowedConfig(), backgroundOnly: true, permission: 'never-ask' as const };
     cfg.screenshot.afterAction = false;
-    const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'yes' });
+    driver.identities.set(123, {
+      bundleId: 'com.apple.TextEdit',
+      executablePath: '/System/Applications/TextEdit.app/Contents/MacOS/TextEdit',
+      processStart: 'Tue Oct 27 12:00:00 2026',
+    });
+    const w = withCalculatorWindow(new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'yes' }));
     await call(w, 'pet_cua_window', { window: '123:456' });
     const out = await call(w, 'pet_cua_click', { x: 10, y: 20 });
     expect(out.failed).toBe(true);
@@ -630,12 +643,12 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
     const driver = new FakeDriver();
     const cfg = { ...allowedConfig(), permission: 'never-ask' as const };
     cfg.screenshot.settleMs = 0;
-    const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'no' });
+    const w = withCalculatorWindow(new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'no' }));
     await call(w, 'pet_cua_window', { window: '123:456' });
     const listed = await call(w, 'pet_cua_accessibility', {});
     expect((await call(w, 'pet_cua_click', { elementToken: 'snapshot-2:1' })).failed).toBe(true);
     expect(driver.elementClicks).toEqual([]);
-    const renewed = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'yes' });
+    const renewed = withCalculatorWindow(new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'yes' }));
     await call(renewed, 'pet_cua_window', { window: '123:456' });
     await call(renewed, 'pet_cua_accessibility', {});
     const stale = await call(renewed, 'pet_cua_click', { elementToken: listed.text.match(/snapshot-\d+:1/)?.[0] ?? '' });
@@ -665,10 +678,16 @@ describe.runIf(process.platform === 'darwin')('background windows through Cua Dr
     const driver = new FakeDriver();
     const cfg = { ...allowedConfig(), backgroundOnly: true, permission: 'never-ask' as const };
     cfg.screenshot.settleMs = 0;
+    driver.identities.set(123, {
+      bundleId: 'com.apple.TextEdit',
+      executablePath: '/System/Applications/TextEdit.app/Contents/MacOS/TextEdit',
+      processStart: 'Tue Oct 27 12:00:00 2026',
+    });
     const w = new Cua({ cfg: () => cfg, driver: () => driver, modelLanguage: () => 'en', askPermission: async () => 'yes' });
     const engineOps: string[] = [];
     const inner = w as unknown as { call: (req: { op: string }) => Promise<unknown> };
     inner.call = async (req) => {
+      if (req.op === 'windows') return [{ handle: '123:456', title: 'Calculator', pid: 123, display: 1, rect: { x: 0, y: 0, width: 500, height: 300 }, minimized: false, foreground: false }];
       engineOps.push(req.op);
       if (req.op === 'screenshot') return SHOT;
       throw new Error('foreground input must not run');
