@@ -400,6 +400,20 @@ describe('the fence covers reads and writes', () => {
     expect(await memory.searchResults('trip')).toEqual([]);
   });
 
+  it('treats the Hindsight SDK missing-document response as a completed deletion', async () => {
+    const root = dir();
+    const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
+    const ledger = new ForgetLedger(join(root, 'forget.json'));
+    const memory = memoryWith(outbox, ledger, {
+      deleteDocument: async () => { throw new Error('deleteDocument failed: {"detail":"Document not found"}'); },
+    });
+
+    const result = await memory.forgetDocument('already-absent');
+
+    expect(result).toMatchObject({ deleted: 1, pending: 0, failed: 0 });
+    expect(ledger.unresolved('bank-a', 'http://hindsight.test')).toBe(0);
+  });
+
   it('drops a result with no source while a deletion is unresolved', async () => {
     const root = dir();
     const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));

@@ -134,6 +134,11 @@ function isMissing(err: unknown): boolean {
   return err instanceof HindsightError && (err.statusCode === 404 || err.statusCode === 410);
 }
 
+function isMissingDelete(err: unknown): boolean {
+  return isMissing(err)
+    || (err instanceof Error && err.message === 'deleteDocument failed: {"detail":"Document not found"}');
+}
+
 /** A forget request cancels queued payloads that contain the same words, not every item in the queue. */
 function matchesForget(item: { content: string }, query: string): boolean {
   const text = item.content.toLowerCase();
@@ -369,7 +374,7 @@ export class HindsightMemory {
         await this.client!.deleteDocument(task.bankId, task.documentId);
         this.ledger.markDone(task.id);
       } catch (err) {
-        if (isMissing(err)) this.ledger.markDone(task.id);
+        if (isMissingDelete(err)) this.ledger.markDone(task.id);
         else this.ledger.markFailed(task.id, err instanceof Error ? err.message : String(err));
       }
     }
