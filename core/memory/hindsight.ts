@@ -701,7 +701,7 @@ export class HindsightMemory {
           const fact = sourceFactsById[sourceFactId];
           const factDocumentId = fact?.document_id?.trim();
           const text = String(fact?.text ?? '').trim();
-          if (!fact || !factDocumentId || !text) {
+          if (!fact || fact.id !== sourceFactId || !factDocumentId || !text) {
             missingSourceFact = true;
             continue;
           }

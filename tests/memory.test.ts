@@ -130,6 +130,26 @@ describe('memory formatting', () => {
     expect(text).toContain('Supporting source facts are incomplete for this result.');
   });
 
+  it('keeps the full recall block under maxChars including headers and truncation notices', () => {
+    const text = formatRecall([
+      recallResult({ id: 'long', text: 'x'.repeat(700), sourceFactsIncomplete: true }),
+    ], { header: 'H'.repeat(90), maxChars: 800, sourceFactsTruncated: true });
+    expect(text.length).toBeLessThanOrEqual(800);
+    expect(text).toContain('[memory] Supporting source facts were truncated');
+    expect(text).toContain('Supporting source facts are incomplete for this result.');
+    expect(text).toContain('xxxxxxxxxxxxxxxx');
+  });
+
+  it('preserves distinct supporting facts for duplicate observations with the same source document', () => {
+    const common = { text: 'The team worked on the same plan.', document_id: 'doc-observation' };
+    const text = formatRecall([
+      recallResult({ id: 'observation-a', ...common, sourceFacts: [{ id: 'fact-a', text: 'Lin coordinated.', type: 'world', date: '2026-10-20', documentId: 'doc-source' }] }),
+      recallResult({ id: 'observation-b', ...common, sourceFacts: [{ id: 'fact-b', text: 'Wei reviewed.', type: 'experience', date: '2026-10-21', documentId: 'doc-source' }] }),
+    ]);
+    expect(text).toContain('Lin coordinated.');
+    expect(text).toContain('Wei reviewed.');
+  });
+
   it('skips empty portraits and empty recall', () => {
     expect(formatPortrait([{ title: 'The person', text: 'I cannot find any information.' }])).toBe('');
     expect(formatRecall([])).toBe('');

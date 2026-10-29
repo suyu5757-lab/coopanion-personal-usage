@@ -119,4 +119,138 @@ describe('Hindsight source-fact recall', () => {
     expect(include?.source_facts?.max_tokens).toBeGreaterThan(0);
     expect(include?.source_facts?.max_tokens).toBeLessThanOrEqual(1024);
   });
+async function configuredMemory(baseUrl: string, root: string): Promise<{
+  memory: {
+    config: {
+      enabled: boolean;
+      autostart: boolean;
+      apiUrl: string;
+      apiToken: string;
+      bankId: string;
+      recall: { maxTokens: number; budget: 'low'; timeoutMs: number; types: string[] };
+      retain: { async: boolean };
+      portrait: { maxTokens: number };
+      affection: { enabled: boolean; dailyPositive: number; dailyNegative: number };
+    };
+    client: HindsightClient;
+    outbox: MemoryOutbox;
+    ledger: ForgetLedger;
+    stateStore: MemoryOutbox['stateStore'];
+    ready: boolean;
+    unavailableUntil: number;
+    recallBlockDetailed: (query: string) => Promise<{ text: string; status: string }>;
+  };
+  ledger: ForgetLedger;
+}> {
+  const outbox = new MemoryOutbox(join(root, 'memory-outbox.jsonl'));
+  const ledger = new ForgetLedger(join(root, 'memory-forget.json'));
+  const memory = new HindsightMemory() as unknown as {
+    config: {
+      enabled: boolean;
+      autostart: boolean;
+      apiUrl: string;
+      apiToken: string;
+      bankId: string;
+      recall: { maxTokens: number; budget: 'low'; timeoutMs: number; types: string[] };
+      retain: { async: boolean };
+      portrait: { maxTokens: number };
+      affection: { enabled: boolean; dailyPositive: number; dailyNegative: number };
+    };
+    client: HindsightClient;
+    outbox: MemoryOutbox;
+    ledger: ForgetLedger;
+    stateStore: MemoryOutbox['stateStore'];
+    ready: boolean;
+    unavailableUntil: number;
+    recallBlockDetailed: (query: string) => Promise<{ text: string; status: string }>;
+  };
+  memory.config = {
+    enabled: true,
+    autostart: false,
+    apiUrl: baseUrl,
+    apiToken: '',
+    bankId: 'bank-test',
+    recall: { maxTokens: 900, budget: 'low', timeoutMs: 800, types: ['observation'] },
+    retain: { async: true },
+    portrait: { maxTokens: 500 },
+    affection: { enabled: false, dailyPositive: 10, dailyNegative: 5 },
+  };
+  memory.client = new HindsightClient({ baseUrl, maxAttempts: 1 });
+  memory.outbox = outbox;
+  memory.ledger = ledger;
+  memory.stateStore = outbox.stateStore;
+  memory.ready = true;
+  memory.unavailableUntil = 0;
+  return { memory, ledger };
+}
+
+  it('fences a derived result when the linked source map value has a different id', async () => {
+    const api = await hindsightServer({
+      results: [{
+        id: 'observation-mismatch',
+        text: 'A synthetic observation derived from a forgotten source.',
+        context: 'The observation points at a deleted fact.',
+        type: 'observation',
+        document_id: 'doc-observation',
+        source_fact_ids: ['fact-linked'],
+      }],
+      source_facts: {
+        'fact-linked': {
+          id: 'fact-unrelated',
+          text: 'Unrelated synthetic fact returned under the wrong key.',
+          type: 'world',
+          document_id: 'doc-unrelated',
+        },
+      },
+      source_facts_truncated: false,
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-recall-mismatched-id-fenced-'));
+    roots.push(root);
+    const { memory, ledger } = await configuredMemory(api.baseUrl, root);
+    const fence = ledger.add({
+      bankId: 'bank-test',
+      endpoint: api.baseUrl,
+      documentId: 'doc-linked',
+      reason: 'synthetic forget',
+    });
+    expect(fence).not.toBeNull();
+    expect(ledger.markDone(fence!.id)).toBe(true);
+
+    const read = await memory.recallBlockDetailed('What project is the observation about?');
+
+    expect(read).toEqual({ text: '', status: 'fenced' });
+  });
+
+  it('omits a mismatched source fact and marks the parent result incomplete when no fence exists', async () => {
+    const api = await hindsightServer({
+      results: [{
+        id: 'observation-mismatch-no-fence',
+        text: 'A synthetic observation with unverified support.',
+        context: 'The parent context remains visible.',
+        type: 'observation',
+        document_id: 'doc-observation',
+        source_fact_ids: ['fact-linked'],
+      }],
+      source_facts: {
+        'fact-linked': {
+          id: 'fact-unrelated',
+          text: 'Unrelated synthetic text must not enter the prompt.',
+          type: 'world',
+          document_id: 'doc-unrelated',
+        },
+      },
+      source_facts_truncated: false,
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-recall-mismatched-id-open-'));
+    roots.push(root);
+    const { memory } = await configuredMemory(api.baseUrl, root);
+
+    const read = await memory.recallBlockDetailed('What project is the observation about?');
+
+    expect(read.status).toBe('found');
+    expect(read.text).toContain('A synthetic observation with unverified support.');
+    expect(read.text).toContain('Supporting source facts are incomplete for this result.');
+    expect(read.text).not.toContain('Unrelated synthetic text must not enter the prompt.');
+  });
+
 });
