@@ -164,6 +164,49 @@ describe('action gate', () => {
     expect(current!.consume(target, request.expectedChange)).toBe(false);
   });
 
+  it('does not issue a desktop grant when computer input is turned off during approval', async () => {
+    let computerInput = true;
+    let answer!: (approved: boolean) => void;
+    const approval = new Promise<boolean>((resolve) => { answer = resolve; });
+    const g = new ActionGate({
+      platformWrites: () => false,
+      imageGeneration: () => false,
+      imageSaving: () => false,
+      mediaUpload: () => false,
+      computerInput: () => computerInput,
+      desktopTargetAllowed: () => true,
+    });
+    const target = {
+      surface: 'desktop' as const,
+      instanceId: 'run-test',
+      bundleId: 'com.example.Editor',
+      executablePath: '/Applications/Editor.app/Contents/MacOS/Editor',
+      pid: 11,
+      ownerPid: 11,
+      processStart: '2026-10-28T00:00:00Z',
+      windowId: 3,
+      bounds: { x: 0, y: 0, width: 600, height: 400 },
+      display: null,
+      space: null,
+      snapshotId: 'snapshot-1',
+      captureId: 'capture-1',
+      route: 'background-ax' as const,
+      source: 'cua-driver' as const,
+    };
+    const pending = g.requestDesktopStep({
+      taskId: 'desktop:edit-once',
+      taskText: 'Type the approved sentence in the editor.',
+      expectedChange: 'type the approved sentence',
+      target,
+      expiresInMs: 30_000,
+      maxSteps: 1,
+    }, () => approval);
+
+    computerInput = false;
+    answer(true);
+    await expect(pending).resolves.toBeNull();
+  });
+
   it('rejects an unsupported desktop app before asking for a task grant', async () => {
     let confirmed = 0;
     const g = new ActionGate({
