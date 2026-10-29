@@ -39,6 +39,62 @@ async function hindsightServer(response: unknown): Promise<{ baseUrl: string; re
   return { baseUrl: `http://127.0.0.1:${address.port}`, requests };
 }
 
+async function bankHindsightServer(): Promise<{ baseUrl: string }> {
+  const server = createServer((req, res) => {
+    req.resume();
+    const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+    const bankId = /\/banks\/([^/]+)\/memories\/recall$/.exec(path)?.[1];
+    const marker = bankId === 'bank-a' ? 'A' : bankId === 'bank-b' ? 'B' : null;
+    if (!marker) {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    const id = `fact-${marker}`;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      results: [{ id: `observation-${marker}`, text: `Bank ${marker} observation.`, type: 'observation', document_id: `doc-observation-${marker}`, source_fact_ids: [id] }],
+      source_facts: { [id]: { id, text: `Bank ${marker} source fact.`, type: 'world', document_id: `doc-${marker}` } },
+      source_facts_truncated: false,
+    }));
+  });
+  servers.push(server);
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address() as AddressInfo;
+  return { baseUrl: `http://127.0.0.1:${address.port}` };
+}
+
+async function deferredHindsightServer(response: unknown): Promise<{
+  baseUrl: string;
+  requestReceived: Promise<void>;
+  releaseResponse: () => void;
+}> {
+  let received!: () => void;
+  let release!: () => void;
+  const requestReceived = new Promise<void>((resolve) => { received = resolve; });
+  const responseReleased = new Promise<void>((resolve) => { release = resolve; });
+  const server = createServer((req, res) => {
+    req.resume();
+    req.once('end', () => {
+      received();
+      void responseReleased.then(() => {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(response));
+      });
+    });
+  });
+  servers.push(server);
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address() as AddressInfo;
+  return { baseUrl: `http://127.0.0.1:${address.port}`, requestReceived, releaseResponse: release };
+}
+
 describe('Hindsight source-fact recall', () => {
   it('passes visible observations with their context and source facts to the memory reader', async () => {
     const api = await hindsightServer({
@@ -119,7 +175,7 @@ describe('Hindsight source-fact recall', () => {
     expect(include?.source_facts?.max_tokens).toBeGreaterThan(0);
     expect(include?.source_facts?.max_tokens).toBeLessThanOrEqual(1024);
   });
-async function configuredMemory(baseUrl: string, root: string): Promise<{
+async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-test'): Promise<{
   memory: {
     config: {
       enabled: boolean;
@@ -169,7 +225,7 @@ async function configuredMemory(baseUrl: string, root: string): Promise<{
     autostart: false,
     apiUrl: baseUrl,
     apiToken: '',
-    bankId: 'bank-test',
+    bankId,
     recall: { maxTokens: 900, budget: 'low', timeoutMs: 800, types: ['observation'] },
     retain: { async: true },
     portrait: { maxTokens: 500 },
@@ -183,6 +239,62 @@ async function configuredMemory(baseUrl: string, root: string): Promise<{
   memory.unavailableUntil = 0;
   return { memory, ledger };
 }
+
+  it('keeps source facts isolated when two banks recall the same question', async () => {
+    const api = await bankHindsightServer();
+    const rootA = mkdtempSync(join(tmpdir(), 'coo-recall-bank-a-'));
+    const rootB = mkdtempSync(join(tmpdir(), 'coo-recall-bank-b-'));
+    roots.push(rootA, rootB);
+    const { memory: bankA } = await configuredMemory(api.baseUrl, rootA, 'bank-a');
+    const { memory: bankB } = await configuredMemory(api.baseUrl, rootB, 'bank-b');
+
+    const [readA, readB] = await Promise.all([
+      bankA.recallBlockDetailed('What did the project record?'),
+      bankB.recallBlockDetailed('What did the project record?'),
+    ]);
+
+    expect(readA.status).toBe('found');
+    expect(readA.text).toContain('Bank A source fact.');
+    expect(readA.text).not.toContain('Bank B source fact.');
+    expect(readB.status).toBe('found');
+    expect(readB.text).toContain('Bank B source fact.');
+    expect(readB.text).not.toContain('Bank A source fact.');
+  });
+
+  it('discards a recall response that arrives after Memory is disabled', async () => {
+    const api = await deferredHindsightServer({
+      results: [{
+        id: 'observation-revoked',
+        text: 'Synthetic content received after permission was revoked.',
+        type: 'observation',
+        document_id: 'doc-observation',
+        source_fact_ids: ['fact-revoked'],
+      }],
+      source_facts: {
+        'fact-revoked': { id: 'fact-revoked', text: 'Synthetic source that must not be returned.', type: 'world', document_id: 'doc-revoked' },
+      },
+      source_facts_truncated: false,
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-recall-revoked-'));
+    roots.push(root);
+    const { memory } = await configuredMemory(api.baseUrl, root);
+    const pending = memory.recallBlockDetailed('What did the source say?');
+
+    try {
+      await api.requestReceived;
+      (memory as unknown as HindsightMemory).configure(root, { warn: () => {} }, {
+        enabled: false,
+        apiUrl: api.baseUrl,
+        bankId: 'bank-test',
+      });
+    } finally {
+      api.releaseResponse();
+    }
+
+    const read = await pending;
+    expect(read).toEqual({ text: '', status: 'fenced' });
+    expect(read.text).not.toContain('Synthetic source that must not be returned.');
+  });
 
   it('fences a derived result when the linked source map value has a different id', async () => {
     const api = await hindsightServer({

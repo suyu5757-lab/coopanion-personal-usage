@@ -681,6 +681,8 @@ export class HindsightMemory {
         queryTimestamp: new Date().toISOString(),
         signal: AbortSignal.timeout(timeoutMs),
       });
+      // A forget can invalidate the bank while recall is in flight; discard before reading state or source facts.
+      if (epoch !== this.cacheEpoch) return { results: [], status: 'fenced' };
       const superseded = this.stateStore!.supersededSources(config.bankId, config.apiUrl);
       const currentRevisions = this.stateStore!.currentRevisionSources(config.bankId, config.apiUrl);
       const sourceFactsById = response.source_facts ?? {};
@@ -739,8 +741,6 @@ export class HindsightMemory {
           ...(sourceFactsIncomplete ? { sourceFactsIncomplete: true } : {}),
         }];
       });
-      // A forget can invalidate the bank while this recall is in flight; do not hand the old text back.
-      if (epoch !== this.cacheEpoch) return { results: [], status: 'fenced' };
       // A ledger that cannot be read may be missing tombstones, so no source can be shown clear.
       if (this.ledger?.damaged()) return { results: [], status: 'fenced' };
       // A source-less result cannot be shown to exclude any source that has a durable forget fence.
