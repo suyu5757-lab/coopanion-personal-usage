@@ -21,9 +21,31 @@ export interface MemoryTextRead {
   status: MemoryReadStatus;
 }
 
+export interface MemorySearchSourceFact {
+  id: string;
+  text: string;
+  type: string;
+  date: string;
+  documentId: string;
+  metadata?: Record<string, string>;
+}
+
+export interface MemorySearchResult {
+  id: string;
+  text: string;
+  type: string;
+  date: string;
+  documentId: string | null;
+  context?: string;
+  metadata?: Record<string, string>;
+  sourceFacts?: MemorySearchSourceFact[];
+  sourceFactsIncomplete?: boolean;
+}
+
 export interface MemorySearchRead {
-  results: Array<{ id: string; text: string; type: string; date: string; documentId: string | null; metadata?: Record<string, string> }>;
+  results: MemorySearchResult[];
   status: MemoryReadStatus;
+  sourceFactsTruncated?: boolean;
 }
 
 export interface MemoryLog {
@@ -654,37 +676,85 @@ export class HindsightMemory {
         budget: opts.budget ?? config.recall.budget,
         preferObservations: true,
         includeEntities: false,
+        includeSourceFacts: true,
+        maxSourceFactsTokens: Math.min(1024, opts.maxTokens ?? config.recall.maxTokens),
         queryTimestamp: new Date().toISOString(),
         signal: AbortSignal.timeout(timeoutMs),
       });
       const superseded = this.stateStore!.supersededSources(config.bankId, config.apiUrl);
       const currentRevisions = this.stateStore!.currentRevisionSources(config.bankId, config.apiUrl);
-      const results = response.results.map((result) => {
+      const sourceFactsById = response.source_facts ?? {};
+      const sourceFactsTruncated = response.source_facts_truncated === true;
+      const unresolved = this.ledger?.unresolved(config.bankId, config.apiUrl) ?? 0;
+      const hasFencedSources = this.ledger?.hasFencedSources(config.bankId, config.apiUrl) ?? false;
+      let blockedDerivedResults = 0;
+      const results = response.results.flatMap((result): MemorySearchResult[] => {
         const documentId = result.document_id ?? null;
         const metadata = result.metadata ? { ...result.metadata } : {};
         if (documentId && currentRevisions.has(documentId)) metadata.status = 'current';
         else if (documentId && superseded.has(documentId)) metadata.status = 'superseded';
-        return {
-        id: result.id,
-        text: String(result.text ?? ''),
-        type: String(result.type ?? 'memory'),
-        date: String(result.occurred_start ?? result.mentioned_at ?? ''),
-        documentId,
-        ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
-      };
+        const sourceFacts: MemorySearchSourceFact[] = [];
+        const sourceFactIds = [...new Set(result.source_fact_ids ?? [])];
+        let missingSourceFact = false;
+        let forgottenSupport = false;
+        for (const sourceFactId of sourceFactIds) {
+          const fact = sourceFactsById[sourceFactId];
+          const factDocumentId = fact?.document_id?.trim();
+          const text = String(fact?.text ?? '').trim();
+          if (!fact || !factDocumentId || !text) {
+            missingSourceFact = true;
+            continue;
+          }
+          if (this.forgottenSource(factDocumentId)) {
+            forgottenSupport = true;
+            continue;
+          }
+          const factMetadata = fact.metadata ? { ...fact.metadata } : {};
+          if (currentRevisions.has(factDocumentId)) factMetadata.status = 'current';
+          else if (superseded.has(factDocumentId)) factMetadata.status = 'superseded';
+          sourceFacts.push({
+            id: fact.id,
+            text,
+            type: String(fact.type ?? 'memory'),
+            date: String(fact.occurred_start ?? fact.mentioned_at ?? ''),
+            documentId: factDocumentId,
+            ...(Object.keys(factMetadata).length > 0 ? { metadata: factMetadata } : {}),
+          });
+        }
+        const cannotVerifySupport = sourceFactIds.length > 0 && missingSourceFact && (unresolved > 0 || hasFencedSources);
+        if (forgottenSupport || cannotVerifySupport) {
+          blockedDerivedResults += 1;
+          return [];
+        }
+        const sourceFactsIncomplete = sourceFactIds.length > 0 && (missingSourceFact || sourceFactsTruncated);
+        return [{
+          id: result.id,
+          text: String(result.text ?? ''),
+          type: String(result.type ?? 'memory'),
+          date: String(result.occurred_start ?? result.mentioned_at ?? ''),
+          documentId,
+          ...(result.context ? { context: String(result.context) } : {}),
+          ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+          ...(sourceFacts.length > 0 ? { sourceFacts } : {}),
+          ...(sourceFactsIncomplete ? { sourceFactsIncomplete: true } : {}),
+        }];
       });
       // A forget can invalidate the bank while this recall is in flight; do not hand the old text back.
       if (epoch !== this.cacheEpoch) return { results: [], status: 'fenced' };
       // A ledger that cannot be read may be missing tombstones, so no source can be shown clear.
       if (this.ledger?.damaged()) return { results: [], status: 'fenced' };
       // A source-less result cannot be shown to exclude any source that has a durable forget fence.
-      const unresolved = this.ledger?.unresolved(config.bankId, config.apiUrl) ?? 0;
-      const hasFencedSources = this.ledger?.hasFencedSources(config.bankId, config.apiUrl) ?? false;
       const visible = results.filter((result) =>
         (result.documentId !== null || (unresolved === 0 && !hasFencedSources))
         && !this.forgottenSource(result.documentId));
-      if (visible.length > 0) return { results: visible, status: 'found' };
-      if (results.length > 0 || unresolved > 0) return { results: [], status: 'fenced' };
+      if (visible.length > 0) return {
+        results: visible,
+        status: 'found',
+        ...(sourceFactsTruncated ? { sourceFactsTruncated: true } : {}),
+      };
+      if (results.length > 0 || response.results.length > 0 || unresolved > 0 || blockedDerivedResults > 0) {
+        return { results: [], status: 'fenced' };
+      }
       return { results: [], status: 'absent' };
     } catch (err) {
       this.noteFailure('recall', err);
@@ -707,8 +777,14 @@ export class HindsightMemory {
       type: result.type,
       occurred_start: result.date,
       document_id: result.documentId ?? undefined,
+      ...(result.context ? { context: result.context } : {}),
       ...(result.metadata ? { metadata: result.metadata } : {}),
-    })), { maxChars: opts.maxChars ?? Math.max(800, (opts.maxTokens ?? config.recall.maxTokens) * 5) });
+      ...(result.sourceFacts ? { sourceFacts: result.sourceFacts } : {}),
+      ...(result.sourceFactsIncomplete ? { sourceFactsIncomplete: true } : {}),
+    })), {
+      maxChars: opts.maxChars ?? Math.max(800, (opts.maxTokens ?? config.recall.maxTokens) * 5),
+      ...(read.sourceFactsTruncated ? { sourceFactsTruncated: true } : {}),
+    });
     return text ? { text, status: 'found' } : { text: '', status: 'absent' };
   }
 

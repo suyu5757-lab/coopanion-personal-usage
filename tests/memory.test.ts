@@ -5,13 +5,13 @@ import { describe, expect, it } from 'vitest';
 import type { RecallResult } from '@vectorize-io/hindsight-client';
 import { loadHindsightConfig } from '../core/memory/config.ts';
 import { hindsightConfigGroup } from '../core/memory/config-group.ts';
-import { cleanSpeech, formatPortrait, formatRecall } from '../core/memory/format.ts';
+import { cleanSpeech, formatPortrait, formatRecall, type FormattedRecallResult } from '../core/memory/format.ts';
 import { sanitizeForMemory } from '../core/memory/policy.ts';
 
 const workspace = () => mkdtempSync(join(tmpdir(), 'coo-memory-'));
 const fixedNow = () => new Date('2026-10-24T10:00:00.000Z');
 
-const recallResult = (over: Partial<RecallResult>): RecallResult => ({ id: 'f1', text: 'a fact', type: 'observation', ...over });
+const recallResult = (over: Partial<FormattedRecallResult>): FormattedRecallResult => ({ id: 'f1', text: 'a fact', type: 'observation', ...over });
 
 describe('Hindsight config', () => {
   it('is off without a file or environment', () => {
@@ -103,6 +103,31 @@ describe('memory formatting', () => {
     expect(text).toContain('(observation, undated, the person said, planned, source_id:doc-plan) plans to move to Hangzhou');
     expect(text).toContain('(observation, undated, the person said, completed, confirmed by the person) already moved');
     expect(text).toContain('(observation, undated, inferred) seems to like rain');
+  });
+
+  it('keeps the retrieved context and its linked source facts', () => {
+    const text = formatRecall([
+      recallResult({
+        id: 'observation-1',
+        text: 'The two people worked together on a planning document.',
+        context: 'The observation joins two dated source events.',
+        sourceFacts: [
+          { id: 'fact-1', text: 'Lin coordinated the materials.', type: 'world', date: '2026-10-20T00:00:00Z', documentId: 'doc-1', metadata: { source_actor: 'user' } },
+          { id: 'fact-2', text: 'Wei reviewed the plan.', type: 'experience', date: '2026-10-21T00:00:00Z', documentId: 'doc-2' },
+        ],
+      }),
+    ]);
+
+    expect(text).toContain('context: The observation joins two dated source events.');
+    expect(text).toContain('supporting source (world, 2026-10-20, the person said, source_id:doc-1) Lin coordinated the materials.');
+    expect(text).toContain('supporting source (experience, 2026-10-21, source_id:doc-2) Wei reviewed the plan.');
+  });
+
+  it('labels a recall whose supporting source facts were truncated', () => {
+    const text = formatRecall([recallResult({ text: 'A synthetic observation.', sourceFactsIncomplete: true })], { sourceFactsTruncated: true });
+
+    expect(text).toContain('Supporting source facts were truncated');
+    expect(text).toContain('Supporting source facts are incomplete for this result.');
   });
 
   it('skips empty portraits and empty recall', () => {

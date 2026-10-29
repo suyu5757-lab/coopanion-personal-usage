@@ -6,7 +6,7 @@ import { ForgetLedger, VERIFY_DELAY_MS } from '../core/memory/forget-ledger.ts';
 import { MemoryOutbox, type RetainItem } from '../core/memory/outbox.ts';
 import { closeMemoryStateStores } from '../core/memory/state-store.ts';
 import { OutboxDelivery } from '../core/memory/delivery.ts';
-import { HindsightMemory } from '../core/memory/hindsight.ts';
+import { HindsightMemory, type MemorySearchRead, type MemoryTextRead } from '../core/memory/hindsight.ts';
 import { ExperienceCards } from '../core/growth/experience-cards.ts';
 
 const roots: string[] = [];
@@ -32,10 +32,26 @@ const item = (over: Partial<RetainItem> = {}): RetainItem => ({
   ...over,
 });
 
+interface FakeRecallResult {
+  id: string;
+  text: string;
+  type: string;
+  document_id?: string | null;
+  context?: string | null;
+  metadata?: Record<string, string> | null;
+  source_fact_ids?: string[] | null;
+  occurred_start?: string | null;
+  mentioned_at?: string | null;
+}
+
 interface FakeClient {
   getDocument?: (bankId: string, documentId: string) => Promise<unknown | null>;
   deleteDocument?: (bankId: string, documentId: string) => Promise<void>;
-  recall?: (bankId: string, query: string) => Promise<{ results: Array<{ id: string; text: string; type: string; document_id?: string | null }> }>;
+  recall?: (bankId: string, query: string, options?: { includeSourceFacts?: boolean; maxSourceFactsTokens?: number }) => Promise<{
+    results: FakeRecallResult[];
+    source_facts?: Record<string, FakeRecallResult> | null;
+    source_facts_truncated?: boolean | null;
+  }>;
   getMentalModel?: (bankId: string, id: string) => Promise<{ content: string }>;
   clearMentalModel?: (bankId: string, id: string) => Promise<unknown>;
   refreshMentalModel?: (bankId: string, id: string, options?: { mode?: 'full' }) => Promise<{ operation_id?: string }>;
@@ -58,7 +74,8 @@ function memoryWith(outbox: MemoryOutbox, ledger: ForgetLedger, client: FakeClie
     forget: (query: string) => Promise<{ local: number; deleted: number; pending: number; failed: number }>;
     forgetDocument: (documentId: string) => Promise<{ local: number; deleted: number; pending: number; failed: number }>;
     searchResults: (query: string) => Promise<Array<{ text: string; documentId: string | null; metadata?: Record<string, string> }>>;
-    searchResultsDetailed: (query: string) => Promise<unknown>;
+    searchResultsDetailed: (query: string) => Promise<MemorySearchRead>;
+    recallBlockDetailed: (query: string) => Promise<MemoryTextRead>;
     recent: () => Promise<Array<{ id: string; text: string; date: string; type: string; documentId: string | null }>>;
     sessionBriefing: () => Promise<{ text: string; source: string }>;
     reflect: (question: string) => Promise<string>;
@@ -443,6 +460,82 @@ describe('the fence covers reads and writes', () => {
     expect(ledger.unresolved('bank-a', 'http://hindsight.test')).toBe(0);
     expect(ledger.hasFencedSources('bank-a', 'http://hindsight.test')).toBe(true);
     expect(await memory.searchResultsDetailed('anything')).toEqual({ results: [], status: 'fenced' });
+  });
+
+  it('hands visible supporting source facts to recall and suppresses derived results backed by forgotten sources', async () => {
+    const root = dir();
+    const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
+    const ledger = new ForgetLedger(join(root, 'forget.json'));
+    const fence = ledger.add({ bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: 'doc-forgotten', reason: 'synthetic forget' })!;
+    ledger.markDone(fence.id);
+    const results: FakeRecallResult[] = [
+      {
+        id: 'observation-visible',
+        text: 'Lin and Wei worked together on a planning document.',
+        type: 'observation',
+        document_id: 'doc-observation-visible',
+        context: 'The observation links the coordination and review events.',
+        source_fact_ids: ['fact-coordination', 'fact-review'],
+      },
+      {
+        id: 'observation-derived-from-forgotten-source',
+        text: 'The pair planned the forgotten trip.',
+        type: 'observation',
+        document_id: 'doc-derived',
+        source_fact_ids: ['fact-forgotten'],
+      },
+    ];
+    const sourceFacts: Record<string, FakeRecallResult> = {
+      'fact-coordination': { id: 'fact-coordination', text: 'Lin coordinated the shared materials.', type: 'world', document_id: 'doc-coordination' },
+      'fact-review': { id: 'fact-review', text: 'Wei reviewed the shared plan.', type: 'experience', document_id: 'doc-review' },
+      'fact-forgotten': { id: 'fact-forgotten', text: 'Lin and Wei planned the forgotten trip.', type: 'world', document_id: 'doc-forgotten' },
+    };
+    const memory = memoryWith(outbox, ledger, {
+      recall: async (_bank, _query, options) => ({
+        results,
+        ...(options?.includeSourceFacts ? { source_facts: sourceFacts } : {}),
+      }),
+    });
+
+    const read = await memory.searchResultsDetailed('What project did Lin and Wei work on?');
+    const text = await memory.recallBlockDetailed('What project did Lin and Wei work on?');
+
+    expect(read.status).toBe('found');
+    expect(read.results).toHaveLength(1);
+    expect(read.results[0]?.sourceFacts?.map((fact) => fact.documentId)).toEqual(['doc-coordination', 'doc-review']);
+    expect(text.text).toContain('The observation links the coordination and review events.');
+    expect(text.text).toContain('Lin coordinated the shared materials.');
+    expect(text.text).toContain('Wei reviewed the shared plan.');
+    expect(text.text).not.toContain('forgotten trip');
+  });
+
+  it('fences an observation when a truncated source-fact response cannot rule out forgotten support', async () => {
+    const root = dir();
+    const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
+    const ledger = new ForgetLedger(join(root, 'forget.json'));
+    const fence = ledger.add({ bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: 'doc-forgotten', reason: 'synthetic forget' })!;
+    ledger.markDone(fence.id);
+    const memory = memoryWith(outbox, ledger, {
+      recall: async (_bank, _query, options) => ({
+        results: [{
+          id: 'observation-partial',
+          text: 'The team planned a trip.',
+          type: 'observation',
+          document_id: 'doc-observation',
+          source_fact_ids: ['fact-visible', 'fact-not-returned'],
+        }],
+        ...(options?.includeSourceFacts ? {
+          source_facts: {
+            'fact-visible': { id: 'fact-visible', text: 'The team planned an event.', type: 'world', document_id: 'doc-visible' },
+          },
+          source_facts_truncated: true,
+        } : {}),
+      }),
+    });
+
+    const read = await memory.searchResultsDetailed('What did the team plan?');
+
+    expect(read).toEqual({ results: [], status: 'fenced' });
   });
 
   it('does not show source-less recent memories while a deletion is unresolved', async () => {
