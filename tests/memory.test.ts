@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import type { RecallResult } from '@vectorize-io/hindsight-client';
 import { loadHindsightConfig } from '../core/memory/config.ts';
 import { hindsightConfigGroup } from '../core/memory/config-group.ts';
-import { cleanSpeech, formatPortrait, formatRecall, formatRecallDetailed, type FormattedRecallResult } from '../core/memory/format.ts';
+import { cleanSpeech, DEFAULT_ACTIVATION_RANK_INFLUENCE, formatPortrait, formatRecall, formatRecallDetailed, type FormattedRecallResult } from '../core/memory/format.ts';
 import { sanitizeForMemory } from '../core/memory/policy.ts';
 
 const workspace = () => mkdtempSync(join(tmpdir(), 'coo-memory-'));
@@ -194,7 +194,7 @@ describe('memory formatting', () => {
     const directMatch = formatRecallDetailed([results[0]!], { maxItems: 1, coverageWeight: 0 });
 
     expect(formatted.trace.candidateResultIndexes).toEqual([0, 1, 4, 2, 3]);
-    expect(formatted.trace.activationInfluence).toBe(0.25);
+    expect(formatted.trace.activationInfluence).toBe(DEFAULT_ACTIVATION_RANK_INFLUENCE);
     expect(formatted.trace.activationWeights).toEqual([
       { resultId: 'direct-old-event', weight: 0.05 },
       { resultId: 'recent-1', weight: 0.05 },

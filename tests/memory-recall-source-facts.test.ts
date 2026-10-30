@@ -6,6 +6,7 @@ import type { AddressInfo } from 'node:net';
 import { HindsightClient } from '@vectorize-io/hindsight-client';
 import { afterEach, describe, expect, it } from 'vitest';
 import { HindsightMemory, type MemoryTextRead } from '../core/memory/hindsight.ts';
+import { DEFAULT_ACTIVATION_RANK_INFLUENCE } from '../core/memory/format.ts';
 import { growthMemorySearchTool } from '../core/growth/review.ts';
 import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import { MemoryOutbox } from '../core/memory/outbox.ts';
@@ -250,7 +251,7 @@ describe('Hindsight source-fact recall', () => {
     expect(read.trace?.format.activationWeights).toEqual([
       { resultId: 'observation-old-event', weight: read.trace?.search.items[0]?.activationWeight },
     ]);
-    expect(read.trace?.format.activationInfluence).toBe(0.25);
+    expect(read.trace?.format.activationInfluence).toBe(DEFAULT_ACTIVATION_RANK_INFLUENCE);
     expect(activation).toMatchObject({ anchorAt: oldAt, independentMentionCount: 1 });
     expect(activation?.anchorWeight).toBe(0.8);
     expect(activation?.lastRetrievedAt).not.toBeNull();
@@ -287,7 +288,7 @@ describe('Hindsight source-fact recall', () => {
     expect(baseline.trace?.format.activationInfluence).toBe(0);
     expect(baseline.trace?.search.items[0]?.activationWeight).toBeUndefined();
     expect(afterBaseline).toMatchObject({ anchorAt: oldAt, independentMentionCount: 1, lastRetrievedAt: null });
-    expect(activation.trace?.format.activationInfluence).toBe(0.25);
+    expect(activation.trace?.format.activationInfluence).toBe(DEFAULT_ACTIVATION_RANK_INFLUENCE);
     expect(activation.status).toBe('found');
     expect(afterActivation).toMatchObject({ anchorAt: currentAt, independentMentionCount: 2 });
     expect(afterActivation?.lastRetrievedAt).not.toBeNull();

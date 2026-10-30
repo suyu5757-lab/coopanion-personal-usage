@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { formatRecallDetailed, type FormattedRecallResult } from '../core/memory/format.ts';
+import { activationAt } from '../core/memory/activation.ts';
+import { DEFAULT_ACTIVATION_RANK_INFLUENCE, formatRecallDetailed, type FormattedRecallResult } from '../core/memory/format.ts';
 import { compareMemoryEvaluationRepeats, compareMemoryEvaluations, fingerprintMemoryEvaluationDataset, groupMemoryEvaluationRunRows, observationFromRecallTrace, scoreMemoryEvaluation } from '../scripts/memory-evaluation.ts';
 import { createDevelopmentMemoryEvaluationSet } from './fixtures/memory-evaluation.ts';
 
@@ -155,7 +156,7 @@ describe('memory evaluation contract', () => {
       includedResultIndexes: [0, 1], includedResultIds: ['observation', 'direct'], omittedResultIndexes: [], omittedResultIds: [],
       deduplicatedResultIndexes: [], deduplicatedResultIds: [], includedSourceDocumentIds: ['doc-a', 'doc-b'], omittedSourceDocumentIds: [],
       incompleteResultIds: [], clippedResultIds: [], clippedContextResultIds: [], clippedSourceFactIds: [],
-      sourceFactsTruncated: false, coverageWeight: 0.5, activationInfluence: 0.25, activationWeights: [], maxChars: 2000, usedChars: 400,
+      sourceFactsTruncated: false, coverageWeight: 0.5, activationInfluence: DEFAULT_ACTIVATION_RANK_INFLUENCE, activationWeights: [], maxChars: 2000, usedChars: 400,
     }, { finalAnswer: 'doc-a and doc-b support the answer.', citationSourceIds: ['doc-a', 'doc-b'], citationCorrect: true, hallucinationDetected: false, sqliteDeltaBytes: 24, activationComputations: 3, activationStateRestored: true });
 
     expect(observation.sourceIdsAt5).toEqual([['doc-a'], ['doc-b']]);
@@ -207,10 +208,62 @@ describe('memory evaluation contract', () => {
     expect(formatted.trace.includedSourceDocumentIds).toEqual(['doc-a', 'doc-b']);
   });
 
+  it('does not let activation reduce multi-hop coverage under duplicate-result pressure', () => {
+    const cases = createDevelopmentMemoryEvaluationSet();
+    const now = Date.UTC(2026, 9, 31);
+    const age = (days: number) => new Date(now - days * 86_400_000).toISOString();
+    const run = (activationInfluence: number) => cases.map((testCase) => {
+      const documents = testCase.documents.filter((document) => document.state !== 'deleted');
+      const results: FormattedRecallResult[] = [];
+      for (const [index, document] of documents.entries()) {
+        const isForbidden = testCase.forbiddenSourceIds?.includes(document.sourceId) ?? false;
+        const isFirstRequired = testCase.requiredSourceIds[0] === document.sourceId;
+        const anchorAt = isFirstRequired || (isForbidden && document.state === 'current') ? age(0) : age(400);
+        const activationWeight = document.state === 'current'
+          ? activationAt({ weight: anchorAt === age(0) ? 1 : 0.8, at: anchorAt }, now)
+          : undefined;
+        results.push({
+          id: `${testCase.id}-source-${index}`,
+          text: document.text,
+          type: 'world',
+          document_id: document.sourceId,
+          metadata: { status: document.state },
+          activationWeight,
+        });
+        if (index === 0) {
+          for (let repeat = 1; repeat <= 3; repeat += 1) {
+            results.push({
+              id: `${testCase.id}-repeat-${repeat}`,
+              text: `${document.text} Repeated retrieval record ${repeat}.`,
+              type: 'observation',
+              document_id: document.sourceId,
+              metadata: { status: document.state },
+              activationWeight,
+            });
+          }
+        }
+      }
+      const formatted = formatRecallDetailed(results, { maxItems: 2, activationInfluence });
+      return {
+        caseId: testCase.id,
+        sourceIdsAt5: results.slice(0, 5).map((result) => [result.document_id!]),
+        visibleSourceIds: [...new Set(results.map((result) => result.document_id!))],
+        contextSourceIds: formatted.trace.includedSourceDocumentIds,
+      };
+    });
+    const comparison = compareMemoryEvaluations(cases, run(0), run(DEFAULT_ACTIVATION_RANK_INFLUENCE));
+
+    expect(comparison.baseline.contextComplete).toEqual({ numerator: 200, denominator: 200, value: 1 });
+    expect(comparison.activation.contextComplete).toEqual({ numerator: 200, denominator: 200, value: 1 });
+    expect(comparison.delta.contextComplete).toBeGreaterThanOrEqual(-0.02);
+    expect(comparison.byCategory.multi_hop?.baseline.contextComplete.value).toBe(1);
+    expect(comparison.byCategory.multi_hop?.activation.contextComplete.value).toBe(1);
+  });
+
   it('compares disabled and default activation influence in the same recall formatter', () => {
     const results: FormattedRecallResult[] = [
-      { id: 'active-a', text: 'A result from source A.', type: 'world', document_id: 'doc-a', activationWeight: 0.2 },
-      { id: 'active-a-repeat', text: 'A second result from source A.', type: 'world', document_id: 'doc-a', activationWeight: 0.2 },
+      { id: 'active-a', text: 'A result from source A.', type: 'world', document_id: 'doc-a', activationWeight: 0.05 },
+      { id: 'active-a-repeat', text: 'A second result from source A.', type: 'world', document_id: 'doc-a', activationWeight: 0.05 },
       { id: 'direct-b', text: 'A direct result from a second required source.', type: 'world', document_id: 'doc-b', activationWeight: 1 },
     ];
     const baseline = formatRecallDetailed(results, { maxItems: 2, coverageWeight: 0, activationInfluence: 0 });
@@ -219,7 +272,7 @@ describe('memory evaluation contract', () => {
     expect(baseline.trace.includedResultIds).toEqual(['active-a', 'active-a-repeat']);
     expect(activation.trace.includedResultIds).toEqual(['active-a', 'direct-b']);
     expect(baseline.trace.activationInfluence).toBe(0);
-    expect(activation.trace.activationInfluence).toBe(0.25);
+    expect(activation.trace.activationInfluence).toBe(DEFAULT_ACTIVATION_RANK_INFLUENCE);
   });
 
   it('recovers multi-source context coverage across the generated development set under redundant-source pressure', () => {
