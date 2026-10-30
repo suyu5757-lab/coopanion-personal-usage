@@ -140,7 +140,7 @@ describe('the memory transaction database', () => {
     });
   });
 
-  it('restores an activation anchor in a new process after a restart', () => {
+  it('restores activation state and keeps a forget fence in a new process after a restart', () => {
     const path = join(root(), 'memory-state.sqlite');
     const store = openMemoryStateStore(path);
     store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
@@ -154,15 +154,35 @@ describe('the memory transaction database', () => {
       userEventDocumentId, targetCreatedAt: '2026-09-01T12:00:00.000Z', semanticMatch: 0.9, intensity: 0.12,
     }).status).toBe('applied');
     store.activationForRetrieval('bank-a', 'http://hindsight.test', 'fact:restart-test', '2026-09-01T12:00:00.000Z', retrievedAt);
-    const saved = store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:restart-test');
-    expect(saved).not.toBeNull();
+    expect(store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:restart-test')).not.toBeNull();
+
+    const keptEventId = 'user:main:kept-test';
+    outbox.add({ ...userEventItem(keptEventId, occurredAt), bankId: 'bank-b' });
+    expect(store.recordUserMention({
+      bankId: 'bank-b', endpoint: 'http://hindsight.test', targetDocumentId: 'fact:kept-test',
+      userEventDocumentId: keptEventId, targetCreatedAt: '2026-09-01T12:00:00.000Z', semanticMatch: 0.9, intensity: 0.12,
+    }).status).toBe('applied');
+    store.activationForRetrieval('bank-b', 'http://hindsight.test', 'fact:kept-test', '2026-09-01T12:00:00.000Z', retrievedAt);
+    const kept = store.loadActivationState('bank-b', 'http://hindsight.test', 'fact:kept-test');
+    expect(kept).not.toBeNull();
+
+    const ledger = new ForgetLedger(store);
+    expect(ledger.add({
+      bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: 'fact:restart-test', reason: 'synthetic restart fence',
+    })).not.toBeNull();
+    expect(store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:restart-test')).toBeNull();
     closeMemoryStateStores();
 
     const stateStoreModule = pathToFileURL(join(process.cwd(), 'core/memory/state-store.ts')).href;
     const childSource = `
       import { closeMemoryStateStores, openMemoryStateStore } from ${JSON.stringify(stateStoreModule)};
       const store = openMemoryStateStore(process.env.COO_TEST_MEMORY_STATE_PATH);
-      process.stdout.write(JSON.stringify(store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:restart-test')));
+      const forget = store.loadForgetState().state;
+      process.stdout.write(JSON.stringify({
+        forgotten: store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:restart-test'),
+        kept: store.loadActivationState('bank-b', 'http://hindsight.test', 'fact:kept-test'),
+        tombstones: forget?.tombstones ?? [],
+      }));
       closeMemoryStateStores();
     `;
     const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', childSource], {
@@ -173,7 +193,12 @@ describe('the memory transaction database', () => {
     });
     expect(child.error).toBeUndefined();
     expect(child.status).toBe(0);
-    expect(JSON.parse(child.stdout)).toEqual(saved);
+    const restarted = JSON.parse(child.stdout) as { forgotten: unknown; kept: unknown; tombstones: unknown[] };
+    expect(restarted.forgotten).toBeNull();
+    expect(restarted.kept).toEqual(kept);
+    expect(restarted.tombstones).toContainEqual(expect.objectContaining({
+      bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: 'fact:restart-test',
+    }));
   });
 
   it('accepts only persisted user-origin events for mention reinforcement', () => {
