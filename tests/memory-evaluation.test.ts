@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { formatRecallDetailed, type FormattedRecallResult } from '../core/memory/format.ts';
-import { compareMemoryEvaluations, observationFromRecallTrace, scoreMemoryEvaluation } from '../scripts/memory-evaluation.ts';
+import { compareMemoryEvaluationRepeats, compareMemoryEvaluations, groupMemoryEvaluationRunRows, observationFromRecallTrace, scoreMemoryEvaluation } from '../scripts/memory-evaluation.ts';
 import { createDevelopmentMemoryEvaluationSet } from './fixtures/memory-evaluation.ts';
 
 describe('memory evaluation contract', () => {
@@ -25,8 +25,8 @@ describe('memory evaluation contract', () => {
       { id: 'd', answerable: false, requiredSourceIds: [], deletedSourceIds: ['src-deleted-2'], forbiddenSourceIds: ['src-deleted-2'] },
     ];
     const observations = [
-      { caseId: 'a', sourceIdsAt5: [['src-a']], visibleSourceIds: ['src-a'], contextSourceIds: ['src-a'], answerOutcome: 'abstained' as const, answerCorrect: false, latencyMs: 10, inputTokens: 10, outputTokens: 2, costMicros: 50, costCurrency: 'USD', cpuMs: 12, peakMemoryBytes: 1_000, sqliteDeltaBytes: 600, activationComputations: 2, activationStateRestored: true },
-      { caseId: 'b', sourceIdsAt5: [['src-x']], visibleSourceIds: ['src-x'], contextSourceIds: ['src-x'], answerOutcome: 'answered' as const, answerCorrect: true, latencyMs: 20, inputTokens: 20, outputTokens: 4, costMicros: 70, costCurrency: 'USD', cpuMs: 20, peakMemoryBytes: 1_500, sqliteDeltaBytes: -100, activationComputations: 3, activationStateRestored: false },
+      { caseId: 'a', sourceIdsAt5: [['src-a']], visibleSourceIds: ['src-a'], contextSourceIds: ['src-a'], answerOutcome: 'abstained' as const, answerCorrect: false, citationCorrect: false, hallucinationDetected: true, latencyMs: 10, inputTokens: 10, outputTokens: 2, costMicros: 50, costCurrency: 'USD', cpuMs: 12, peakMemoryBytes: 1_000, sqliteDeltaBytes: 600, activationComputations: 2, activationStateRestored: true },
+      { caseId: 'b', sourceIdsAt5: [['src-x']], visibleSourceIds: ['src-x'], contextSourceIds: ['src-x'], answerOutcome: 'answered' as const, answerCorrect: true, citationCorrect: true, hallucinationDetected: false, latencyMs: 20, inputTokens: 20, outputTokens: 4, costMicros: 70, costCurrency: 'USD', cpuMs: 20, peakMemoryBytes: 1_500, sqliteDeltaBytes: -100, activationComputations: 3, activationStateRestored: false },
       { caseId: 'c', sourceIdsAt5: [['src-deleted']], visibleSourceIds: ['src-deleted'], contextSourceIds: ['src-deleted'], answerOutcome: 'answered' as const, answerCorrect: false, latencyMs: 30, activationStateRestored: true },
       { caseId: 'd', sourceIdsAt5: [], visibleSourceIds: [], contextSourceIds: [], answerOutcome: 'abstained' as const, answerCorrect: true, latencyMs: 40 },
     ];
@@ -38,6 +38,8 @@ describe('memory evaluation contract', () => {
     expect(score.visibleComplete).toEqual({ numerator: 1, denominator: 2, value: 0.5 });
     expect(score.contextComplete).toEqual({ numerator: 1, denominator: 2, value: 0.5 });
     expect(score.answerAccuracy).toEqual({ numerator: 2, denominator: 4, value: 0.5 });
+    expect(score.citationAccuracy).toEqual({ numerator: 1, denominator: 2, value: 0.5 });
+    expect(score.hallucinationRate).toEqual({ numerator: 1, denominator: 2, value: 0.5 });
     expect(score.noAnswerPrecision).toEqual({ numerator: 1, denominator: 2, value: 0.5 });
     expect(score.noAnswerRecall).toEqual({ numerator: 1, denominator: 2, value: 0.5 });
     expect(score.unrelatedHistoryAt5).toEqual({ numerator: 1, denominator: 2, value: 0.5 });
@@ -57,18 +59,49 @@ describe('memory evaluation contract', () => {
     expect(score.activationStateRestored).toEqual({ numerator: 0, denominator: 0, value: null });
   });
 
+  it('pairs repeated runs by ID and reports sample variance without counting retries as cases', () => {
+    const cases = [
+      { id: 'answer', answerable: true, requiredSourceIds: ['src-a'] },
+      { id: 'no-answer', answerable: false, requiredSourceIds: [] },
+    ];
+    const observations = (found: boolean) => [
+      { caseId: 'answer', sourceIdsAt5: found ? [['src-a']] : [], visibleSourceIds: found ? ['src-a'] : [], contextSourceIds: found ? ['src-a'] : [] },
+      { caseId: 'no-answer', sourceIdsAt5: [], visibleSourceIds: [], contextSourceIds: [] },
+    ];
+
+    const result = compareMemoryEvaluationRepeats(cases, [
+      { runId: 'seed-1', observations: observations(false) },
+      { runId: 'seed-2', observations: observations(true) },
+    ], [
+      { runId: 'seed-2', observations: observations(false) },
+      { runId: 'seed-1', observations: observations(true) },
+    ]);
+
+    expect(result.runs.map((run) => run.runId)).toEqual(['seed-1', 'seed-2']);
+    expect(result.baseline.sourceRecallAt5).toEqual({ mean: 0.5, sampleVariance: 0.5, samples: 2 });
+    expect(result.activation.sourceRecallAt5).toEqual({ mean: 0.5, sampleVariance: 0.5, samples: 2 });
+    expect(result.delta.sourceRecallAt5).toEqual({ mean: 0, sampleVariance: 2, samples: 2 });
+    expect(groupMemoryEvaluationRunRows([
+      { runId: 'seed-2', ...observations(false)[0]! },
+      { runId: 'seed-1', ...observations(true)[0]! },
+    ]).map((run) => run.runId)).toEqual(['seed-2', 'seed-1']);
+    expect(() => groupMemoryEvaluationRunRows([{ runId: ' ', ...observations(false)[0]! }])).toThrow('empty run ID');
+    expect(() => compareMemoryEvaluationRepeats(cases, [{ runId: 'seed-1', observations: observations(false) }], [])).toThrow('at least one run');
+    expect(() => compareMemoryEvaluationRepeats(cases, [{ runId: 'seed-1', observations: observations(false) }], [{ runId: 'seed-2', observations: observations(true) }])).toThrow('same run IDs');
+  });
+
   it('compares paired conditions and reports unrelated-history changes separately', () => {
     const cases = [
       { id: 'answer', answerable: true, requiredSourceIds: ['src-good'], forbiddenSourceIds: ['src-bad'], category: 'single_fact' },
       { id: 'no-answer', answerable: false, requiredSourceIds: [], forbiddenSourceIds: ['src-unrelated'], category: 'no_answer' },
     ];
     const baseline = [
-      { caseId: 'answer', sourceIdsAt5: [['src-good'], ['src-bad']], visibleSourceIds: ['src-good', 'src-bad'], contextSourceIds: ['src-good', 'src-bad'], answerOutcome: 'answered' as const, answerCorrect: true, activationStateRestored: false, sqliteDeltaBytes: 30, activationComputations: 3 },
-      { caseId: 'no-answer', sourceIdsAt5: [], visibleSourceIds: ['src-unrelated'], contextSourceIds: [], answerOutcome: 'answered' as const, answerCorrect: false, activationStateRestored: false, sqliteDeltaBytes: 10, activationComputations: 2 },
+      { caseId: 'answer', sourceIdsAt5: [['src-good'], ['src-bad']], visibleSourceIds: ['src-good', 'src-bad'], contextSourceIds: ['src-good', 'src-bad'], answerOutcome: 'answered' as const, answerCorrect: true, citationCorrect: false, hallucinationDetected: true, activationStateRestored: false, sqliteDeltaBytes: 30, activationComputations: 3 },
+      { caseId: 'no-answer', sourceIdsAt5: [], visibleSourceIds: ['src-unrelated'], contextSourceIds: [], answerOutcome: 'answered' as const, answerCorrect: false, citationCorrect: false, hallucinationDetected: false, activationStateRestored: false, sqliteDeltaBytes: 10, activationComputations: 2 },
     ];
     const activation = [
-      { caseId: 'answer', sourceIdsAt5: [['src-good']], visibleSourceIds: ['src-good'], contextSourceIds: ['src-good'], answerOutcome: 'answered' as const, answerCorrect: true, activationStateRestored: true, sqliteDeltaBytes: 60, activationComputations: 6 },
-      { caseId: 'no-answer', sourceIdsAt5: [], visibleSourceIds: [], contextSourceIds: [], answerOutcome: 'abstained' as const, answerCorrect: true, activationStateRestored: true, sqliteDeltaBytes: 20, activationComputations: 4 },
+      { caseId: 'answer', sourceIdsAt5: [['src-good']], visibleSourceIds: ['src-good'], contextSourceIds: ['src-good'], answerOutcome: 'answered' as const, answerCorrect: true, citationCorrect: true, hallucinationDetected: false, activationStateRestored: true, sqliteDeltaBytes: 60, activationComputations: 6 },
+      { caseId: 'no-answer', sourceIdsAt5: [], visibleSourceIds: [], contextSourceIds: [], answerOutcome: 'abstained' as const, answerCorrect: true, citationCorrect: true, hallucinationDetected: false, activationStateRestored: true, sqliteDeltaBytes: 20, activationComputations: 4 },
     ];
 
     const comparison = compareMemoryEvaluations(cases, baseline, activation);
@@ -76,6 +109,8 @@ describe('memory evaluation contract', () => {
     expect(comparison.delta.unrelatedHistoryAt5).toBe(-0.5);
     expect(comparison.delta.unrelatedHistoryInContext).toBe(-0.5);
     expect(comparison.delta.answerAccuracy).toBe(0.5);
+    expect(comparison.delta.citationAccuracy).toBe(1);
+    expect(comparison.delta.hallucinationRate).toBe(-0.5);
     expect(comparison.delta.activationStateRestored).toBe(1);
     expect(comparison.delta.sqliteDeltaBytes).toBe(40);
     expect(comparison.delta.activationComputations).toBe(5);
@@ -106,7 +141,7 @@ describe('memory evaluation contract', () => {
       deduplicatedResultIndexes: [], deduplicatedResultIds: [], includedSourceDocumentIds: ['doc-a', 'doc-b'], omittedSourceDocumentIds: [],
       incompleteResultIds: [], clippedResultIds: [], clippedContextResultIds: [], clippedSourceFactIds: [],
       sourceFactsTruncated: false, coverageWeight: 0.5, activationInfluence: 0.25, activationWeights: [], maxChars: 2000, usedChars: 400,
-    }, { sqliteDeltaBytes: 24, activationComputations: 3, activationStateRestored: true });
+    }, { finalAnswer: 'doc-a and doc-b support the answer.', citationSourceIds: ['doc-a', 'doc-b'], citationCorrect: true, hallucinationDetected: false, sqliteDeltaBytes: 24, activationComputations: 3, activationStateRestored: true });
 
     expect(observation.sourceIdsAt5).toEqual([['doc-a'], ['doc-b']]);
     expect(observation.visibleSourceIds).toEqual(['doc-a', 'doc-b']);
@@ -114,6 +149,11 @@ describe('memory evaluation contract', () => {
     expect(observation.sqliteDeltaBytes).toBe(24);
     expect(observation.activationComputations).toBe(3);
     expect(observation.activationStateRestored).toBe(true);
+    expect(observation.recallTrace?.search.candidateResultIds).toEqual(['observation', 'direct']);
+    expect(observation.recallTrace?.search.items[0]?.verifiedSources).toEqual([{ sourceFactId: 'fact-a', documentId: 'doc-a' }]);
+    expect(observation.recallTrace?.format.includedSourceDocumentIds).toEqual(['doc-a', 'doc-b']);
+    expect(observation.finalAnswer).toBe('doc-a and doc-b support the answer.');
+    expect(observation.citationSourceIds).toEqual(['doc-a', 'doc-b']);
   });
 
   it('compares context coverage after a one-variable pack-order change', () => {

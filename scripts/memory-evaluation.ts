@@ -21,6 +21,11 @@ export interface MemoryEvaluationObservation {
   deletedSourceIds?: string[];
   answerOutcome?: 'answered' | 'abstained';
   answerCorrect?: boolean;
+  finalAnswer?: string;
+  citationSourceIds?: string[];
+  citationCorrect?: boolean;
+  hallucinationDetected?: boolean;
+  recallTrace?: { search: MemorySearchTrace; format: RecallFormatTrace };
   latencyMs?: number;
   inputTokens?: number;
   outputTokens?: number;
@@ -48,6 +53,8 @@ export interface MemoryEvaluationScore {
   visibleComplete: MemoryEvaluationRate;
   contextComplete: MemoryEvaluationRate;
   answerAccuracy: MemoryEvaluationRate;
+  citationAccuracy: MemoryEvaluationRate;
+  hallucinationRate: MemoryEvaluationRate;
   noAnswerPrecision: MemoryEvaluationRate;
   noAnswerRecall: MemoryEvaluationRate;
   /** Case rates; denominator includes only cases with at least one forbidden source. */
@@ -77,6 +84,8 @@ export interface MemoryEvaluationDelta {
   visibleComplete: number | null;
   contextComplete: number | null;
   answerAccuracy: number | null;
+  citationAccuracy: number | null;
+  hallucinationRate: number | null;
   noAnswerPrecision: number | null;
   noAnswerRecall: number | null;
   unrelatedHistoryAt5: number | null;
@@ -105,6 +114,28 @@ export interface MemoryEvaluationComparison {
   }>;
 }
 
+export interface MemoryEvaluationRun {
+  runId: string;
+  observations: readonly MemoryEvaluationObservation[];
+}
+
+export interface MemoryEvaluationRunObservation extends MemoryEvaluationObservation {
+  runId: string;
+}
+
+export interface MemoryEvaluationMetricSpread {
+  mean: number | null;
+  sampleVariance: number | null;
+  samples: number;
+}
+
+export interface MemoryEvaluationRepeatedComparison {
+  runs: Array<{ runId: string; comparison: MemoryEvaluationComparison }>;
+  baseline: Record<keyof MemoryEvaluationDelta, MemoryEvaluationMetricSpread>;
+  activation: Record<keyof MemoryEvaluationDelta, MemoryEvaluationMetricSpread>;
+  delta: Record<keyof MemoryEvaluationDelta, MemoryEvaluationMetricSpread>;
+}
+
 const ratio = (numerator: number, denominator: number): MemoryEvaluationRate => ({
   numerator,
   denominator,
@@ -121,7 +152,7 @@ export function observationFromRecallTrace(
   caseId: string,
   search: MemorySearchTrace,
   format: RecallFormatTrace,
-  extras: Pick<MemoryEvaluationObservation, 'deletedSourceIds' | 'answerOutcome' | 'answerCorrect' | 'latencyMs' | 'inputTokens' | 'outputTokens' | 'costMicros' | 'costCurrency' | 'cpuMs' | 'peakMemoryBytes' | 'sqliteDeltaBytes' | 'activationComputations' | 'activationStateRestored'> = {},
+  extras: Pick<MemoryEvaluationObservation, 'deletedSourceIds' | 'answerOutcome' | 'answerCorrect' | 'finalAnswer' | 'citationSourceIds' | 'citationCorrect' | 'hallucinationDetected' | 'latencyMs' | 'inputTokens' | 'outputTokens' | 'costMicros' | 'costCurrency' | 'cpuMs' | 'peakMemoryBytes' | 'sqliteDeltaBytes' | 'activationComputations' | 'activationStateRestored'> = {},
 ): MemoryEvaluationObservation {
   const visible = search.items.filter((item) => item.disposition === 'visible');
   const sourcesFor = (item: MemorySearchTrace['items'][number]): string[] => {
@@ -134,6 +165,7 @@ export function observationFromRecallTrace(
     sourceIdsAt5: visible.slice(0, 5).map(sourcesFor),
     visibleSourceIds: visible.flatMap(sourcesFor),
     contextSourceIds: [...format.includedSourceDocumentIds],
+    recallTrace: { search, format },
     ...extras,
   };
 }
@@ -165,6 +197,10 @@ export function scoreMemoryEvaluation(
   let contextComplete = 0;
   let answerCorrect = 0;
   let answerCount = 0;
+  let citationCorrect = 0;
+  let citationCount = 0;
+  let hallucinationCount = 0;
+  let hallucinationLabeledCount = 0;
   let noAnswerTruePositive = 0;
   let abstentionPredictions = 0;
   let unrelatedHistoryCases = 0;
@@ -214,6 +250,14 @@ export function scoreMemoryEvaluation(
       answerCount += 1;
       if (observation.answerCorrect === true) answerCorrect += 1;
       if (observation.answerOutcome === 'abstained') abstentionPredictions += 1;
+    }
+    if (typeof observation.citationCorrect === 'boolean') {
+      citationCount += 1;
+      if (observation.citationCorrect) citationCorrect += 1;
+    }
+    if (typeof observation.hallucinationDetected === 'boolean') {
+      hallucinationLabeledCount += 1;
+      if (observation.hallucinationDetected) hallucinationCount += 1;
     }
     if (!testCase.answerable && observation.answerOutcome) {
       if (observation.answerOutcome === 'abstained' && observation.answerCorrect === true) noAnswerTruePositive += 1;
@@ -277,6 +321,8 @@ export function scoreMemoryEvaluation(
     visibleComplete: ratio(visibleComplete, answerable.length),
     contextComplete: ratio(contextComplete, answerable.length),
     answerAccuracy: ratio(answerCorrect, answerCount),
+    citationAccuracy: ratio(citationCorrect, citationCount),
+    hallucinationRate: ratio(hallucinationCount, hallucinationLabeledCount),
     noAnswerPrecision: ratio(noAnswerTruePositive, abstentionPredictions),
     noAnswerRecall: ratio(noAnswerTruePositive, noAnswer.length),
     unrelatedHistoryAt5: ratio(unrelatedHistoryAt5, unrelatedHistoryCases),
@@ -311,6 +357,8 @@ function compareScores(baseline: MemoryEvaluationScore, activation: MemoryEvalua
     visibleComplete: delta(activation.visibleComplete.value, baseline.visibleComplete.value),
     contextComplete: delta(activation.contextComplete.value, baseline.contextComplete.value),
     answerAccuracy: delta(activation.answerAccuracy.value, baseline.answerAccuracy.value),
+    citationAccuracy: delta(activation.citationAccuracy.value, baseline.citationAccuracy.value),
+    hallucinationRate: delta(activation.hallucinationRate.value, baseline.hallucinationRate.value),
     noAnswerPrecision: delta(activation.noAnswerPrecision.value, baseline.noAnswerPrecision.value),
     noAnswerRecall: delta(activation.noAnswerRecall.value, baseline.noAnswerRecall.value),
     unrelatedHistoryAt5: delta(activation.unrelatedHistoryAt5.value, baseline.unrelatedHistoryAt5.value),
@@ -366,18 +414,122 @@ export function compareMemoryEvaluations(
   };
 }
 
+function scoreMetrics(score: MemoryEvaluationScore): Record<keyof MemoryEvaluationDelta, number | null> {
+  return {
+    sourceRecallAt5: score.sourceRecallAt5.value,
+    completeEvidenceAt5: score.completeEvidenceAt5.value,
+    visibleComplete: score.visibleComplete.value,
+    contextComplete: score.contextComplete.value,
+    answerAccuracy: score.answerAccuracy.value,
+    citationAccuracy: score.citationAccuracy.value,
+    hallucinationRate: score.hallucinationRate.value,
+    noAnswerPrecision: score.noAnswerPrecision.value,
+    noAnswerRecall: score.noAnswerRecall.value,
+    unrelatedHistoryAt5: score.unrelatedHistoryAt5.value,
+    unrelatedHistoryInContext: score.unrelatedHistoryInContext.value,
+    deleteLeak: score.deleteLeak.value,
+    activationStateRestored: score.activationStateRestored.value,
+    p50LatencyMs: score.latencyMs.p50,
+    p95LatencyMs: score.latencyMs.p95,
+    inputTokens: score.usage.inputTokens,
+    outputTokens: score.usage.outputTokens,
+    costMicros: score.usage.costMicros,
+    cpuMs: score.usage.cpuMs,
+    peakMemoryBytes: score.usage.peakMemoryBytes,
+    sqliteDeltaBytes: score.usage.sqliteDeltaBytes,
+    activationComputations: score.usage.activationComputations,
+  };
+}
+
+function metricSpread(values: readonly (number | null)[]): MemoryEvaluationMetricSpread {
+  const samples = values.filter((value): value is number => value !== null && Number.isFinite(value));
+  if (samples.length === 0) return { mean: null, sampleVariance: null, samples: 0 };
+  const mean = samples.reduce((sum, value) => sum + value, 0) / samples.length;
+  const squaredError = samples.reduce((sum, value) => sum + (value - mean) ** 2, 0);
+  return {
+    mean,
+    sampleVariance: samples.length > 1 ? squaredError / (samples.length - 1) : null,
+    samples: samples.length,
+  };
+}
+
+function summarizeMetricRows(
+  rows: readonly Record<keyof MemoryEvaluationDelta, number | null>[],
+): Record<keyof MemoryEvaluationDelta, MemoryEvaluationMetricSpread> {
+  const keys = Object.keys(rows[0] ?? {}) as Array<keyof MemoryEvaluationDelta>;
+  return Object.fromEntries(keys.map((key) => [key, metricSpread(rows.map((row) => row[key]))])) as Record<keyof MemoryEvaluationDelta, MemoryEvaluationMetricSpread>;
+}
+
+export function compareMemoryEvaluationRepeats(
+  cases: readonly MemoryEvaluationCase[],
+  baselineRuns: readonly MemoryEvaluationRun[],
+  activationRuns: readonly MemoryEvaluationRun[],
+): MemoryEvaluationRepeatedComparison {
+  if (baselineRuns.length === 0 || activationRuns.length === 0) throw new Error('paired evaluation requires at least one run');
+  const runMap = (runs: readonly MemoryEvaluationRun[], condition: string) => {
+    const map = new Map<string, MemoryEvaluationRun>();
+    for (const run of runs) {
+      const id = run.runId.trim();
+      if (!id || map.has(id)) throw new Error(`${condition} evaluation has a duplicate or empty run ID: ${run.runId}`);
+      map.set(id, run);
+    }
+    return map;
+  };
+  const baselineById = runMap(baselineRuns, 'baseline');
+  const activationById = runMap(activationRuns, 'activation');
+  if (baselineById.size !== activationById.size || [...baselineById.keys()].some((id) => !activationById.has(id))) {
+    throw new Error('baseline and activation evaluations do not contain the same run IDs');
+  }
+  const runs = [...baselineById].map(([runId, baseline]) => ({
+    runId,
+    comparison: compareMemoryEvaluations(cases, baseline.observations, activationById.get(runId)!.observations),
+  }));
+  return {
+    runs,
+    baseline: summarizeMetricRows(runs.map(({ comparison }) => scoreMetrics(comparison.baseline))),
+    activation: summarizeMetricRows(runs.map(({ comparison }) => scoreMetrics(comparison.activation))),
+    delta: summarizeMetricRows(runs.map(({ comparison }) => comparison.delta)),
+  };
+}
+
+export function groupMemoryEvaluationRunRows(rows: readonly MemoryEvaluationRunObservation[]): MemoryEvaluationRun[] {
+  const runs = new Map<string, MemoryEvaluationObservation[]>();
+  for (const row of rows) {
+    const runId = row.runId.trim();
+    if (!runId) throw new Error('evaluation observation has an empty run ID');
+    const observations = runs.get(runId) ?? [];
+    const { runId: _runId, ...observation } = row;
+    observations.push(observation);
+    runs.set(runId, observations);
+  }
+  return [...runs].map(([runId, observations]) => ({ runId, observations }));
+}
+
 function readJsonLines<T>(path: string): T[] {
   return readFileSync(path, 'utf8').split(/\r?\n/u).filter((line) => line.trim()).map((line) => JSON.parse(line) as T);
 }
 
 function runCli(): void {
-  const [casesPath, observationsPath, activationObservationsPath] = process.argv.slice(2);
+  const args = process.argv.slice(2);
+  const [casesPath, observationsPath, activationObservationsPath] = args;
   if (!casesPath || !observationsPath) {
     process.stderr.write('usage: tsx scripts/memory-evaluation.ts <cases.jsonl> <baseline.jsonl> [activation.jsonl]\n');
+    process.stderr.write('   or: tsx scripts/memory-evaluation.ts <cases.jsonl> --repeats <baseline-runs.jsonl> <activation-runs.jsonl>\n');
     process.exitCode = 2;
     return;
   }
   const cases = readJsonLines<MemoryEvaluationCase>(resolve(casesPath));
+  if (observationsPath === '--repeats') {
+    if (!activationObservationsPath || args.length !== 4) {
+      process.stderr.write('usage: tsx scripts/memory-evaluation.ts <cases.jsonl> --repeats <baseline-runs.jsonl> <activation-runs.jsonl>\n');
+      process.exitCode = 2;
+      return;
+    }
+    const baselineRuns = groupMemoryEvaluationRunRows(readJsonLines<MemoryEvaluationRunObservation>(resolve(args[2]!)));
+    const activationRuns = groupMemoryEvaluationRunRows(readJsonLines<MemoryEvaluationRunObservation>(resolve(args[3]!)));
+    process.stdout.write(`${JSON.stringify(compareMemoryEvaluationRepeats(cases, baselineRuns, activationRuns), null, 2)}\n`);
+    return;
+  }
   const baseline = readJsonLines<MemoryEvaluationObservation>(resolve(observationsPath));
   const result = activationObservationsPath
     ? compareMemoryEvaluations(cases, baseline, readJsonLines<MemoryEvaluationObservation>(resolve(activationObservationsPath)))

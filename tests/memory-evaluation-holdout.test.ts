@@ -10,6 +10,7 @@ describe('memory evaluation sealed holdout', () => {
     const developmentIds = new Set(createDevelopmentMemoryEvaluationSet().map((item) => item.id));
 
     expect(cases).toHaveLength(140);
+    expect(cases.every((item) => !('expectedAnswer' in item))).toBe(true);
     expect(cases.filter((item) => item.answerable)).toHaveLength(100);
     expect(cases.filter((item) => !item.answerable)).toHaveLength(40);
     expect(new Set(cases.map((item) => item.id)).size).toBe(cases.length);
