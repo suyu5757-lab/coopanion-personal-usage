@@ -4,6 +4,11 @@ import { closeSync, existsSync, openSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createClient, createConfig, HindsightClient, HindsightError, sdk } from '@vectorize-io/hindsight-client';
+import {
+  activationAt,
+  DEFAULT_REINFORCEMENT_PARAMETERS,
+  mentionIntensityForText,
+} from './activation.ts';
 import { formatPortrait, formatRecall, formatRecallDetailed, type RecallFormatTrace } from './format.ts';
 import { sanitizeForMemory } from './policy.ts';
 import { loadHindsightConfig, type HindsightConfig, type HindsightFileConfig } from './config.ts';
@@ -47,6 +52,8 @@ export interface MemorySearchResult {
   metadata?: Record<string, string>;
   sourceFacts?: MemorySearchSourceFact[];
   sourceFactsIncomplete?: boolean;
+  matchScore?: number;
+  activationWeight?: number;
 }
 
 export interface MemorySearchRead {
@@ -65,6 +72,7 @@ export interface MemorySearchTraceItem {
   disposition: 'candidate' | 'visible' | 'filtered' | 'fenced';
   reason?: 'forgotten-support' | 'unverified-source-fact' | 'unlinked-observation' | 'fence-unresolved' | 'ledger-unreadable';
   sourceFactsIncomplete: boolean;
+  activationWeight?: number;
 }
 
 export interface MemorySearchTrace {
@@ -92,6 +100,29 @@ export interface RecallOptions {
   budget?: 'low' | 'mid' | 'high';
   types?: string[];
   captureTrace?: boolean;
+  userEventDocumentId?: string;
+}
+
+interface UserEventSource {
+  documentId: string;
+  date: string;
+}
+
+function userEventSources(result: MemorySearchResult): UserEventSource[] {
+  const sources = result.sourceFacts?.length
+    ? result.sourceFacts.map((fact) => ({ documentId: fact.documentId, date: fact.date, metadata: fact.metadata }))
+    : result.sourceFactsIncomplete || !result.documentId
+      ? []
+      : [{ documentId: result.documentId, date: result.date, metadata: result.metadata }];
+  const seen = new Set<string>();
+  return sources.filter((source) => {
+    if (!source.documentId || !source.date || !Number.isFinite(Date.parse(source.date))) return false;
+    if (source.metadata?.source_actor !== 'user' || source.metadata.kind !== 'event') return false;
+    if (source.metadata.status === 'superseded' || source.metadata.status === 'disputed') return false;
+    if (seen.has(source.documentId)) return false;
+    seen.add(source.documentId);
+    return true;
+  }).map(({ documentId, date }) => ({ documentId, date }));
 }
 
 export interface TurnRecall {
@@ -695,6 +726,60 @@ export class HindsightMemory {
     }
   }
 
+  private addActivationWeight(result: MemorySearchResult, now: string): MemorySearchResult {
+    const sources = userEventSources(result);
+    if (sources.length === 0) return result;
+    const config = this.config;
+    const store = this.stateStore;
+    if (!config || !store) return result;
+    const weights: number[] = [];
+    try {
+      for (const source of sources) {
+        const state = store.activationForRetrieval(config.bankId, config.apiUrl, source.documentId, source.date, now);
+        if (!state) continue;
+        const weight = activationAt({ weight: state.anchorWeight, at: state.anchorAt }, now, {
+          halfLifeDays: state.halfLifeDays,
+          epsilon: state.epsilon,
+        });
+        weights.push(weight);
+      }
+    } catch (error) {
+      this.log?.warn('[memory] activation state could not be read during recall', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return result;
+    }
+    return weights.length > 0 ? { ...result, activationWeight: weights.reduce((sum, value) => sum + value, 0) / weights.length } : result;
+  }
+
+  private reinforceFromUserTurn(results: readonly MemorySearchResult[], userEventDocumentId: string, userText: string): void {
+    const config = this.config;
+    const store = this.stateStore;
+    if (!config || !store) return;
+    const candidate = results
+      .filter((result) => typeof result.matchScore === 'number'
+        && Number.isFinite(result.matchScore)
+        && result.matchScore >= DEFAULT_REINFORCEMENT_PARAMETERS.minimumSemanticMatch)
+      .map((result) => ({ result, source: userEventSources(result)[0] }))
+      .find((entry) => !!entry.source);
+    if (!candidate?.source || typeof candidate.result.matchScore !== 'number') return;
+    try {
+      store.recordUserMention({
+        bankId: config.bankId,
+        endpoint: config.apiUrl,
+        targetDocumentId: candidate.source.documentId,
+        userEventDocumentId,
+        targetCreatedAt: candidate.source.date,
+        semanticMatch: candidate.result.matchScore,
+        intensity: mentionIntensityForText(userText),
+      });
+    } catch (error) {
+      this.log?.warn('[memory] user mention reinforcement could not be saved', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   async searchResultsDetailed(query: string, opts: RecallOptions = {}): Promise<MemorySearchRead> {
     const traceItems: MemorySearchTraceItem[] = [];
     let recallTokenBudget: number | undefined;
@@ -811,6 +896,11 @@ export class HindsightMemory {
           type: String(result.type ?? 'memory'),
           date: String(result.occurred_start ?? result.mentioned_at ?? ''),
           documentId,
+          ...(typeof result.scores?.reranker === 'number' && Number.isFinite(result.scores.reranker)
+            ? { matchScore: result.scores.reranker }
+            : typeof result.scores?.semantic === 'number' && Number.isFinite(result.scores.semantic)
+              ? { matchScore: result.scores.semantic }
+              : {}),
           ...(result.context ? { context: String(result.context) } : {}),
           ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
           ...(sourceFacts.length > 0 ? { sourceFacts } : {}),
@@ -843,7 +933,16 @@ export class HindsightMemory {
         }
         return isVisible;
       });
-      if (visible.length > 0) return finishRead(visible, 'found', sourceFactsTruncated);
+      if (visible.length > 0) {
+        const activationNow = new Date().toISOString();
+        const weighted = visible.map((result) => {
+          const withWeight = this.addActivationWeight(result, activationNow);
+          const traceItem = traceByMapped?.get(result);
+          if (traceItem && withWeight.activationWeight !== undefined) traceItem.activationWeight = withWeight.activationWeight;
+          return withWeight;
+        });
+        return finishRead(weighted, 'found', sourceFactsTruncated);
+      }
       if (results.length > 0 || response.results.length > 0 || unresolved > 0 || blockedDerivedResults > 0) {
         return finishRead([], 'fenced', sourceFactsTruncated);
       }
@@ -860,6 +959,7 @@ export class HindsightMemory {
 
   async recallBlockDetailed(query: string, opts: RecallOptions = {}): Promise<MemoryTextRead> {
     const read = await this.searchResultsDetailed(query, opts);
+    if (opts.userEventDocumentId && read.status === 'found') this.reinforceFromUserTurn(read.results, opts.userEventDocumentId, query);
     const config = this.config;
     const maxTokens = opts.maxTokens ?? config?.recall.maxTokens ?? 900;
     const maxChars = opts.maxChars ?? Math.max(800, maxTokens * 5);
@@ -873,6 +973,7 @@ export class HindsightMemory {
       ...(result.metadata ? { metadata: result.metadata } : {}),
       ...(result.sourceFacts ? { sourceFacts: result.sourceFacts } : {}),
       ...(result.sourceFactsIncomplete ? { sourceFactsIncomplete: true } : {}),
+      ...(result.activationWeight === undefined ? {} : { activationWeight: result.activationWeight }),
     }));
     const formatOptions = {
       maxChars,
@@ -907,7 +1008,7 @@ export class HindsightMemory {
    * One recall for an incoming turn, routed by whether the answer depends on a past fact.
    * Results are cached briefly; explicit memory changes clear the cache.
    */
-  async recallForTurn(query: string): Promise<TurnRecall> {
+  async recallForTurn(query: string, context: { userEventDocumentId?: string } = {}): Promise<TurnRecall> {
     const started = Date.now();
     const epoch = this.cacheEpoch;
     const config = this.config;
@@ -925,7 +1026,7 @@ export class HindsightMemory {
       return { text, route: plan.route, found: !!text, status };
     };
     if (plan.route === 'fast') return finish('', 'skipped');
-    const key = `${config?.bankId ?? ''}|${config?.apiUrl ?? ''}|${this.visibilityEpoch()}|${plan.route}|${query.trim().toLowerCase().slice(0, 300)}`;
+    const key = `${config?.bankId ?? ''}|${config?.apiUrl ?? ''}|${this.visibilityEpoch()}|${plan.route}|${context.userEventDocumentId ?? ''}|${query.trim().toLowerCase().slice(0, 300)}`;
     const cached = plan.route === 'standard' ? this.recallCache.get(key) : undefined;
     if (cached && Date.now() - cached.at < 5 * 60_000) return finish(cached.value, 'found');
     const read = await this.recallBlockDetailed(query, {
@@ -933,6 +1034,7 @@ export class HindsightMemory {
       maxTokens: plan.maxTokens,
       timeoutMs: plan.timeoutMs,
       maxChars: plan.maxChars,
+      ...(context.userEventDocumentId ? { userEventDocumentId: context.userEventDocumentId } : {}),
     });
     if (epoch !== this.cacheEpoch) return finish('', 'fenced');
     const text = read.text;

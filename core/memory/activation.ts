@@ -22,6 +22,13 @@ export type MentionSpacingBucket = 'initial' | 'same-turn' | 'same-day' | 'cross
 export interface ReinforcementParameters {
   version: string;
   initialWeight: number;
+  defaultMentionIntensity: number;
+  detailedMentionIntensity: number;
+  extendedMentionIntensity: number;
+  emphasizedMentionIntensity: number;
+  detailedMentionUnits: number;
+  extendedMentionUnits: number;
+  minimumSemanticMatch: number;
   maxBoostPerMention: number;
   maxDailyBoost: number;
   maxDailyEvents: number;
@@ -36,6 +43,13 @@ export interface ReinforcementParameters {
 export const DEFAULT_REINFORCEMENT_PARAMETERS: Readonly<ReinforcementParameters> = Object.freeze({
   version: 'mention-v1',
   initialWeight: 0.8,
+  defaultMentionIntensity: 0.06,
+  detailedMentionIntensity: 0.12,
+  extendedMentionIntensity: 0.2,
+  emphasizedMentionIntensity: 0.35,
+  detailedMentionUnits: 30,
+  extendedMentionUnits: 80,
+  minimumSemanticMatch: 0.75,
   maxBoostPerMention: 0.35,
   maxDailyBoost: 0.25,
   maxDailyEvents: 3,
@@ -99,6 +113,15 @@ function unit(value: number, name: string): number {
 function validateReinforcementParameters(parameters: ReinforcementParameters): void {
   if (!parameters.version) throw new RangeError('reinforcement parameter version is required');
   unit(parameters.initialWeight, 'initial activation weight');
+  unit(parameters.defaultMentionIntensity, 'default mention intensity');
+  unit(parameters.detailedMentionIntensity, 'detailed mention intensity');
+  unit(parameters.extendedMentionIntensity, 'extended mention intensity');
+  unit(parameters.emphasizedMentionIntensity, 'emphasized mention intensity');
+  unit(parameters.minimumSemanticMatch, 'minimum semantic match');
+  if (!Number.isInteger(parameters.detailedMentionUnits) || parameters.detailedMentionUnits < 1
+    || !Number.isInteger(parameters.extendedMentionUnits) || parameters.extendedMentionUnits <= parameters.detailedMentionUnits) {
+    throw new RangeError('mention detail thresholds must be positive increasing integers');
+  }
   unit(parameters.maxBoostPerMention, 'maximum mention boost');
   unit(parameters.maxDailyBoost, 'maximum daily boost');
   unit(parameters.sameTurnFactor, 'same-turn factor');
@@ -116,6 +139,22 @@ function validateReinforcementParameters(parameters: ReinforcementParameters): v
   if (!Number.isFinite(parameters.maxHalfLifeDays) || parameters.maxHalfLifeDays <= 0) {
     throw new RangeError('maximum half-life must be greater than zero');
   }
+}
+
+/** Estimates user-event depth from the message shape; a semantic match is checked separately. */
+export function mentionIntensityForText(
+  text: string,
+  parameters: ReinforcementParameters = DEFAULT_REINFORCEMENT_PARAMETERS,
+): number {
+  validateReinforcementParameters(parameters);
+  const normalized = text.trim();
+  if (/(?:以后|今后|总是|一直|每次|约定|非常重要|对我很重要|请记住|记住这个|记住我|别忘记|不要忘记)|\b(?:from now on|always|every time|please remember|remember this|don't forget|do not forget|keep this in mind|this is (?:very )?important)\b/i.test(normalized)) {
+    return parameters.emphasizedMentionIntensity;
+  }
+  const units = (normalized.match(/[\p{Script=Han}]/gu)?.length ?? 0) + (normalized.match(/[a-z0-9]+/gi)?.length ?? 0);
+  if (units >= parameters.extendedMentionUnits) return parameters.extendedMentionIntensity;
+  if (units >= parameters.detailedMentionUnits) return parameters.detailedMentionIntensity;
+  return parameters.defaultMentionIntensity;
 }
 
 function mentionSpacing(lastAt: string | null, occurredAt: number, parameters: ReinforcementParameters): MentionSpacingBucket {

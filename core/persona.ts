@@ -639,6 +639,7 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
       this.core?.injectInternal(`[system] ${n} new event${n === 1 ? '' : 's'}.`, 'notice');
 
       let latest: string | null = null;
+      let latestUserDocumentId: string | null = null;
       for (const event of external) {
         if (event.type === 'desktop-pet.touch') {
           const touch = event.meta?.touch as { kind?: unknown; count?: unknown; crashed?: unknown } | undefined;
@@ -655,15 +656,19 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
           else await this.longTerm?.forgetMostRecent('main', new Date(Date.now() - FORGET_WINDOW_MS));
           this.lastUserMemory = null;
           latest = null;
+          latestUserDocumentId = null;
           continue;
         }
         latest = said;
         const documentId = this.longTerm?.retainUser(said, { session: 'main', cursor: event.cursor, timestamp: event.ts });
+        latestUserDocumentId = documentId ?? null;
         this.lastUserMemory = documentId ? { documentId, at: Date.now() } : null;
       }
 
       if (!latest || !this.longTerm?.enabled()) return;
-      const recalled = await this.longTerm.recallForTurn(latest);
+      const recalled = await this.longTerm.recallForTurn(latest, {
+        ...(latestUserDocumentId ? { userEventDocumentId: latestUserDocumentId } : {}),
+      });
       if (recalled.text) this.core?.injectInternal(recalled.text, 'memory');
       else if (recalled.route === 'deep' && recalled.status !== 'skipped') {
         this.core?.injectInternal(`${memoryReadNotice(recalled.status)} If you are not sure, say so; do not invent dates, names or past events.`, 'memory');

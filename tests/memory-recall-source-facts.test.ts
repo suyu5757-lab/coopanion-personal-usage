@@ -9,7 +9,7 @@ import { HindsightMemory, type MemoryTextRead } from '../core/memory/hindsight.t
 import { growthMemorySearchTool } from '../core/growth/review.ts';
 import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import { MemoryOutbox } from '../core/memory/outbox.ts';
-import { closeMemoryStateStores } from '../core/memory/state-store.ts';
+import { closeMemoryStateStores, type MemoryStateStore } from '../core/memory/state-store.ts';
 
 const roots: string[] = [];
 const servers: Server[] = [];
@@ -94,6 +94,31 @@ async function deferredHindsightServer(response: unknown): Promise<{
   });
   const address = server.address() as AddressInfo;
   return { baseUrl: `http://127.0.0.1:${address.port}`, requestReceived, releaseResponse: release };
+}
+
+function historicalEventResponse(at: string, actor = 'user', semanticScore = 0.95): unknown {
+  return {
+    results: [{
+      id: 'observation-old-event',
+      text: 'The person described an earlier trip.',
+      type: 'observation',
+      document_id: 'doc-derived-trip',
+      source_fact_ids: ['fact-old-event'],
+      metadata: { source_actor: 'inference', kind: 'fact', status: 'current' },
+      scores: { semantic: semanticScore },
+    }],
+    source_facts: {
+      'fact-old-event': {
+        id: 'fact-old-event',
+        text: 'The person visited a coastal town.',
+        type: 'experience',
+        document_id: 'doc-old-event',
+        occurred_start: at,
+        metadata: { source_actor: actor, kind: 'event', status: 'completed', said_at: at },
+      },
+    },
+    source_facts_truncated: false,
+  };
 }
 
 describe('Hindsight source-fact recall', () => {
@@ -191,6 +216,101 @@ describe('Hindsight source-fact recall', () => {
     const include = api.requests[0]?.include as { source_facts?: { max_tokens?: number } } | undefined;
     expect(include?.source_facts?.max_tokens).toBeGreaterThan(0);
     expect(include?.source_facts?.max_tokens).toBeLessThanOrEqual(1024);
+  });
+
+  it('keeps a low-activation user event retrievable by an explicit past-event question', async () => {
+    const now = Date.now();
+    const oldAt = new Date(now - 400 * 86_400_000).toISOString();
+    const api = await hindsightServer(historicalEventResponse(oldAt));
+    const root = mkdtempSync(join(tmpdir(), 'coo-recall-low-activation-'));
+    roots.push(root);
+    const { memory } = await configuredMemory(api.baseUrl, root);
+    const runtime = memory as unknown as HindsightMemory;
+    const store = (memory as unknown as { stateStore: MemoryStateStore }).stateStore;
+    const sourceEvent = runtime.retainUser('I visited a coastal town.', { cursor: 9101, timestamp: oldAt });
+    expect(sourceEvent).not.toBeNull();
+    store.recordUserMention({
+      bankId: 'bank-test', endpoint: api.baseUrl, targetDocumentId: 'doc-old-event',
+      userEventDocumentId: sourceEvent!, targetCreatedAt: oldAt, semanticMatch: 0.9, intensity: 0,
+    });
+
+    const read = await runtime.recallBlockDetailed('What did I tell you last time?', { captureTrace: true });
+    const activation = store.loadActivationState('bank-test', api.baseUrl, 'doc-old-event');
+
+    expect(read.status).toBe('found');
+    expect(read.text).toContain('The person visited a coastal town.');
+    expect(read.trace?.search.items[0]?.activationWeight).toBeCloseTo(0.05, 2);
+    expect(read.trace?.format.activationWeights).toEqual([
+      { resultId: 'observation-old-event', weight: read.trace?.search.items[0]?.activationWeight },
+    ]);
+    expect(activation).toMatchObject({ anchorAt: oldAt, independentMentionCount: 1 });
+    expect(activation?.anchorWeight).toBe(0.8);
+    expect(activation?.lastRetrievedAt).not.toBeNull();
+  });
+
+  it('boosts and re-times one verified personal event on a strong user remention', async () => {
+    const now = new Date();
+    const oldAt = new Date(now.getTime() - 400 * 86_400_000).toISOString();
+    const currentAt = now.toISOString();
+    const api = await hindsightServer(historicalEventResponse(oldAt));
+    const root = mkdtempSync(join(tmpdir(), 'coo-recall-remention-'));
+    roots.push(root);
+    const { memory } = await configuredMemory(api.baseUrl, root);
+    const runtime = memory as unknown as HindsightMemory;
+    const store = (memory as unknown as { stateStore: MemoryStateStore }).stateStore;
+    const oldSource = runtime.retainUser('I visited a coastal town.', { cursor: 9201, timestamp: oldAt });
+    expect(oldSource).not.toBeNull();
+    store.recordUserMention({
+      bankId: 'bank-test', endpoint: api.baseUrl, targetDocumentId: 'doc-old-event',
+      userEventDocumentId: oldSource!, targetCreatedAt: oldAt, semanticMatch: 0.9, intensity: 0,
+    });
+    const currentSource = runtime.retainUser('What did I tell you last time?', { cursor: 9202, timestamp: currentAt });
+    expect(currentSource).not.toBeNull();
+
+    const recalled = await runtime.recallForTurn('What did I tell you last time?', { userEventDocumentId: currentSource! });
+    const activation = store.loadActivationState('bank-test', api.baseUrl, 'doc-old-event');
+
+    expect(recalled.status).toBe('found');
+    expect(recalled.text).toContain('The person visited a coastal town.');
+    expect(activation).toMatchObject({
+      anchorAt: currentAt,
+      lastUserMentionAt: currentAt,
+      independentMentionCount: 2,
+    });
+    expect(activation?.anchorWeight).toBeGreaterThan(0.05);
+    expect(activation?.anchorWeight).toBeLessThan(0.2);
+    expect(activation?.halfLifeDays).toBeGreaterThan(100);
+  });
+
+  it('does not reinforce a weak association or decay a tool source', async () => {
+    const currentAt = new Date().toISOString();
+    const weakApi = await hindsightServer(historicalEventResponse(currentAt, 'user', 0.6));
+    const weakRoot = mkdtempSync(join(tmpdir(), 'coo-recall-weak-match-'));
+    roots.push(weakRoot);
+    const weak = await configuredMemory(weakApi.baseUrl, weakRoot);
+    const weakRuntime = weak.memory as unknown as HindsightMemory;
+    const weakStore = (weak.memory as unknown as { stateStore: MemoryStateStore }).stateStore;
+    const weakEvent = weakRuntime.retainUser('What did I tell you last time?', { cursor: 9301, timestamp: currentAt });
+    expect(weakEvent).not.toBeNull();
+    expect((await weakRuntime.recallForTurn('What did I tell you last time?', { userEventDocumentId: weakEvent! })).status).toBe('found');
+    expect(weakStore.loadActivationState('bank-test', weakApi.baseUrl, 'doc-old-event')).toMatchObject({
+      anchorAt: currentAt,
+      independentMentionCount: 0,
+      lastUserMentionAt: null,
+    });
+
+    const toolApi = await hindsightServer(historicalEventResponse(currentAt, 'tool', 0.99));
+    const toolRoot = mkdtempSync(join(tmpdir(), 'coo-recall-tool-source-'));
+    roots.push(toolRoot);
+    const tool = await configuredMemory(toolApi.baseUrl, toolRoot);
+    const toolRuntime = tool.memory as unknown as HindsightMemory;
+    const toolStore = (tool.memory as unknown as { stateStore: MemoryStateStore }).stateStore;
+    const toolEvent = toolRuntime.retainUser('What did I tell you last time?', { cursor: 9302, timestamp: currentAt });
+    expect(toolEvent).not.toBeNull();
+    const recalledTool = await toolRuntime.recallForTurn('What did I tell you last time?', { userEventDocumentId: toolEvent! });
+
+    expect(recalledTool.status).toBe('found');
+    expect(toolStore.loadActivationState('bank-test', toolApi.baseUrl, 'doc-old-event')).toBeNull();
   });
 async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-test'): Promise<{
   memory: {

@@ -182,6 +182,30 @@ describe('memory formatting', () => {
     expect(formatted.text).not.toContain('A second record from the same source.');
   });
 
+  it('uses activation as a soft ranking signal and keeps a low-activation direct match eligible', () => {
+    const results = [
+      recallResult({ id: 'direct-old-event', text: 'The directly requested old event.', document_id: 'doc-old', activationWeight: 0.05 }),
+      recallResult({ id: 'recent-1', document_id: 'doc-recent-1', activationWeight: 0.05 }),
+      recallResult({ id: 'recent-2', document_id: 'doc-recent-2', activationWeight: 0.05 }),
+      recallResult({ id: 'recent-3', document_id: 'doc-recent-3', activationWeight: 0.05 }),
+      recallResult({ id: 'recent-4', document_id: 'doc-recent-4', activationWeight: 1 }),
+    ];
+    const formatted = formatRecallDetailed(results, { maxItems: results.length, coverageWeight: 0 });
+    const directMatch = formatRecallDetailed([results[0]!], { maxItems: 1, coverageWeight: 0 });
+
+    expect(formatted.trace.candidateResultIndexes).toEqual([0, 1, 4, 2, 3]);
+    expect(formatted.trace.activationInfluence).toBe(0.25);
+    expect(formatted.trace.activationWeights).toEqual([
+      { resultId: 'direct-old-event', weight: 0.05 },
+      { resultId: 'recent-1', weight: 0.05 },
+      { resultId: 'recent-4', weight: 1 },
+      { resultId: 'recent-2', weight: 0.05 },
+      { resultId: 'recent-3', weight: 0.05 },
+    ]);
+    expect(directMatch.trace.includedResultIds).toEqual(['direct-old-event']);
+    expect(directMatch.trace.includedSourceDocumentIds).toEqual(['doc-old']);
+  });
+
   it('preserves distinct supporting facts for duplicate observations with the same source document', () => {
     const common = { text: 'The team worked on the same plan.', document_id: 'doc-observation' };
     const text = formatRecall([

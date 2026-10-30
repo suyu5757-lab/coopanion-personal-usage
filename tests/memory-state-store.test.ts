@@ -116,6 +116,14 @@ describe('the memory transaction database', () => {
       metadata: { source_actor: 'user', kind: 'event', said_at: '2026-10-01T12:00:00.000Z' },
     });
     expect(store.recordUserMention(input).status).toBe('duplicate');
+    expect(store.activationForRetrieval(
+      'bank-a', 'http://hindsight.test', 'fact:old-trip', '2026-09-01T12:00:00.000Z', '2026-10-03T12:00:00.000Z',
+    )).toMatchObject({
+      anchorWeight: first.activation?.anchorWeight,
+      anchorAt: first.activation?.anchorAt,
+      independentMentionCount: 1,
+      lastRetrievedAt: '2026-10-03T12:00:00.000Z',
+    });
     const database = new DatabaseSync(path);
     expect((database.prepare('SELECT COUNT(*) AS count FROM memory_mention_events').get() as { count: number }).count).toBe(1);
     database.close();
@@ -126,6 +134,7 @@ describe('the memory transaction database', () => {
       independentMentionCount: 1,
       anchorWeight: first.activation?.anchorWeight,
       lastUserMentionAt: '2026-10-01T12:00:00.000Z',
+      lastRetrievedAt: '2026-10-03T12:00:00.000Z',
     });
   });
 

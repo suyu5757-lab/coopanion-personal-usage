@@ -63,7 +63,8 @@ describe('Coo with long-term memory and the affinity extension', () => {
     expect(retainTouch).toHaveBeenCalledWith({ kind: 'pet', count: 2 }, expect.objectContaining({ session: 'main', cursor: 1 }));
     expect(retainAffinityChange).toHaveBeenCalledWith(expect.objectContaining({ subject: 7, score: 21, delta: 1, kind: 'happy', reason: 'shared tea' }));
     expect(retainUser).toHaveBeenCalledWith('I like jasmine tea', expect.objectContaining({ session: 'main', cursor: 3 }));
-    expect(recallForTurn).toHaveBeenCalledWith('I like jasmine tea');
+    const userEventDocumentId = retainUser.mock.results[0]?.value;
+    expect(recallForTurn).toHaveBeenCalledWith('I like jasmine tea', { userEventDocumentId });
     expect(calls).toContain('memory:[memory] you like tea');
   });
 

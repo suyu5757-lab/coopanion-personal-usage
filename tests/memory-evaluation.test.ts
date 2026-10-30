@@ -66,7 +66,7 @@ describe('memory evaluation contract', () => {
       includedResultIndexes: [0, 1], includedResultIds: ['observation', 'direct'], omittedResultIndexes: [], omittedResultIds: [],
       deduplicatedResultIndexes: [], deduplicatedResultIds: [], includedSourceDocumentIds: ['doc-a', 'doc-b'], omittedSourceDocumentIds: [],
       incompleteResultIds: [], clippedResultIds: [], clippedContextResultIds: [], clippedSourceFactIds: [],
-      sourceFactsTruncated: false, coverageWeight: 0.5, maxChars: 2000, usedChars: 400,
+      sourceFactsTruncated: false, coverageWeight: 0.5, activationInfluence: 0.25, activationWeights: [], maxChars: 2000, usedChars: 400,
     });
 
     expect(observation.sourceIdsAt5).toEqual([['doc-a'], ['doc-b']]);
@@ -96,6 +96,18 @@ describe('memory evaluation contract', () => {
     expect(baselineScore.completeEvidenceAt5.value).toBe(1);
     expect(baselineScore.contextComplete.value).toBe(0);
     expect(adjustedScore.contextComplete.value).toBe(1);
+  });
+
+  it('keeps source coverage ahead of the maximum activation-ranking bonus', () => {
+    const results: FormattedRecallResult[] = [
+      { id: 'active-a', text: 'An active result from source A.', type: 'world', document_id: 'doc-a', activationWeight: 1 },
+      { id: 'active-a-repeat', text: 'Another active result from source A.', type: 'world', document_id: 'doc-a', activationWeight: 1 },
+      { id: 'dormant-b', text: 'A directly useful result from source B.', type: 'world', document_id: 'doc-b', activationWeight: 0.001 },
+    ];
+    const formatted = formatRecallDetailed(results, { maxItems: 2, coverageWeight: 0.5 });
+
+    expect(formatted.trace.includedResultIds).toEqual(['active-a', 'dormant-b']);
+    expect(formatted.trace.includedSourceDocumentIds).toEqual(['doc-a', 'doc-b']);
   });
 
   it('recovers multi-source context coverage across the generated development set under redundant-source pressure', () => {

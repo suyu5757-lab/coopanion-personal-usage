@@ -1,6 +1,7 @@
 import type { RecallResult } from '@vectorize-io/hindsight-client';
 
 const MARKER = /【[^】]*】|<[^<>]*>/g;
+const ACTIVATION_RANK_INFLUENCE = 0.25;
 
 export function cleanSpeech(text: string): string {
   return text.replace(MARKER, ' ').replace(/\s+/g, ' ').trim();
@@ -36,6 +37,7 @@ export interface RecallSourceFact {
 export type FormattedRecallResult = RecallResult & {
   sourceFacts?: readonly RecallSourceFact[];
   sourceFactsIncomplete?: boolean;
+  activationWeight?: number;
 };
 
 export interface RecallFormatTrace {
@@ -57,6 +59,8 @@ export interface RecallFormatTrace {
   clippedSourceFactIds: string[];
   sourceFactsTruncated: boolean;
   coverageWeight: number;
+  activationInfluence: number;
+  activationWeights: Array<{ resultId: string; weight: number }>;
   maxChars: number;
   usedChars: number;
 }
@@ -97,7 +101,11 @@ function rankRecallCandidates(candidates: readonly RecallCandidate[], coverageWe
       const newlyCovered = sources.filter((id) => !coveredSources.has(id)).length;
       const coverage = sources.length > 0 ? newlyCovered / sources.length : 0;
       const relevance = 1 / (candidate.inputIndex + 1);
-      const score = relevance + coverage * coverageWeight;
+      const activationWeight = candidate.result.activationWeight;
+      const activationScore = typeof activationWeight === 'number' && Number.isFinite(activationWeight)
+        ? Math.min(1, Math.max(0, activationWeight)) * ACTIVATION_RANK_INFLUENCE
+        : 0;
+      const score = relevance + coverage * coverageWeight + activationScore;
       if (score > bestScore) {
         bestScore = score;
         bestPosition = position;
@@ -177,6 +185,7 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
       deduplicatedResultIndexes: [], deduplicatedResultIds: [],
       includedSourceDocumentIds: [], omittedSourceDocumentIds: [], incompleteResultIds: [], clippedResultIds: [],
       clippedContextResultIds: [], clippedSourceFactIds: [], sourceFactsTruncated: false, coverageWeight: 0, maxChars,
+      activationInfluence: 0, activationWeights: [],
       usedChars: text ? usedChars : 0,
     };
     const included = new Set(includedResultIndexes);
@@ -200,6 +209,13 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
       clippedSourceFactIds: [...new Set(clippedSourceFactIds)],
       sourceFactsTruncated: opts.sourceFactsTruncated === true || incompleteResultIds.length > 0,
       coverageWeight,
+      activationInfluence: ACTIVATION_RANK_INFLUENCE,
+      activationWeights: rankedCandidates.flatMap((candidate) => {
+        const value = candidate.result.activationWeight;
+        return typeof value === 'number' && Number.isFinite(value)
+          ? [{ resultId: candidate.result.id, weight: Math.min(1, Math.max(0, value)) }]
+          : [];
+      }),
       maxChars,
       usedChars: text ? usedChars : 0,
     };

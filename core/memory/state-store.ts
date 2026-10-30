@@ -425,6 +425,43 @@ export class MemoryStateStore {
     return row;
   }
 
+  activationForRetrieval(
+    bankId: string,
+    endpoint: string,
+    documentId: string,
+    sourceCreatedAt: string,
+    retrievedAt = new Date().toISOString(),
+  ): ActivationState | null {
+    const retrievedTime = Date.parse(retrievedAt);
+    const createdTime = Date.parse(sourceCreatedAt);
+    if (!Number.isFinite(retrievedTime) || !Number.isFinite(createdTime)) throw new RangeError('activation source and retrieval timestamps must be finite');
+    const retrieved = new Date(retrievedTime).toISOString();
+    const created = new Date(createdTime).toISOString();
+    return this.transaction(() => {
+      if (this.meta('forget:damaged') === '1' || this.isFenced(bankId, endpoint, documentId)) return null;
+      const epoch = this.currentEpoch(bankId, endpoint);
+      const current = this.activationRow(bankId, endpoint, documentId);
+      if (current && current.sourceEpoch !== epoch) return null;
+      const state: ActivationState = current
+        ? { ...current, lastRetrievedAt: retrieved, updatedAt: retrieved }
+        : {
+            anchorWeight: DEFAULT_REINFORCEMENT_PARAMETERS.initialWeight,
+            anchorAt: created,
+            halfLifeDays: DEFAULT_ACTIVATION_PARAMETERS.halfLifeDays,
+            epsilon: DEFAULT_ACTIVATION_PARAMETERS.epsilon,
+            paramsVersion: `${DEFAULT_ACTIVATION_PARAMETERS.version}+${DEFAULT_REINFORCEMENT_PARAMETERS.version}`,
+            lastUserMentionAt: null,
+            lastReinforcedAt: null,
+            lastRetrievedAt: retrieved,
+            independentMentionCount: 0,
+            sourceEpoch: epoch,
+            updatedAt: retrieved,
+          };
+      this.writeActivation(bankId, endpoint, documentId, state);
+      return state;
+    });
+  }
+
   recordUserMention(
     input: UserMentionInput,
     decay: ActivationParameters = DEFAULT_ACTIVATION_PARAMETERS,
@@ -469,6 +506,15 @@ export class MemoryStateStore {
           appliedBoost: mention.applied_boost,
         };
       }
+      if (!Number.isFinite(input.semanticMatch) || input.semanticMatch < 0 || input.semanticMatch > 1) {
+        throw new RangeError('semantic match must be in the interval [0, 1]');
+      }
+      if (!Number.isFinite(input.intensity) || input.intensity < 0 || input.intensity > 1) {
+        throw new RangeError('mention intensity must be in the interval [0, 1]');
+      }
+      if (input.semanticMatch < reinforcement.minimumSemanticMatch || input.targetDocumentId === input.userEventDocumentId) {
+        return { status: 'no-match', activation: current };
+      }
 
       const dayStart = new Date(occurredAtMs);
       dayStart.setUTCHours(0, 0, 0, 0);
@@ -490,7 +536,7 @@ export class MemoryStateStore {
         eventCount: daily.event_count,
         appliedBoost: daily.applied_boost,
       }, decay, reinforcement);
-      const activation: ActivationState = { ...reinforced.state, sourceEpoch: epoch };
+      const activation: ActivationState = { ...reinforced.state, sourceEpoch: epoch, updatedAt: new Date().toISOString() };
       const mentionEventId = `mention-${HASH([input.bankId, input.endpoint, input.targetDocumentId, source.event_id])}`;
       this.db.prepare(`
         INSERT INTO memory_mention_events(mention_event_id, bank_id, endpoint, target_document_id,

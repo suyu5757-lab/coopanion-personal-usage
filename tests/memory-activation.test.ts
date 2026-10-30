@@ -4,6 +4,7 @@ import {
   DEFAULT_ACTIVATION_PARAMETERS,
   DEFAULT_REINFORCEMENT_PARAMETERS,
   activationAt,
+  mentionIntensityForText,
   reinforceActivation,
 } from '../core/memory/activation.ts';
 
@@ -52,6 +53,14 @@ describe('memory activation decay', () => {
 });
 
 describe('user mention reinforcement', () => {
+  it('classifies casual, detailed, extended and explicitly important user mentions', () => {
+    expect(mentionIntensityForText('What did I tell you last time?')).toBe(0.06);
+    expect(mentionIntensityForText('details '.repeat(32))).toBe(0.12);
+    expect(mentionIntensityForText('details '.repeat(85))).toBe(0.2);
+    expect(mentionIntensityForText('以后请记住这个约定')).toBe(0.35);
+    expect(mentionIntensityForText('Please remember this from now on.')).toBe(0.35);
+  });
+
   it('boosts the decayed activation by a small verified mention and starts a new anchor', () => {
     const eventAt = 100 * ACTIVATION_DAY_MS;
     const result = reinforceActivation(null, {
