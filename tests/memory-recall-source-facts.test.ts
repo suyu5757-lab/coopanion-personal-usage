@@ -365,4 +365,120 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
     expect(read.text).not.toContain('Unrelated synthetic text must not enter the prompt.');
   });
 
+  it.each(['pending', 'done'] as const)('withholds an unlinked observation while its bank has a %s deletion fence', async (state) => {
+    const api = await hindsightServer({
+      results: [{
+        id: 'observation-unlinked',
+        text: 'A derived relationship that may contain forgotten information.',
+        context: 'The supporting source is not identified.',
+        type: 'observation',
+        document_id: 'doc-derived',
+      }],
+      source_facts: {},
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-unlinked-fenced-'));
+    roots.push(root);
+    const { memory, ledger } = await configuredMemory(api.baseUrl, root);
+    const fence = ledger.add({ bankId: 'bank-test', endpoint: api.baseUrl, documentId: 'doc-forgotten', reason: 'synthetic forget' });
+    expect(fence).not.toBeNull();
+    if (state === 'done') expect(ledger.markDone(fence!.id)).toBe(true);
+
+    expect(await memory.recallBlockDetailed('What relationship was recorded?')).toEqual({ text: '', status: 'fenced' });
+  });
+
+  it.each([{ sourceFactIds: null }, { sourceFactIds: [] }])('treats $sourceFactIds source links as unverified after a completed deletion', async ({ sourceFactIds }) => {
+    const api = await hindsightServer({
+      results: [{ id: 'observation-empty-links', text: 'An unlinked derived fact.', type: 'observation', document_id: 'doc-derived', source_fact_ids: sourceFactIds }],
+      source_facts: {},
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-empty-links-fenced-'));
+    roots.push(root);
+    const { memory, ledger } = await configuredMemory(api.baseUrl, root);
+    const fence = ledger.add({ bankId: 'bank-test', endpoint: api.baseUrl, documentId: 'doc-forgotten', reason: 'synthetic forget' });
+    expect(ledger.markDone(fence!.id)).toBe(true);
+
+    expect(await memory.recallBlockDetailed('What was derived?')).toEqual({ text: '', status: 'fenced' });
+  });
+
+  it('withholds an unlinked observation whose attachment cannot identify its supporting source', async () => {
+    const api = await hindsightServer({
+      results: [{
+        id: 'observation-attachment', text: 'An unlinked derived fact.', type: 'observation', document_id: 'doc-derived',
+        attachments: [{ id: 'attachment-test', hash: 'a'.repeat(64), kind: 'file', media_type: 'text/plain', byte_size: 32, filename: 'source.txt', url: '/api/v1/banks/bank-test/attachments/attachment-test' }],
+      }],
+      source_facts: {},
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-attachment-fenced-'));
+    roots.push(root);
+    const { memory, ledger } = await configuredMemory(api.baseUrl, root);
+    const fence = ledger.add({ bankId: 'bank-test', endpoint: api.baseUrl, documentId: 'doc-forgotten', reason: 'synthetic forget' });
+    expect(ledger.markDone(fence!.id)).toBe(true);
+
+    expect(await memory.recallBlockDetailed('What did the attachment establish?')).toEqual({ text: '', status: 'fenced' });
+  });
+
+  it.each(['no fence', 'another bank', 'another endpoint'] as const)('keeps an unlinked observation available with %s', async (scope) => {
+    const api = await hindsightServer({
+      results: [{ id: 'observation-visible', text: 'An observation in the current bank.', type: 'observation', document_id: 'doc-derived' }],
+      source_facts: {},
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-unlinked-fence-scope-'));
+    roots.push(root);
+    const { memory, ledger } = await configuredMemory(api.baseUrl, root);
+    if (scope !== 'no fence') {
+      const fence = ledger.add({
+        bankId: scope === 'another bank' ? 'bank-other' : 'bank-test',
+        endpoint: scope === 'another endpoint' ? 'http://127.0.0.1:1' : api.baseUrl,
+        documentId: 'doc-forgotten', reason: 'synthetic forget',
+      });
+      expect(ledger.markDone(fence!.id)).toBe(true);
+    }
+
+    const read = await memory.recallBlockDetailed('What does this bank record?');
+
+    expect(read.status).toBe('found');
+    expect(read.text).toContain('An observation in the current bank.');
+  });
+
+  it('keeps direct facts and verified observations while withholding unlinked observations from a fenced bank', async () => {
+    const api = await hindsightServer({
+      results: [
+        { id: 'fact-direct', text: 'A direct fact from a visible document.', type: 'world', document_id: 'doc-direct' },
+        { id: 'observation-linked', text: 'A relationship with verified support.', type: 'observation', document_id: 'doc-derived-linked', source_fact_ids: ['fact-support'] },
+        { id: 'observation-unlinked', text: 'An unsupported relationship.', context: 'Unsupported relationship context.', type: 'observation', document_id: 'doc-derived-unlinked' },
+      ],
+      source_facts: { 'fact-support': { id: 'fact-support', text: 'The supporting fact is still visible.', type: 'world', document_id: 'doc-support' } },
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-mixed-source-fence-'));
+    roots.push(root);
+    const { memory, ledger } = await configuredMemory(api.baseUrl, root);
+    const fence = ledger.add({ bankId: 'bank-test', endpoint: api.baseUrl, documentId: 'doc-forgotten', reason: 'synthetic forget' });
+    expect(ledger.markDone(fence!.id)).toBe(true);
+
+    const read = await memory.recallBlockDetailed('What facts and relationships remain visible?');
+
+    expect(read.status).toBe('found');
+    expect(read.text).toContain('A direct fact from a visible document.');
+    expect(read.text).toContain('A relationship with verified support.');
+    expect(read.text).toContain('The supporting fact is still visible.');
+    expect(read.text).not.toContain('An unsupported relationship.');
+    expect(read.text).not.toContain('Unsupported relationship context.');
+  });
+
+  it('keeps an unlinked observation fenced after reopening the local state store', async () => {
+    const api = await hindsightServer({
+      results: [{ id: 'observation-after-reopen', text: 'A derived fact returned after restart.', type: 'observation', document_id: 'doc-derived' }],
+      source_facts: {},
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-unlinked-fence-reopen-'));
+    roots.push(root);
+    const { ledger } = await configuredMemory(api.baseUrl, root);
+    const fence = ledger.add({ bankId: 'bank-test', endpoint: api.baseUrl, documentId: 'doc-forgotten', reason: 'synthetic forget' });
+    expect(ledger.markDone(fence!.id)).toBe(true);
+    closeMemoryStateStores();
+    const { memory } = await configuredMemory(api.baseUrl, root);
+
+    expect(await memory.recallBlockDetailed('What remains after restart?')).toEqual({ text: '', status: 'fenced' });
+  });
+
 });

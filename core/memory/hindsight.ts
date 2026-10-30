@@ -724,7 +724,9 @@ export class HindsightMemory {
           });
         }
         const cannotVerifySupport = sourceFactIds.length > 0 && missingSourceFact && (unresolved > 0 || hasFencedSources);
-        if (forgottenSupport || cannotVerifySupport) {
+        // An observation's parent document does not identify the sources it was derived from.
+        const unlinkedObservationWithFence = result.type === 'observation' && sourceFactIds.length === 0 && hasFencedSources;
+        if (forgottenSupport || cannotVerifySupport || unlinkedObservationWithFence) {
           blockedDerivedResults += 1;
           return [];
         }
