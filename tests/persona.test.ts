@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ToolDef } from 'cortico/core/types.ts';
@@ -20,6 +20,27 @@ function persona() {
 }
 
 describe.skipIf(!gitInstalled())('Coo’s workspace history', () => {
+  it('keeps Git metadata outside workspace file tools', async () => {
+    const { dir, p, run } = persona();
+    try {
+      p.snapshot('1.0.0');
+      symlinkSync('.git', join(dir, 'git-history'));
+
+      expect(String(await run('read_file', { path: '.git/HEAD' }))).toContain('Git metadata is not available through workspace tools');
+      expect(String(await run('read_file', { path: 'notes/../.git/HEAD' }))).toContain('Git metadata is not available through workspace tools');
+      expect(String(await run('read_file', { path: 'git-history/HEAD' }))).toContain('Git metadata is not available through workspace tools');
+      expect(String(await run('grep_files', { pattern: 'checkpoint0', path: '.git' }))).toContain('Git metadata is not available through workspace tools');
+      expect(String(await run('glob_files', { glob_pattern: '*', target_directory: '.git' }))).toContain('Git metadata is not available through workspace tools');
+      expect(String(await run('list_files', { dir: '.git' }))).toContain('Git metadata is not available through workspace tools');
+      expect(String(await run('write_file', { path: '.git/HEAD', content: 'damaged' }))).toContain('Git metadata is not available through workspace tools');
+      expect(String(await run('delete_file', { path: '.git/HEAD' }))).toContain('Git metadata is not available through workspace tools');
+      rmSync(join(dir, 'git-history'));
+      expect(git(dir, 'status', '--porcelain')).toBe('');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('commits each write Coo makes, as Coo, and nothing for a write that failed', async () => {
     const { dir, run } = persona();
     await run('write_file', { path: 'notes/today.md', content: 'tea' });

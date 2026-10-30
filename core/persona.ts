@@ -17,10 +17,10 @@
  * passed in: the app loads it from the staged Cortico (`companion.ts`), the tests from vendor/cortico.
  */
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, statfsSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, statfsSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { freemem, totalmem } from 'node:os';
-import { join, dirname } from 'node:path';
-import type { CoreApi, EventEnvelope, PersonaWebUiDecl, SessionDecl, SessionOpeningReason, StoragePart, ToolDef, WorldLifecycleEvent } from 'cortico/core/types.ts';
+import { dirname, join, relative, resolve, sep } from 'node:path';
+import type { CoreApi, EventEnvelope, PersonaWebUiDecl, SessionDecl, SessionOpeningReason, StoragePart, ToolCallContext, ToolDef, WorldLifecycleEvent } from 'cortico/core/types.ts';
 import { withText, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import type { Language } from 'cortico/core/language.ts';
@@ -61,6 +61,36 @@ export const SNAPSHOT_TAG = (version: string) => `start-${version}`;
 /** How long after a line a "don't remember that" still refers to it. */
 const FORGET_WINDOW_MS = 10 * 60_000;
 const MEMORY_TOOL_NAMES = new Set(['memory_search', 'memory_remember', 'memory_correct', 'memory_forget', 'memory_reflect']);
+const WORKSPACE_READ_PATHS: Record<string, string> = {
+  read_file: 'path',
+  list_files: 'dir',
+  glob_files: 'target_directory',
+  grep_files: 'path',
+};
+
+function isWorkspaceGitMetadataPath(root: string, candidate: unknown): boolean {
+  if (typeof candidate !== 'string' || !candidate.trim()) return false;
+  const rootPath = resolve(root);
+  const path = resolve(rootPath, candidate);
+  const hasGitSegment = (value: string): boolean => value.split(sep).includes('.git');
+  const workspacePath = relative(rootPath, path);
+  if (hasGitSegment(workspacePath)) return true;
+
+  const existingRealPath = (value: string): string => {
+    try {
+      return realpathSync(value);
+    } catch {
+      const parent = dirname(value);
+      return parent === value ? value : join(existingRealPath(parent), relative(parent, value));
+    }
+  };
+  try {
+    const realRoot = realpathSync(rootPath);
+    return hasGitSegment(relative(realRoot, existingRealPath(path)));
+  } catch {
+    return false;
+  }
+}
 
 /** Write tools and the receipt each starts with when it succeeded (Cormini's workspaceTools.ts and blobs.ts). */
 const WRITES: Record<string, { ok: string; verb: string }> = {
@@ -380,6 +410,11 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return join(this.memoryDir, PARTNER_FILE);
     }
 
+    protected override writeGuard(op: 'write' | 'append' | 'rename' | 'delete', path: string, role: string): string | null {
+      if (isWorkspaceGitMetadataPath(this.memoryDir, path)) return 'Git metadata is not available through workspace tools.';
+      return super.writeGuard(op, path, role);
+    }
+
     protected override partnerDoc(): string {
       return `${PARTNER_NOTE}
 
@@ -423,7 +458,21 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
     }
 
     protected override tools(): ToolDef[] {
-      const base = super.tools().map((t) => (WRITES[t.name] ? this.committed(t, WRITES[t.name]!) : t));
+      const base = super.tools().map((tool) => {
+        const write = WRITES[tool.name];
+        if (write) return this.committed(tool, write);
+        const pathArgument = WORKSPACE_READ_PATHS[tool.name];
+        if (!pathArgument) return tool;
+        return {
+          ...tool,
+          handler: async (args: Record<string, unknown>, ctx: ToolCallContext) => {
+            if (isWorkspaceGitMetadataPath(this.memoryDir, args[pathArgument])) {
+              return `[workspace read failed] Git metadata is not available through workspace tools.`;
+            }
+            return tool.handler(args, ctx);
+          },
+        };
+      });
       return [...base, ...memoryTools({
         memory: () => this.longTerm,
         currentUserSource: (session) => session === 'main' && Date.now() - (this.lastUserMemory?.at ?? 0) < FORGET_WINDOW_MS
