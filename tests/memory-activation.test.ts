@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { ACTIVATION_DAY_MS, DEFAULT_ACTIVATION_PARAMETERS, activationAt } from '../core/memory/activation.ts';
+import {
+  ACTIVATION_DAY_MS,
+  DEFAULT_ACTIVATION_PARAMETERS,
+  DEFAULT_REINFORCEMENT_PARAMETERS,
+  activationAt,
+  reinforceActivation,
+} from '../core/memory/activation.ts';
 
 describe('memory activation decay', () => {
   it('follows the candidate 100-day half-life examples without deleting or mutating the anchor', () => {
@@ -42,5 +48,121 @@ describe('memory activation decay', () => {
     expect(() => activationAt({ weight: Number.NaN, at: 0 }, 0)).toThrow('anchor weight');
     expect(() => activationAt(anchor, 0, { halfLifeDays: 0, epsilon: 0.001 })).toThrow('half-life');
     expect(() => activationAt(anchor, 0, { halfLifeDays: 100, epsilon: 0 })).toThrow('activation floor');
+  });
+});
+
+describe('user mention reinforcement', () => {
+  it('boosts the decayed activation by a small verified mention and starts a new anchor', () => {
+    const eventAt = 100 * ACTIVATION_DAY_MS;
+    const result = reinforceActivation(null, {
+      targetCreatedAt: 0,
+      occurredAt: eventAt,
+      semanticMatch: 0.9,
+      intensity: 0.06,
+    }, { eventCount: 0, appliedBoost: 0 });
+
+    expect(result.spacingBucket).toBe('initial');
+    expect(result.boost).toBeCloseTo(0.054, 12);
+    expect(result.state.anchorWeight).toBeCloseTo(0.4324, 12);
+    expect(result.state.anchorAt).toBe(new Date(eventAt).toISOString());
+    expect(result.state.halfLifeDays).toBe(100);
+    expect(result.state.independentMentionCount).toBe(1);
+  });
+
+  it('grows stability only for qualified cross-day mentions', () => {
+    const first = reinforceActivation(null, {
+      targetCreatedAt: 0,
+      occurredAt: 0,
+      semanticMatch: 1,
+      intensity: 0.1,
+    }, { eventCount: 0, appliedBoost: 0 });
+    const sameDay = reinforceActivation(first.state, {
+      targetCreatedAt: 0,
+      occurredAt: 60 * 60_000,
+      semanticMatch: 1,
+      intensity: 0.2,
+    }, { eventCount: 0, appliedBoost: 0 });
+    const nextDay = reinforceActivation(sameDay.state, {
+      targetCreatedAt: 0,
+      occurredAt: ACTIVATION_DAY_MS + 60 * 60_000,
+      semanticMatch: 0.9,
+      intensity: 0.2,
+    }, { eventCount: 0, appliedBoost: 0 });
+
+    expect(sameDay.spacingBucket).toBe('same-day');
+    expect(sameDay.state.halfLifeDays).toBe(100);
+    expect(nextDay.spacingBucket).toBe('cross-day');
+    expect(nextDay.state.halfLifeDays).toBeCloseTo(104.5, 12);
+  });
+
+  it('never reduces existing stability when a later parameter set lowers the maximum', () => {
+    const first = reinforceActivation(null, {
+      targetCreatedAt: 0,
+      occurredAt: 0,
+      semanticMatch: 1,
+      intensity: 0.1,
+    }, { eventCount: 0, appliedBoost: 0 });
+    const result = reinforceActivation(first.state, {
+      targetCreatedAt: 0,
+      occurredAt: 2 * ACTIVATION_DAY_MS,
+      semanticMatch: 1,
+      intensity: 0.3,
+    }, { eventCount: 0, appliedBoost: 0 }, undefined, {
+      ...DEFAULT_REINFORCEMENT_PARAMETERS,
+      maxHalfLifeDays: 50,
+    });
+
+    expect(result.state.halfLifeDays).toBe(100);
+  });
+
+  it('records a capped event without boosting or moving the activation anchor', () => {
+    const first = reinforceActivation(null, {
+      targetCreatedAt: 0,
+      occurredAt: 0,
+      semanticMatch: 1,
+      intensity: 0.1,
+    }, { eventCount: 0, appliedBoost: 0 });
+    const capped = reinforceActivation(first.state, {
+      targetCreatedAt: 0,
+      occurredAt: 2 * ACTIVATION_DAY_MS,
+      semanticMatch: 1,
+      intensity: 0.3,
+    }, { eventCount: DEFAULT_REINFORCEMENT_PARAMETERS.maxDailyEvents, appliedBoost: 0 });
+
+    expect(capped.outcome).toBe('daily-cap');
+    expect(capped.appliedBoost).toBe(0);
+    expect(capped.state.anchorWeight).toBe(first.state.anchorWeight);
+    expect(capped.state.anchorAt).toBe(first.state.anchorAt);
+    expect(capped.state.halfLifeDays).toBe(first.state.halfLifeDays);
+    expect(capped.state.independentMentionCount).toBe(2);
+  });
+
+  it('caps a daily boost and rejects invalid or out-of-order mention evidence', () => {
+    const first = reinforceActivation(null, {
+      targetCreatedAt: 0,
+      occurredAt: 0,
+      semanticMatch: 1,
+      intensity: 0.2,
+    }, { eventCount: 0, appliedBoost: 0 });
+    const capped = reinforceActivation(first.state, {
+      targetCreatedAt: 0,
+      occurredAt: 60 * 60_000,
+      semanticMatch: 1,
+      intensity: 0.2,
+    }, { eventCount: 1, appliedBoost: DEFAULT_REINFORCEMENT_PARAMETERS.maxDailyBoost - 0.01 });
+
+    expect(capped.appliedBoost).toBeCloseTo(0.01, 12);
+    expect(() => reinforceActivation(first.state, {
+      targetCreatedAt: 0,
+      occurredAt: -1,
+      semanticMatch: 1,
+      intensity: 0.1,
+    }, { eventCount: 0, appliedBoost: 0 })).toThrow('precedes');
+    expect(() => reinforceActivation(first.state, {
+      targetCreatedAt: 0,
+      occurredAt: 1,
+      semanticMatch: 1.1,
+      intensity: 0.1,
+    }, { eventCount: 0, appliedBoost: 0 })).toThrow('semantic match');
   });
 });
