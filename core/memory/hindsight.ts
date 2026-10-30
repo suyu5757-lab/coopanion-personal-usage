@@ -4,7 +4,7 @@ import { closeSync, existsSync, openSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createClient, createConfig, HindsightClient, HindsightError, sdk } from '@vectorize-io/hindsight-client';
-import { formatPortrait, formatRecall } from './format.ts';
+import { formatPortrait, formatRecall, formatRecallDetailed, type RecallFormatTrace } from './format.ts';
 import { sanitizeForMemory } from './policy.ts';
 import { loadHindsightConfig, type HindsightConfig, type HindsightFileConfig } from './config.ts';
 import { DeliveryError, OutboxDelivery, type DeliveryOps, type OperationState } from './delivery.ts';
@@ -19,6 +19,12 @@ export type TurnRecallStatus = MemoryReadStatus | 'skipped';
 export interface MemoryTextRead {
   text: string;
   status: MemoryReadStatus;
+  trace?: {
+    search: MemorySearchTrace;
+    format: RecallFormatTrace;
+    maxTokens: number;
+    maxChars: number;
+  };
 }
 
 export interface MemorySearchSourceFact {
@@ -46,6 +52,24 @@ export interface MemorySearchRead {
   results: MemorySearchResult[];
   status: MemoryReadStatus;
   sourceFactsTruncated?: boolean;
+  trace?: MemorySearchTrace;
+}
+
+export interface MemorySearchTraceItem {
+  resultId: string;
+  parentDocumentId: string | null;
+  declaredSourceFactIds: string[];
+  verifiedSources: Array<{ sourceFactId: string; documentId: string }>;
+  disposition: 'candidate' | 'visible' | 'filtered' | 'fenced';
+  reason?: 'forgotten-support' | 'unverified-source-fact' | 'unlinked-observation' | 'fence-unresolved' | 'ledger-unreadable';
+  sourceFactsIncomplete: boolean;
+}
+
+export interface MemorySearchTrace {
+  items: MemorySearchTraceItem[];
+  candidateResultIds: string[];
+  status: MemoryReadStatus;
+  sourceFactsTruncated: boolean;
 }
 
 export interface MemoryLog {
@@ -59,6 +83,7 @@ export interface RecallOptions {
   maxChars?: number;
   budget?: 'low' | 'mid' | 'high';
   types?: string[];
+  captureTrace?: boolean;
 }
 
 export interface TurnRecall {
@@ -663,9 +688,23 @@ export class HindsightMemory {
   }
 
   async searchResultsDetailed(query: string, opts: RecallOptions = {}): Promise<MemorySearchRead> {
-    if (!query.trim()) return { results: [], status: 'absent' };
-    if (this.forgetScanDepth > 0) return { results: [], status: 'fenced' };
-    if (!this.canTry() || !await this.ensureStarted()) return { results: [], status: 'unavailable' };
+    const traceItems: MemorySearchTraceItem[] = [];
+    const finishRead = (results: MemorySearchResult[], status: MemoryReadStatus, sourceFactsTruncated = false): MemorySearchRead => ({
+      results,
+      status,
+      ...(status === 'found' && sourceFactsTruncated ? { sourceFactsTruncated: true } : {}),
+      ...(opts.captureTrace ? {
+        trace: {
+          items: traceItems,
+          candidateResultIds: traceItems.filter((item) => item.disposition === 'visible').map((item) => item.resultId),
+          status,
+          sourceFactsTruncated,
+        },
+      } : {}),
+    });
+    if (!query.trim()) return finishRead([], 'absent');
+    if (this.forgetScanDepth > 0) return finishRead([], 'fenced');
+    if (!this.canTry() || !await this.ensureStarted()) return finishRead([], 'unavailable');
     const epoch = this.cacheEpoch;
     const config = this.config!;
     const timeoutMs = opts.timeoutMs ?? config.recall.timeoutMs;
@@ -682,7 +721,7 @@ export class HindsightMemory {
         signal: AbortSignal.timeout(timeoutMs),
       });
       // A forget can invalidate the bank while recall is in flight; discard before reading state or source facts.
-      if (epoch !== this.cacheEpoch) return { results: [], status: 'fenced' };
+      if (epoch !== this.cacheEpoch) return finishRead([], 'fenced');
       const superseded = this.stateStore!.supersededSources(config.bankId, config.apiUrl);
       const currentRevisions = this.stateStore!.currentRevisionSources(config.bankId, config.apiUrl);
       const sourceFactsById = response.source_facts ?? {};
@@ -691,6 +730,7 @@ export class HindsightMemory {
       const hasFencedSources = this.ledger?.hasFencedSources(config.bankId, config.apiUrl) ?? false;
       let blockedDerivedResults = 0;
       const verifiedSupport = new WeakSet<MemorySearchResult>();
+      const traceByMapped = opts.captureTrace ? new Map<MemorySearchResult, MemorySearchTraceItem>() : undefined;
       const results = response.results.flatMap((result): MemorySearchResult[] => {
         const documentId = result.document_id ?? null;
         const metadata = result.metadata ? { ...result.metadata } : {};
@@ -698,6 +738,15 @@ export class HindsightMemory {
         else if (documentId && superseded.has(documentId)) metadata.status = 'superseded';
         const sourceFacts: MemorySearchSourceFact[] = [];
         const sourceFactIds = [...new Set(result.source_fact_ids ?? [])];
+        const traceItem: MemorySearchTraceItem | undefined = opts.captureTrace ? {
+          resultId: result.id,
+          parentDocumentId: documentId,
+          declaredSourceFactIds: sourceFactIds,
+          verifiedSources: [],
+          disposition: 'candidate',
+          sourceFactsIncomplete: false,
+        } : undefined;
+        if (traceItem) traceItems.push(traceItem);
         let missingSourceFact = false;
         let forgottenSupport = false;
         for (const sourceFactId of sourceFactIds) {
@@ -723,12 +772,18 @@ export class HindsightMemory {
             documentId: factDocumentId,
             ...(Object.keys(factMetadata).length > 0 ? { metadata: factMetadata } : {}),
           });
+          traceItem?.verifiedSources.push({ sourceFactId, documentId: factDocumentId });
         }
         const cannotVerifySupport = sourceFactIds.length > 0 && missingSourceFact && (unresolved > 0 || hasFencedSources);
         // An observation's parent document does not identify the sources it was derived from.
         const unlinkedObservationWithFence = result.type === 'observation' && sourceFactIds.length === 0 && hasFencedSources;
+        if (traceItem) traceItem.sourceFactsIncomplete = sourceFactIds.length > 0 && (missingSourceFact || sourceFactsTruncated);
         if (forgottenSupport || cannotVerifySupport || unlinkedObservationWithFence) {
           blockedDerivedResults += 1;
+          if (traceItem) {
+            traceItem.disposition = 'filtered';
+            traceItem.reason = forgottenSupport ? 'forgotten-support' : cannotVerifySupport ? 'unverified-source-fact' : 'unlinked-observation';
+          }
           return [];
         }
         const sourceFactsIncomplete = sourceFactIds.length > 0 && (missingSourceFact || sourceFactsTruncated);
@@ -744,26 +799,40 @@ export class HindsightMemory {
           ...(sourceFactsIncomplete ? { sourceFactsIncomplete: true } : {}),
         };
         if (sourceFactIds.length > 0 && !missingSourceFact) verifiedSupport.add(mapped);
+        if (traceItem) traceByMapped?.set(mapped, traceItem);
         return [mapped];
       });
       // A ledger that cannot be read may be missing tombstones, so no source can be shown clear.
-      if (this.ledger?.damaged()) return { results: [], status: 'fenced' };
-      // A parentless result is visible behind a fence only when every declared source is verified.
-      const visible = results.filter((result) =>
-        (result.documentId !== null || verifiedSupport.has(result) || (unresolved === 0 && !hasFencedSources))
-        && !this.forgottenSource(result.documentId));
-      if (visible.length > 0) return {
-        results: visible,
-        status: 'found',
-        ...(sourceFactsTruncated ? { sourceFactsTruncated: true } : {}),
-      };
-      if (results.length > 0 || response.results.length > 0 || unresolved > 0 || blockedDerivedResults > 0) {
-        return { results: [], status: 'fenced' };
+      if (this.ledger?.damaged()) {
+        if (opts.captureTrace) {
+          for (const item of traceItems) {
+            item.disposition = 'fenced';
+            item.reason = 'ledger-unreadable';
+          }
+        }
+        return finishRead([], 'fenced', sourceFactsTruncated);
       }
-      return { results: [], status: 'absent' };
+      // A parentless result is visible behind a fence only when every declared source is verified.
+      const visible = results.filter((result) => {
+        const isVisible = (result.documentId !== null || verifiedSupport.has(result) || (unresolved === 0 && !hasFencedSources))
+          && !this.forgottenSource(result.documentId);
+        if (opts.captureTrace) {
+          const traceItem = traceByMapped?.get(result);
+          if (traceItem) {
+            traceItem.disposition = isVisible ? 'visible' : 'fenced';
+            if (!isVisible) traceItem.reason = 'fence-unresolved';
+          }
+        }
+        return isVisible;
+      });
+      if (visible.length > 0) return finishRead(visible, 'found', sourceFactsTruncated);
+      if (results.length > 0 || response.results.length > 0 || unresolved > 0 || blockedDerivedResults > 0) {
+        return finishRead([], 'fenced', sourceFactsTruncated);
+      }
+      return finishRead([], 'absent', sourceFactsTruncated);
     } catch (err) {
       this.noteFailure('recall', err);
-      return { results: [], status: 'unavailable' };
+      return finishRead([], 'unavailable');
     }
   }
 
@@ -773,10 +842,10 @@ export class HindsightMemory {
 
   async recallBlockDetailed(query: string, opts: RecallOptions = {}): Promise<MemoryTextRead> {
     const read = await this.searchResultsDetailed(query, opts);
-    const results = read.results;
-    if (results.length === 0) return { text: '', status: read.status };
-    const config = this.config!;
-    const text = formatRecall(results.map((result) => ({
+    const config = this.config;
+    const maxTokens = opts.maxTokens ?? config?.recall.maxTokens ?? 900;
+    const maxChars = opts.maxChars ?? Math.max(800, maxTokens * 5);
+    const formattedResults = read.results.map((result) => ({
       id: result.id,
       text: result.text,
       type: result.type,
@@ -786,11 +855,22 @@ export class HindsightMemory {
       ...(result.metadata ? { metadata: result.metadata } : {}),
       ...(result.sourceFacts ? { sourceFacts: result.sourceFacts } : {}),
       ...(result.sourceFactsIncomplete ? { sourceFactsIncomplete: true } : {}),
-    })), {
-      maxChars: opts.maxChars ?? Math.max(800, (opts.maxTokens ?? config.recall.maxTokens) * 5),
+    }));
+    const formatOptions = {
+      maxChars,
       ...(read.sourceFactsTruncated ? { sourceFactsTruncated: true } : {}),
-    });
-    return text ? { text, status: 'found' } : { text: '', status: 'absent' };
+    };
+    if (opts.captureTrace) {
+      const formatted = formatRecallDetailed(formattedResults, formatOptions);
+      if (!read.trace) return { text: formatted.text, status: formatted.text ? 'found' : read.status };
+      return {
+        text: formatted.text,
+        status: formatted.text ? 'found' : read.results.length > 0 ? 'absent' : read.status,
+        trace: { search: read.trace, format: formatted.trace, maxTokens, maxChars },
+      };
+    }
+    const text = formatRecall(formattedResults, formatOptions);
+    return text ? { text, status: 'found' } : { text: '', status: read.status === 'found' ? 'absent' : read.status };
   }
 
   async recallBlock(query: string, opts: RecallOptions = {}): Promise<string> {

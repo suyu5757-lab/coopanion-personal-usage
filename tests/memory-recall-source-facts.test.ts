@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { HindsightClient } from '@vectorize-io/hindsight-client';
 import { afterEach, describe, expect, it } from 'vitest';
-import { HindsightMemory } from '../core/memory/hindsight.ts';
+import { HindsightMemory, type MemoryTextRead } from '../core/memory/hindsight.ts';
 import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import { MemoryOutbox } from '../core/memory/outbox.ts';
 import { closeMemoryStateStores } from '../core/memory/state-store.ts';
@@ -144,7 +144,7 @@ describe('Hindsight source-fact recall', () => {
       stateStore: MemoryOutbox['stateStore'];
       ready: boolean;
       unavailableUntil: number;
-      recallBlockDetailed: (query: string) => Promise<{ text: string; status: string }>;
+      recallBlockDetailed: (query: string, opts?: { captureTrace?: boolean }) => Promise<MemoryTextRead>;
     };
     memory.config = {
       enabled: true,
@@ -164,12 +164,26 @@ describe('Hindsight source-fact recall', () => {
     memory.ready = true;
     memory.unavailableUntil = 0;
 
-    const read = await memory.recallBlockDetailed('What planning work did Lin and Wei share?');
+    const read = await memory.recallBlockDetailed('What planning work did Lin and Wei share?', { captureTrace: true });
 
     expect(read.status).toBe('found');
     expect(read.text).toContain('The observation links the coordination and review records.');
     expect(read.text).toContain('Lin coordinated the shared materials.');
     expect(read.text).toContain('Wei reviewed the shared plan.');
+    expect(read.trace?.search.items).toEqual([{
+      resultId: 'observation-plan',
+      parentDocumentId: 'doc-observation',
+      declaredSourceFactIds: ['fact-coordination', 'fact-review'],
+      verifiedSources: [
+        { sourceFactId: 'fact-coordination', documentId: 'doc-coordination' },
+        { sourceFactId: 'fact-review', documentId: 'doc-review' },
+      ],
+      disposition: 'visible',
+      sourceFactsIncomplete: false,
+    }]);
+    expect(read.trace?.search.candidateResultIds).toEqual(['observation-plan']);
+    expect(read.trace?.format.includedSourceDocumentIds).toEqual(['doc-coordination', 'doc-review']);
+    expect(JSON.stringify(read.trace)).not.toContain('Lin coordinated the shared materials.');
     expect(api.requests).toHaveLength(1);
     const include = api.requests[0]?.include as { source_facts?: { max_tokens?: number } } | undefined;
     expect(include?.source_facts?.max_tokens).toBeGreaterThan(0);

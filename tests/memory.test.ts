@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import type { RecallResult } from '@vectorize-io/hindsight-client';
 import { loadHindsightConfig } from '../core/memory/config.ts';
 import { hindsightConfigGroup } from '../core/memory/config-group.ts';
-import { cleanSpeech, formatPortrait, formatRecall, type FormattedRecallResult } from '../core/memory/format.ts';
+import { cleanSpeech, formatPortrait, formatRecall, formatRecallDetailed, type FormattedRecallResult } from '../core/memory/format.ts';
 import { sanitizeForMemory } from '../core/memory/policy.ts';
 
 const workspace = () => mkdtempSync(join(tmpdir(), 'coo-memory-'));
@@ -138,6 +138,27 @@ describe('memory formatting', () => {
     expect(text).toContain('[memory] Supporting source facts were truncated');
     expect(text).toContain('Supporting source facts are incomplete for this result.');
     expect(text).toContain('xxxxxxxxxxxxxxxx');
+  });
+
+  it('reports which evidence sources made it through the character budget without recording text', () => {
+    const formatted = formatRecallDetailed([
+      recallResult({
+        id: 'observation-trace',
+        text: 'A synthetic observation joins two source events.',
+        sourceFacts: [
+          { id: 'fact-a', text: 'First synthetic supporting event.', type: 'world', date: '2026-10-20', documentId: 'doc-a' },
+          { id: 'fact-b', text: 'Second synthetic supporting event.', type: 'world', date: '2026-10-21', documentId: 'doc-b' },
+        ],
+      }),
+    ], { maxChars: 260 });
+
+    expect(formatted.text.length).toBeLessThanOrEqual(260);
+    expect(formatted.trace.inputResultIds).toEqual(['observation-trace']);
+    expect(formatted.trace.includedResultIds).toEqual(['observation-trace']);
+    expect(formatted.trace.includedSourceDocumentIds).toEqual(['doc-a']);
+    expect(formatted.trace.omittedSourceDocumentIds).toEqual(['doc-b']);
+    expect(formatted.trace.incompleteResultIds).toEqual(['observation-trace']);
+    expect(JSON.stringify(formatted.trace)).not.toContain('First synthetic supporting event.');
   });
 
   it('preserves distinct supporting facts for duplicate observations with the same source document', () => {
