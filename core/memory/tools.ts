@@ -106,7 +106,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
     },
     {
       name: 'memory_forget',
-      description: 'Remove memories matching a query from long-term memory. Use it only when the person asks you to forget something, not to correct a fact. The source is fenced from historical reads immediately; removing it from the service can still be pending. Content already in this active conversation may remain, so do not say it was erased from the session or is gone everywhere. If they say "that thing just now" and the topic is clear from the conversation, use that topic; if it is not clear, ask which one. It cannot be undone.',
+      description: 'Remove memories matching a query from long-term memory. Use it only when the person asks you to forget something, not to correct a fact. The source is fenced from historical reads immediately; removing it from the service can still be pending. Do not recover the fenced source from workspace files, Handoff notes or Git history. Content already in this active conversation may remain, so do not say it was erased from the session or is gone everywhere. If they say "that thing just now" and the topic is clear from the conversation, use that topic; if it is not clear, ask which one. It cannot be undone.',
       tags: ['write'],
       parameters: {
         type: 'object',
@@ -121,7 +121,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         const result = await memory.forget(text(args, 'query'));
         const total = result.local + result.deleted + result.pending + result.failed;
         if (total === 0) return '[memory] Nothing matching was found to forget.';
-        return `[forget status] local cancellations: ${result.local}; remote deletions: ${result.deleted}; pending: ${result.pending}; failed: ${result.failed}. The active conversation may still contain this source.`;
+        return `[forget status] local cancellations: ${result.local}; remote deletions: ${result.deleted}; pending: ${result.pending}; failed: ${result.failed}. The active conversation may still contain this source. Do not recover it from workspace files, Handoff notes or Git history.`;
       },
     },
     {

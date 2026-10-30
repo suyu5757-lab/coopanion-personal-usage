@@ -39,6 +39,7 @@ describe('memory correction tool', () => {
     const result = await tool.handler({ query: 'the old route' }, {} as never);
 
     expect(result).toContain('active conversation may still contain this source');
+    expect(result).toContain('Do not recover it from workspace files, Handoff notes or Git history.');
   });
 });
 
