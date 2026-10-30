@@ -78,7 +78,7 @@ export interface ReinforcementResult {
   spacingBucket: MentionSpacingBucket;
   boost: number;
   appliedBoost: number;
-  outcome: 'applied' | 'daily-cap';
+  outcome: 'applied' | 'daily-cap' | 'no-match';
 }
 
 function timestamp(value: string | number): number {
@@ -166,7 +166,8 @@ export function reinforceActivation(
   const boost = Math.min(parameters.maxBoostPerMention, evidence.semanticMatch * evidence.intensity * spacingFactor);
   const remainingDailyBoost = Math.max(0, parameters.maxDailyBoost - daily.appliedBoost);
   const appliedBoost = daily.eventCount >= parameters.maxDailyEvents ? 0 : Math.min(boost, remainingDailyBoost);
-  const outcome = appliedBoost > 0 ? 'applied' : 'daily-cap';
+  const outcome = appliedBoost > 0 ? 'applied'
+    : daily.eventCount >= parameters.maxDailyEvents || remainingDailyBoost === 0 ? 'daily-cap' : 'no-match';
   const halfLifeDays = spacingBucket === 'cross-day' && appliedBoost > 0
     ? Math.max(initial.halfLifeDays, Math.min(parameters.maxHalfLifeDays, initial.halfLifeDays
       * (1 + parameters.stabilityGrowthFactor * evidence.semanticMatch * evidence.intensity)))

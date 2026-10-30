@@ -21,6 +21,13 @@ const retainItem = (documentId = 'doc-a'): RetainItem => ({
   bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId, content: 'A synthetic fact.',
   context: 'test', tags: ['scope:life'], priority: 'critical',
 });
+const userEventItem = (documentId: string, at: string, actor = 'user'): RetainItem => ({
+  ...retainItem(documentId),
+  content: `Synthetic ${actor} event.`,
+  timestamp: at,
+  priority: 'normal',
+  metadata: { source_actor: actor, kind: 'event', said_at: at },
+});
 
 afterEach(() => {
   closeMemoryStateStores();
@@ -36,6 +43,31 @@ describe('the memory transaction database', () => {
     for (const file of [path, `${path}-wal`, `${path}-shm`]) {
       if (existsSync(file)) expect(statSync(file).mode & 0o777).toBe(0o600);
     }
+  });
+
+  it('migrates schema 2 to 3 without dropping committed delivery records', () => {
+    const path = join(root(), 'memory-state.sqlite');
+    const store = openMemoryStateStore(path);
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    const outbox = new MemoryOutbox(store);
+    outbox.add(retainItem('existing-source'));
+    closeMemoryStateStores();
+
+    const oldSchema = new DatabaseSync(path);
+    oldSchema.exec(`
+      DROP INDEX memory_mention_events_day;
+      DROP INDEX memory_mention_events_source;
+      DROP TABLE memory_mention_events;
+      DROP TABLE memory_activation;
+      PRAGMA user_version = 2;
+    `);
+    oldSchema.close();
+
+    const migrated = openMemoryStateStore(path);
+    const version = new DatabaseSync(path);
+    expect((version.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(3);
+    expect(new MemoryOutbox(migrated).matching(() => true).map((item) => item.documentId)).toEqual(['existing-source']);
+    version.close();
   });
 
   it('reopens committed requests, fences, deletion work and epochs from disk', () => {
@@ -58,6 +90,177 @@ describe('the memory transaction database', () => {
     expect(reopenedLedger.forgotten('bank-a', 'http://hindsight.test', 'doc-a')).toBe(true);
     expect(reopenedLedger.unresolved('bank-a', 'http://hindsight.test')).toBe(1);
     expect(reopenedLedger.epoch('bank-a', 'http://hindsight.test')).toBe(1);
+  });
+
+  it('persists one activation per verified user event and treats a replay as idempotent', () => {
+    const path = join(root(), 'memory-state.sqlite');
+    const store = openMemoryStateStore(path);
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    const outbox = new MemoryOutbox(store);
+    const userDocumentId = 'user:main:101';
+    outbox.add(userEventItem(userDocumentId, '2026-10-01T12:00:00.000Z'));
+    const input = {
+      bankId: 'bank-a', endpoint: 'http://hindsight.test', targetDocumentId: 'fact:old-trip',
+      userEventDocumentId: userDocumentId, targetCreatedAt: '2026-09-01T12:00:00.000Z',
+      semanticMatch: 0.9, intensity: 0.06,
+    };
+
+    const first = store.recordUserMention(input);
+    expect(first).toMatchObject({ status: 'applied', activation: { independentMentionCount: 1, sourceEpoch: 0 } });
+    expect(store.recordUserMention(input)).toMatchObject({ status: 'duplicate', activation: { independentMentionCount: 1 } });
+    store.saveOutbox({
+      id: 'user-event-replay', bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: userDocumentId,
+      operationId: 'operation-replay', state: 'pending', attempts: 0, nextAttemptAt: '2026-10-01T12:00:00.000Z',
+      updatedAt: '2026-10-01T12:00:00.000Z', createdAt: '2026-10-01T12:00:00.000Z',
+      content: 'Synthetic replay.', context: 'test', tags: [], priority: 'normal',
+      metadata: { source_actor: 'user', kind: 'event', said_at: '2026-10-01T12:00:00.000Z' },
+    });
+    expect(store.recordUserMention(input).status).toBe('duplicate');
+    const database = new DatabaseSync(path);
+    expect((database.prepare('SELECT COUNT(*) AS count FROM memory_mention_events').get() as { count: number }).count).toBe(1);
+    database.close();
+
+    closeMemoryStateStores();
+    const reopened = openMemoryStateStore(path);
+    expect(reopened.loadActivationState('bank-a', 'http://hindsight.test', 'fact:old-trip')).toMatchObject({
+      independentMentionCount: 1,
+      anchorWeight: first.activation?.anchorWeight,
+      lastUserMentionAt: '2026-10-01T12:00:00.000Z',
+    });
+  });
+
+  it('accepts only persisted user-origin events for mention reinforcement', () => {
+    const store = openMemoryStateStore(join(root(), 'memory-state.sqlite'));
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    const outbox = new MemoryOutbox(store);
+    outbox.add(userEventItem('coo:main:1', '2026-10-01T12:00:00.000Z', 'coo'));
+    outbox.add(userEventItem('tool:main:1', '2026-10-01T12:01:00.000Z', 'tool'));
+    const request = (userEventDocumentId: string) => store.recordUserMention({
+      bankId: 'bank-a', endpoint: 'http://hindsight.test', targetDocumentId: 'fact:old-trip',
+      userEventDocumentId, targetCreatedAt: '2026-09-01T12:00:00.000Z', semanticMatch: 1, intensity: 0.1,
+    });
+
+    expect(request('user:main:missing').status).toBe('source-missing');
+    expect(request('coo:main:1').status).toBe('source-missing');
+    expect(request('tool:main:1').status).toBe('source-missing');
+    expect(store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:old-trip')).toBeNull();
+  });
+
+  it('refuses reinforcement while the durable forget ledger is damaged', () => {
+    const store = openMemoryStateStore(join(root(), 'memory-state.sqlite'));
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: true });
+    new MemoryOutbox(store).add(userEventItem('user:main:damaged', '2026-10-01T12:00:00.000Z'));
+
+    expect(store.recordUserMention({
+      bankId: 'bank-a', endpoint: 'http://hindsight.test', targetDocumentId: 'fact:old-trip',
+      userEventDocumentId: 'user:main:damaged', targetCreatedAt: '2026-09-01T12:00:00.000Z',
+      semanticMatch: 1, intensity: 0.1,
+    })).toMatchObject({ status: 'forget-unavailable', activation: null });
+  });
+
+  it('caps daily reinforcement and grows stability only across spaced user events', () => {
+    const store = openMemoryStateStore(join(root(), 'memory-state.sqlite'));
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    const outbox = new MemoryOutbox(store);
+    const eventDates = [
+      '2026-10-01T00:00:00.000Z',
+      '2026-10-01T01:00:00.000Z',
+      '2026-10-01T02:00:00.000Z',
+      '2026-10-01T03:00:00.000Z',
+      '2026-10-02T04:00:00.000Z',
+    ];
+    const results = eventDates.map((at, index) => {
+      const documentId = `user:main:daily-${index}`;
+      outbox.add(userEventItem(documentId, at));
+      return store.recordUserMention({
+        bankId: 'bank-a', endpoint: 'http://hindsight.test', targetDocumentId: 'fact:old-trip',
+        userEventDocumentId: documentId, targetCreatedAt: '2026-09-01T00:00:00.000Z',
+        semanticMatch: 1, intensity: 0.1,
+      });
+    });
+
+    expect(results.slice(0, 3).map((result) => result.status)).toEqual(['applied', 'applied', 'applied']);
+    expect(results[3]).toMatchObject({ status: 'daily-cap', appliedBoost: 0 });
+    expect(results[4]).toMatchObject({ status: 'applied', spacingBucket: 'cross-day' });
+    expect(results[4]?.activation?.halfLifeDays).toBeCloseTo(102.5, 12);
+    expect(results[4]?.activation?.independentMentionCount).toBe(5);
+  });
+
+  it('removes derived activation and mention history when a target or its user evidence is fenced', () => {
+    const store = openMemoryStateStore(join(root(), 'memory-state.sqlite'));
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    const outbox = new MemoryOutbox(store);
+    const ledger = new ForgetLedger(store);
+    const firstDocumentId = 'user:main:201';
+    const secondDocumentId = 'user:main:202';
+    const survivorDocumentId = 'user:main:203';
+    outbox.add(userEventItem(firstDocumentId, '2026-10-01T12:00:00.000Z'));
+    outbox.add(userEventItem(secondDocumentId, '2026-10-02T12:00:00.000Z'));
+    outbox.add(userEventItem(survivorDocumentId, '2026-10-03T12:00:00.000Z'));
+    const input = (targetDocumentId: string, userEventDocumentId: string) => ({
+      bankId: 'bank-a', endpoint: 'http://hindsight.test', targetDocumentId,
+      userEventDocumentId, targetCreatedAt: '2026-09-01T12:00:00.000Z', semanticMatch: 0.9, intensity: 0.1,
+    });
+    store.recordUserMention(input('fact:forgotten-event', firstDocumentId));
+    store.recordUserMention(input('fact:forgotten-evidence', secondDocumentId));
+    store.recordUserMention(input('fact:survivor', survivorDocumentId));
+
+    expect(ledger.add({ bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: firstDocumentId, reason: 'user forgot source' })).not.toBeNull();
+    expect(store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:forgotten-event')).toBeNull();
+    expect(store.recordUserMention(input('fact:forgotten-event', firstDocumentId)).status).toBe('forgotten');
+    expect(store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:survivor')).toMatchObject({ sourceEpoch: 1 });
+
+    expect(ledger.add({ bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: 'fact:forgotten-evidence', reason: 'user forgot target' })).not.toBeNull();
+    expect(store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:forgotten-evidence')).toBeNull();
+    expect(store.recordUserMention(input('fact:forgotten-evidence', secondDocumentId)).status).toBe('forgotten');
+    expect(store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:survivor')).toMatchObject({ sourceEpoch: 2 });
+    const database = new DatabaseSync(store.path);
+    expect((database.prepare('SELECT COUNT(*) AS count FROM memory_mention_events').get() as { count: number }).count).toBe(1);
+    database.close();
+  });
+
+  it('keeps activation intact when the source fence transaction fails', () => {
+    const store = openMemoryStateStore(join(root(), 'memory-state.sqlite'));
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    const outbox = new MemoryOutbox(store);
+    const ledger = new ForgetLedger(store);
+    const userDocumentId = 'user:main:401';
+    outbox.add(userEventItem(userDocumentId, '2026-10-01T12:00:00.000Z'));
+    store.recordUserMention({
+      bankId: 'bank-a', endpoint: 'http://hindsight.test', targetDocumentId: 'fact:kept',
+      userEventDocumentId: userDocumentId, targetCreatedAt: '2026-09-01T12:00:00.000Z',
+      semanticMatch: 0.9, intensity: 0.1,
+    });
+    const database = new DatabaseSync(store.path);
+    database.exec(`CREATE TRIGGER reject_forget BEFORE INSERT ON memory_fences BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END;`);
+    database.close();
+
+    expect(ledger.add({ bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: userDocumentId, reason: 'user forgot source' })).toBeNull();
+    expect(ledger.forgotten('bank-a', 'http://hindsight.test', userDocumentId)).toBe(false);
+    expect(store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:kept')).not.toBeNull();
+    const after = new DatabaseSync(store.path);
+    expect((after.prepare('SELECT COUNT(*) AS count FROM memory_mention_events').get() as { count: number }).count).toBe(1);
+    after.close();
+  });
+
+  it('clears all activation records for a bank when the whole target is cleared', () => {
+    const store = openMemoryStateStore(join(root(), 'memory-state.sqlite'));
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    const outbox = new MemoryOutbox(store);
+    const ledger = new ForgetLedger(store);
+    const documentId = 'user:main:301';
+    outbox.add(userEventItem(documentId, '2026-10-01T12:00:00.000Z'));
+    store.recordUserMention({
+      bankId: 'bank-a', endpoint: 'http://hindsight.test', targetDocumentId: 'fact:old-trip',
+      userEventDocumentId: documentId, targetCreatedAt: '2026-09-01T12:00:00.000Z',
+      semanticMatch: 1, intensity: 0.1,
+    });
+
+    expect(ledger.clearTarget('bank-a', 'http://hindsight.test')).toBe(true);
+    expect(store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:old-trip')).toBeNull();
+    const database = new DatabaseSync(store.path);
+    expect((database.prepare('SELECT COUNT(*) AS count FROM memory_mention_events').get() as { count: number }).count).toBe(0);
+    database.close();
   });
 
   it('deduplicates a source event after verification and rejects a changed replay', () => {

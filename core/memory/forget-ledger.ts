@@ -198,6 +198,23 @@ export class ForgetLedger {
     }
   }
 
+  private persistClearedTarget(bankId: string, endpoint: string): boolean {
+    if (this.damagedLedger || !this.stateStore) {
+      this.persistenceError ??= `could not write the memory database: ${this.initializationError ?? 'forget state is damaged'}`;
+      return false;
+    }
+    try {
+      this.stateStore.clearMemoryTarget(bankId, endpoint, this.file);
+      this.persistenceError = null;
+      this.damagedLedger = false;
+      return true;
+    } catch (err) {
+      this.persistenceError = `could not write the memory database: ${err instanceof Error ? err.message : String(err)}`;
+      this.opts.log?.warn('[memory] could not write the cleared target state', { message: err instanceof Error ? err.message : String(err) });
+      return false;
+    }
+  }
+
   /**
    * Fence every source and record the deletions in one write. A source already fenced keeps its
    * tombstone; an open task for it is reused so a repeated forget does not duplicate the work.
@@ -426,7 +443,7 @@ export class ForgetLedger {
         : task),
       stale: this.file.stale.filter((entry) => entry !== key(bankId, endpoint)),
     };
-    if (!this.persist()) {
+    if (!this.persistClearedTarget(bankId, endpoint)) {
       this.file = before;
       return false;
     }
