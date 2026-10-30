@@ -25,8 +25,8 @@ describe('memory evaluation contract', () => {
       { id: 'd', answerable: false, requiredSourceIds: [], deletedSourceIds: ['src-deleted-2'], forbiddenSourceIds: ['src-deleted-2'] },
     ];
     const observations = [
-      { caseId: 'a', sourceIdsAt5: [['src-a']], visibleSourceIds: ['src-a'], contextSourceIds: ['src-a'], answerOutcome: 'abstained' as const, answerCorrect: false, latencyMs: 10, inputTokens: 10, outputTokens: 2, costMicros: 50, costCurrency: 'USD', cpuMs: 12, peakMemoryBytes: 1_000, activationStateRestored: true },
-      { caseId: 'b', sourceIdsAt5: [['src-x']], visibleSourceIds: ['src-x'], contextSourceIds: ['src-x'], answerOutcome: 'answered' as const, answerCorrect: true, latencyMs: 20, inputTokens: 20, outputTokens: 4, costMicros: 70, costCurrency: 'USD', cpuMs: 20, peakMemoryBytes: 1_500, activationStateRestored: false },
+      { caseId: 'a', sourceIdsAt5: [['src-a']], visibleSourceIds: ['src-a'], contextSourceIds: ['src-a'], answerOutcome: 'abstained' as const, answerCorrect: false, latencyMs: 10, inputTokens: 10, outputTokens: 2, costMicros: 50, costCurrency: 'USD', cpuMs: 12, peakMemoryBytes: 1_000, sqliteDeltaBytes: 600, activationComputations: 2, activationStateRestored: true },
+      { caseId: 'b', sourceIdsAt5: [['src-x']], visibleSourceIds: ['src-x'], contextSourceIds: ['src-x'], answerOutcome: 'answered' as const, answerCorrect: true, latencyMs: 20, inputTokens: 20, outputTokens: 4, costMicros: 70, costCurrency: 'USD', cpuMs: 20, peakMemoryBytes: 1_500, sqliteDeltaBytes: -100, activationComputations: 3, activationStateRestored: false },
       { caseId: 'c', sourceIdsAt5: [['src-deleted']], visibleSourceIds: ['src-deleted'], contextSourceIds: ['src-deleted'], answerOutcome: 'answered' as const, answerCorrect: false, latencyMs: 30, activationStateRestored: true },
       { caseId: 'd', sourceIdsAt5: [], visibleSourceIds: [], contextSourceIds: [], answerOutcome: 'abstained' as const, answerCorrect: true, latencyMs: 40 },
     ];
@@ -45,7 +45,7 @@ describe('memory evaluation contract', () => {
     expect(score.deleteLeak).toEqual({ numerator: 1, denominator: 2, value: 0.5 });
     expect(score.activationStateRestored).toEqual({ numerator: 2, denominator: 3, value: 2 / 3 });
     expect(score.latencyMs).toEqual({ p50: 20, p95: 40, samples: 4 });
-    expect(score.usage).toEqual({ inputTokens: 30, outputTokens: 6, costMicros: 120, costCurrency: 'USD', cpuMs: 32, peakMemoryBytes: 1_500, samples: 2 });
+    expect(score.usage).toEqual({ inputTokens: 30, outputTokens: 6, costMicros: 120, costCurrency: 'USD', cpuMs: 32, peakMemoryBytes: 1_500, sqliteDeltaBytes: 500, sqliteDeltaSamples: 2, activationComputations: 5, activationComputationSamples: 2, samples: 2 });
   });
 
   it('reports an unavailable cross-restart metric when no case records it', () => {
@@ -63,12 +63,12 @@ describe('memory evaluation contract', () => {
       { id: 'no-answer', answerable: false, requiredSourceIds: [], forbiddenSourceIds: ['src-unrelated'], category: 'no_answer' },
     ];
     const baseline = [
-      { caseId: 'answer', sourceIdsAt5: [['src-good'], ['src-bad']], visibleSourceIds: ['src-good', 'src-bad'], contextSourceIds: ['src-good', 'src-bad'], answerOutcome: 'answered' as const, answerCorrect: true, activationStateRestored: false },
-      { caseId: 'no-answer', sourceIdsAt5: [], visibleSourceIds: ['src-unrelated'], contextSourceIds: [], answerOutcome: 'answered' as const, answerCorrect: false, activationStateRestored: false },
+      { caseId: 'answer', sourceIdsAt5: [['src-good'], ['src-bad']], visibleSourceIds: ['src-good', 'src-bad'], contextSourceIds: ['src-good', 'src-bad'], answerOutcome: 'answered' as const, answerCorrect: true, activationStateRestored: false, sqliteDeltaBytes: 30, activationComputations: 3 },
+      { caseId: 'no-answer', sourceIdsAt5: [], visibleSourceIds: ['src-unrelated'], contextSourceIds: [], answerOutcome: 'answered' as const, answerCorrect: false, activationStateRestored: false, sqliteDeltaBytes: 10, activationComputations: 2 },
     ];
     const activation = [
-      { caseId: 'answer', sourceIdsAt5: [['src-good']], visibleSourceIds: ['src-good'], contextSourceIds: ['src-good'], answerOutcome: 'answered' as const, answerCorrect: true, activationStateRestored: true },
-      { caseId: 'no-answer', sourceIdsAt5: [], visibleSourceIds: [], contextSourceIds: [], answerOutcome: 'abstained' as const, answerCorrect: true, activationStateRestored: true },
+      { caseId: 'answer', sourceIdsAt5: [['src-good']], visibleSourceIds: ['src-good'], contextSourceIds: ['src-good'], answerOutcome: 'answered' as const, answerCorrect: true, activationStateRestored: true, sqliteDeltaBytes: 60, activationComputations: 6 },
+      { caseId: 'no-answer', sourceIdsAt5: [], visibleSourceIds: [], contextSourceIds: [], answerOutcome: 'abstained' as const, answerCorrect: true, activationStateRestored: true, sqliteDeltaBytes: 20, activationComputations: 4 },
     ];
 
     const comparison = compareMemoryEvaluations(cases, baseline, activation);
@@ -77,6 +77,8 @@ describe('memory evaluation contract', () => {
     expect(comparison.delta.unrelatedHistoryInContext).toBe(-0.5);
     expect(comparison.delta.answerAccuracy).toBe(0.5);
     expect(comparison.delta.activationStateRestored).toBe(1);
+    expect(comparison.delta.sqliteDeltaBytes).toBe(40);
+    expect(comparison.delta.activationComputations).toBe(5);
     expect(comparison.byCategory.single_fact.delta.unrelatedHistoryAt5).toBe(-1);
     expect(comparison.byCategory.no_answer.activation.activationStateRestored).toEqual({ numerator: 1, denominator: 1, value: 1 });
   });
@@ -104,11 +106,13 @@ describe('memory evaluation contract', () => {
       deduplicatedResultIndexes: [], deduplicatedResultIds: [], includedSourceDocumentIds: ['doc-a', 'doc-b'], omittedSourceDocumentIds: [],
       incompleteResultIds: [], clippedResultIds: [], clippedContextResultIds: [], clippedSourceFactIds: [],
       sourceFactsTruncated: false, coverageWeight: 0.5, activationInfluence: 0.25, activationWeights: [], maxChars: 2000, usedChars: 400,
-    }, { activationStateRestored: true });
+    }, { sqliteDeltaBytes: 24, activationComputations: 3, activationStateRestored: true });
 
     expect(observation.sourceIdsAt5).toEqual([['doc-a'], ['doc-b']]);
     expect(observation.visibleSourceIds).toEqual(['doc-a', 'doc-b']);
     expect(observation.contextSourceIds).toEqual(['doc-a', 'doc-b']);
+    expect(observation.sqliteDeltaBytes).toBe(24);
+    expect(observation.activationComputations).toBe(3);
     expect(observation.activationStateRestored).toBe(true);
   });
 

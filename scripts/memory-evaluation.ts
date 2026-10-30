@@ -28,6 +28,8 @@ export interface MemoryEvaluationObservation {
   costCurrency?: string;
   cpuMs?: number;
   peakMemoryBytes?: number;
+  sqliteDeltaBytes?: number;
+  activationComputations?: number;
   activationStateRestored?: boolean;
 }
 
@@ -61,6 +63,10 @@ export interface MemoryEvaluationScore {
     costCurrency: string | null;
     cpuMs: number | null;
     peakMemoryBytes: number | null;
+    sqliteDeltaBytes: number | null;
+    sqliteDeltaSamples: number;
+    activationComputations: number | null;
+    activationComputationSamples: number;
     samples: number;
   };
 }
@@ -84,6 +90,8 @@ export interface MemoryEvaluationDelta {
   costMicros: number | null;
   cpuMs: number | null;
   peakMemoryBytes: number | null;
+  sqliteDeltaBytes: number | null;
+  activationComputations: number | null;
 }
 
 export interface MemoryEvaluationComparison {
@@ -113,7 +121,7 @@ export function observationFromRecallTrace(
   caseId: string,
   search: MemorySearchTrace,
   format: RecallFormatTrace,
-  extras: Pick<MemoryEvaluationObservation, 'deletedSourceIds' | 'answerOutcome' | 'answerCorrect' | 'latencyMs' | 'inputTokens' | 'outputTokens' | 'costMicros' | 'costCurrency' | 'cpuMs' | 'peakMemoryBytes' | 'activationStateRestored'> = {},
+  extras: Pick<MemoryEvaluationObservation, 'deletedSourceIds' | 'answerOutcome' | 'answerCorrect' | 'latencyMs' | 'inputTokens' | 'outputTokens' | 'costMicros' | 'costCurrency' | 'cpuMs' | 'peakMemoryBytes' | 'sqliteDeltaBytes' | 'activationComputations' | 'activationStateRestored'> = {},
 ): MemoryEvaluationObservation {
   const visible = search.items.filter((item) => item.disposition === 'visible');
   const sourcesFor = (item: MemorySearchTrace['items'][number]): string[] => {
@@ -171,10 +179,14 @@ export function scoreMemoryEvaluation(
   let outputTokens = 0;
   let costMicros = 0;
   let cpuMs = 0;
+  let sqliteDeltaBytes = 0;
+  let activationComputations = 0;
   let inputTokenSamples = 0;
   let outputTokenSamples = 0;
   let costSamples = 0;
   let cpuSamples = 0;
+  let sqliteDeltaSamples = 0;
+  let activationComputationSamples = 0;
   let peakMemoryBytes: number | null = null;
   let usageSamples = 0;
   const currencies = new Set<string>();
@@ -218,9 +230,10 @@ export function scoreMemoryEvaluation(
     if (typeof observation.latencyMs === 'number' && Number.isFinite(observation.latencyMs) && observation.latencyMs >= 0) {
       latencies.push(observation.latencyMs);
     }
-    const hasUsage = [observation.inputTokens, observation.outputTokens, observation.costMicros, observation.cpuMs, observation.peakMemoryBytes]
+    const hasUsage = [observation.inputTokens, observation.outputTokens, observation.costMicros, observation.cpuMs, observation.peakMemoryBytes, observation.activationComputations]
       .some((value) => typeof value === 'number' && Number.isFinite(value) && value >= 0);
-    if (hasUsage) {
+    const hasSqliteDelta = typeof observation.sqliteDeltaBytes === 'number' && Number.isFinite(observation.sqliteDeltaBytes);
+    if (hasUsage || hasSqliteDelta) {
       usageSamples += 1;
       if (typeof observation.inputTokens === 'number' && Number.isFinite(observation.inputTokens) && observation.inputTokens >= 0) {
         inputTokens += observation.inputTokens;
@@ -242,6 +255,14 @@ export function scoreMemoryEvaluation(
       }
       if (typeof observation.peakMemoryBytes === 'number' && Number.isFinite(observation.peakMemoryBytes) && observation.peakMemoryBytes >= 0) {
         peakMemoryBytes = Math.max(peakMemoryBytes ?? 0, observation.peakMemoryBytes);
+      }
+      if (hasSqliteDelta) {
+        sqliteDeltaBytes += observation.sqliteDeltaBytes!;
+        sqliteDeltaSamples += 1;
+      }
+      if (typeof observation.activationComputations === 'number' && Number.isFinite(observation.activationComputations) && observation.activationComputations >= 0) {
+        activationComputations += observation.activationComputations;
+        activationComputationSamples += 1;
       }
     }
   }
@@ -270,6 +291,10 @@ export function scoreMemoryEvaluation(
       costCurrency: costSamples > 0 ? [...currencies][0] ?? null : null,
       cpuMs: cpuSamples > 0 ? cpuMs : null,
       peakMemoryBytes,
+      sqliteDeltaBytes: sqliteDeltaSamples > 0 ? sqliteDeltaBytes : null,
+      sqliteDeltaSamples,
+      activationComputations: activationComputationSamples > 0 ? activationComputations : null,
+      activationComputationSamples,
       samples: usageSamples,
     },
   };
@@ -299,6 +324,8 @@ function compareScores(baseline: MemoryEvaluationScore, activation: MemoryEvalua
     costMicros: delta(activation.usage.costMicros, baseline.usage.costMicros),
     cpuMs: delta(activation.usage.cpuMs, baseline.usage.cpuMs),
     peakMemoryBytes: delta(activation.usage.peakMemoryBytes, baseline.usage.peakMemoryBytes),
+    sqliteDeltaBytes: delta(activation.usage.sqliteDeltaBytes, baseline.usage.sqliteDeltaBytes),
+    activationComputations: delta(activation.usage.activationComputations, baseline.usage.activationComputations),
   };
 }
 
