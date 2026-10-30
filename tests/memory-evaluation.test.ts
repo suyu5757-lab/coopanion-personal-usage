@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { formatRecallDetailed, type FormattedRecallResult } from '../core/memory/format.ts';
-import { compareMemoryEvaluationRepeats, compareMemoryEvaluations, groupMemoryEvaluationRunRows, observationFromRecallTrace, scoreMemoryEvaluation } from '../scripts/memory-evaluation.ts';
+import { compareMemoryEvaluationRepeats, compareMemoryEvaluations, fingerprintMemoryEvaluationDataset, groupMemoryEvaluationRunRows, observationFromRecallTrace, scoreMemoryEvaluation } from '../scripts/memory-evaluation.ts';
 import { createDevelopmentMemoryEvaluationSet } from './fixtures/memory-evaluation.ts';
 
 describe('memory evaluation contract', () => {
@@ -68,13 +68,25 @@ describe('memory evaluation contract', () => {
       { caseId: 'answer', sourceIdsAt5: found ? [['src-a']] : [], visibleSourceIds: found ? ['src-a'] : [], contextSourceIds: found ? ['src-a'] : [] },
       { caseId: 'no-answer', sourceIdsAt5: [], visibleSourceIds: [], contextSourceIds: [] },
     ];
+    const datasetDigest = fingerprintMemoryEvaluationDataset(cases);
+    const metadata = (activationInfluence: number, seed: string) => ({
+      modelLabel: 'test-model',
+      serviceLabel: 'loopback-service',
+      codeRevision: 'test-revision',
+      datasetDigest,
+      nonActivationConfigDigest: 'test-settings',
+      activationEnabled: activationInfluence > 0,
+      activationInfluence,
+      seed,
+    });
+    expect(fingerprintMemoryEvaluationDataset([...cases].reverse())).toBe(datasetDigest);
 
     const result = compareMemoryEvaluationRepeats(cases, [
-      { runId: 'seed-1', observations: observations(false) },
-      { runId: 'seed-2', observations: observations(true) },
+      { runId: 'seed-1', metadata: metadata(0, 'seed-1'), observations: observations(false) },
+      { runId: 'seed-2', metadata: metadata(0, 'seed-2'), observations: observations(true) },
     ], [
-      { runId: 'seed-2', observations: observations(false) },
-      { runId: 'seed-1', observations: observations(true) },
+      { runId: 'seed-2', metadata: metadata(0.25, 'seed-2'), observations: observations(false) },
+      { runId: 'seed-1', metadata: metadata(0.25, 'seed-1'), observations: observations(true) },
     ]);
 
     expect(result.runs.map((run) => run.runId)).toEqual(['seed-1', 'seed-2']);
@@ -82,12 +94,15 @@ describe('memory evaluation contract', () => {
     expect(result.activation.sourceRecallAt5).toEqual({ mean: 0.5, sampleVariance: 0.5, samples: 2 });
     expect(result.delta.sourceRecallAt5).toEqual({ mean: 0, sampleVariance: 2, samples: 2 });
     expect(groupMemoryEvaluationRunRows([
-      { runId: 'seed-2', ...observations(false)[0]! },
-      { runId: 'seed-1', ...observations(true)[0]! },
+      { runId: 'seed-2', runMetadata: metadata(0.25, 'seed-2'), ...observations(false)[0]! },
+      { runId: 'seed-1', runMetadata: metadata(0.25, 'seed-1'), ...observations(true)[0]! },
     ]).map((run) => run.runId)).toEqual(['seed-2', 'seed-1']);
-    expect(() => groupMemoryEvaluationRunRows([{ runId: ' ', ...observations(false)[0]! }])).toThrow('empty run ID');
-    expect(() => compareMemoryEvaluationRepeats(cases, [{ runId: 'seed-1', observations: observations(false) }], [])).toThrow('at least one run');
-    expect(() => compareMemoryEvaluationRepeats(cases, [{ runId: 'seed-1', observations: observations(false) }], [{ runId: 'seed-2', observations: observations(true) }])).toThrow('same run IDs');
+    expect(() => groupMemoryEvaluationRunRows([{ runId: ' ', runMetadata: metadata(0, 'seed-1'), ...observations(false)[0]! }])).toThrow('empty run ID');
+    expect(() => compareMemoryEvaluationRepeats(cases, [{ runId: 'seed-1', metadata: metadata(0, 'seed-1'), observations: observations(false) }], [])).toThrow('at least one run');
+    expect(() => compareMemoryEvaluationRepeats(cases, [{ runId: 'seed-1', metadata: metadata(0, 'seed-1'), observations: observations(false) }], [{ runId: 'seed-2', metadata: metadata(0.25, 'seed-2'), observations: observations(true) }])).toThrow('same run IDs');
+    expect(() => compareMemoryEvaluationRepeats(cases, [
+      { runId: 'seed-1', metadata: { ...metadata(0, 'seed-1'), datasetDigest: 'different' }, observations: observations(false) },
+    ], [{ runId: 'seed-1', metadata: metadata(0.25, 'seed-1'), observations: observations(true) }])).toThrow('dataset digest');
   });
 
   it('compares paired conditions and reports unrelated-history changes separately', () => {

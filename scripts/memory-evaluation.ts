@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -116,11 +117,24 @@ export interface MemoryEvaluationComparison {
 
 export interface MemoryEvaluationRun {
   runId: string;
+  metadata: MemoryEvaluationRunMetadata;
   observations: readonly MemoryEvaluationObservation[];
+}
+
+export interface MemoryEvaluationRunMetadata {
+  modelLabel: string;
+  serviceLabel: string;
+  codeRevision: string;
+  datasetDigest: string;
+  nonActivationConfigDigest: string;
+  activationEnabled: boolean;
+  activationInfluence: number;
+  seed?: string | number;
 }
 
 export interface MemoryEvaluationRunObservation extends MemoryEvaluationObservation {
   runId: string;
+  runMetadata: MemoryEvaluationRunMetadata;
 }
 
 export interface MemoryEvaluationMetricSpread {
@@ -141,6 +155,22 @@ const ratio = (numerator: number, denominator: number): MemoryEvaluationRate => 
   denominator,
   value: denominator > 0 ? numerator / denominator : null,
 });
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+    return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+export function fingerprintMemoryEvaluationDataset(cases: readonly MemoryEvaluationCase[]): string {
+  const ordered = [...cases].sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
+  return createHash('sha256').update(canonicalJson(ordered)).digest('hex');
+}
 
 function percentile(values: readonly number[], percentile: number): number | null {
   if (values.length === 0) return null;
@@ -466,11 +496,29 @@ export function compareMemoryEvaluationRepeats(
   activationRuns: readonly MemoryEvaluationRun[],
 ): MemoryEvaluationRepeatedComparison {
   if (baselineRuns.length === 0 || activationRuns.length === 0) throw new Error('paired evaluation requires at least one run');
+  const datasetDigest = fingerprintMemoryEvaluationDataset(cases);
   const runMap = (runs: readonly MemoryEvaluationRun[], condition: string) => {
     const map = new Map<string, MemoryEvaluationRun>();
     for (const run of runs) {
       const id = run.runId.trim();
       if (!id || map.has(id)) throw new Error(`${condition} evaluation has a duplicate or empty run ID: ${run.runId}`);
+      const metadata = run.metadata;
+      if (!metadata || typeof metadata !== 'object') throw new Error(`${condition} evaluation run has incomplete metadata: ${id}`);
+      const { modelLabel, serviceLabel, codeRevision, datasetDigest: runDatasetDigest, nonActivationConfigDigest, activationEnabled, activationInfluence } = metadata;
+      if (![modelLabel, serviceLabel, codeRevision, runDatasetDigest, nonActivationConfigDigest]
+        .every((value) => typeof value === 'string' && value.trim().length > 0)) {
+        throw new Error(`${condition} evaluation run has incomplete metadata: ${id}`);
+      }
+      if (runDatasetDigest !== datasetDigest) throw new Error(`${condition} evaluation dataset digest does not match the cases: ${id}`);
+      if (typeof activationEnabled !== 'boolean') throw new Error(`${condition} evaluation run has an invalid activation flag: ${id}`);
+      if (!Number.isFinite(activationInfluence) || activationInfluence < 0 || activationInfluence > 1) {
+        throw new Error(`${condition} evaluation run has an invalid activation influence: ${id}`);
+      }
+      if (metadata.seed !== undefined && typeof metadata.seed !== 'string' && typeof metadata.seed !== 'number') {
+        throw new Error(`${condition} evaluation run has an invalid seed: ${id}`);
+      }
+      if (typeof metadata.seed === 'string' && !metadata.seed.trim()) throw new Error(`${condition} evaluation run has an empty seed: ${id}`);
+      if (typeof metadata.seed === 'number' && !Number.isFinite(metadata.seed)) throw new Error(`${condition} evaluation run has an invalid seed: ${id}`);
       map.set(id, run);
     }
     return map;
@@ -479,6 +527,32 @@ export function compareMemoryEvaluationRepeats(
   const activationById = runMap(activationRuns, 'activation');
   if (baselineById.size !== activationById.size || [...baselineById.keys()].some((id) => !activationById.has(id))) {
     throw new Error('baseline and activation evaluations do not contain the same run IDs');
+  }
+  const commonSignature = (metadata: MemoryEvaluationRunMetadata) => canonicalJson({
+    modelLabel: metadata.modelLabel,
+    serviceLabel: metadata.serviceLabel,
+    codeRevision: metadata.codeRevision,
+    datasetDigest: metadata.datasetDigest,
+    nonActivationConfigDigest: metadata.nonActivationConfigDigest,
+  });
+  const allMetadata = [...baselineById.values(), ...activationById.values()].map((run) => run.metadata);
+  if (new Set(allMetadata.map(commonSignature)).size !== 1) {
+    throw new Error('paired evaluation changed the model, service, code, dataset or non-activation configuration');
+  }
+  const baselineInfluences = new Set([...baselineById.values()].map((run) => run.metadata.activationInfluence));
+  const activationInfluences = new Set([...activationById.values()].map((run) => run.metadata.activationInfluence));
+  const baselineActivation = new Set([...baselineById.values()].map((run) => run.metadata.activationEnabled));
+  const activeActivation = new Set([...activationById.values()].map((run) => run.metadata.activationEnabled));
+  if (baselineActivation.size !== 1 || !baselineActivation.has(false) || baselineInfluences.size !== 1 || !baselineInfluences.has(0)) {
+    throw new Error('baseline evaluation must disable activation and use influence 0 for every run');
+  }
+  if (activeActivation.size !== 1 || !activeActivation.has(true) || activationInfluences.size !== 1 || [...activationInfluences][0] === 0) {
+    throw new Error('activation evaluation must enable activation with one nonzero influence for every run');
+  }
+  for (const [runId, baseline] of baselineById) {
+    if (baseline.metadata.seed !== activationById.get(runId)!.metadata.seed) {
+      throw new Error(`paired evaluation run has different seeds: ${runId}`);
+    }
   }
   const runs = [...baselineById].map(([runId, baseline]) => ({
     runId,
@@ -493,16 +567,21 @@ export function compareMemoryEvaluationRepeats(
 }
 
 export function groupMemoryEvaluationRunRows(rows: readonly MemoryEvaluationRunObservation[]): MemoryEvaluationRun[] {
-  const runs = new Map<string, MemoryEvaluationObservation[]>();
+  const runs = new Map<string, { metadata: MemoryEvaluationRunMetadata; observations: MemoryEvaluationObservation[] }>();
   for (const row of rows) {
     const runId = row.runId.trim();
     if (!runId) throw new Error('evaluation observation has an empty run ID');
-    const observations = runs.get(runId) ?? [];
-    const { runId: _runId, ...observation } = row;
+    const run = runs.get(runId);
+    if (run && canonicalJson(run.metadata) !== canonicalJson(row.runMetadata)) {
+      throw new Error(`evaluation run metadata changes between observations: ${runId}`);
+    }
+    const metadata = run?.metadata ?? row.runMetadata;
+    const observations = run?.observations ?? [];
+    const { runId: _runId, runMetadata: _runMetadata, ...observation } = row;
     observations.push(observation);
-    runs.set(runId, observations);
+    runs.set(runId, { metadata, observations });
   }
-  return [...runs].map(([runId, observations]) => ({ runId, observations }));
+  return [...runs].map(([runId, run]) => ({ runId, ...run }));
 }
 
 function readJsonLines<T>(path: string): T[] {
