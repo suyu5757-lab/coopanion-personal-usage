@@ -97,6 +97,7 @@ export interface RecallOptions {
   maxChars?: number;
   maxItems?: number;
   coverageWeight?: number;
+  activationInfluence?: number;
   budget?: 'low' | 'mid' | 'high';
   types?: string[];
   captureTrace?: boolean;
@@ -981,6 +982,7 @@ export class HindsightMemory {
       maxChars,
       ...(opts.maxItems === undefined ? {} : { maxItems: opts.maxItems }),
       ...(opts.coverageWeight === undefined ? {} : { coverageWeight: opts.coverageWeight }),
+      ...(opts.activationInfluence === undefined ? {} : { activationInfluence: opts.activationInfluence }),
       ...(read.sourceFactsTruncated ? { sourceFactsTruncated: true } : {}),
     };
     if (opts.captureTrace) {

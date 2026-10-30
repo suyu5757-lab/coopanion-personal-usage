@@ -192,6 +192,21 @@ describe('memory evaluation contract', () => {
     expect(formatted.trace.includedSourceDocumentIds).toEqual(['doc-a', 'doc-b']);
   });
 
+  it('compares disabled and default activation influence in the same recall formatter', () => {
+    const results: FormattedRecallResult[] = [
+      { id: 'active-a', text: 'A result from source A.', type: 'world', document_id: 'doc-a', activationWeight: 0.2 },
+      { id: 'active-a-repeat', text: 'A second result from source A.', type: 'world', document_id: 'doc-a', activationWeight: 0.2 },
+      { id: 'direct-b', text: 'A direct result from a second required source.', type: 'world', document_id: 'doc-b', activationWeight: 1 },
+    ];
+    const baseline = formatRecallDetailed(results, { maxItems: 2, coverageWeight: 0, activationInfluence: 0 });
+    const activation = formatRecallDetailed(results, { maxItems: 2, coverageWeight: 0 });
+
+    expect(baseline.trace.includedResultIds).toEqual(['active-a', 'active-a-repeat']);
+    expect(activation.trace.includedResultIds).toEqual(['active-a', 'direct-b']);
+    expect(baseline.trace.activationInfluence).toBe(0);
+    expect(activation.trace.activationInfluence).toBe(0.25);
+  });
+
   it('recovers multi-source context coverage across the generated development set under redundant-source pressure', () => {
     const cases = createDevelopmentMemoryEvaluationSet();
     const traces = (coverageWeight: number) => cases.map((testCase) => {
