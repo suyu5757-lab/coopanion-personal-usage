@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { formatRecallDetailed, type FormattedRecallResult } from '../core/memory/format.ts';
-import { observationFromRecallTrace, scoreMemoryEvaluation } from '../scripts/memory-evaluation.ts';
+import { compareMemoryEvaluations, observationFromRecallTrace, scoreMemoryEvaluation } from '../scripts/memory-evaluation.ts';
 import { createDevelopmentMemoryEvaluationSet } from './fixtures/memory-evaluation.ts';
 
 describe('memory evaluation contract', () => {
@@ -45,6 +45,27 @@ describe('memory evaluation contract', () => {
     expect(score.deleteLeak).toEqual({ numerator: 1, denominator: 2, value: 0.5 });
     expect(score.latencyMs).toEqual({ p50: 20, p95: 40, samples: 4 });
     expect(score.usage).toEqual({ inputTokens: 30, outputTokens: 6, costMicros: 120, costCurrency: 'USD', cpuMs: 32, peakMemoryBytes: 1_500, samples: 2 });
+  });
+
+  it('compares paired conditions and reports unrelated-history changes separately', () => {
+    const cases = [
+      { id: 'answer', answerable: true, requiredSourceIds: ['src-good'], forbiddenSourceIds: ['src-bad'] },
+      { id: 'no-answer', answerable: false, requiredSourceIds: [], forbiddenSourceIds: ['src-unrelated'] },
+    ];
+    const baseline = [
+      { caseId: 'answer', sourceIdsAt5: [['src-good'], ['src-bad']], visibleSourceIds: ['src-good', 'src-bad'], contextSourceIds: ['src-good', 'src-bad'], answerOutcome: 'answered' as const, answerCorrect: true },
+      { caseId: 'no-answer', sourceIdsAt5: [], visibleSourceIds: ['src-unrelated'], contextSourceIds: [], answerOutcome: 'answered' as const, answerCorrect: false },
+    ];
+    const activation = [
+      { caseId: 'answer', sourceIdsAt5: [['src-good']], visibleSourceIds: ['src-good'], contextSourceIds: ['src-good'], answerOutcome: 'answered' as const, answerCorrect: true },
+      { caseId: 'no-answer', sourceIdsAt5: [], visibleSourceIds: [], contextSourceIds: [], answerOutcome: 'abstained' as const, answerCorrect: true },
+    ];
+
+    const comparison = compareMemoryEvaluations(cases, baseline, activation);
+
+    expect(comparison.delta.unrelatedHistoryAt5).toBe(-0.5);
+    expect(comparison.delta.unrelatedHistoryInContext).toBe(-0.5);
+    expect(comparison.delta.answerAccuracy).toBe(0.5);
   });
 
   it('turns only verified evidence and final context sources into evaluation observations', () => {

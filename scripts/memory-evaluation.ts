@@ -62,6 +62,30 @@ export interface MemoryEvaluationScore {
   };
 }
 
+export interface MemoryEvaluationComparison {
+  baseline: MemoryEvaluationScore;
+  activation: MemoryEvaluationScore;
+  delta: {
+    sourceRecallAt5: number | null;
+    completeEvidenceAt5: number | null;
+    visibleComplete: number | null;
+    contextComplete: number | null;
+    answerAccuracy: number | null;
+    noAnswerPrecision: number | null;
+    noAnswerRecall: number | null;
+    unrelatedHistoryAt5: number | null;
+    unrelatedHistoryInContext: number | null;
+    deleteLeak: number | null;
+    p50LatencyMs: number | null;
+    p95LatencyMs: number | null;
+    inputTokens: number | null;
+    outputTokens: number | null;
+    costMicros: number | null;
+    cpuMs: number | null;
+    peakMemoryBytes: number | null;
+  };
+}
+
 const ratio = (numerator: number, denominator: number): MemoryEvaluationRate => ({
   numerator,
   denominator,
@@ -233,20 +257,64 @@ export function scoreMemoryEvaluation(
   };
 }
 
+function delta(current: number | null, baseline: number | null): number | null {
+  return current === null || baseline === null ? null : current - baseline;
+}
+
+export function compareMemoryEvaluations(
+  cases: readonly MemoryEvaluationCase[],
+  baselineObservations: readonly MemoryEvaluationObservation[],
+  activationObservations: readonly MemoryEvaluationObservation[],
+): MemoryEvaluationComparison {
+  const baseline = scoreMemoryEvaluation(cases, baselineObservations);
+  const activation = scoreMemoryEvaluation(cases, activationObservations);
+  const baselineCurrency = baseline.usage.costCurrency;
+  const activationCurrency = activation.usage.costCurrency;
+  if (baselineCurrency && activationCurrency && baselineCurrency !== activationCurrency) {
+    throw new Error('paired evaluation contains different cost currencies');
+  }
+  return {
+    baseline,
+    activation,
+    delta: {
+      sourceRecallAt5: delta(activation.sourceRecallAt5.value, baseline.sourceRecallAt5.value),
+      completeEvidenceAt5: delta(activation.completeEvidenceAt5.value, baseline.completeEvidenceAt5.value),
+      visibleComplete: delta(activation.visibleComplete.value, baseline.visibleComplete.value),
+      contextComplete: delta(activation.contextComplete.value, baseline.contextComplete.value),
+      answerAccuracy: delta(activation.answerAccuracy.value, baseline.answerAccuracy.value),
+      noAnswerPrecision: delta(activation.noAnswerPrecision.value, baseline.noAnswerPrecision.value),
+      noAnswerRecall: delta(activation.noAnswerRecall.value, baseline.noAnswerRecall.value),
+      unrelatedHistoryAt5: delta(activation.unrelatedHistoryAt5.value, baseline.unrelatedHistoryAt5.value),
+      unrelatedHistoryInContext: delta(activation.unrelatedHistoryInContext.value, baseline.unrelatedHistoryInContext.value),
+      deleteLeak: delta(activation.deleteLeak.value, baseline.deleteLeak.value),
+      p50LatencyMs: delta(activation.latencyMs.p50, baseline.latencyMs.p50),
+      p95LatencyMs: delta(activation.latencyMs.p95, baseline.latencyMs.p95),
+      inputTokens: delta(activation.usage.inputTokens, baseline.usage.inputTokens),
+      outputTokens: delta(activation.usage.outputTokens, baseline.usage.outputTokens),
+      costMicros: delta(activation.usage.costMicros, baseline.usage.costMicros),
+      cpuMs: delta(activation.usage.cpuMs, baseline.usage.cpuMs),
+      peakMemoryBytes: delta(activation.usage.peakMemoryBytes, baseline.usage.peakMemoryBytes),
+    },
+  };
+}
+
 function readJsonLines<T>(path: string): T[] {
   return readFileSync(path, 'utf8').split(/\r?\n/u).filter((line) => line.trim()).map((line) => JSON.parse(line) as T);
 }
 
 function runCli(): void {
-  const [casesPath, observationsPath] = process.argv.slice(2);
+  const [casesPath, observationsPath, activationObservationsPath] = process.argv.slice(2);
   if (!casesPath || !observationsPath) {
-    process.stderr.write('usage: tsx scripts/memory-evaluation.ts <cases.jsonl> <observations.jsonl>\n');
+    process.stderr.write('usage: tsx scripts/memory-evaluation.ts <cases.jsonl> <baseline.jsonl> [activation.jsonl]\n');
     process.exitCode = 2;
     return;
   }
   const cases = readJsonLines<MemoryEvaluationCase>(resolve(casesPath));
-  const observations = readJsonLines<MemoryEvaluationObservation>(resolve(observationsPath));
-  process.stdout.write(`${JSON.stringify(scoreMemoryEvaluation(cases, observations), null, 2)}\n`);
+  const baseline = readJsonLines<MemoryEvaluationObservation>(resolve(observationsPath));
+  const result = activationObservationsPath
+    ? compareMemoryEvaluations(cases, baseline, readJsonLines<MemoryEvaluationObservation>(resolve(activationObservationsPath)))
+    : scoreMemoryEvaluation(cases, baseline);
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) runCli();
