@@ -234,21 +234,63 @@ describe('Hindsight source-fact recall', () => {
       userEventDocumentId: sourceEvent!, targetCreatedAt: oldAt, semanticMatch: 0.9, intensity: 0,
     });
 
-    const read = await runtime.recallForTurn('What did I tell you last time?', { captureTrace: true, activationInfluence: 0 });
-    const defaultRead = await runtime.recallForTurn('What did I tell you last time?', { captureTrace: true });
+    const baselineRead = await runtime.recallForTurn('What did I tell you last time?', { captureTrace: true, activationEnabled: false });
+    const baselineActivation = store.loadActivationState('bank-test', api.baseUrl, 'doc-old-event');
+    const read = await runtime.recallForTurn('What did I tell you last time?', { captureTrace: true });
     const activation = store.loadActivationState('bank-test', api.baseUrl, 'doc-old-event');
 
+    expect(baselineRead.status).toBe('found');
+    expect(baselineRead.text).toContain('The person visited a coastal town.');
+    expect(baselineRead.trace?.format.activationInfluence).toBe(0);
+    expect(baselineRead.trace?.search.items[0]?.activationWeight).toBeUndefined();
+    expect(baselineActivation).toMatchObject({ independentMentionCount: 1, lastRetrievedAt: null });
     expect(read.status).toBe('found');
     expect(read.text).toContain('The person visited a coastal town.');
     expect(read.trace?.search.items[0]?.activationWeight).toBeCloseTo(0.05, 2);
     expect(read.trace?.format.activationWeights).toEqual([
       { resultId: 'observation-old-event', weight: read.trace?.search.items[0]?.activationWeight },
     ]);
-    expect(read.trace?.format.activationInfluence).toBe(0);
-    expect(defaultRead.trace?.format.activationInfluence).toBe(0.25);
+    expect(read.trace?.format.activationInfluence).toBe(0.25);
     expect(activation).toMatchObject({ anchorAt: oldAt, independentMentionCount: 1 });
     expect(activation?.anchorWeight).toBe(0.8);
     expect(activation?.lastRetrievedAt).not.toBeNull();
+  });
+
+  it('holds user remention state fixed in the no-activation baseline', async () => {
+    const now = new Date();
+    const oldAt = new Date(now.getTime() - 400 * 86_400_000).toISOString();
+    const currentAt = now.toISOString();
+    const api = await hindsightServer(historicalEventResponse(oldAt));
+    const root = mkdtempSync(join(tmpdir(), 'coo-recall-no-activation-'));
+    roots.push(root);
+    const { memory } = await configuredMemory(api.baseUrl, root);
+    const runtime = memory as unknown as HindsightMemory;
+    const store = (memory as unknown as { stateStore: MemoryStateStore }).stateStore;
+    const oldSource = runtime.retainUser('I visited a coastal town.', { cursor: 9151, timestamp: oldAt });
+    expect(oldSource).not.toBeNull();
+    store.recordUserMention({
+      bankId: 'bank-test', endpoint: api.baseUrl, targetDocumentId: 'doc-old-event',
+      userEventDocumentId: oldSource!, targetCreatedAt: oldAt, semanticMatch: 0.9, intensity: 0,
+    });
+    const currentSource = runtime.retainUser('What did I tell you last time?', { cursor: 9152, timestamp: currentAt });
+    expect(currentSource).not.toBeNull();
+
+    const baseline = await runtime.recallForTurn('What did I tell you last time?', {
+      userEventDocumentId: currentSource!, activationEnabled: false, captureTrace: true,
+    });
+    const afterBaseline = store.loadActivationState('bank-test', api.baseUrl, 'doc-old-event');
+    const activation = await runtime.recallForTurn('What did I tell you last time?', {
+      userEventDocumentId: currentSource!, captureTrace: true,
+    });
+    const afterActivation = store.loadActivationState('bank-test', api.baseUrl, 'doc-old-event');
+
+    expect(baseline.trace?.format.activationInfluence).toBe(0);
+    expect(baseline.trace?.search.items[0]?.activationWeight).toBeUndefined();
+    expect(afterBaseline).toMatchObject({ anchorAt: oldAt, independentMentionCount: 1, lastRetrievedAt: null });
+    expect(activation.trace?.format.activationInfluence).toBe(0.25);
+    expect(activation.status).toBe('found');
+    expect(afterActivation).toMatchObject({ anchorAt: currentAt, independentMentionCount: 2 });
+    expect(afterActivation?.lastRetrievedAt).not.toBeNull();
   });
 
   it('boosts and re-times one verified personal event on a strong user remention', async () => {

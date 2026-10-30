@@ -100,6 +100,7 @@ export interface RecallOptions {
   maxItems?: number;
   coverageWeight?: number;
   activationInfluence?: number;
+  activationEnabled?: boolean;
   budget?: 'low' | 'mid' | 'high';
   types?: string[];
   captureTrace?: boolean;
@@ -941,7 +942,7 @@ export class HindsightMemory {
       });
       if (visible.length > 0) {
         const activationNow = new Date().toISOString();
-        const weighted = visible.map((result) => {
+        const weighted = opts.activationEnabled === false ? visible : visible.map((result) => {
           const withWeight = this.addActivationWeight(result, activationNow);
           const traceItem = traceByMapped?.get(result);
           if (traceItem && withWeight.activationWeight !== undefined) traceItem.activationWeight = withWeight.activationWeight;
@@ -965,7 +966,9 @@ export class HindsightMemory {
 
   async recallBlockDetailed(query: string, opts: RecallOptions = {}): Promise<MemoryTextRead> {
     const read = await this.searchResultsDetailed(query, opts);
-    if (opts.userEventDocumentId && read.status === 'found') this.reinforceFromUserTurn(read.results, opts.userEventDocumentId, query);
+    if (opts.activationEnabled !== false && opts.userEventDocumentId && read.status === 'found') {
+      this.reinforceFromUserTurn(read.results, opts.userEventDocumentId, query);
+    }
     const config = this.config;
     const maxTokens = opts.maxTokens ?? config?.recall.maxTokens ?? 900;
     const maxChars = opts.maxChars ?? Math.max(800, maxTokens * 5);
@@ -985,7 +988,9 @@ export class HindsightMemory {
       maxChars,
       ...(opts.maxItems === undefined ? {} : { maxItems: opts.maxItems }),
       ...(opts.coverageWeight === undefined ? {} : { coverageWeight: opts.coverageWeight }),
-      ...(opts.activationInfluence === undefined ? {} : { activationInfluence: opts.activationInfluence }),
+      ...(opts.activationEnabled === false
+        ? { activationInfluence: 0 }
+        : opts.activationInfluence === undefined ? {} : { activationInfluence: opts.activationInfluence }),
       ...(read.sourceFactsTruncated ? { sourceFactsTruncated: true } : {}),
     };
     if (opts.captureTrace) {
@@ -1015,7 +1020,7 @@ export class HindsightMemory {
    * One recall for an incoming turn, routed by whether the answer depends on a past fact.
    * Results are cached briefly; explicit memory changes clear the cache.
    */
-  async recallForTurn(query: string, context: { userEventDocumentId?: string; activationInfluence?: number; captureTrace?: boolean } = {}): Promise<TurnRecall> {
+  async recallForTurn(query: string, context: { userEventDocumentId?: string; activationInfluence?: number; activationEnabled?: boolean; captureTrace?: boolean } = {}): Promise<TurnRecall> {
     const started = Date.now();
     const epoch = this.cacheEpoch;
     const config = this.config;
@@ -1039,7 +1044,7 @@ export class HindsightMemory {
       };
     };
     if (plan.route === 'fast') return finish('', 'skipped');
-    const key = `${config?.bankId ?? ''}|${config?.apiUrl ?? ''}|${this.visibilityEpoch()}|${plan.route}|${context.userEventDocumentId ?? ''}|${context.activationInfluence ?? 'default'}|${query.trim().toLowerCase().slice(0, 300)}`;
+    const key = `${config?.bankId ?? ''}|${config?.apiUrl ?? ''}|${this.visibilityEpoch()}|${plan.route}|${context.userEventDocumentId ?? ''}|${context.activationEnabled === false ? 'disabled' : 'enabled'}|${context.activationInfluence ?? 'default'}|${query.trim().toLowerCase().slice(0, 300)}`;
     const cached = !context.captureTrace && plan.route === 'standard' ? this.recallCache.get(key) : undefined;
     if (cached && Date.now() - cached.at < 5 * 60_000) return finish(cached.value, 'found');
     const read = await this.recallBlockDetailed(query, {
@@ -1047,6 +1052,7 @@ export class HindsightMemory {
       maxTokens: plan.maxTokens,
       timeoutMs: plan.timeoutMs,
       maxChars: plan.maxChars,
+      ...(context.activationEnabled === undefined ? {} : { activationEnabled: context.activationEnabled }),
       ...(context.activationInfluence === undefined ? {} : { activationInfluence: context.activationInfluence }),
       ...(context.captureTrace ? { captureTrace: true } : {}),
       ...(context.userEventDocumentId ? { userEventDocumentId: context.userEventDocumentId } : {}),
