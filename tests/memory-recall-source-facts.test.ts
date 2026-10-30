@@ -6,6 +6,7 @@ import type { AddressInfo } from 'node:net';
 import { HindsightClient } from '@vectorize-io/hindsight-client';
 import { afterEach, describe, expect, it } from 'vitest';
 import { HindsightMemory, type MemoryTextRead } from '../core/memory/hindsight.ts';
+import { growthMemorySearchTool } from '../core/growth/review.ts';
 import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import { MemoryOutbox } from '../core/memory/outbox.ts';
 import { closeMemoryStateStores } from '../core/memory/state-store.ts';
@@ -171,6 +172,7 @@ describe('Hindsight source-fact recall', () => {
     expect(read.text).toContain('Lin coordinated the shared materials.');
     expect(read.text).toContain('Wei reviewed the shared plan.');
     expect(read.trace?.search.items).toEqual([{
+      resultIndex: 0,
       resultId: 'observation-plan',
       parentDocumentId: 'doc-observation',
       declaredSourceFactIds: ['fact-coordination', 'fact-review'],
@@ -181,6 +183,7 @@ describe('Hindsight source-fact recall', () => {
       disposition: 'visible',
       sourceFactsIncomplete: false,
     }]);
+    expect(read.trace?.search.candidateResultIndexes).toEqual([0]);
     expect(read.trace?.search.candidateResultIds).toEqual(['observation-plan']);
     expect(read.trace?.format.includedSourceDocumentIds).toEqual(['doc-coordination', 'doc-review']);
     expect(JSON.stringify(read.trace)).not.toContain('Lin coordinated the shared materials.');
@@ -253,6 +256,54 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
   memory.unavailableUntil = 0;
   return { memory, ledger };
 }
+
+  it('uses the shared source-fact formatter in the Growth memory search', async () => {
+    const api = await hindsightServer({
+      results: [{
+        id: 'observation-growth',
+        text: 'Two verified events describe the shared work.',
+        type: 'observation',
+        document_id: 'doc-observation',
+        source_fact_ids: ['fact-one', 'fact-two'],
+      }],
+      source_facts: {
+        'fact-one': { id: 'fact-one', text: 'Lin coordinated the materials.', type: 'world', document_id: 'doc-one' },
+        'fact-two': { id: 'fact-two', text: 'Wei reviewed the plan.', type: 'experience', document_id: 'doc-two' },
+      },
+      source_facts_truncated: false,
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-growth-memory-search-'));
+    roots.push(root);
+    const { memory } = await configuredMemory(api.baseUrl, root);
+    const tool = growthMemorySearchTool(() => memory as unknown as HindsightMemory);
+    const result = await tool.handler!({ query: 'What shared work was recorded?', max_tokens: 600 }, {} as never);
+
+    expect(result).toContain('source_id:doc-one');
+    expect(result).toContain('source_id:doc-two');
+    expect(result).not.toContain('source_id:doc-observation');
+    expect(result).toContain('Lin coordinated the materials.');
+    expect(result).toContain('Wei reviewed the plan.');
+    expect(api.requests).toHaveLength(1);
+  });
+
+  it('keeps the source-fact request budget independent from the recall token budget', async () => {
+    const api = await hindsightServer({ results: [], source_facts: {}, source_facts_truncated: false });
+    const root = mkdtempSync(join(tmpdir(), 'coo-recall-source-budget-'));
+    roots.push(root);
+    const { memory } = await configuredMemory(api.baseUrl, root);
+    const read = await (memory as unknown as HindsightMemory).searchResultsDetailed('Find one synthetic record.', {
+      maxTokens: 300,
+      maxSourceFactsTokens: 5000,
+      captureTrace: true,
+    });
+    const include = api.requests[0]?.include as { source_facts?: { max_tokens?: number } } | undefined;
+
+    expect(read.status).toBe('absent');
+    expect(read.trace?.recallTokenBudget).toBe(300);
+    expect(read.trace?.sourceFactsTokenBudget).toBe(4096);
+    expect(include?.source_facts?.max_tokens).toBe(4096);
+    expect(api.requests[0]?.max_tokens).toBe(300);
+  });
 
   it('keeps source facts isolated when two banks recall the same question', async () => {
     const api = await bankHindsightServer();

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { formatRecallDetailed, type FormattedRecallResult } from '../core/memory/format.ts';
 import { observationFromRecallTrace, scoreMemoryEvaluation } from '../scripts/memory-evaluation.ts';
 import { createDevelopmentMemoryEvaluationSet } from './fixtures/memory-evaluation.ts';
 
@@ -47,27 +48,54 @@ describe('memory evaluation contract', () => {
     const observation = observationFromRecallTrace('case-a', {
       status: 'found',
       sourceFactsTruncated: false,
+      candidateResultIndexes: [0, 1],
       candidateResultIds: ['observation', 'direct'],
       items: [
         {
-          resultId: 'observation', parentDocumentId: 'doc-derived', declaredSourceFactIds: ['fact-a'],
+          resultIndex: 0, resultId: 'observation', parentDocumentId: 'doc-derived', declaredSourceFactIds: ['fact-a'],
           verifiedSources: [{ sourceFactId: 'fact-a', documentId: 'doc-a' }], disposition: 'visible', sourceFactsIncomplete: false,
         },
         {
-          resultId: 'direct', parentDocumentId: 'doc-b', declaredSourceFactIds: [], verifiedSources: [],
+          resultIndex: 1, resultId: 'direct', parentDocumentId: 'doc-b', declaredSourceFactIds: [], verifiedSources: [],
           disposition: 'visible', sourceFactsIncomplete: false,
         },
       ],
     }, {
-      inputResultIds: ['observation', 'direct'], includedResultIds: ['observation', 'direct'], omittedResultIds: [],
-      deduplicatedResultIds: [], includedSourceDocumentIds: ['doc-a', 'doc-b'], omittedSourceDocumentIds: [],
+      inputResultIndexes: [0, 1], inputResultIds: ['observation', 'direct'],
+      candidateResultIndexes: [0, 1], candidateResultIds: ['observation', 'direct'],
+      includedResultIndexes: [0, 1], includedResultIds: ['observation', 'direct'], omittedResultIndexes: [], omittedResultIds: [],
+      deduplicatedResultIndexes: [], deduplicatedResultIds: [], includedSourceDocumentIds: ['doc-a', 'doc-b'], omittedSourceDocumentIds: [],
       incompleteResultIds: [], clippedResultIds: [], clippedContextResultIds: [], clippedSourceFactIds: [],
-      sourceFactsTruncated: false, maxChars: 2000, usedChars: 400,
+      sourceFactsTruncated: false, coverageWeight: 0.5, maxChars: 2000, usedChars: 400,
     });
 
     expect(observation.sourceIdsAt5).toEqual([['doc-a'], ['doc-b']]);
     expect(observation.visibleSourceIds).toEqual(['doc-a', 'doc-b']);
     expect(observation.contextSourceIds).toEqual(['doc-a', 'doc-b']);
+  });
+
+  it('compares context coverage after a one-variable pack-order change', () => {
+    const results: FormattedRecallResult[] = [
+      { id: 'a-primary', text: 'The first relevant record.', type: 'world', document_id: 'doc-a' },
+      { id: 'a-repeated', text: 'Another record from the same source.', type: 'world', document_id: 'doc-a' },
+      { id: 'b-support', text: 'The second required source.', type: 'world', document_id: 'doc-b' },
+    ];
+    const baseline = formatRecallDetailed(results, { maxItems: 2, coverageWeight: 0 });
+    const adjusted = formatRecallDetailed(results, { maxItems: 2, coverageWeight: 0.5 });
+    const testCase = { id: 'case-a', answerable: true, requiredSourceIds: ['doc-a', 'doc-b'] };
+    const observation = (format: typeof baseline): Parameters<typeof scoreMemoryEvaluation>[1][number] => ({
+      caseId: 'case-a',
+      sourceIdsAt5: [[ 'doc-a' ], [ 'doc-a' ], [ 'doc-b' ]],
+      visibleSourceIds: ['doc-a', 'doc-b'],
+      contextSourceIds: format.trace.includedSourceDocumentIds,
+    });
+
+    const baselineScore = scoreMemoryEvaluation([testCase], [observation(baseline)]);
+    const adjustedScore = scoreMemoryEvaluation([testCase], [observation(adjusted)]);
+
+    expect(baselineScore.completeEvidenceAt5.value).toBe(1);
+    expect(baselineScore.contextComplete.value).toBe(0);
+    expect(adjustedScore.contextComplete.value).toBe(1);
   });
 
   it('rejects missing, duplicate and unpaired evaluation rows', () => {

@@ -153,12 +153,33 @@ describe('memory formatting', () => {
     ], { maxChars: 260 });
 
     expect(formatted.text.length).toBeLessThanOrEqual(260);
+    expect(formatted.trace.candidateResultIndexes).toEqual([0]);
+    expect(formatted.trace.includedResultIndexes).toEqual([0]);
     expect(formatted.trace.inputResultIds).toEqual(['observation-trace']);
     expect(formatted.trace.includedResultIds).toEqual(['observation-trace']);
     expect(formatted.trace.includedSourceDocumentIds).toEqual(['doc-a']);
     expect(formatted.trace.omittedSourceDocumentIds).toEqual(['doc-b']);
     expect(formatted.trace.incompleteResultIds).toEqual(['observation-trace']);
     expect(JSON.stringify(formatted.trace)).not.toContain('First synthetic supporting event.');
+  });
+
+  it('selects a result that adds source coverage when the item budget is tight', () => {
+    const results = [
+      recallResult({ id: 'primary', text: 'The first record is relevant.', document_id: 'doc-a' }),
+      recallResult({ id: 'redundant', text: 'A second record from the same source.', document_id: 'doc-a' }),
+      recallResult({ id: 'additional', text: 'A useful record from another source.', document_id: 'doc-b' }),
+    ];
+    const baseline = formatRecallDetailed(results, { maxItems: 2, coverageWeight: 0 });
+    const formatted = formatRecallDetailed(results, { maxItems: 2, coverageWeight: 0.5 });
+
+    expect(formatted.trace.inputResultIndexes).toEqual([0, 1, 2]);
+    expect(formatted.trace.candidateResultIndexes).toEqual([0, 2, 1]);
+    expect(formatted.trace.includedResultIndexes).toEqual([0, 2]);
+    expect(formatted.trace.includedSourceDocumentIds).toEqual(['doc-a', 'doc-b']);
+    expect(baseline.trace.includedResultIndexes).toEqual([0, 1]);
+    expect(baseline.trace.includedSourceDocumentIds).toEqual(['doc-a']);
+    expect(formatted.text.indexOf('The first record is relevant.')).toBeLessThan(formatted.text.indexOf('A useful record from another source.'));
+    expect(formatted.text).not.toContain('A second record from the same source.');
   });
 
   it('preserves distinct supporting facts for duplicate observations with the same source document', () => {

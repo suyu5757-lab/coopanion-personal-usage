@@ -24,6 +24,7 @@ export interface MemoryTextRead {
     format: RecallFormatTrace;
     maxTokens: number;
     maxChars: number;
+    sourceFactsTokenBudget?: number;
   };
 }
 
@@ -56,6 +57,7 @@ export interface MemorySearchRead {
 }
 
 export interface MemorySearchTraceItem {
+  resultIndex: number;
   resultId: string;
   parentDocumentId: string | null;
   declaredSourceFactIds: string[];
@@ -67,9 +69,12 @@ export interface MemorySearchTraceItem {
 
 export interface MemorySearchTrace {
   items: MemorySearchTraceItem[];
+  candidateResultIndexes: number[];
   candidateResultIds: string[];
   status: MemoryReadStatus;
   sourceFactsTruncated: boolean;
+  recallTokenBudget?: number;
+  sourceFactsTokenBudget?: number;
 }
 
 export interface MemoryLog {
@@ -80,7 +85,10 @@ export interface MemoryLog {
 export interface RecallOptions {
   timeoutMs?: number;
   maxTokens?: number;
+  maxSourceFactsTokens?: number;
   maxChars?: number;
+  maxItems?: number;
+  coverageWeight?: number;
   budget?: 'low' | 'mid' | 'high';
   types?: string[];
   captureTrace?: boolean;
@@ -689,6 +697,8 @@ export class HindsightMemory {
 
   async searchResultsDetailed(query: string, opts: RecallOptions = {}): Promise<MemorySearchRead> {
     const traceItems: MemorySearchTraceItem[] = [];
+    let recallTokenBudget: number | undefined;
+    let sourceFactsTokenBudget: number | undefined;
     const finishRead = (results: MemorySearchResult[], status: MemoryReadStatus, sourceFactsTruncated = false): MemorySearchRead => ({
       results,
       status,
@@ -696,9 +706,12 @@ export class HindsightMemory {
       ...(opts.captureTrace ? {
         trace: {
           items: traceItems,
+          candidateResultIndexes: traceItems.filter((item) => item.disposition === 'visible').map((item) => item.resultIndex),
           candidateResultIds: traceItems.filter((item) => item.disposition === 'visible').map((item) => item.resultId),
           status,
           sourceFactsTruncated,
+          ...(recallTokenBudget === undefined ? {} : { recallTokenBudget }),
+          ...(sourceFactsTokenBudget === undefined ? {} : { sourceFactsTokenBudget }),
         },
       } : {}),
     });
@@ -708,15 +721,19 @@ export class HindsightMemory {
     const epoch = this.cacheEpoch;
     const config = this.config!;
     const timeoutMs = opts.timeoutMs ?? config.recall.timeoutMs;
+    recallTokenBudget = opts.maxTokens ?? config.recall.maxTokens;
+    sourceFactsTokenBudget = typeof opts.maxSourceFactsTokens === 'number' && Number.isFinite(opts.maxSourceFactsTokens)
+      ? Math.min(4096, Math.max(1, Math.round(opts.maxSourceFactsTokens)))
+      : Math.min(1024, recallTokenBudget);
     try {
       const response = await this.client!.recall(config.bankId, query.slice(0, 1800), {
         types: opts.types ?? config.recall.types,
-        maxTokens: opts.maxTokens ?? config.recall.maxTokens,
+        maxTokens: recallTokenBudget,
         budget: opts.budget ?? config.recall.budget,
         preferObservations: true,
         includeEntities: false,
         includeSourceFacts: true,
-        maxSourceFactsTokens: Math.min(1024, opts.maxTokens ?? config.recall.maxTokens),
+        maxSourceFactsTokens: sourceFactsTokenBudget,
         queryTimestamp: new Date().toISOString(),
         signal: AbortSignal.timeout(timeoutMs),
       });
@@ -731,7 +748,7 @@ export class HindsightMemory {
       let blockedDerivedResults = 0;
       const verifiedSupport = new WeakSet<MemorySearchResult>();
       const traceByMapped = opts.captureTrace ? new Map<MemorySearchResult, MemorySearchTraceItem>() : undefined;
-      const results = response.results.flatMap((result): MemorySearchResult[] => {
+      const results = response.results.flatMap((result, resultIndex): MemorySearchResult[] => {
         const documentId = result.document_id ?? null;
         const metadata = result.metadata ? { ...result.metadata } : {};
         if (documentId && currentRevisions.has(documentId)) metadata.status = 'current';
@@ -739,6 +756,7 @@ export class HindsightMemory {
         const sourceFacts: MemorySearchSourceFact[] = [];
         const sourceFactIds = [...new Set(result.source_fact_ids ?? [])];
         const traceItem: MemorySearchTraceItem | undefined = opts.captureTrace ? {
+          resultIndex,
           resultId: result.id,
           parentDocumentId: documentId,
           declaredSourceFactIds: sourceFactIds,
@@ -858,6 +876,8 @@ export class HindsightMemory {
     }));
     const formatOptions = {
       maxChars,
+      ...(opts.maxItems === undefined ? {} : { maxItems: opts.maxItems }),
+      ...(opts.coverageWeight === undefined ? {} : { coverageWeight: opts.coverageWeight }),
       ...(read.sourceFactsTruncated ? { sourceFactsTruncated: true } : {}),
     };
     if (opts.captureTrace) {
@@ -866,7 +886,13 @@ export class HindsightMemory {
       return {
         text: formatted.text,
         status: formatted.text ? 'found' : read.results.length > 0 ? 'absent' : read.status,
-        trace: { search: read.trace, format: formatted.trace, maxTokens, maxChars },
+        trace: {
+          search: read.trace,
+          format: formatted.trace,
+          maxTokens,
+          maxChars,
+          ...(read.trace.sourceFactsTokenBudget === undefined ? {} : { sourceFactsTokenBudget: read.trace.sourceFactsTokenBudget }),
+        },
       };
     }
     const text = formatRecall(formattedResults, formatOptions);
