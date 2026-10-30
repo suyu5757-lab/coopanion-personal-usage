@@ -3,6 +3,7 @@ import { createDevelopmentMemoryEvaluationSet } from './fixtures/memory-evaluati
 import {
   createMemoryEvaluationHoldoutCorpus,
   createMemoryEvaluationHoldoutPrompts,
+  createMemoryEvaluationHoldoutScoringCases,
   createMemoryEvaluationHoldoutSet,
 } from './fixtures/memory-evaluation-holdout.ts';
 import { createMemoryEvaluationHoldoutGold, validateMemoryEvaluationHoldoutGold } from './fixtures/memory-evaluation-holdout-gold.ts';
@@ -12,6 +13,7 @@ describe('memory evaluation sealed holdout', () => {
     const cases = createMemoryEvaluationHoldoutSet();
     const prompts = createMemoryEvaluationHoldoutPrompts();
     const corpus = createMemoryEvaluationHoldoutCorpus();
+    const scoringCases = createMemoryEvaluationHoldoutScoringCases();
     const gold = createMemoryEvaluationHoldoutGold();
     const developmentIds = new Set(createDevelopmentMemoryEvaluationSet().map((item) => item.id));
 
@@ -30,6 +32,19 @@ describe('memory evaluation sealed holdout', () => {
     expect(prompts.filter((item) => item.id.startsWith('holdout-natural-')).every((item) => !/what did .* choose|what colour did|你之前选|上次选/i.test(item.query))).toBe(true);
     expect(corpus).toHaveLength(cases.length);
     expect(corpus.every((item) => !('query' in item) && !('category' in item) && !('requiredSourceIds' in item) && !('deletedSourceIds' in item) && !('forbiddenSourceIds' in item))).toBe(true);
+    expect(scoringCases).toHaveLength(cases.length);
+    expect(scoringCases.every((item) => Object.keys(item).sort().join(',') === 'answerable,category,deletedSourceIds,forbiddenSourceIds,id,requiredSourceIds')).toBe(true);
+    expect(scoringCases.map(({ id, answerable, requiredSourceIds, deletedSourceIds, forbiddenSourceIds, category }) => ({ id, answerable, requiredSourceIds, deletedSourceIds, forbiddenSourceIds, category }))).toEqual(
+      cases.map(({ id, answerable, requiredSourceIds, deletedSourceIds, forbiddenSourceIds, category }) => ({
+        id,
+        answerable,
+        requiredSourceIds,
+        deletedSourceIds: deletedSourceIds ?? [],
+        forbiddenSourceIds,
+        category,
+      })),
+    );
+    expect(scoringCases.every((item) => !('query' in item) && !('documents' in item) && !('expectedAnswer' in item))).toBe(true);
     expect(gold.filter((item) => item.category === 'natural_recall')).toHaveLength(10);
     expect(gold.filter((item) => item.category === 'low_activation_cue')).toHaveLength(10);
     expect(cases.some((item) => item.category === 'low_activation_multihop')).toBe(true);

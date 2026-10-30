@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import {
   createMemoryEvaluationHoldoutCorpus,
   createMemoryEvaluationHoldoutPrompts,
+  createMemoryEvaluationHoldoutScoringCases,
 } from '../tests/fixtures/memory-evaluation-holdout.ts';
 
 async function runCli(): Promise<void> {
@@ -15,6 +16,10 @@ async function runCli(): Promise<void> {
     for (const item of createMemoryEvaluationHoldoutCorpus()) process.stdout.write(`${JSON.stringify(item)}\n`);
     return;
   }
+  if (mode === '--reveal-scoring-cases') {
+    for (const item of createMemoryEvaluationHoldoutScoringCases()) process.stdout.write(`${JSON.stringify(item)}\n`);
+    return;
+  }
   if (mode === '--reveal-gold') {
     const { createMemoryEvaluationHoldoutGold } = await import('../tests/fixtures/memory-evaluation-holdout-gold.ts');
     for (const item of createMemoryEvaluationHoldoutGold()) process.stdout.write(`${JSON.stringify(item)}\n`);
@@ -22,6 +27,7 @@ async function runCli(): Promise<void> {
   }
   process.stderr.write('usage: tsx scripts/memory-evaluation-holdout.ts cases\n');
   process.stderr.write('   or: tsx scripts/memory-evaluation-holdout.ts --reveal-corpus\n');
+  process.stderr.write('   or: tsx scripts/memory-evaluation-holdout.ts --reveal-scoring-cases (after outputs are frozen)\n');
   process.stderr.write('   or: tsx scripts/memory-evaluation-holdout.ts --reveal-gold\n');
   process.exitCode = 2;
 }

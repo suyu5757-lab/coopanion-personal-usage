@@ -266,6 +266,17 @@ export function createMemoryEvaluationHoldoutSet(): MemoryEvaluationHoldoutCase[
   ];
 }
 
+export function createMemoryEvaluationHoldoutScoringCases(): MemoryEvaluationCase[] {
+  return createMemoryEvaluationHoldoutSet().map(({ id, answerable, requiredSourceIds, deletedSourceIds, forbiddenSourceIds, category }) => ({
+    id,
+    answerable,
+    requiredSourceIds,
+    deletedSourceIds: deletedSourceIds ?? [],
+    forbiddenSourceIds,
+    category,
+  }));
+}
+
 export function createMemoryEvaluationHoldoutPrompts(): MemoryEvaluationHoldoutPrompt[] {
   return createMemoryEvaluationHoldoutSet().map(({ id, query }) => ({ id, query }));
 }
