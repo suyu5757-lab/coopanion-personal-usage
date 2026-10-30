@@ -1,7 +1,9 @@
 import { createRequire } from 'node:module';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { MemoryOutbox, readLegacyOutbox, requestHashFor, type RetainItem } from '../core/memory/outbox.ts';
 import { ForgetLedger, readLegacyForget } from '../core/memory/forget-ledger.ts';
@@ -136,6 +138,42 @@ describe('the memory transaction database', () => {
       lastUserMentionAt: '2026-10-01T12:00:00.000Z',
       lastRetrievedAt: '2026-10-03T12:00:00.000Z',
     });
+  });
+
+  it('restores an activation anchor in a new process after a restart', () => {
+    const path = join(root(), 'memory-state.sqlite');
+    const store = openMemoryStateStore(path);
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    const outbox = new MemoryOutbox(store);
+    const userEventDocumentId = 'user:main:restart-test';
+    const occurredAt = '2026-10-01T12:00:00.000Z';
+    const retrievedAt = '2026-10-03T12:00:00.000Z';
+    outbox.add(userEventItem(userEventDocumentId, occurredAt));
+    expect(store.recordUserMention({
+      bankId: 'bank-a', endpoint: 'http://hindsight.test', targetDocumentId: 'fact:restart-test',
+      userEventDocumentId, targetCreatedAt: '2026-09-01T12:00:00.000Z', semanticMatch: 0.9, intensity: 0.12,
+    }).status).toBe('applied');
+    store.activationForRetrieval('bank-a', 'http://hindsight.test', 'fact:restart-test', '2026-09-01T12:00:00.000Z', retrievedAt);
+    const saved = store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:restart-test');
+    expect(saved).not.toBeNull();
+    closeMemoryStateStores();
+
+    const stateStoreModule = pathToFileURL(join(process.cwd(), 'core/memory/state-store.ts')).href;
+    const childSource = `
+      import { closeMemoryStateStores, openMemoryStateStore } from ${JSON.stringify(stateStoreModule)};
+      const store = openMemoryStateStore(process.env.COO_TEST_MEMORY_STATE_PATH);
+      process.stdout.write(JSON.stringify(store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:restart-test')));
+      closeMemoryStateStores();
+    `;
+    const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', childSource], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: { ...process.env, COO_TEST_MEMORY_STATE_PATH: path },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    expect(JSON.parse(child.stdout)).toEqual(saved);
   });
 
   it('accepts only persisted user-origin events for mention reinforcement', () => {
