@@ -26,7 +26,7 @@ const zhHant: Translation<CoreText> = {
     },
     growth: {
       title: '自我成長',
-      description: '每隔一段時間，在安靜的時候回顧最近的經歷；只會留下候選成長提案，不會自動改動人設。',
+      description: '定期回顧預設關閉。開啟且長期記憶可用時，會在安靜時留下附來源的人設提案或體驗卡候選。每項都要你審核；不會自動修改人設或啟用卡片。',
       every: '每隔', everyDescription: '隔這麼多天回顧一次。',
       days: '天',
     },

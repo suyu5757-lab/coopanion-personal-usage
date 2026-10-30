@@ -168,6 +168,8 @@ export interface MemorySourceEvidence {
   visible: boolean;
   actor: string | null;
   status: string | null;
+  kind?: string;
+  occurredAt?: string;
 }
 
 function sourceMetadata(meta: SourceMeta): Record<string, string> {
@@ -1716,12 +1718,16 @@ export class HindsightMemory {
         : {};
       const locallySuperseded = this.stateStore!.supersededSources(config.bankId, config.apiUrl).has(documentId);
       const localCurrent = this.stateStore!.currentRevisionSources(config.bankId, config.apiUrl).has(documentId);
+      const kind = typeof metadata.kind === 'string' ? metadata.kind : undefined;
+      const occurredAt = typeof metadata.said_at === 'string' ? metadata.said_at : undefined;
       return {
         present: true,
         visible,
         actor: typeof metadata.source_actor === 'string' ? metadata.source_actor : null,
         status: localCurrent ? 'current' : locallySuperseded ? 'superseded'
           : typeof metadata.status === 'string' ? metadata.status : null,
+        ...(kind === undefined ? {} : { kind }),
+        ...(typeof occurredAt === 'string' ? { occurredAt } : {}),
       };
     } catch (err) {
       if (isMissing(err)) return { present: false, visible: this.sourceVisible(documentId), actor: null, status: null };

@@ -26,7 +26,7 @@ const de: Translation<CoreText> = {
     },
     growth: {
       title: 'Selbst wachsen',
-      description: 'Von Zeit zu Zeit blickt sie in einer ruhigen Minute auf die letzten Erfahrungen zurück. Dabei entsteht nur ein Vorschlag zur Entwicklung; ihre Persönlichkeit ändert sich dadurch nicht von selbst.',
+      description: 'Regelmäßige Rückblicke sind standardmäßig ausgeschaltet. Wenn du sie aktivierst und Langzeitgedächtnis verfügbar ist, kann ein ruhiger Rückblick quellenbasierte Persona-Vorschläge oder Erfahrungskarten hinterlassen. Du prüfst jeden Vorschlag; Persona wird nicht geändert und keine Karte automatisch aktiviert.',
       every: 'Alle', everyDescription: 'Nach so vielen Tagen blickt sie auf sich zurück.',
       days: 'Tage',
     },

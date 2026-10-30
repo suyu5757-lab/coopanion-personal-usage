@@ -26,7 +26,7 @@ const it: Translation<CoreText> = {
     },
     growth: {
       title: 'Crescere da sola',
-      description: 'Ogni tanto, in un momento tranquillo, ripensa alle esperienze recenti. Lascia solo una proposta di crescita da esaminare; non cambia la personalità da sola.',
+      description: 'Le revisioni periodiche sono disattivate per impostazione predefinita. Se le attivi e la memoria a lungo termine è disponibile, una revisione tranquilla può lasciare proposte per la Persona o schede esperienza con le relative fonti. Esamini ogni proposta; la Persona non cambia e nessuna scheda si attiva da sola.',
       every: 'Ogni', everyDescription: 'Ripensa a sé dopo questi giorni.',
       days: 'giorni',
     },

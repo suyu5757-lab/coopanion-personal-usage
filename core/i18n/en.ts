@@ -31,7 +31,7 @@ const en: CoreText = {
     },
     growth: {
       title: 'Growing on her own',
-      description: 'Every so often, during a quiet moment, she reviews recent experience. A review only leaves a candidate growth proposal; it does not change her persona by itself.',
+      description: 'Reviews are off by default. When enabled and long-term memory is available, a quiet review can leave source-linked Persona proposals or experience-card candidates. Each needs your review; neither changes Persona nor activates a card by itself.',
       every: 'Every', everyDescription: 'Review herself after this many days.',
       days: 'days',
     },

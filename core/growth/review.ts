@@ -5,10 +5,12 @@
  */
 import { hasRole, textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import { message, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
+import { join } from 'node:path';
 import type { CoreApi, ToolDef } from 'cortico/core/types.ts';
 import type { ModelLanguage } from '../language.ts';
 import type { HindsightMemory } from '../memory/hindsight.ts';
 import { memoryReadNotice } from '../memory/model-text.ts';
+import { ExperienceCards, readExperienceCardInput } from './experience-cards.ts';
 import { SELF_REVIEW_TEXT } from './model-text.ts';
 import { GrowthProposals, readProposalInput } from './proposals.ts';
 
@@ -27,9 +29,10 @@ export const GROWTH_TOOL_NAMES = [
 ] as const;
 
 export const PROPOSE_GROWTH_TOOL = 'propose_growth';
+export const PROPOSE_EXPERIENCE_TOOL = 'propose_experience';
 
 /** Growth reads include the exact source document id that a proposal must carry. */
-export function growthMemorySearchTool(memory: () => HindsightMemory | null): ToolDef {
+export function growthMemorySearchTool(memory: () => HindsightMemory | null, observedSourceIds?: Set<string>): ToolDef {
   return {
     name: 'memory_search',
     description: 'Search long-term memory for dated facts. Results include source_id values for the record and verified supporting sources; use exact IDs in a growth proposal so a later forget request can remove the derived proposal.',
@@ -51,7 +54,8 @@ export function growthMemorySearchTool(memory: () => HindsightMemory | null): To
       const maxTokens = typeof args.max_tokens === 'number' && Number.isFinite(args.max_tokens)
         ? Math.min(2000, Math.max(400, Math.round(args.max_tokens)))
         : 900;
-      const read = await store.recallBlockDetailed(query, { budget: 'low', maxTokens, timeoutMs: 5000, maxItems: 8 });
+      const read = await store.recallBlockDetailed(query, { budget: 'low', maxTokens, timeoutMs: 5000, maxItems: 8, captureTrace: true });
+      for (const sourceId of read.trace?.format.includedSourceDocumentIds ?? []) observedSourceIds?.add(sourceId);
       if (read.status !== 'found') return memoryReadNotice(read.status);
       return read.text || memoryReadNotice('fenced');
     },
@@ -99,7 +103,7 @@ const PROPOSE_GROWTH_DECL: Omit<ToolDef, 'handler'> = {
 
 const FINISH_REVIEW_DECL: Omit<ToolDef, 'handler'> = {
   name: 'finish_review',
-  description: 'Finish the self-review. Call it once, after leaving a proposal or deciding that nothing should change.',
+  description: 'Finish the self-review. Call it once, after leaving a Persona proposal or an experience candidate, or deciding that nothing should change.',
   tags: ['flow'],
   barrierAfter: true,
   endsTurn: true,
@@ -124,11 +128,13 @@ export interface GrowthReviewDeps {
   core: () => CoreApi | null;
   /** The main session's request context; its system records and recent messages are used. */
   snapshot: () => ContextRecord[];
-  /** The Persona's read-only and memory tools, already filtered to `GROWTH_TOOL_NAMES`. */
+  /** Persona read tools; Growth supplies a tracked memory_search tool for each run. */
   tools: () => ToolDef[];
   memory: () => HindsightMemory | null;
   /** Where candidate proposals are written, outside the Persona workspace. */
   proposalsDir: string;
+  /** Where source-linked experience candidates are written, outside the Persona workspace. */
+  experienceCardsDir?: string;
   modelLanguage: () => ModelLanguage;
   timezone: () => string;
   now?: () => Date;
@@ -209,6 +215,7 @@ function proposeGrowthTool(
   state: { cancelled: boolean; deadline: number },
   done: { proposals: number },
   memory: () => HindsightMemory | null,
+  observedSourceIds: ReadonlySet<string>,
 ): ToolDef {
   return {
     ...PROPOSE_GROWTH_DECL,
@@ -217,6 +224,8 @@ function proposeGrowthTool(
       if (done.proposals >= 3) return '[proposal rejected] At most three proposals per review.';
       const parsed = readProposalInput(args);
       if ('errors' in parsed) return `[proposal rejected] ${parsed.errors.join('; ')}`;
+      const unseen = parsed.proposal.sourceIds.find((sourceId) => !observedSourceIds.has(sourceId));
+      if (unseen) return `[proposal rejected] Source ${unseen} was not returned by memory_search.`;
       const source = memory();
       if (!source?.enabled()) return '[proposal rejected] Long-term memory is unavailable for source verification.';
       for (const sourceId of parsed.proposal.sourceIds) {
@@ -230,6 +239,70 @@ function proposeGrowthTool(
       if (!result.ok) return `[proposal rejected] ${result.errors.join('; ')}`;
       done.proposals += 1;
       return `[proposal saved] ${result.proposal.id}`;
+    },
+  };
+}
+
+const PROPOSE_EXPERIENCE_DECL: Omit<ToolDef, 'handler'> = {
+  name: PROPOSE_EXPERIENCE_TOOL,
+  description: 'Leave one source-linked experience card for the person to review. Use only a repeated, useful pattern supported by user-source records from different times; the card stays inactive until the person approves it.',
+  tags: ['write'],
+  parameters: {
+    type: 'object',
+    properties: {
+      title: { type: 'string', description: 'A short name for the candidate.' },
+      situation: { type: 'string', description: 'The recurring situation in which the experience applies.' },
+      lesson: { type: 'string', description: 'A short, concrete conversational lesson.' },
+      scope: { type: 'string', enum: ['conversation', 'proactive_speech', 'browser_exploration'] },
+      sourceIds: { type: 'array', items: { type: 'string' }, description: 'One to eight exact source_id values returned by memory_search.' },
+    },
+    required: ['title', 'situation', 'lesson', 'scope', 'sourceIds'],
+  },
+};
+
+function proposeExperienceTool(
+  store: ExperienceCards,
+  state: { cancelled: boolean; deadline: number },
+  done: { proposals: number },
+  memory: () => HindsightMemory | null,
+  observedSourceIds: ReadonlySet<string>,
+): ToolDef {
+  return {
+    ...PROPOSE_EXPERIENCE_DECL,
+    handler: async (args) => {
+      if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] No experience candidate was written.';
+      if (done.proposals >= 3) return '[candidate rejected] At most three candidates per review.';
+      const parsed = readExperienceCardInput(args);
+      if ('errors' in parsed) return `[candidate rejected] ${parsed.errors.join('; ')}`;
+      const unseen = parsed.card.sourceIds.find((sourceId) => !observedSourceIds.has(sourceId));
+      if (unseen) return `[candidate rejected] Source ${unseen} was not returned by memory_search.`;
+      if (new Set(parsed.card.sourceIds).size < 2) {
+        return '[candidate rejected] A recurring experience needs at least two different user-event sources.';
+      }
+      const source = memory();
+      if (!source?.enabled()) return '[candidate rejected] Long-term memory is unavailable for source verification.';
+      const dates = new Set<string>();
+      for (const sourceId of parsed.card.sourceIds) {
+        if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] No experience candidate was written.';
+        const evidence = await source.sourceEvidence(sourceId);
+        if (!evidence.present || !evidence.visible || evidence.actor !== 'user' || evidence.kind !== 'event'
+          || (evidence.status !== 'completed' && evidence.status !== 'current') || !source.sourceVisible(sourceId)) {
+          return `[candidate rejected] Source ${sourceId} is missing or fenced.`;
+        }
+        if (!evidence.occurredAt || !Number.isFinite(Date.parse(evidence.occurredAt))) {
+          return `[candidate rejected] Source ${sourceId} has no verifiable user-event date.`;
+        }
+        dates.add(new Date(evidence.occurredAt).toISOString().slice(0, 10));
+      }
+      if (dates.size < 2) return '[candidate rejected] User-event sources must span different dates.';
+      if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] No experience candidate was written.';
+      if (!parsed.card.sourceIds.every((sourceId) => source.sourceVisible(sourceId))) {
+        return '[candidate rejected] One or more sources are now fenced.';
+      }
+      const result = store.propose(args);
+      if (!result.ok) return `[candidate rejected] ${result.errors.join('; ')}`;
+      done.proposals += 1;
+      return `[experience candidate saved] ${result.card.id}`;
     },
   };
 }
@@ -252,6 +325,11 @@ export class GrowthReview {
     const deadline = Date.now() + timeoutMs;
     const state = { cancelled: false, deadline };
     const store = new GrowthProposals(this.d.proposalsDir, this.d.now ?? (() => new Date()));
+    const observedSourceIds = new Set<string>();
+    const experienceCards = new ExperienceCards(
+      this.d.experienceCardsDir ?? join(this.d.proposalsDir, 'experience-cards'),
+      this.d.now ?? (() => new Date()),
+    );
     const messages = [
       ...prefix,
       message('user', SELF_REVIEW_TEXT[this.d.modelLanguage()]({
@@ -265,7 +343,13 @@ export class GrowthReview {
     const fork = core.spawnFork({
       id: GROWTH_SESSION,
       messages,
-      tools: [...this.d.tools().map((tool) => guardRead(tool, state)), proposeGrowthTool(store, state, done, () => memory), finishReviewTool(done)],
+      tools: [
+        ...this.d.tools().filter((tool) => tool.name !== 'memory_search').map((tool) => guardRead(tool, state)),
+        guardRead(growthMemorySearchTool(() => memory, observedSourceIds), state),
+        proposeGrowthTool(store, state, done, () => memory, observedSourceIds),
+        proposeExperienceTool(experienceCards, state, done, () => memory, observedSourceIds),
+        finishReviewTool(done),
+      ],
       stopWhen: () => {
         if (Date.now() >= deadline) state.cancelled = true;
         return state.cancelled;

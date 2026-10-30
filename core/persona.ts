@@ -189,6 +189,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         tools: () => this.growthTools(),
         memory: () => this.longTerm,
         proposalsDir: join(dirname(this.growthStateFile), 'growth-proposals'),
+        experienceCardsDir: join(dirname(this.growthStateFile), 'experience-cards'),
         modelLanguage: () => this.modelLang(),
         timezone: this.timezoneNow,
         log,
@@ -200,7 +201,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         run: () => review.run(),
         paused: this.pausedNow,
         forkRunning: () => (this.core?.sessionInfo(GROWTH_SESSION).running ?? 0) > 0,
-        allowed: () => false,
+        allowed: () => this.longTerm?.enabled() ?? false,
         log,
       });
       try {
@@ -267,13 +268,36 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return memory.enabled() && memory.settled() && sourceIds.every((id) => memory.sourceVisible(id));
     }
 
+    private async verifiedRepeatedUserEventSources(sourceIds: readonly string[]): Promise<boolean> {
+      const memory = this.longTerm;
+      if (!memory?.enabled() || !memory.settled() || new Set(sourceIds).size < 2) return false;
+      const dates = new Set<string>();
+      for (const sourceId of new Set(sourceIds)) {
+        if (!memory.sourceVisible(sourceId)) return false;
+        try {
+          const source = await memory.sourceEvidence(sourceId);
+          if (!source.present || !source.visible || source.actor !== 'user' || source.kind !== 'event'
+            || (source.status !== 'completed' && source.status !== 'current') || !source.occurredAt
+            || !Number.isFinite(Date.parse(source.occurredAt)) || !memory.sourceVisible(sourceId)) return false;
+          dates.add(new Date(source.occurredAt).toISOString().slice(0, 10));
+        } catch {
+          return false;
+        }
+      }
+      return dates.size >= 2 && memory.enabled() && memory.settled()
+        && sourceIds.every((id) => memory.sourceVisible(id));
+    }
+
     private async experienceContext(): Promise<string> {
       const cards = this.experienceCards();
       const memory = this.longTerm;
       if (!cards || !memory?.enabled() || !memory.settled()) return '';
       const valid = new Set<string>();
       for (const card of cards.list('approved').slice(0, 8)) {
-        if (await this.verifiedMemorySources(card.sourceIds)) valid.add(card.id);
+        const sourcesValid = card.userExplicit
+          ? await this.verifiedMemorySources(card.sourceIds)
+          : await this.verifiedRepeatedUserEventSources(card.sourceIds);
+        if (sourcesValid) valid.add(card.id);
       }
       if (!memory.enabled() || !memory.settled()) return '';
       return cards.approvedContext(8, 3200, (card) => valid.has(card.id));
@@ -498,7 +522,10 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
         const before = cards?.get(id);
         if (action === 'approved') {
           const memory = this.longTerm;
-          if (!before || !memory?.enabled() || !await this.verifiedMemorySources(before.sourceIds)) {
+          const sourcesValid = before && (before.userExplicit
+            ? await this.verifiedMemorySources(before.sourceIds)
+            : await this.verifiedRepeatedUserEventSources(before.sourceIds));
+          if (!memory?.enabled() || !sourcesValid) {
             throw new Error('The experience sources cannot be verified.');
           }
         }

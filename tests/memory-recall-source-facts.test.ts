@@ -395,15 +395,39 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
     const root = mkdtempSync(join(tmpdir(), 'coo-growth-memory-search-'));
     roots.push(root);
     const { memory } = await configuredMemory(api.baseUrl, root);
-    const tool = growthMemorySearchTool(() => memory as unknown as HindsightMemory);
+    const observedSourceIds = new Set<string>();
+    const tool = growthMemorySearchTool(() => memory as unknown as HindsightMemory, observedSourceIds);
     const result = await tool.handler!({ query: 'What shared work was recorded?', max_tokens: 600 }, {} as never);
 
     expect(result).toContain('source_id:doc-one');
     expect(result).toContain('source_id:doc-two');
     expect(result).not.toContain('source_id:doc-observation');
+    expect(observedSourceIds).toEqual(new Set(['doc-one', 'doc-two']));
     expect(result).toContain('Lin coordinated the materials.');
     expect(result).toContain('Wei reviewed the plan.');
     expect(api.requests).toHaveLength(1);
+  });
+
+  it('uses a user event said_at as its evidence date and does not substitute ingestion time', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'coo-source-evidence-date-'));
+    roots.push(root);
+    const { memory } = await configuredMemory('http://127.0.0.1:1', root);
+    const client = memory.client as unknown as {
+      getDocument: (bankId: string, documentId: string, options?: unknown) => Promise<unknown>;
+    };
+    client.getDocument = async (_bankId, documentId) => ({
+      id: documentId,
+      bank_id: 'bank-test',
+      created_at: '2026-10-31T12:00:00.000Z',
+      document_metadata: documentId === 'doc-dated'
+        ? { source_actor: 'user', kind: 'event', said_at: '2026-10-01T12:00:00.000Z' }
+        : { source_actor: 'user', kind: 'event' },
+    });
+    const source = memory as unknown as HindsightMemory;
+
+    await expect(source.sourceEvidence('doc-dated')).resolves.toMatchObject({ occurredAt: '2026-10-01T12:00:00.000Z' });
+    await expect(source.sourceEvidence('doc-no-said-at')).resolves.toMatchObject({ kind: 'event' });
+    await expect(source.sourceEvidence('doc-no-said-at')).resolves.not.toHaveProperty('occurredAt');
   });
 
   it('keeps the source-fact request budget independent from the recall token budget', async () => {

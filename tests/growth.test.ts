@@ -1,7 +1,7 @@
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CoreApi, ForkOptions, TimerEntry, TimersApi, ToolDef } from 'cortico/core/types.ts';
 import { message, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
@@ -10,7 +10,8 @@ import { coopanionPersona } from '../core/persona.ts';
 import type { HindsightMemory } from '../core/memory/hindsight.ts';
 import { GROWTH_DEFAULTS, readGrowth } from '../core/growth/config.ts';
 import { SELF_REVIEW_TEXT } from '../core/growth/model-text.ts';
-import { GROWTH_SESSION, GrowthReview, PROPOSE_GROWTH_TOOL } from '../core/growth/review.ts';
+import { ExperienceCards } from '../core/growth/experience-cards.ts';
+import { GROWTH_SESSION, GrowthReview, PROPOSE_EXPERIENCE_TOOL, PROPOSE_GROWTH_TOOL } from '../core/growth/review.ts';
 import { GrowthSchedule } from '../core/growth/schedule.ts';
 import { GrowthProposals, readProposalInput } from '../core/growth/proposals.ts';
 
@@ -47,9 +48,29 @@ class FakeTimers implements TimersApi {
   }
 }
 
-function tempState(): string {
-  return join(mkdtempSync(join(tmpdir(), 'coo-growth-')), 'growth.json');
+const tempRoots: string[] = [];
+
+function tempDir(prefix: string): string {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  tempRoots.push(root);
+  return root;
 }
+
+function tempState(): string {
+  return join(tempDir('coo-growth-'), 'growth.json');
+}
+
+function memoryRead(sourceIds: string[], text = '[memory] Synthetic dated event records.'): {
+  text: string;
+  status: 'found';
+  trace: { format: { includedSourceDocumentIds: string[] } };
+} {
+  return { text, status: 'found', trace: { format: { includedSourceDocumentIds: sourceIds } } };
+}
+
+afterEach(() => {
+  for (const root of tempRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 
 function schedule(stateFile: string, opts: {
   now: () => Date;
@@ -86,6 +107,8 @@ describe('the self-review prompt', () => {
     expect(en).toContain('Person: hello');
     expect(en).toContain('2026-10-26');
     expect(en).toContain('propose_growth');
+    expect(en).toContain('propose_experience');
+    expect(en).toContain('remain a candidate');
     expect(en).not.toMatch(/\p{Script=Han}/u);
     expect(SELF_REVIEW_TEXT.zh({ portrait: '', recent: '', date: '2026-10-26' })).toContain('2026-10-26');
     expect(SELF_REVIEW_TEXT.zh({ portrait: '', recent: '', date: '2026-10-26' })).toContain('提案');
@@ -298,6 +321,35 @@ function prefix(): ContextRecord[] {
 }
 
 describe('the growth review session', () => {
+  it('allows scheduled reviews only when long-term memory is available', () => {
+    const root = tempDir('coo-growth-opt-in-');
+    let memoryAvailable = true;
+    const memory = {
+      enabled: () => memoryAvailable,
+      setLifecycleHooks: vi.fn(),
+    } as unknown as HindsightMemory;
+    const Persona = coopanionPersona(Cormini, {
+      memory,
+      growth: () => ({ enabled: true, everyDays: 7 }),
+      growthStateFile: join(root, 'growth.json'),
+      timezone: () => 'UTC',
+    });
+    const persona = new Persona({ memoryDir: join(root, 'workspace') });
+    const core = {
+      timers: new FakeTimers(),
+      sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
+      log: { info: vi.fn(), warn: vi.fn() },
+    } as unknown as CoreApi;
+    persona.attach(core);
+    const review = persona as unknown as { growthSchedule: GrowthSchedule | null; stopGrowth(): void };
+
+    expect(review.growthSchedule?.status()).toMatchObject({ enabled: true, blocked: false });
+    memoryAvailable = false;
+    expect(review.growthSchedule?.status()).toMatchObject({ enabled: false, blocked: true });
+    review.stopGrowth();
+    rmSync(root, { recursive: true, force: true });
+  });
+
   it('feeds the system prefix, the recent stretch and the portrait to a fork with read tools and a proposal tool', async () => {
     const captured: ForkOptions[] = [];
     const core = {
@@ -308,11 +360,11 @@ describe('the growth review session', () => {
       enabled: () => true,
       selfPortrait: vi.fn(async () => 'You have been softer lately.'),
     } as unknown as HindsightMemory;
-    const proposalsDir = mkdtempSync(join(tmpdir(), 'coo-growth-proposals-'));
+    const proposalsDir = tempDir('coo-growth-proposals-');
     const review = new GrowthReview({
       core: () => core,
       snapshot: prefix,
-      tools: () => [tool('read_file')],
+      tools: () => [tool('read_file'), tool('memory_search')],
       memory: () => memory,
       proposalsDir,
       modelLanguage: () => 'en',
@@ -327,12 +379,14 @@ describe('the growth review session', () => {
     expect(textOf(opts.messages[1]!)).toContain('You have been softer lately.');
     expect(textOf(opts.messages[1]!)).toContain('Person: hello');
     expect(textOf(opts.messages[1]!)).toContain('2026-10-26');
-    expect(opts.tools?.map((entry) => entry.name)).toEqual(['read_file', PROPOSE_GROWTH_TOOL, 'finish_review']);
+    expect(textOf(opts.messages[1]!)).toContain('propose_experience');
+    expect(textOf(opts.messages[1]!)).toContain('remain a candidate for the person\'s review');
+    expect(opts.tools?.map((entry) => entry.name)).toEqual(['read_file', 'memory_search', PROPOSE_GROWTH_TOOL, PROPOSE_EXPERIENCE_TOOL, 'finish_review']);
   });
 
   it('declares a growth session with read and memory tools but no file writes or speaking', () => {
-    const Persona = coopanionPersona(Cormini, { growthStateFile: join(mkdtempSync(join(tmpdir(), 'coo-growth-persona-')), 'growth.json'), timezone: () => 'UTC' });
-    const p = new Persona({ memoryDir: mkdtempSync(join(tmpdir(), 'coo-growth-workspace-')) });
+    const Persona = coopanionPersona(Cormini, { growthStateFile: join(tempDir('coo-growth-persona-'), 'growth.json'), timezone: () => 'UTC' });
+    const p = new Persona({ memoryDir: tempDir('coo-growth-workspace-') });
     const growth = p.declareSessions().find((session) => session.id === GROWTH_SESSION)!;
     const names = growth.tools().map((entry) => entry.name);
     expect(growth.persistent).toBe(false);
@@ -354,6 +408,8 @@ describe('the growth review session', () => {
       sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
       spawnFork: vi.fn(async (opts: ForkOptions) => {
         captured.push(opts);
+        const search = opts.tools!.find((entry) => entry.name === 'memory_search')!;
+        await search.handler({ query: 'coding preferences' }, {} as never);
         const propose = opts.tools!.find((entry) => entry.name === PROPOSE_GROWTH_TOOL)!;
         const finish = opts.tools!.find((entry) => entry.name === 'finish_review')!;
         const result = await propose.handler({
@@ -369,11 +425,12 @@ describe('the growth review session', () => {
         return '';
       }),
     } as unknown as CoreApi;
-    const proposalsDir = mkdtempSync(join(tmpdir(), 'coo-growth-proposals-'));
+    const proposalsDir = tempDir('coo-growth-proposals-');
     const memory = {
       enabled: () => true,
       sourceVisible: () => true,
       hasSource: async () => true,
+      recallBlockDetailed: async () => memoryRead(['user-turn-42']),
       selfPortrait: async () => '',
     } as unknown as HindsightMemory;
     const review = new GrowthReview({
@@ -394,6 +451,91 @@ describe('the growth review session', () => {
     expect(captured[0]!.tools?.some((entry) => ['write_file', 'edit_file', 'append_file'].includes(entry.name))).toBe(false);
   });
 
+  it('stores a repeated experience as an inactive source-linked candidate', async () => {
+    const captured: ForkOptions[] = [];
+    const core = {
+      sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
+      spawnFork: vi.fn(async (opts: ForkOptions) => {
+        captured.push(opts);
+        const search = opts.tools!.find((entry) => entry.name === 'memory_search')!;
+        await search.handler({ query: 'repeated experiences' }, {} as never);
+        const propose = opts.tools!.find((entry) => entry.name === PROPOSE_EXPERIENCE_TOOL)!;
+        const finish = opts.tools!.find((entry) => entry.name === 'finish_review')!;
+        const saved = await propose.handler({
+          title: 'Quiet coding time',
+          situation: 'The person is coding.',
+          lesson: 'Wait before routine interruptions.',
+          scope: 'proactive_speech',
+          sourceIds: ['user:focus-1', 'user:focus-2'],
+        }, {} as never);
+        expect(saved).toContain('[experience candidate saved]');
+        expect(await propose.handler({
+          title: 'Unsearched source', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation',
+          sourceIds: ['user:not-returned-1', 'user:not-returned-2'],
+        }, {} as never)).toContain('was not returned by memory_search');
+        hiddenSources.add('user:forgotten');
+        expect(await propose.handler({
+          title: 'Forgotten source', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation', sourceIds: ['user:focus-1', 'user:forgotten'],
+        }, {} as never)).toContain('[candidate rejected] Source user:forgotten is missing or fenced.');
+        expect(await propose.handler({
+          title: 'Same-day repeats', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation',
+          sourceIds: ['user:focus-1', 'user:focus-same-day'],
+        }, {} as never)).toContain('[candidate rejected] User-event sources must span different dates.');
+        expect(await propose.handler({
+          title: 'Undated event', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation',
+          sourceIds: ['user:focus-1', 'user:undated'],
+        }, {} as never)).toContain('has no verifiable user-event date');
+        await finish.handler({ note: 'saved a recurring experience' }, {} as never);
+        return '';
+      }),
+    } as unknown as CoreApi;
+    const proposalsDir = tempDir('coo-growth-proposals-');
+    const experienceCardsDir = join(proposalsDir, 'experience-cards');
+    const hiddenSources = new Set<string>();
+    const memory = {
+      enabled: () => true,
+      sourceVisible: (id: string) => !hiddenSources.has(id),
+      hasSource: async (id: string) => !hiddenSources.has(id),
+      sourceEvidence: async (id: string) => hiddenSources.has(id)
+        ? { present: false, visible: false, actor: null, status: null }
+        : id === 'user:undated'
+          ? { present: true, visible: true, actor: 'user', status: 'completed', kind: 'event' }
+        : {
+            present: true,
+            visible: true,
+            actor: 'user',
+            status: 'completed',
+            kind: 'event',
+            occurredAt: id.endsWith('-1') || id.endsWith('-same-day') ? '2026-10-01T12:00:00.000Z' : '2026-10-08T12:00:00.000Z',
+          },
+      recallBlockDetailed: async () => memoryRead(['user:focus-1', 'user:focus-2', 'user:focus-same-day', 'user:undated', 'user:forgotten']),
+      selfPortrait: async () => '',
+    } as unknown as HindsightMemory;
+    const review = new GrowthReview({
+      core: () => core,
+      snapshot: prefix,
+      tools: () => [],
+      memory: () => memory,
+      proposalsDir,
+      experienceCardsDir,
+      modelLanguage: () => 'en',
+      timezone: () => 'UTC',
+    });
+
+    const result = await review.run();
+    const cards = new ExperienceCards(experienceCardsDir).list();
+
+    expect(result.proposals).toBe(1);
+    expect(cards).toMatchObject([{
+      title: 'Quiet coding time',
+      sourceIds: ['user:focus-1', 'user:focus-2'],
+      state: 'candidate',
+      userExplicit: false,
+    }]);
+    expect(new GrowthProposals(proposalsDir).list()).toHaveLength(0);
+    expect(captured[0]!.tools?.some((entry) => ['write_file', 'edit_file', 'append_file'].includes(entry.name))).toBe(false);
+  });
+
   it('stops accepting proposals after the deadline', async () => {
     const captured: ForkOptions[] = [];
     const read = vi.fn(async () => 'file contents');
@@ -404,7 +546,7 @@ describe('the growth review session', () => {
         return new Promise<string>(() => {});
       }),
     } as unknown as CoreApi;
-    const proposalsDir = mkdtempSync(join(tmpdir(), 'coo-growth-proposals-'));
+    const proposalsDir = tempDir('coo-growth-proposals-');
     const review = new GrowthReview({
       core: () => core,
       snapshot: prefix,
@@ -427,6 +569,11 @@ describe('the growth review session', () => {
     }, {} as never);
     expect(result).toContain('[review cancelled]');
     expect(new GrowthProposals(proposalsDir).list()).toHaveLength(0);
+    const proposeExperience = captured[0]!.tools!.find((entry) => entry.name === PROPOSE_EXPERIENCE_TOOL)!;
+    expect(await proposeExperience.handler({
+      title: 'Late card', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation', sourceIds: ['source-late'],
+    }, {} as never)).toContain('[review cancelled]');
+    expect(new ExperienceCards(join(proposalsDir, 'experience-cards')).list()).toHaveLength(0);
     const lateRead = captured[0]!.tools!.find((entry) => entry.name === 'read_file')!;
     expect(await lateRead.handler({ path: 'SELF.md' }, {} as never)).toContain('[review cancelled]');
     expect(read).not.toHaveBeenCalled();

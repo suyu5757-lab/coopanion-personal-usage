@@ -195,6 +195,76 @@ describe('experience policy cards', () => {
     expect(result.ok).toBe(false);
   });
 
+  it('keeps a Growth-proposed experience inactive until a person approves it', () => {
+    const root = temp();
+    const cards = new ExperienceCards(join(root, 'experience-cards'));
+    const result = cards.propose({
+      title: 'Quiet coding time',
+      situation: 'The person is coding.',
+      lesson: 'Wait before routine interruptions.',
+      scope: 'proactive_speech',
+      sourceIds: ['user:focus-1', 'user:focus-2'],
+    });
+
+    expect(result).toMatchObject({ ok: true, card: { state: 'candidate', userExplicit: false } });
+    if (!result.ok) return;
+    expect(cards.approvedContext()).toBe('');
+    expect(cards.transition(result.card.id, 'approved')?.userExplicit).toBe(false);
+    expect(cards.approvedContext()).toContain('Wait before routine interruptions.');
+  });
+
+  it('rechecks Growth experience sources as user events on distinct dates before approval', async () => {
+    const root = temp();
+    const workspace = join(root, 'workspace');
+    const deploy = join(root, 'deploy');
+    mkdirSync(workspace);
+    mkdirSync(deploy);
+    const cards = new ExperienceCards(join(deploy, 'experience-cards'));
+    const sameDay = cards.propose({
+      title: 'Repeated quiet time', situation: 'The person is focused.', lesson: 'Wait before interrupting.',
+      scope: 'proactive_speech', sourceIds: ['same-1', 'same-2'],
+    });
+    if (!sameDay.ok) throw new Error(sameDay.errors.join('; '));
+    const memory = {
+      enabled: () => true,
+      settled: () => true,
+      sourceVisible: () => true,
+      sourceEvidence: async (id: string) => ({
+        present: true, visible: true, actor: 'user', status: 'completed', kind: 'event',
+        occurredAt: id.startsWith('same-') ? '2026-10-01T12:00:00.000Z' : id.endsWith('-1') ? '2026-10-01T12:00:00.000Z' : '2026-10-08T12:00:00.000Z',
+      }),
+    } as unknown as HindsightMemory;
+    const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory });
+    const persona = new Persona({ memoryDir: workspace });
+    const invoke = persona.webUi('en').invoke!;
+
+    await expect(invoke('hindsight', 'experience-review', [sameDay.card.id, 'approved']))
+      .rejects.toThrow(/sources cannot be verified/);
+    expect(cards.get(sameDay.card.id)?.state).toBe('candidate');
+
+    const repeated = cards.propose({
+      title: 'Repeated quiet time', situation: 'The person is focused.', lesson: 'Wait before interrupting.',
+      scope: 'proactive_speech', sourceIds: ['valid-1', 'valid-2'],
+    });
+    if (!repeated.ok) throw new Error(repeated.errors.join('; '));
+    await invoke('hindsight', 'experience-review', [repeated.card.id, 'approved']);
+    expect(cards.get(repeated.card.id)?.state).toBe('approved');
+  });
+
+  it('reads experience cards from before the source author field as explicit user records', () => {
+    const root = temp();
+    const dir = join(root, 'experience-cards');
+    const id = '00000000-0000-4000-8000-000000000001';
+    mkdirSync(dir);
+    writeFileSync(join(dir, `${id}.json`), JSON.stringify({
+      id, createdAt: '2026-10-01T00:00:00.000Z', updatedAt: '2026-10-01T00:00:00.000Z',
+      title: 'Quiet coding time', situation: 'The person is coding.', lesson: 'Wait.', scope: 'conversation',
+      sourceIds: ['user:focus'], state: 'candidate',
+    }));
+
+    expect(new ExperienceCards(dir).get(id)?.userExplicit).toBe(true);
+  });
+
   it('tells the current session which approved policy was revoked', async () => {
     const root = temp();
     const workspace = join(root, 'workspace');

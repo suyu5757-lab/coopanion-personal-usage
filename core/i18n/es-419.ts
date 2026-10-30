@@ -26,7 +26,7 @@ const es419: Translation<CoreText> = {
     },
     growth: {
       title: 'Crecer por su cuenta',
-      description: 'Cada cierto tiempo, en un momento tranquilo, repasa las experiencias recientes. Solo deja una propuesta de crecimiento pendiente; no cambia su personalidad por sí sola.',
+      description: 'Las revisiones están desactivadas de forma predeterminada. Si las activas y la memoria a largo plazo está disponible, una revisión tranquila puede dejar propuestas de Persona o tarjetas de experiencia con fuentes. Tú revisas cada propuesta; ninguna cambia la Persona ni activa una tarjeta por sí sola.',
       every: 'Cada', everyDescription: 'Vuelve sobre sí misma después de estos días.',
       days: 'días',
     },

@@ -26,7 +26,7 @@ const ptBR: Translation<CoreText> = {
     },
     growth: {
       title: 'Crescer sozinha',
-      description: 'De tempos em tempos, num momento tranquilo, ela revê as experiências recentes. Ela só deixa uma proposta de crescimento para você revisar; a personalidade não muda sozinha.',
+      description: 'As revisões periódicas ficam desativadas por padrão. Se você ativá-las e a memória de longo prazo estiver disponível, uma revisão tranquila pode deixar propostas para a Persona ou cartões de experiência com fontes. Você revisa cada proposta; a Persona não muda e nenhum cartão é ativado automaticamente.',
       every: 'A cada', everyDescription: 'Ela revê a si mesma depois destes dias.',
       days: 'dias',
     },

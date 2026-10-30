@@ -37,9 +37,9 @@ ${portrait}
 - 做事的方式变了吗：怎么计划、怎么检查、什么时候开口求助、怎么认错；
 - 说话变了吗：句子长短、语气、常用的词、已经不再说的话。
 
-一次情绪、一个反常的日子或我自己的推测不算长期变化。只有多次、跨时间且有来源的证据支持一项具体改进时，才调用 propose_growth 留下候选提案；提案必须带 memory_search 返回的来源 ID，并且只写最小的 SELF.md 或 CONSTITUTION.md 改动。大多数自省不需要提案。
+一次情绪、一个反常的日子或我自己的推测不算长期变化。只有多次、跨时间且有来源的证据支持一项具体改进时，才调用 propose_growth 留下人设候选；提案必须带 memory_search 返回的来源 ID，并且只写最小的 SELF.md 或 CONSTITUTION.md 改动。若多条不同日期的用户事件共同支持一个对未来对话有帮助的具体规律，可以调用 propose_experience 留下候选体验卡；卡片必须引用 memory_search 返回的来源 ID，并保持为 candidate，等待使用者审核。一次事件、检索命中或模型复述不能单独构成持续证据。
 
-不要修改文件，也不要把自省日志写入 Persona。候选提案须由使用者审核；只有审核通过并再次确认后，应用程序才会修改 Persona 文件。
+不要修改工作区文件，也不要把自省日志写入 Persona。只留下候选文件；体验卡经使用者审核批准前不会进入会话。
 
 你说话用哪种语言仍由环境说明决定；这里改的是你怎么说，不是换成另一种语言。
 
@@ -73,9 +73,9 @@ Ask yourself one thing at a time:
 - Has the way I work changed: how I plan, check, ask for help, admit a mistake?
 - Has the way I talk changed: length, tone, the words I use, what I no longer say?
 
-One mood, one unusual day or my own inference is not a lasting change. Only when repeated evidence across time supports a specific improvement should I call propose_growth to leave a candidate proposal. It must cite exact source IDs returned by memory_search and make only minimal changes to SELF.md or CONSTITUTION.md. Most reviews need no proposal.
+One mood, one unusual day or my own inference is not a lasting change. Only when repeated evidence across time supports a specific improvement should I call propose_growth to leave a Persona candidate. It must cite exact source IDs returned by memory_search and make only minimal changes to SELF.md or CONSTITUTION.md. When distinct user events from different dates support a concrete pattern that would help future conversations, I may call propose_experience to leave an experience-card candidate. It must cite exact memory_search source IDs and remain a candidate for the person's review. One event, a retrieval hit or the model repeating a memory is not sustained evidence.
 
-Do not edit files or write a self-review log into Persona. The person reviews each proposal; the app changes Persona files only after approval and a separate confirmation.
+Do not edit workspace files or write a self-review log into Persona. Leave candidate files only; an experience card stays out of the session until the person approves it.
 
 Your speaking language still comes from your environment; change how you speak, not which language.
 

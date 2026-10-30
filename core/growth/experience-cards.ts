@@ -17,7 +17,7 @@ export interface ExperienceCard {
   scope: ExperienceScope;
   sourceIds: string[];
   state: ExperienceState;
-  userExplicit: true;
+  userExplicit: boolean;
   reviewedAt?: string;
 }
 
@@ -73,11 +73,19 @@ export class ExperienceCards {
       if (typeof value.title !== 'string' || typeof value.situation !== 'string' || typeof value.lesson !== 'string') return null;
       if (!SCOPES.has(value.scope as ExperienceScope) || !Array.isArray(value.sourceIds)) return null;
       if (!['candidate', 'approved', 'rejected', 'deprecated'].includes(String(value.state))) return null;
-      return value as ExperienceCard;
+      return { ...value, userExplicit: value.userExplicit !== false } as ExperienceCard;
     } catch { return null; }
   }
 
   create(input: ExperienceCardInput): { ok: true; card: ExperienceCard } | { ok: false; errors: string[] } {
+    return this.write(input, true);
+  }
+
+  propose(input: ExperienceCardInput): { ok: true; card: ExperienceCard } | { ok: false; errors: string[] } {
+    return this.write(input, false);
+  }
+
+  private write(input: ExperienceCardInput, userExplicit: boolean): { ok: true; card: ExperienceCard } | { ok: false; errors: string[] } {
     const parsed = readExperienceCardInput(input);
     if ('errors' in parsed) return { ok: false, errors: parsed.errors };
     if (this.list().length >= 40) return { ok: false, errors: ['at most 40 experience cards may be retained'] };
@@ -88,7 +96,7 @@ export class ExperienceCards {
       createdAt: at,
       updatedAt: at,
       state: 'candidate',
-      userExplicit: true,
+      userExplicit,
     };
     try {
       mkdirSync(this.dir, { recursive: true });

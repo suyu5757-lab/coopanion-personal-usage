@@ -26,7 +26,7 @@ const ko: Translation<CoreText> = {
     },
     growth: {
       title: '스스로 성장하기',
-      description: '가끔 조용한 때에 최근의 경험을 돌아봅니다. 남기는 것은 성장 후보 제안뿐이며, 인물 설정은 자동으로 바뀌지 않습니다.',
+      description: '정기 회고는 기본적으로 꺼져 있습니다. 켜고 장기 기억을 사용할 수 있으면 조용한 시간에 출처가 연결된 Persona 제안이나 경험 카드 후보를 남길 수 있습니다. 각 후보는 직접 검토해야 하며, Persona나 카드가 자동으로 바뀌거나 활성화되지 않습니다.',
       every: '간격', everyDescription: '이 일수마다 한 번 돌아봅니다.',
       days: '일',
     },

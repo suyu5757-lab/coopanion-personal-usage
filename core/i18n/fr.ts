@@ -26,7 +26,7 @@ const fr: Translation<CoreText> = {
     },
     growth: {
       title: 'Grandir par elle-même',
-      description: "De temps en temps, dans un moment calme, elle revient sur les expériences récentes. Elle ne laisse qu'une proposition d'évolution à examiner ; sa personnalité ne change pas toute seule.",
+      description: 'Les revues sont désactivées par défaut. Si vous les activez et que la mémoire à long terme est disponible, une revue au calme peut laisser des propositions Persona ou des cartes d’expérience avec leurs sources. Vous examinez chaque proposition ; rien ne modifie Persona ni n’active une carte automatiquement.',
       every: 'Tous les', everyDescription: 'Elle fait un retour sur elle-même après ce nombre de jours.',
       days: 'jours',
     },
