@@ -690,6 +690,7 @@ export class HindsightMemory {
       const unresolved = this.ledger?.unresolved(config.bankId, config.apiUrl) ?? 0;
       const hasFencedSources = this.ledger?.hasFencedSources(config.bankId, config.apiUrl) ?? false;
       let blockedDerivedResults = 0;
+      const verifiedSupport = new WeakSet<MemorySearchResult>();
       const results = response.results.flatMap((result): MemorySearchResult[] => {
         const documentId = result.document_id ?? null;
         const metadata = result.metadata ? { ...result.metadata } : {};
@@ -731,7 +732,7 @@ export class HindsightMemory {
           return [];
         }
         const sourceFactsIncomplete = sourceFactIds.length > 0 && (missingSourceFact || sourceFactsTruncated);
-        return [{
+        const mapped: MemorySearchResult = {
           id: result.id,
           text: String(result.text ?? ''),
           type: String(result.type ?? 'memory'),
@@ -741,13 +742,15 @@ export class HindsightMemory {
           ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
           ...(sourceFacts.length > 0 ? { sourceFacts } : {}),
           ...(sourceFactsIncomplete ? { sourceFactsIncomplete: true } : {}),
-        }];
+        };
+        if (sourceFactIds.length > 0 && !missingSourceFact) verifiedSupport.add(mapped);
+        return [mapped];
       });
       // A ledger that cannot be read may be missing tombstones, so no source can be shown clear.
       if (this.ledger?.damaged()) return { results: [], status: 'fenced' };
-      // A source-less result cannot be shown to exclude any source that has a durable forget fence.
+      // A parentless result is visible behind a fence only when every declared source is verified.
       const visible = results.filter((result) =>
-        (result.documentId !== null || (unresolved === 0 && !hasFencedSources))
+        (result.documentId !== null || verifiedSupport.has(result) || (unresolved === 0 && !hasFencedSources))
         && !this.forgottenSource(result.documentId));
       if (visible.length > 0) return {
         results: visible,

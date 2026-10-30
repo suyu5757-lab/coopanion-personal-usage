@@ -481,4 +481,54 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
     expect(await memory.recallBlockDetailed('What remains after restart?')).toEqual({ text: '', status: 'fenced' });
   });
 
+  it.each([
+    { state: 'pending', truncated: false },
+    { state: 'done', truncated: false },
+    { state: 'pending', truncated: true },
+    { state: 'done', truncated: true },
+  ])('keeps parentless observations whose declared sources are all verified with a $state fence and truncated=$truncated', async ({ state, truncated }) => {
+    const api = await hindsightServer({
+      results: [{ id: 'supported-parentless', text: 'Lin coordinated and Wei reviewed the plan.', type: 'observation', document_id: null, source_fact_ids: ['fact-a', 'fact-b'] }],
+      source_facts: {
+        'fact-a': { id: 'fact-a', text: 'Lin coordinated the materials.', type: 'world', document_id: 'doc-a' },
+        'fact-b': { id: 'fact-b', text: 'Wei reviewed the shared plan.', type: 'world', document_id: 'doc-b' },
+      },
+      source_facts_truncated: truncated,
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-parentless-supported-'));
+    roots.push(root);
+    const { memory, ledger } = await configuredMemory(api.baseUrl, root);
+    const fence = ledger.add({ bankId: 'bank-test', endpoint: api.baseUrl, documentId: 'doc-unrelated', reason: 'synthetic unrelated forget' });
+    expect(fence).not.toBeNull();
+    if (state === 'done') expect(ledger.markDone(fence!.id)).toBe(true);
+
+    const read = await memory.recallBlockDetailed('What planning work did Lin and Wei share?');
+
+    expect(read.status).toBe('found');
+    expect(read.text).toContain('Lin coordinated the materials.');
+    expect(read.text).toContain('Wei reviewed the shared plan.');
+    expect(read.text).toContain('source_id:doc-a');
+    expect(read.text).toContain('source_id:doc-b');
+  });
+
+  it('does not share verified support between results with the same response ID', async () => {
+    const api = await hindsightServer({
+      results: [
+        { id: 'shared-id', text: 'A supported relationship.', type: 'observation', document_id: null, source_fact_ids: ['fact-a'] },
+        { id: 'shared-id', text: 'An unsupported source-free claim.', type: 'world', document_id: null },
+      ],
+      source_facts: { 'fact-a': { id: 'fact-a', text: 'A verified source event.', type: 'world', document_id: 'doc-a' } },
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-support-result-identity-'));
+    roots.push(root);
+    const { memory, ledger } = await configuredMemory(api.baseUrl, root);
+    ledger.add({ bankId: 'bank-test', endpoint: api.baseUrl, documentId: 'doc-unrelated', reason: 'synthetic unrelated forget' });
+
+    const read = await memory.recallBlockDetailed('What relationship was recorded?');
+
+    expect(read.status).toBe('found');
+    expect(read.text).toContain('A supported relationship.');
+    expect(read.text).not.toContain('An unsupported source-free claim.');
+  });
+
 });
