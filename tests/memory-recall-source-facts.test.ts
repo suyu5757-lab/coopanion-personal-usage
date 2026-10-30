@@ -327,6 +327,100 @@ describe('Hindsight source-fact recall', () => {
     expect(activation?.halfLifeDays).toBeGreaterThan(100);
   });
 
+  it('does not choose an arbitrary source when a rementioned observation links multiple user events', async () => {
+    const firstAt = '2026-09-01T12:00:00.000Z';
+    const secondAt = '2026-09-20T12:00:00.000Z';
+    const api = await hindsightServer({
+      results: [{
+        id: 'observation-two-events',
+        text: 'The person visited a coastal town and a forest reserve.',
+        type: 'observation',
+        document_id: 'doc-derived-two-events',
+        source_fact_ids: ['fact-first-event', 'fact-second-event'],
+        scores: { semantic: 0.99 },
+      }, {
+        id: 'observation-lower-ranked-event',
+        text: 'The person visited a mountain trail.',
+        type: 'observation',
+        document_id: 'doc-derived-fallback-event',
+        source_fact_ids: ['fact-fallback-event'],
+        scores: { semantic: 0.8 },
+      }],
+      source_facts: {
+        'fact-first-event': {
+          id: 'fact-first-event', text: 'The person visited a coastal town.', type: 'experience', document_id: 'doc-first-event',
+          occurred_start: firstAt,
+          metadata: { source_actor: 'user', kind: 'event', status: 'completed', said_at: firstAt },
+        },
+        'fact-second-event': {
+          id: 'fact-second-event', text: 'The person visited a forest reserve.', type: 'experience', document_id: 'doc-second-event',
+          occurred_start: secondAt,
+          metadata: { source_actor: 'user', kind: 'event', status: 'completed', said_at: secondAt },
+        },
+        'fact-fallback-event': {
+          id: 'fact-fallback-event', text: 'The person visited a mountain trail.', type: 'experience', document_id: 'doc-fallback-event',
+          occurred_start: secondAt,
+          metadata: { source_actor: 'user', kind: 'event', status: 'completed', said_at: secondAt },
+        },
+      },
+      source_facts_truncated: false,
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-recall-ambiguous-event-sources-'));
+    roots.push(root);
+    const { memory } = await configuredMemory(api.baseUrl, root);
+    const runtime = memory as unknown as HindsightMemory;
+    const store = (memory as unknown as { stateStore: MemoryStateStore }).stateStore;
+    const currentAt = new Date().toISOString();
+    const currentEvent = runtime.retainUser('Can you remind me about the places I visited?', { cursor: 9311, timestamp: currentAt });
+    expect(currentEvent).not.toBeNull();
+
+    const recalled = await runtime.recallForTurn('Can you remind me about the places I visited?', {
+      userEventDocumentId: currentEvent!, captureTrace: true,
+    });
+
+    expect(recalled.status).toBe('found');
+    expect(recalled.trace?.search.items[0]?.activationWeight).toBeDefined();
+    for (const documentId of ['doc-first-event', 'doc-second-event', 'doc-fallback-event']) {
+      expect(store.loadActivationState('bank-test', api.baseUrl, documentId)).toMatchObject({
+        independentMentionCount: 0,
+        lastUserMentionAt: null,
+      });
+    }
+  });
+
+  it('does not apply event activation to a stable user fact', async () => {
+    const createdAt = new Date(Date.now() - 400 * 86_400_000).toISOString();
+    const api = await hindsightServer({
+      results: [{
+        id: 'fact-preference',
+        text: 'The person prefers turquoise.',
+        type: 'world',
+        document_id: 'doc-preference',
+        created_at: createdAt,
+        metadata: { source_actor: 'user', kind: 'fact', status: 'current' },
+        scores: { semantic: 0.99 },
+      }],
+      source_facts: {},
+      source_facts_truncated: false,
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-recall-stable-user-fact-'));
+    roots.push(root);
+    const { memory } = await configuredMemory(api.baseUrl, root);
+    const runtime = memory as unknown as HindsightMemory;
+    const store = (memory as unknown as { stateStore: MemoryStateStore }).stateStore;
+    const currentEvent = runtime.retainUser('Which color do I prefer?', { cursor: 9312 });
+    expect(currentEvent).not.toBeNull();
+
+    const recalled = await runtime.recallForTurn('Which color do I prefer?', {
+      userEventDocumentId: currentEvent!, captureTrace: true,
+    });
+
+    expect(recalled.status).toBe('found');
+    expect(recalled.text).toContain('The person prefers turquoise.');
+    expect(recalled.trace?.search.items[0]?.activationWeight).toBeUndefined();
+    expect(store.loadActivationState('bank-test', api.baseUrl, 'doc-preference')).toBeNull();
+  });
+
   it('does not reinforce a weak association or decay a tool source', async () => {
     const currentAt = new Date().toISOString();
     const weakApi = await hindsightServer(historicalEventResponse(currentAt, 'user', 0.6));

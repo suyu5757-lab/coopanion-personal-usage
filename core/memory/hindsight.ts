@@ -767,16 +767,19 @@ export class HindsightMemory {
       .filter((result) => typeof result.matchScore === 'number'
         && Number.isFinite(result.matchScore)
         && result.matchScore >= DEFAULT_REINFORCEMENT_PARAMETERS.minimumSemanticMatch)
-      .map((result) => ({ result, source: userEventSources(result)[0] }))
-      .find((entry) => !!entry.source);
-    if (!candidate?.source || typeof candidate.result.matchScore !== 'number') return;
+      .map((result) => ({ result, sources: userEventSources(result) }))
+      .find((entry) => entry.sources.length > 0);
+    // A result-level match cannot identify which of several supporting user events was mentioned.
+    if (!candidate || candidate.sources.length !== 1) return;
+    const source = candidate.sources[0];
+    if (!source || typeof candidate.result.matchScore !== 'number') return;
     try {
       store.recordUserMention({
         bankId: config.bankId,
         endpoint: config.apiUrl,
-        targetDocumentId: candidate.source.documentId,
+        targetDocumentId: source.documentId,
         userEventDocumentId,
-        targetCreatedAt: candidate.source.date,
+        targetCreatedAt: source.date,
         semanticMatch: candidate.result.matchScore,
         intensity: mentionIntensityForText(userText),
       });
