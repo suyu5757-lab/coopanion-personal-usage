@@ -98,6 +98,43 @@ describe('memory evaluation contract', () => {
     expect(adjustedScore.contextComplete.value).toBe(1);
   });
 
+  it('recovers multi-source context coverage across the generated development set under redundant-source pressure', () => {
+    const cases = createDevelopmentMemoryEvaluationSet();
+    const traces = (coverageWeight: number) => cases.map((testCase) => {
+      const documents = testCase.documents.filter((document) => document.state !== 'deleted');
+      const firstRequired = testCase.requiredSourceIds.length > 1
+        ? documents.find((document) => document.sourceId === testCase.requiredSourceIds[0])
+        : undefined;
+      const ordered = firstRequired
+        ? [firstRequired, { ...firstRequired, text: `${firstRequired.text} A repeated result from the same source.` }, ...documents.filter((document) => document !== firstRequired)]
+        : documents;
+      const results = ordered.map((document, index): FormattedRecallResult => ({
+        id: `${testCase.id}-${index}`,
+        text: document.text,
+        type: 'world',
+        document_id: document.sourceId,
+        metadata: { status: document.state },
+      }));
+      const formatted = formatRecallDetailed(results, { maxItems: 2, coverageWeight });
+      return {
+        caseId: testCase.id,
+        sourceIdsAt5: results.slice(0, 5).map((result) => [result.document_id!]),
+        visibleSourceIds: results.map((result) => result.document_id!),
+        contextSourceIds: formatted.trace.includedSourceDocumentIds,
+        deletedSourceIds: testCase.deletedSourceIds,
+      };
+    });
+
+    const baseline = scoreMemoryEvaluation(cases, traces(0));
+    const coveragePacked = scoreMemoryEvaluation(cases, traces(0.5));
+
+    expect(baseline.contextComplete).toEqual({ numerator: 125, denominator: 200, value: 0.625 });
+    expect(coveragePacked.contextComplete).toEqual({ numerator: 200, denominator: 200, value: 1 });
+    expect(coveragePacked.contextComplete.value! - baseline.contextComplete.value!).toBeGreaterThanOrEqual(0.25);
+    expect(baseline.deleteLeak).toEqual({ numerator: 0, denominator: 25, value: 0 });
+    expect(coveragePacked.deleteLeak).toEqual({ numerator: 0, denominator: 25, value: 0 });
+  });
+
   it('rejects missing, duplicate and unpaired evaluation rows', () => {
     expect(() => scoreMemoryEvaluation([{ id: 'a', answerable: true, requiredSourceIds: ['src-a'] }], [])).toThrow('evaluation case has no observation');
     expect(() => scoreMemoryEvaluation([
