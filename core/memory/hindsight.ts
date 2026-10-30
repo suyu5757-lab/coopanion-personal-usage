@@ -1684,6 +1684,14 @@ export class HindsightMemory {
     return !ledger.forgotten(config.bankId, config.apiUrl, documentId);
   }
 
+  /** Whether a persisted forget fence covers this source, independent of whether Memory is enabled. */
+  sourceFenced(documentId: string): boolean {
+    const config = this.config;
+    const ledger = this.ledger;
+    return !!documentId && !!config && !!ledger && !ledger.damaged()
+      && ledger.forgotten(config.bankId, config.apiUrl, documentId);
+  }
+
   /** Whether the bank still holds this source. Throws when memory cannot be asked at all. */
   async hasSource(documentId: string): Promise<boolean> {
     if (!documentId) return false;

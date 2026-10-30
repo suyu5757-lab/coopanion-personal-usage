@@ -2,12 +2,16 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { CoreApi } from 'cortico/core/types.ts';
+import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import { ForgetLedger, VERIFY_DELAY_MS } from '../core/memory/forget-ledger.ts';
 import { MemoryOutbox, type RetainItem } from '../core/memory/outbox.ts';
 import { closeMemoryStateStores } from '../core/memory/state-store.ts';
 import { OutboxDelivery } from '../core/memory/delivery.ts';
 import { HindsightMemory, type MemorySearchRead, type MemoryTextRead } from '../core/memory/hindsight.ts';
 import { ExperienceCards } from '../core/growth/experience-cards.ts';
+import { GrowthProposals } from '../core/growth/proposals.ts';
+import { coopanionPersona } from '../core/persona.ts';
 
 const roots: string[] = [];
 const dir = () => {
@@ -53,6 +57,7 @@ interface FakeClient {
     source_facts_truncated?: boolean | null;
   }>;
   getMentalModel?: (bankId: string, id: string) => Promise<{ content: string }>;
+  deleteBank?: (bankId: string) => Promise<void>;
   clearMentalModel?: (bankId: string, id: string) => Promise<unknown>;
   refreshMentalModel?: (bankId: string, id: string, options?: { mode?: 'full' }) => Promise<{ operation_id?: string }>;
   reflect?: (bankId: string, question: string) => Promise<{ text: string }>;
@@ -81,7 +86,9 @@ function memoryWith(outbox: MemoryOutbox, ledger: ForgetLedger, client: FakeClie
     reflect: (question: string) => Promise<string>;
     remember: (text: string) => string;
     correct: (text: string, sourceIds: readonly string[], meta?: { session?: string }) => Promise<string>;
+    clear: () => Promise<string>;
     settled: () => boolean;
+    sourceFenced: (documentId: string) => boolean;
     setLifecycleHooks: (hooks: { forgetSources: (sourceIds: readonly string[]) => void; clearDerived: () => void }) => void;
   };
   memory.config = {
@@ -95,6 +102,7 @@ function memoryWith(outbox: MemoryOutbox, ledger: ForgetLedger, client: FakeClie
     clearMentalModel: async () => ({}),
     refreshMentalModel: async (_bankId: string, id: string) => ({ operation_id: `refresh-${id}` }),
     getMentalModel: async () => ({ content: '' }),
+    deleteBank: async () => {},
     recall: async () => ({ results: [] }),
     deleteDocument: async () => {},
     ...client,
@@ -359,24 +367,56 @@ describe('remote deletion tasks', () => {
     expect([...outbox.matching((entry) => entry.state === 'pending')].map((entry) => entry.documentId)).toContain('preference');
   });
 
-  it('removes experience policies linked to the exact forgotten source document', async () => {
+  it('removes source-linked Growth state on forget and clears it with the whole bank', async () => {
     const root = dir();
+    const sourceId = 'user:focus';
     const cards = new ExperienceCards(join(root, 'experience-cards'));
-    const created = cards.create({ title: 'Quiet coding time', situation: 'The person is programming.', lesson: 'Wait before routine interruptions.', scope: 'proactive_speech', sourceIds: ['user:focus'] });
+    const created = cards.create({ title: 'Quiet coding time', situation: 'The person is programming.', lesson: 'Wait before routine interruptions.', scope: 'proactive_speech', sourceIds: [sourceId] });
     if (!created.ok) throw new Error(created.errors.join('; '));
     cards.transition(created.card.id, 'approved');
+    const proposals = new GrowthProposals(join(root, 'growth-proposals'));
+    const proposal = proposals.write({
+      title: 'Leave coding time quiet', summary: 'Wait during focused work.', evidence: ['The person asked for focus time.'],
+      sourceIds: [sourceId], risk: 'low',
+      changes: [{ file: 'CONSTITUTION.md', to: 'Wait during focused work.', reason: 'The person asked for focus time.' }],
+    });
+    if (!proposal.ok) throw new Error(proposal.errors.join('; '));
     const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
     const ledger = new ForgetLedger(join(root, 'forget.json'));
     const memory = memoryWith(outbox, ledger, { deleteDocument: async () => {} });
-    memory.setLifecycleHooks({
-      forgetSources: (ids) => { cards.removeBySource(ids); },
-      clearDerived: () => { cards.clear(); },
+    const core = {
+      timers: {
+        onDue: () => {}, set: () => ({ ok: true as const, id: 'timer' }), cancel: () => true,
+        list: () => [], clearAll: () => 0,
+      },
+      sessionInfo: () => ({ snapshot: [], running: 0 }),
+      log: { info: () => {}, warn: () => {} },
+      injectInternal: () => {},
+    } as unknown as CoreApi;
+    const Persona = coopanionPersona(Cormini, {
+      growthStateFile: join(root, 'growth.json'),
+      memory: memory as unknown as HindsightMemory,
     });
+    const persona = new Persona({ memoryDir: join(root, 'workspace') });
+    persona.attach(core);
 
-    const result = await memory.forgetDocument('user:focus');
+    const result = await memory.forgetDocument(sourceId);
     expect(result).toMatchObject({ deleted: 1, pending: 0, failed: 0 });
     expect(cards.approvedContext()).toBe('');
     expect(cards.list()).toEqual([]);
+    expect(proposals.list()).toEqual([]);
+    expect(memory.sourceFenced(sourceId)).toBe(true);
+
+    const secondCard = cards.create({ title: 'Second card', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation', sourceIds: ['user:other'] });
+    const secondProposal = proposals.write({
+      title: 'Second proposal', summary: 'A summary.', evidence: ['An event.'], sourceIds: ['user:other'], risk: 'low',
+      changes: [{ file: 'SELF.md', to: 'A line.', reason: 'A reason.' }],
+    });
+    expect(secondCard.ok && secondProposal.ok).toBe(true);
+    await memory.clear();
+    expect(cards.list()).toEqual([]);
+    expect(proposals.list()).toEqual([]);
+    persona.stopGrowth();
   });
 });
 

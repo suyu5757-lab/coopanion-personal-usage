@@ -21,7 +21,8 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renam
 import { freemem, totalmem } from 'node:os';
 import { join, dirname } from 'node:path';
 import type { CoreApi, EventEnvelope, PersonaWebUiDecl, SessionDecl, SessionOpeningReason, StoragePart, ToolDef, WorldLifecycleEvent } from 'cortico/core/types.ts';
-import type { ContextRecord } from 'cortico/protocol/open-responses/context.ts';
+import { withText, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
+import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import type { Language } from 'cortico/core/language.ts';
 import type { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import type { GitAuthor, WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
@@ -59,6 +60,7 @@ const IGNORED = 'blobs/';
 export const SNAPSHOT_TAG = (version: string) => `start-${version}`;
 /** How long after a line a "don't remember that" still refers to it. */
 const FORGET_WINDOW_MS = 10 * 60_000;
+const MEMORY_TOOL_NAMES = new Set(['memory_search', 'memory_remember', 'memory_correct', 'memory_forget', 'memory_reflect']);
 
 /** Write tools and the receipt each starts with when it succeeded (Cormini's workspaceTools.ts and blobs.ts). */
 const WRITES: Record<string, { ok: string; verb: string }> = {
@@ -157,6 +159,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     private growthSchedule: GrowthSchedule | null = null;
     private growthCheck: ReturnType<typeof setInterval> | null = null;
     private lastUserMemory: { documentId: string; at: number } | null = null;
+    private readonly memoryContextBlocks = new Set<string>();
 
     override attach(core: CoreApi): void {
       super.attach(core);
@@ -169,13 +172,13 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           if (removed + cards > 0) {
             const titles = policies.map((card) => card.title).slice(0, 8);
             const detail = titles.length ? ` Withdraw these policies: ${titles.join('; ')}.` : '';
-            this.core?.injectInternal(`[memory] A source was forgotten. Do not rely on any proposal or experience policy derived from it; the linked records were removed.${detail}`, 'memory');
+            this.injectMemoryContext(`[memory] A source was forgotten. Do not rely on any proposal or experience policy derived from it; the linked records were removed.${detail}`);
           }
         },
         clearDerived: () => {
           this.growthProposals()?.clear();
           this.experienceCards()?.clear();
-          this.core?.injectInternal('[memory] Long-term memory was cleared. Disregard all Hindsight-derived experience policies injected earlier in this session; none remain active.', 'memory');
+          this.injectMemoryContext('[memory] Long-term memory was cleared. Disregard all Hindsight-derived experience policies injected earlier in this session; none remain active.');
         },
       });
       if (!this.growthStateFile) return;
@@ -248,6 +251,12 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     private experienceCards(): ExperienceCards | null {
       const dir = this.growthDirectory();
       return dir ? new ExperienceCards(join(dir, 'experience-cards')) : null;
+    }
+
+    private injectMemoryContext(text: string): void {
+      if (!text) return;
+      this.memoryContextBlocks.add(text);
+      this.core?.injectInternal(text, 'memory');
     }
 
     private async verifiedMemorySources(sourceIds: readonly string[]): Promise<boolean> {
@@ -533,10 +542,10 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
         if (!card) throw new Error('The experience card is no longer in that state. Refresh the list.');
         if (action === 'approved') {
           const context = await this.experienceContext();
-          if (context) this.core?.injectInternal(context, 'memory');
+          if (context) this.injectMemoryContext(context);
         } else if (action === 'deprecated') {
           const context = await this.experienceContext();
-          this.core?.injectInternal(`[memory] The user revoked the experience policy “${before?.title ?? id}”. Do not follow it anymore. ${context || 'No approved experience policies remain active.'}`, 'memory');
+          this.injectMemoryContext(`[memory] The user revoked the experience policy “${before?.title ?? id}”. Do not follow it anymore. ${context || 'No approved experience policies remain active.'}`);
         }
         return card;
       }
@@ -639,7 +648,10 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
       if (!this.longTerm?.enabled() && !this.experienceCards()?.list('approved').length) return;
       this.core?.injectDeferred('memory', async () => {
         const briefing = this.longTerm?.enabled() ? await this.longTerm.sessionBriefing().catch(() => null) : null;
-        return [briefing?.text?.trim(), await this.experienceContext()].filter(Boolean).join('\n\n') || null;
+        const context = [briefing?.text?.trim(), await this.experienceContext()].filter(Boolean).join('\n\n');
+        if (!context) return null;
+        this.memoryContextBlocks.add(context);
+        return context;
       });
     }
 
@@ -696,10 +708,53 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
       const recalled = await this.longTerm.recallForTurn(latest, {
         ...(latestUserDocumentId ? { userEventDocumentId: latestUserDocumentId } : {}),
       });
-      if (recalled.text) this.core?.injectInternal(recalled.text, 'memory');
+      if (recalled.text) this.injectMemoryContext(recalled.text);
       else if (recalled.route === 'deep' && recalled.status !== 'skipped') {
-        this.core?.injectInternal(`${memoryReadNotice(recalled.status)} If you are not sure, say so; do not invent dates, names or past events.`, 'memory');
+        this.injectMemoryContext(`${memoryReadNotice(recalled.status)} If you are not sure, say so; do not invent dates, names or past events.`);
       }
+    }
+
+    /** Handoff notes omit Memory payloads and source events covered by a persisted forget fence. */
+    override async onHandoff(snapshot: ContextRecord[], ctx: { hardTokens: number | null }) {
+      const memory = this.longTerm;
+      if (!memory) return super.onHandoff(snapshot, ctx);
+      const memoryCallIds = new Set(snapshot.flatMap((record) => record.item.type === 'function_call'
+        && MEMORY_TOOL_NAMES.has(record.item.name) ? [record.item.call_id] : []));
+      const filtered = snapshot
+        .filter((record) => !(record.item.type === 'function_call'
+          && MEMORY_TOOL_NAMES.has(record.item.name))
+          && !(record.item.type === 'function_call_output' && memoryCallIds.has(record.item.call_id)))
+        .map((record) => {
+          if (record.item.type !== 'message') return record;
+          let text = textOf(record);
+          let changed = false;
+          for (const block of this.memoryContextBlocks) {
+            if (!block || !text.includes(block)) continue;
+            const blank = block.replace(/[^\r\n]/g, ' ');
+            text = text.split(block).join(blank);
+            changed = true;
+          }
+          const spans = (record.context.frame?.events ?? []).flatMap((event) => {
+            if (event.source !== 'desktop-pet') return [];
+            const documentId = event.type === 'desktop-pet.touch'
+              ? `touch:main:${event.cursor}`
+              : ['desktop-pet.message', 'desktop-pet.speech', 'desktop-pet.answer'].includes(event.type)
+                ? `user:main:${event.cursor}`
+                : null;
+            return documentId && memory.sourceFenced(documentId)
+              ? [{ start: event.start, end: event.start + event.chars }]
+              : [];
+          }).sort((a, b) => b.start - a.start);
+          for (const { start, end } of spans) {
+            const segment = text.slice(start, end);
+            text = `${text.slice(0, start)}${segment.replace(/[^\r\n]/g, ' ')}${text.slice(end)}`;
+            changed = true;
+          }
+          return changed ? withText(record, text) : record;
+        });
+      const result = await super.onHandoff(filtered, ctx);
+      this.memoryContextBlocks.clear();
+      return result;
     }
 
     protected override pressureNote(): string {

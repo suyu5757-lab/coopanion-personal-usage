@@ -1,7 +1,9 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { EventEnvelope } from 'cortico/core/types.ts';
+import { functionCall, functionResult, message } from 'cortico/protocol/open-responses/context.ts';
 import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import { WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
 import { coopanionPersona } from '../core/persona.ts';
@@ -352,5 +354,63 @@ describe('experience policy cards', () => {
     persona.onOpening({ reason: 'new' });
     expect(deferred).toBeTypeOf('function');
     expect((await deferred!()) ?? '').not.toContain('Wait before routine interruptions');
+  });
+});
+
+describe('forget fences at handoff', () => {
+  it('omits fenced user and touch events while retaining other events', async () => {
+    const root = temp();
+    const workspace = join(root, 'workspace');
+    mkdirSync(workspace);
+    const fenced = new Set(['user:main:42', 'touch:main:43']);
+    const memoryText = '[memory] Past record.\n- (observation, 2026-10-01, source_id:user:main:42) A forgotten fact.';
+    const memory = {
+      enabled: () => true,
+      sourceFenced: (sourceId: string) => fenced.has(sourceId),
+      setLifecycleHooks: () => {},
+      retainUser: () => 'user:main:44',
+      recallForTurn: async () => ({ text: memoryText, route: 'standard', found: true, status: 'found' }),
+    } as unknown as HindsightMemory;
+    const Persona = coopanionPersona(Cormini, { memory });
+    const persona = new Persona({ memoryDir: workspace });
+    const injected: string[] = [];
+    const core = {
+      toolsTagged: () => new Set<string>(),
+      injectInternal: (text: string) => injected.push(text),
+      injectExternal: () => {},
+    };
+    persona.attach(core as never);
+
+    const currentEvent: EventEnvelope = {
+      cursor: 44, ts: '2026-10-31T10:00:02.000Z', type: 'desktop-pet.message', source: 'desktop-pet',
+      origin: 'external', text: 'A current user event.', meta: { text: 'A current user event.' },
+    };
+    await persona.onDelivery({ events: [currentEvent] });
+    expect(injected).toContain(memoryText);
+
+    const forgottenUser = 'Forgotten user event.';
+    const forgottenTouch = 'A forgotten touch event.';
+    const current = 'A current user event.';
+    const body = [memoryText, forgottenUser, forgottenTouch, current].join('\n');
+    const firstStart = memoryText.length + 1;
+    const secondStart = firstStart + forgottenUser.length + 1;
+    const thirdStart = secondStart + forgottenTouch.length + 1;
+    await persona.onHandoff([
+      functionCall('memory-call', 'memory_search', JSON.stringify({ query: 'find my old event' })),
+      functionResult('memory-call', memoryText),
+      message('user', body, { frame: { events: [
+        { cursor: 42, ts: '2026-10-31T10:00:00.000Z', type: 'desktop-pet.message', source: 'desktop-pet', start: firstStart, chars: forgottenUser.length },
+        { cursor: 43, ts: '2026-10-31T10:00:01.000Z', type: 'desktop-pet.touch', source: 'desktop-pet', start: secondStart, chars: forgottenTouch.length },
+        { cursor: 44, ts: '2026-10-31T10:00:02.000Z', type: 'desktop-pet.message', source: 'desktop-pet', start: thirdStart, chars: current.length },
+      ] } }),
+    ], { hardTokens: null });
+
+    const notes = readdirSync(join(workspace, 'handoffs'))
+      .map((name) => readFileSync(join(workspace, 'handoffs', name), 'utf8')).join('\n');
+    expect(notes).not.toContain(memoryText);
+    expect(notes).not.toContain(forgottenUser);
+    expect(notes).not.toContain(forgottenTouch);
+    expect(notes).not.toContain('find my old event');
+    expect(notes).toContain(current);
   });
 });
