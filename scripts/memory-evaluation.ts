@@ -9,6 +9,7 @@ export interface MemoryEvaluationCase {
   answerable: boolean;
   requiredSourceIds: string[];
   deletedSourceIds?: string[];
+  forbiddenSourceIds?: string[];
 }
 
 export interface MemoryEvaluationObservation {
@@ -45,6 +46,9 @@ export interface MemoryEvaluationScore {
   answerAccuracy: MemoryEvaluationRate;
   noAnswerPrecision: MemoryEvaluationRate;
   noAnswerRecall: MemoryEvaluationRate;
+  /** Case rates; denominator includes only cases with at least one forbidden source. */
+  unrelatedHistoryAt5: MemoryEvaluationRate;
+  unrelatedHistoryInContext: MemoryEvaluationRate;
   deleteLeak: MemoryEvaluationRate;
   latencyMs: { p50: number | null; p95: number | null; samples: number };
   usage: {
@@ -120,6 +124,9 @@ export function scoreMemoryEvaluation(
   let answerCount = 0;
   let noAnswerTruePositive = 0;
   let abstentionPredictions = 0;
+  let unrelatedHistoryCases = 0;
+  let unrelatedHistoryAt5 = 0;
+  let unrelatedHistoryInContext = 0;
   let deletedCaseCount = 0;
   let deleteLeaks = 0;
   const latencies: number[] = [];
@@ -141,6 +148,12 @@ export function scoreMemoryEvaluation(
     const top5 = new Set(observation.sourceIdsAt5.slice(0, 5).flat());
     const visible = new Set(observation.visibleSourceIds);
     const context = new Set(observation.contextSourceIds);
+    const forbidden = new Set(testCase.forbiddenSourceIds ?? []);
+    if (forbidden.size > 0) {
+      unrelatedHistoryCases += 1;
+      if ([...forbidden].some((id) => top5.has(id))) unrelatedHistoryAt5 += 1;
+      if ([...forbidden].some((id) => context.has(id))) unrelatedHistoryInContext += 1;
+    }
     if (testCase.answerable && required.size > 0) {
       const found = [...required].filter((id) => top5.has(id)).length;
       recallSum += found / required.size;
@@ -204,6 +217,8 @@ export function scoreMemoryEvaluation(
     answerAccuracy: ratio(answerCorrect, answerCount),
     noAnswerPrecision: ratio(noAnswerTruePositive, abstentionPredictions),
     noAnswerRecall: ratio(noAnswerTruePositive, noAnswer.length),
+    unrelatedHistoryAt5: ratio(unrelatedHistoryAt5, unrelatedHistoryCases),
+    unrelatedHistoryInContext: ratio(unrelatedHistoryInContext, unrelatedHistoryCases),
     deleteLeak: ratio(deleteLeaks, deletedCaseCount),
     latencyMs: { p50: percentile(latencies, 0.5), p95: percentile(latencies, 0.95), samples: latencies.length },
     usage: {

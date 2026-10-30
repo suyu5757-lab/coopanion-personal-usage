@@ -127,7 +127,7 @@ function unanswerableCase(index: number): SyntheticMemoryEvaluationCase {
     return {
       id: `dev-no-answer-${String(index).padStart(4, '0')}`, answerable: false, category: 'explicitly_deleted',
       query: `What colour had ${subject} chosen for the paper kite?`, requiredSourceIds: [],
-      deletedSourceIds: [deleted], forbiddenSourceIds: [deleted],
+      deletedSourceIds: [deleted], forbiddenSourceIds: [deleted, distractor],
       documents: [
         { sourceId: deleted, text: `${subject} chose ${answer} for the paper kite.`, state: 'deleted' },
         { sourceId: distractor, text: `${subject} keeps a notebook in ${PLACES[index % PLACES.length]}.`, state: 'current' },
@@ -136,7 +136,7 @@ function unanswerableCase(index: number): SyntheticMemoryEvaluationCase {
   }
   return {
     id: `dev-no-answer-${String(index).padStart(4, '0')}`, answerable: false, category: 'unrecorded_fact',
-    query: `Which instrument did ${subject} buy last year?`, requiredSourceIds: [], forbiddenSourceIds: [],
+    query: `Which instrument did ${subject} buy last year?`, requiredSourceIds: [], forbiddenSourceIds: [distractor],
     documents: [{ sourceId: distractor, text: `${subject} chose ${COLOURS[index % COLOURS.length]} for the paper kite.`, state: 'current' }],
   };
 }

@@ -9,6 +9,7 @@ describe('memory evaluation contract', () => {
     expect(cases).toHaveLength(250);
     expect(cases.filter((testCase) => testCase.answerable)).toHaveLength(200);
     expect(cases.filter((testCase) => !testCase.answerable)).toHaveLength(50);
+    expect(cases.filter((testCase) => !testCase.answerable).every((testCase) => (testCase.forbiddenSourceIds?.length ?? 0) > 0)).toBe(true);
     expect(new Set(cases.map((testCase) => testCase.id)).size).toBe(cases.length);
     expect(cases.every((testCase) => testCase.documents.every((document) => document.sourceId.startsWith('src-dev-')))).toBe(true);
     expect(cases.some((testCase) => testCase.category === 'multi_source')).toBe(true);
@@ -20,13 +21,13 @@ describe('memory evaluation contract', () => {
     const cases = [
       { id: 'a', answerable: true, requiredSourceIds: ['src-a', 'src-b'] },
       { id: 'b', answerable: true, requiredSourceIds: ['src-x'] },
-      { id: 'c', answerable: false, requiredSourceIds: [], deletedSourceIds: ['src-deleted'] },
-      { id: 'd', answerable: false, requiredSourceIds: [], deletedSourceIds: ['src-deleted-2'] },
+      { id: 'c', answerable: false, requiredSourceIds: [], deletedSourceIds: ['src-deleted'], forbiddenSourceIds: ['src-deleted'] },
+      { id: 'd', answerable: false, requiredSourceIds: [], deletedSourceIds: ['src-deleted-2'], forbiddenSourceIds: ['src-deleted-2'] },
     ];
     const observations = [
       { caseId: 'a', sourceIdsAt5: [['src-a']], visibleSourceIds: ['src-a'], contextSourceIds: ['src-a'], answerOutcome: 'abstained' as const, answerCorrect: false, latencyMs: 10, inputTokens: 10, outputTokens: 2, costMicros: 50, costCurrency: 'USD', cpuMs: 12, peakMemoryBytes: 1_000 },
       { caseId: 'b', sourceIdsAt5: [['src-x']], visibleSourceIds: ['src-x'], contextSourceIds: ['src-x'], answerOutcome: 'answered' as const, answerCorrect: true, latencyMs: 20, inputTokens: 20, outputTokens: 4, costMicros: 70, costCurrency: 'USD', cpuMs: 20, peakMemoryBytes: 1_500 },
-      { caseId: 'c', sourceIdsAt5: [], visibleSourceIds: ['src-deleted'], contextSourceIds: ['src-deleted'], answerOutcome: 'answered' as const, answerCorrect: false, latencyMs: 30 },
+      { caseId: 'c', sourceIdsAt5: [['src-deleted']], visibleSourceIds: ['src-deleted'], contextSourceIds: ['src-deleted'], answerOutcome: 'answered' as const, answerCorrect: false, latencyMs: 30 },
       { caseId: 'd', sourceIdsAt5: [], visibleSourceIds: [], contextSourceIds: [], answerOutcome: 'abstained' as const, answerCorrect: true, latencyMs: 40 },
     ];
 
@@ -39,6 +40,8 @@ describe('memory evaluation contract', () => {
     expect(score.answerAccuracy).toEqual({ numerator: 2, denominator: 4, value: 0.5 });
     expect(score.noAnswerPrecision).toEqual({ numerator: 1, denominator: 2, value: 0.5 });
     expect(score.noAnswerRecall).toEqual({ numerator: 1, denominator: 2, value: 0.5 });
+    expect(score.unrelatedHistoryAt5).toEqual({ numerator: 1, denominator: 2, value: 0.5 });
+    expect(score.unrelatedHistoryInContext).toEqual({ numerator: 1, denominator: 2, value: 0.5 });
     expect(score.deleteLeak).toEqual({ numerator: 1, denominator: 2, value: 0.5 });
     expect(score.latencyMs).toEqual({ p50: 20, p95: 40, samples: 4 });
     expect(score.usage).toEqual({ inputTokens: 30, outputTokens: 6, costMicros: 120, costCurrency: 'USD', cpuMs: 32, peakMemoryBytes: 1_500, samples: 2 });
