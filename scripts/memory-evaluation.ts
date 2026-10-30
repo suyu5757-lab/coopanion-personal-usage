@@ -10,6 +10,7 @@ export interface MemoryEvaluationCase {
   requiredSourceIds: string[];
   deletedSourceIds?: string[];
   forbiddenSourceIds?: string[];
+  category?: string;
 }
 
 export interface MemoryEvaluationObservation {
@@ -27,6 +28,7 @@ export interface MemoryEvaluationObservation {
   costCurrency?: string;
   cpuMs?: number;
   peakMemoryBytes?: number;
+  activationStateRestored?: boolean;
 }
 
 export interface MemoryEvaluationRate {
@@ -50,6 +52,7 @@ export interface MemoryEvaluationScore {
   unrelatedHistoryAt5: MemoryEvaluationRate;
   unrelatedHistoryInContext: MemoryEvaluationRate;
   deleteLeak: MemoryEvaluationRate;
+  activationStateRestored: MemoryEvaluationRate;
   latencyMs: { p50: number | null; p95: number | null; samples: number };
   usage: {
     inputTokens: number | null;
@@ -62,28 +65,36 @@ export interface MemoryEvaluationScore {
   };
 }
 
+export interface MemoryEvaluationDelta {
+  sourceRecallAt5: number | null;
+  completeEvidenceAt5: number | null;
+  visibleComplete: number | null;
+  contextComplete: number | null;
+  answerAccuracy: number | null;
+  noAnswerPrecision: number | null;
+  noAnswerRecall: number | null;
+  unrelatedHistoryAt5: number | null;
+  unrelatedHistoryInContext: number | null;
+  deleteLeak: number | null;
+  activationStateRestored: number | null;
+  p50LatencyMs: number | null;
+  p95LatencyMs: number | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  costMicros: number | null;
+  cpuMs: number | null;
+  peakMemoryBytes: number | null;
+}
+
 export interface MemoryEvaluationComparison {
   baseline: MemoryEvaluationScore;
   activation: MemoryEvaluationScore;
-  delta: {
-    sourceRecallAt5: number | null;
-    completeEvidenceAt5: number | null;
-    visibleComplete: number | null;
-    contextComplete: number | null;
-    answerAccuracy: number | null;
-    noAnswerPrecision: number | null;
-    noAnswerRecall: number | null;
-    unrelatedHistoryAt5: number | null;
-    unrelatedHistoryInContext: number | null;
-    deleteLeak: number | null;
-    p50LatencyMs: number | null;
-    p95LatencyMs: number | null;
-    inputTokens: number | null;
-    outputTokens: number | null;
-    costMicros: number | null;
-    cpuMs: number | null;
-    peakMemoryBytes: number | null;
-  };
+  delta: MemoryEvaluationDelta;
+  byCategory: Record<string, {
+    baseline: MemoryEvaluationScore;
+    activation: MemoryEvaluationScore;
+    delta: MemoryEvaluationDelta;
+  }>;
 }
 
 const ratio = (numerator: number, denominator: number): MemoryEvaluationRate => ({
@@ -102,7 +113,7 @@ export function observationFromRecallTrace(
   caseId: string,
   search: MemorySearchTrace,
   format: RecallFormatTrace,
-  extras: Pick<MemoryEvaluationObservation, 'deletedSourceIds' | 'answerOutcome' | 'answerCorrect' | 'latencyMs' | 'inputTokens' | 'outputTokens' | 'costMicros' | 'costCurrency' | 'cpuMs' | 'peakMemoryBytes'> = {},
+  extras: Pick<MemoryEvaluationObservation, 'deletedSourceIds' | 'answerOutcome' | 'answerCorrect' | 'latencyMs' | 'inputTokens' | 'outputTokens' | 'costMicros' | 'costCurrency' | 'cpuMs' | 'peakMemoryBytes' | 'activationStateRestored'> = {},
 ): MemoryEvaluationObservation {
   const visible = search.items.filter((item) => item.disposition === 'visible');
   const sourcesFor = (item: MemorySearchTrace['items'][number]): string[] => {
@@ -153,6 +164,8 @@ export function scoreMemoryEvaluation(
   let unrelatedHistoryInContext = 0;
   let deletedCaseCount = 0;
   let deleteLeaks = 0;
+  let restartStateCases = 0;
+  let restartStateRestored = 0;
   const latencies: number[] = [];
   let inputTokens = 0;
   let outputTokens = 0;
@@ -197,6 +210,10 @@ export function scoreMemoryEvaluation(
     if (deleted.size > 0) {
       deletedCaseCount += 1;
       if ([...deleted].some((id) => visible.has(id) || context.has(id))) deleteLeaks += 1;
+    }
+    if (typeof observation.activationStateRestored === 'boolean') {
+      restartStateCases += 1;
+      if (observation.activationStateRestored) restartStateRestored += 1;
     }
     if (typeof observation.latencyMs === 'number' && Number.isFinite(observation.latencyMs) && observation.latencyMs >= 0) {
       latencies.push(observation.latencyMs);
@@ -244,6 +261,7 @@ export function scoreMemoryEvaluation(
     unrelatedHistoryAt5: ratio(unrelatedHistoryAt5, unrelatedHistoryCases),
     unrelatedHistoryInContext: ratio(unrelatedHistoryInContext, unrelatedHistoryCases),
     deleteLeak: ratio(deleteLeaks, deletedCaseCount),
+    activationStateRestored: ratio(restartStateRestored, restartStateCases),
     latencyMs: { p50: percentile(latencies, 0.5), p95: percentile(latencies, 0.95), samples: latencies.length },
     usage: {
       inputTokens: inputTokenSamples > 0 ? inputTokens : null,
@@ -261,6 +279,29 @@ function delta(current: number | null, baseline: number | null): number | null {
   return current === null || baseline === null ? null : current - baseline;
 }
 
+function compareScores(baseline: MemoryEvaluationScore, activation: MemoryEvaluationScore): MemoryEvaluationDelta {
+  return {
+    sourceRecallAt5: delta(activation.sourceRecallAt5.value, baseline.sourceRecallAt5.value),
+    completeEvidenceAt5: delta(activation.completeEvidenceAt5.value, baseline.completeEvidenceAt5.value),
+    visibleComplete: delta(activation.visibleComplete.value, baseline.visibleComplete.value),
+    contextComplete: delta(activation.contextComplete.value, baseline.contextComplete.value),
+    answerAccuracy: delta(activation.answerAccuracy.value, baseline.answerAccuracy.value),
+    noAnswerPrecision: delta(activation.noAnswerPrecision.value, baseline.noAnswerPrecision.value),
+    noAnswerRecall: delta(activation.noAnswerRecall.value, baseline.noAnswerRecall.value),
+    unrelatedHistoryAt5: delta(activation.unrelatedHistoryAt5.value, baseline.unrelatedHistoryAt5.value),
+    unrelatedHistoryInContext: delta(activation.unrelatedHistoryInContext.value, baseline.unrelatedHistoryInContext.value),
+    deleteLeak: delta(activation.deleteLeak.value, baseline.deleteLeak.value),
+    activationStateRestored: delta(activation.activationStateRestored.value, baseline.activationStateRestored.value),
+    p50LatencyMs: delta(activation.latencyMs.p50, baseline.latencyMs.p50),
+    p95LatencyMs: delta(activation.latencyMs.p95, baseline.latencyMs.p95),
+    inputTokens: delta(activation.usage.inputTokens, baseline.usage.inputTokens),
+    outputTokens: delta(activation.usage.outputTokens, baseline.usage.outputTokens),
+    costMicros: delta(activation.usage.costMicros, baseline.usage.costMicros),
+    cpuMs: delta(activation.usage.cpuMs, baseline.usage.cpuMs),
+    peakMemoryBytes: delta(activation.usage.peakMemoryBytes, baseline.usage.peakMemoryBytes),
+  };
+}
+
 export function compareMemoryEvaluations(
   cases: readonly MemoryEvaluationCase[],
   baselineObservations: readonly MemoryEvaluationObservation[],
@@ -273,28 +314,28 @@ export function compareMemoryEvaluations(
   if (baselineCurrency && activationCurrency && baselineCurrency !== activationCurrency) {
     throw new Error('paired evaluation contains different cost currencies');
   }
+  const categories = new Map<string, MemoryEvaluationCase[]>();
+  for (const testCase of cases) {
+    const category = testCase.category?.trim() || 'uncategorized';
+    const grouped = categories.get(category) ?? [];
+    grouped.push(testCase);
+    categories.set(category, grouped);
+  }
+  const byCategory = Object.fromEntries([...categories].map(([category, group]) => {
+    const ids = new Set(group.map((testCase) => testCase.id));
+    const categoryBaseline = scoreMemoryEvaluation(group, baselineObservations.filter((item) => ids.has(item.caseId)));
+    const categoryActivation = scoreMemoryEvaluation(group, activationObservations.filter((item) => ids.has(item.caseId)));
+    return [category, {
+      baseline: categoryBaseline,
+      activation: categoryActivation,
+      delta: compareScores(categoryBaseline, categoryActivation),
+    }];
+  }));
   return {
     baseline,
     activation,
-    delta: {
-      sourceRecallAt5: delta(activation.sourceRecallAt5.value, baseline.sourceRecallAt5.value),
-      completeEvidenceAt5: delta(activation.completeEvidenceAt5.value, baseline.completeEvidenceAt5.value),
-      visibleComplete: delta(activation.visibleComplete.value, baseline.visibleComplete.value),
-      contextComplete: delta(activation.contextComplete.value, baseline.contextComplete.value),
-      answerAccuracy: delta(activation.answerAccuracy.value, baseline.answerAccuracy.value),
-      noAnswerPrecision: delta(activation.noAnswerPrecision.value, baseline.noAnswerPrecision.value),
-      noAnswerRecall: delta(activation.noAnswerRecall.value, baseline.noAnswerRecall.value),
-      unrelatedHistoryAt5: delta(activation.unrelatedHistoryAt5.value, baseline.unrelatedHistoryAt5.value),
-      unrelatedHistoryInContext: delta(activation.unrelatedHistoryInContext.value, baseline.unrelatedHistoryInContext.value),
-      deleteLeak: delta(activation.deleteLeak.value, baseline.deleteLeak.value),
-      p50LatencyMs: delta(activation.latencyMs.p50, baseline.latencyMs.p50),
-      p95LatencyMs: delta(activation.latencyMs.p95, baseline.latencyMs.p95),
-      inputTokens: delta(activation.usage.inputTokens, baseline.usage.inputTokens),
-      outputTokens: delta(activation.usage.outputTokens, baseline.usage.outputTokens),
-      costMicros: delta(activation.usage.costMicros, baseline.usage.costMicros),
-      cpuMs: delta(activation.usage.cpuMs, baseline.usage.cpuMs),
-      peakMemoryBytes: delta(activation.usage.peakMemoryBytes, baseline.usage.peakMemoryBytes),
-    },
+    delta: compareScores(baseline, activation),
+    byCategory,
   };
 }
 
