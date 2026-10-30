@@ -234,7 +234,8 @@ describe('Hindsight source-fact recall', () => {
       userEventDocumentId: sourceEvent!, targetCreatedAt: oldAt, semanticMatch: 0.9, intensity: 0,
     });
 
-    const read = await runtime.recallBlockDetailed('What did I tell you last time?', { captureTrace: true });
+    const read = await runtime.recallForTurn('What did I tell you last time?', { captureTrace: true, activationInfluence: 0 });
+    const defaultRead = await runtime.recallForTurn('What did I tell you last time?', { captureTrace: true });
     const activation = store.loadActivationState('bank-test', api.baseUrl, 'doc-old-event');
 
     expect(read.status).toBe('found');
@@ -243,6 +244,8 @@ describe('Hindsight source-fact recall', () => {
     expect(read.trace?.format.activationWeights).toEqual([
       { resultId: 'observation-old-event', weight: read.trace?.search.items[0]?.activationWeight },
     ]);
+    expect(read.trace?.format.activationInfluence).toBe(0);
+    expect(defaultRead.trace?.format.activationInfluence).toBe(0.25);
     expect(activation).toMatchObject({ anchorAt: oldAt, independentMentionCount: 1 });
     expect(activation?.anchorWeight).toBe(0.8);
     expect(activation?.lastRetrievedAt).not.toBeNull();

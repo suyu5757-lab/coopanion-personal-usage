@@ -24,13 +24,15 @@ export type TurnRecallStatus = MemoryReadStatus | 'skipped';
 export interface MemoryTextRead {
   text: string;
   status: MemoryReadStatus;
-  trace?: {
-    search: MemorySearchTrace;
-    format: RecallFormatTrace;
-    maxTokens: number;
-    maxChars: number;
-    sourceFactsTokenBudget?: number;
-  };
+  trace?: MemoryRecallTrace;
+}
+
+export interface MemoryRecallTrace {
+  search: MemorySearchTrace;
+  format: RecallFormatTrace;
+  maxTokens: number;
+  maxChars: number;
+  sourceFactsTokenBudget?: number;
 }
 
 export interface MemorySearchSourceFact {
@@ -131,6 +133,7 @@ export interface TurnRecall {
   route: RecallRoute;
   found: boolean;
   status: TurnRecallStatus;
+  trace?: MemoryRecallTrace;
 }
 
 export interface ForgetResult {
@@ -1012,7 +1015,7 @@ export class HindsightMemory {
    * One recall for an incoming turn, routed by whether the answer depends on a past fact.
    * Results are cached briefly; explicit memory changes clear the cache.
    */
-  async recallForTurn(query: string, context: { userEventDocumentId?: string } = {}): Promise<TurnRecall> {
+  async recallForTurn(query: string, context: { userEventDocumentId?: string; activationInfluence?: number; captureTrace?: boolean } = {}): Promise<TurnRecall> {
     const started = Date.now();
     const epoch = this.cacheEpoch;
     const config = this.config;
@@ -1021,23 +1024,31 @@ export class HindsightMemory {
       maxTokens: config.recall.maxTokens,
       budget: config.recall.budget,
     } : {});
-    const finish = (text: string, status: TurnRecallStatus): TurnRecall => {
+    const finish = (text: string, status: TurnRecallStatus, trace?: MemoryRecallTrace): TurnRecall => {
       this.recallStats[plan.route] += 1;
       if (plan.route !== 'fast') {
         this.recallStats.measured += 1;
         this.recallStats.totalMs += Date.now() - started;
       }
-      return { text, route: plan.route, found: !!text, status };
+      return {
+        text,
+        route: plan.route,
+        found: !!text,
+        status,
+        ...(context.captureTrace && trace ? { trace } : {}),
+      };
     };
     if (plan.route === 'fast') return finish('', 'skipped');
-    const key = `${config?.bankId ?? ''}|${config?.apiUrl ?? ''}|${this.visibilityEpoch()}|${plan.route}|${context.userEventDocumentId ?? ''}|${query.trim().toLowerCase().slice(0, 300)}`;
-    const cached = plan.route === 'standard' ? this.recallCache.get(key) : undefined;
+    const key = `${config?.bankId ?? ''}|${config?.apiUrl ?? ''}|${this.visibilityEpoch()}|${plan.route}|${context.userEventDocumentId ?? ''}|${context.activationInfluence ?? 'default'}|${query.trim().toLowerCase().slice(0, 300)}`;
+    const cached = !context.captureTrace && plan.route === 'standard' ? this.recallCache.get(key) : undefined;
     if (cached && Date.now() - cached.at < 5 * 60_000) return finish(cached.value, 'found');
     const read = await this.recallBlockDetailed(query, {
       budget: plan.budget,
       maxTokens: plan.maxTokens,
       timeoutMs: plan.timeoutMs,
       maxChars: plan.maxChars,
+      ...(context.activationInfluence === undefined ? {} : { activationInfluence: context.activationInfluence }),
+      ...(context.captureTrace ? { captureTrace: true } : {}),
       ...(context.userEventDocumentId ? { userEventDocumentId: context.userEventDocumentId } : {}),
     });
     if (epoch !== this.cacheEpoch) return finish('', 'fenced');
@@ -1049,7 +1060,7 @@ export class HindsightMemory {
         if (!oldest.done) this.recallCache.delete(oldest.value);
       }
     }
-    return finish(text, read.status);
+    return finish(text, read.status, read.trace);
   }
 
   /** Drop recalled text and the session portrait after an explicit write, forget or bank change. */
