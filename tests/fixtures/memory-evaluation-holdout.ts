@@ -24,6 +24,17 @@ export interface MemoryEvaluationHoldoutCase extends MemoryEvaluationCase {
   }>;
 }
 
+export interface MemoryEvaluationHoldoutPrompt {
+  id: string;
+  query: string;
+}
+
+export interface MemoryEvaluationHoldoutCorpusItem {
+  caseId: string;
+  documents: MemoryEvaluationHoldoutDocument[];
+  mentionEvents?: MemoryEvaluationHoldoutCase['mentionEvents'];
+}
+
 const COLOURS = ['aubergine', 'burgundy', 'chartreuse', 'fuchsia', 'lavender', 'maroon', 'turquoise', 'vermilion'] as const;
 const OBJECTS = ['birdhouse', 'hourglass', 'coaster', 'toolbox', 'windmill', 'keyring', 'paperweight', 'telescope'] as const;
 const PLACES = ['the glasshouse', 'the riverside shed', 'the cedar room', 'the east arcade', 'the old observatory'] as const;
@@ -50,6 +61,30 @@ function lowActivationCase(index: number): MemoryEvaluationHoldoutCase {
     requiredSourceIds: [sourceId],
     forbiddenSourceIds: [],
     documents: [{ sourceId, text: `${subject} chose the ${colour} ${object}.`, state: 'current', activationWeight: 0.05 }],
+  };
+}
+
+function naturalRecallCase(index: number): MemoryEvaluationHoldoutCase {
+  const id = itemId('natural', index);
+  const subject = person('Member', index);
+  const object = OBJECTS[(index * 3) % OBJECTS.length]!;
+  const colour = COLOURS[(index * 5 + 2) % COLOURS.length]!;
+  const distractorColour = COLOURS[(index * 5 + 5) % COLOURS.length]!;
+  const selected = source(id, 'memory');
+  const distractor = source(id, 'similar-detail');
+  return {
+    id,
+    category: 'natural_recall',
+    answerable: true,
+    query: index % 2 === 0
+      ? `I'm ordering another ${object} for the workshop. What colour should I choose?`
+      : `我准备再买一个工作坊用的 ${object}，你建议选什么颜色？`,
+    requiredSourceIds: [selected],
+    forbiddenSourceIds: [distractor],
+    documents: [
+      { sourceId: selected, text: `${subject} chose ${colour} for the ${object} at the workshop.`, state: 'current', activationWeight: 0.05 },
+      { sourceId: distractor, text: `${subject} chose ${distractorColour} for a different item at the workshop.`, state: 'current', activationWeight: 0.6 },
+    ],
   };
 }
 
@@ -218,7 +253,8 @@ function nearMissCase(index: number): MemoryEvaluationHoldoutCase {
 
 export function createMemoryEvaluationHoldoutSet(): MemoryEvaluationHoldoutCase[] {
   return [
-    ...Array.from({ length: 20 }, (_, index) => lowActivationCase(index)),
+    ...Array.from({ length: 10 }, (_, index) => lowActivationCase(index)),
+    ...Array.from({ length: 10 }, (_, index) => naturalRecallCase(index)),
     ...Array.from({ length: 20 }, (_, index) => multiHopCase(index)),
     ...Array.from({ length: 20 }, (_, index) => timeUpdateCase(index)),
     ...Array.from({ length: 20 }, (_, index) => correctionCase(index)),
@@ -228,4 +264,16 @@ export function createMemoryEvaluationHoldoutSet(): MemoryEvaluationHoldoutCase[
     ...Array.from({ length: 10 }, (_, index) => ambiguousCase(index)),
     ...Array.from({ length: 10 }, (_, index) => nearMissCase(index)),
   ];
+}
+
+export function createMemoryEvaluationHoldoutPrompts(): MemoryEvaluationHoldoutPrompt[] {
+  return createMemoryEvaluationHoldoutSet().map(({ id, query }) => ({ id, query }));
+}
+
+export function createMemoryEvaluationHoldoutCorpus(): MemoryEvaluationHoldoutCorpusItem[] {
+  return createMemoryEvaluationHoldoutSet().map(({ id, documents, mentionEvents }) => ({
+    caseId: id,
+    documents,
+    ...(mentionEvents ? { mentionEvents } : {}),
+  }));
 }
