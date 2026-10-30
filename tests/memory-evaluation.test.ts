@@ -212,7 +212,7 @@ describe('memory evaluation contract', () => {
     const cases = createDevelopmentMemoryEvaluationSet();
     const now = Date.UTC(2026, 9, 31);
     const age = (days: number) => new Date(now - days * 86_400_000).toISOString();
-    const run = (activationInfluence: number) => cases.map((testCase) => {
+    const run = (activationInfluence: number, duplicateCount: number, maxItems: number) => cases.map((testCase) => {
       const documents = testCase.documents.filter((document) => document.state !== 'deleted');
       const results: FormattedRecallResult[] = [];
       for (const [index, document] of documents.entries()) {
@@ -231,7 +231,7 @@ describe('memory evaluation contract', () => {
           activationWeight,
         });
         if (index === 0) {
-          for (let repeat = 1; repeat <= 3; repeat += 1) {
+          for (let repeat = 1; repeat <= duplicateCount; repeat += 1) {
             results.push({
               id: `${testCase.id}-repeat-${repeat}`,
               text: `${document.text} Repeated retrieval record ${repeat}.`,
@@ -243,7 +243,7 @@ describe('memory evaluation contract', () => {
           }
         }
       }
-      const formatted = formatRecallDetailed(results, { maxItems: 2, activationInfluence });
+      const formatted = formatRecallDetailed(results, { maxItems, activationInfluence });
       return {
         caseId: testCase.id,
         sourceIdsAt5: results.slice(0, 5).map((result) => [result.document_id!]),
@@ -251,13 +251,21 @@ describe('memory evaluation contract', () => {
         contextSourceIds: formatted.trace.includedSourceDocumentIds,
       };
     });
-    const comparison = compareMemoryEvaluations(cases, run(0), run(DEFAULT_ACTIVATION_RANK_INFLUENCE));
+    for (const duplicateCount of [3, 11, 25]) {
+      for (const maxItems of [2, 8, 12]) {
+        const comparison = compareMemoryEvaluations(
+          cases,
+          run(0, duplicateCount, maxItems),
+          run(DEFAULT_ACTIVATION_RANK_INFLUENCE, duplicateCount, maxItems),
+        );
 
-    expect(comparison.baseline.contextComplete).toEqual({ numerator: 200, denominator: 200, value: 1 });
-    expect(comparison.activation.contextComplete).toEqual({ numerator: 200, denominator: 200, value: 1 });
-    expect(comparison.delta.contextComplete).toBeGreaterThanOrEqual(-0.02);
-    expect(comparison.byCategory.multi_hop?.baseline.contextComplete.value).toBe(1);
-    expect(comparison.byCategory.multi_hop?.activation.contextComplete.value).toBe(1);
+        expect(comparison.baseline.contextComplete).toEqual({ numerator: 200, denominator: 200, value: 1 });
+        expect(comparison.activation.contextComplete).toEqual({ numerator: 200, denominator: 200, value: 1 });
+        expect(comparison.delta.contextComplete).toBeGreaterThanOrEqual(-0.02);
+        expect(comparison.byCategory.multi_hop?.baseline.contextComplete.value).toBe(1);
+        expect(comparison.byCategory.multi_hop?.activation.contextComplete.value).toBe(1);
+      }
+    }
   });
 
   it('compares disabled and default activation influence in the same recall formatter', () => {

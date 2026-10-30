@@ -1,7 +1,7 @@
 import type { RecallResult } from '@vectorize-io/hindsight-client';
 
 const MARKER = /【[^】]*】|<[^<>]*>/g;
-export const DEFAULT_ACTIVATION_RANK_INFLUENCE = 0.2;
+export const DEFAULT_ACTIVATION_RANK_INFLUENCE = 0.25;
 
 export function cleanSpeech(text: string): string {
   return text.replace(MARKER, ' ').replace(/\s+/g, ' ').trim();
@@ -102,7 +102,8 @@ function rankRecallCandidates(candidates: readonly RecallCandidate[], coverageWe
       const coverage = sources.length > 0 ? newlyCovered / sources.length : 0;
       const relevance = 1 / (candidate.inputIndex + 1);
       const activationWeight = candidate.result.activationWeight;
-      const activationScore = typeof activationWeight === 'number' && Number.isFinite(activationWeight)
+      // Apply activation on a source's first context appearance; repeated results add no source evidence.
+      const activationScore = newlyCovered > 0 && typeof activationWeight === 'number' && Number.isFinite(activationWeight)
         ? Math.min(1, Math.max(0, activationWeight)) * activationInfluence
         : 0;
       const score = relevance + coverage * coverageWeight + activationScore;
