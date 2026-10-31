@@ -14,6 +14,73 @@ afterEach(() => {
 });
 
 describe('shared ActionReceiptLedger', () => {
+  it('persists non-mutating observations while a media receipt stays unresolved', () => {
+    dir = mkdtempSync(join(tmpdir(), 'coopanion-action-receipts-'));
+    const file = join(dir, 'receipts.json');
+    const ledger = new ActionReceiptLedger(file);
+    const target: BrowserTargetEvidence = {
+      surface: 'browser', instanceId: 'browser-1', origin: 'https://creator.douyin.com',
+      url: 'https://creator.douyin.com/creator-micro/upload', accountRef: 'account-1', snapshotId: 'upload-page-1',
+      formId: 'file:88', control: 'upload input',
+    };
+    const receipt = ledger.begin({
+      taskId: 'browser-upload-1', intent: 'media-upload', risk: 'EXTERNAL_MUTATION', target,
+      payloadDigest: hashContent('preview.mp4'), files: [], duplicateKey: 'douyin-upload-1',
+    }, 1_000);
+    ledger.awaitingApproval(receipt.id, 1_001);
+    ledger.acting(receipt.id, 'a'.repeat(64), 1_002, 30_000, 1_003);
+    ledger.complete(receipt.id, {
+      phase: 'acting', dispatchState: 'delivered', outcome: 'delivered', note: 'file selected',
+    }, 1_004);
+
+    expect(ledger.observe(receipt.id, [{
+      source: 'douyin-upload-status', status: 'uploading', digest: hashContent('正在上传'), observedAt: 1_005,
+    }], 'upload progress observed', 1_005)).toBe(true);
+
+    const reopened = new ActionReceiptLedger(file);
+    expect(reopened.listUnresolved()).toMatchObject([{
+      id: receipt.id,
+      phase: 'acting',
+      dispatchState: 'delivered',
+      note: 'upload progress observed',
+      evidence: [expect.objectContaining({ status: 'uploading', digest: hashContent('正在上传') })],
+    }]);
+    expect(reopened.hasUnresolved('douyin-upload-1')).toBe(true);
+  });
+
+  it('keeps a draft-ready media upload reviewable and stores multiple page observations', () => {
+    dir = mkdtempSync(join(tmpdir(), 'coopanion-action-receipts-'));
+    const file = join(dir, 'receipts.json');
+    const ledger = new ActionReceiptLedger(file);
+    const target: BrowserTargetEvidence = {
+      surface: 'browser', instanceId: 'browser-1', origin: 'https://creator.douyin.com',
+      url: 'https://creator.douyin.com/creator-micro/upload', accountRef: 'account-1', snapshotId: 'upload-page-1',
+      formId: 'file:88', control: 'upload input',
+    };
+    const receipt = ledger.begin({
+      taskId: 'browser-upload-2', intent: 'media-upload', risk: 'EXTERNAL_MUTATION', target,
+      payloadDigest: hashContent('preview.mp4'), files: [], duplicateKey: 'douyin-upload-2',
+    }, 2_000);
+    ledger.awaitingApproval(receipt.id, 2_001);
+    ledger.acting(receipt.id, 'e'.repeat(64), 2_002, 30_000, 2_003);
+    ledger.complete(receipt.id, {
+      phase: 'draft-ready', dispatchState: 'delivered', outcome: 'draft-ready', note: 'draft is ready',
+      evidence: [
+        { source: 'douyin-upload-notice', status: 'observed', digest: hashContent('草稿已保存'), observedAt: 2_004 },
+        { source: 'douyin-upload-state', status: 'draft_ready', observedAt: 2_004 },
+      ],
+    }, 2_004);
+
+    const reopened = new ActionReceiptLedger(file);
+    expect(reopened.listUnresolved()).toMatchObject([{
+      id: receipt.id, phase: 'draft-ready', dispatchState: 'delivered', outcome: 'draft-ready',
+    }]);
+    expect(reopened.reconcile(receipt.id, 'review-pending', 'The page shows the upload under review.', 2_005)).toBe(true);
+    expect(new ActionReceiptLedger(file).listUnresolved()).toMatchObject([{
+      id: receipt.id, phase: 'review-pending', outcome: 'review-pending',
+    }]);
+  });
+
   it('retains an unresolved clipboard write across restart and blocks another copy', () => {
     dir = mkdtempSync(join(tmpdir(), 'coopanion-action-receipts-'));
     const file = join(dir, 'receipts.json');

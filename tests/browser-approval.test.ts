@@ -12,10 +12,10 @@ import { BrowserWorld } from '../core/browser/world.ts';
 type Page = {
   url: string; title: string; header: string; content: string; footer: string;
   video: null; elements: Array<{ id: number; label: string }>;
-  current: { url: string; title: string } | null;
+  current: { url: string; title: string; itemId?: string; authorRef?: string; authorLabel?: string; contentSnippet?: string; containerIdentity?: string; playing?: boolean; observedAt?: number } | null;
   account: { ref: string; label: string } | null;
   snapshotId: string;
-  replyTargets?: Array<{ boxId: number; fingerprint: string; evidenceHash: string; author: string; context: string; timestamp: string; needsExpand: boolean }>;
+  replyTargets?: Array<{ boxId: number; fingerprint: string; evidenceHash: string; author: string; authorRef?: string; context: string; timestamp: string; needsExpand: boolean }>;
   statusMessages?: string[];
 };
 
@@ -27,7 +27,11 @@ const page = (overrides: Partial<Page> = {}): Page => ({
   footer: '',
   video: null,
   elements: [{ id: 2, label: '' }, { id: 3, label: '发送' }],
-  current: { url: 'https://www.douyin.com/video/123', title: '海边的下午' },
+  current: {
+    url: 'https://www.douyin.com/video/123', title: '海边的下午', itemId: '123',
+    authorRef: 'https://www.douyin.com/user/creator-1', authorLabel: '阿青', contentSnippet: '海边的下午',
+    containerIdentity: 'article:video-card:123:article', playing: true, observedAt: Date.now(),
+  },
   account: { ref: 'https://www.douyin.com/user/account-1', label: '我的主页' },
   snapshotId: 'snapshot-1',
   ...overrides,
@@ -422,7 +426,7 @@ describe('public write approval', () => {
     const bridge = new FakeBridge();
     const fingerprint = 'a'.repeat(64), evidenceHash = 'b'.repeat(64);
     bridge.box = element({ placeholder: '回复评论' });
-    bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint, evidenceHash, author: '阿青', context: '阿青 这段配色好舒服', timestamp: '2026-10-28T03:00:00Z', needsExpand: false }], statusMessages: [] });
+    bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint, evidenceHash, author: '阿青', authorRef: 'https://www.douyin.com/user/u-1', context: '阿青 这段配色好舒服', timestamp: '2026-10-28T03:00:00Z', needsExpand: false }], statusMessages: [] });
     bridge.replyStatusAfterPress = ['回复成功'];
     let question = '';
     const { world, dir, taskJournalFile } = await make({ bridge, ask: async (value) => { question = value; return 'yes'; } });
@@ -441,7 +445,7 @@ describe('public write approval', () => {
     const bridge = new FakeBridge();
     const fingerprint = 'c'.repeat(64), evidenceHash = 'd'.repeat(64);
     bridge.box = element({ placeholder: '回复评论' });
-    bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint, evidenceHash, author: '阿青', context: '阿青 评论', timestamp: '', needsExpand: false }], statusMessages: ['回复成功'] });
+    bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint, evidenceHash, author: '阿青', authorRef: 'https://www.douyin.com/user/u-1', context: '阿青 评论', timestamp: '', needsExpand: false }], statusMessages: ['回复成功'] });
     let asked = 0;
     const { world } = await make({ bridge, ask: async () => { asked++; return 'yes'; } });
     await run(world, 'browser_type', { index: 2, text: '第一条回复' });
@@ -457,7 +461,7 @@ describe('public write approval', () => {
   it('refuses comment replies when the durable duplicate guard is unavailable', async () => {
     const bridge = new FakeBridge();
     bridge.box = element({ placeholder: '回复评论' });
-    bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint: '4'.repeat(64), evidenceHash: '5'.repeat(64), author: '阿青', context: '阿青 评论', timestamp: '', needsExpand: false }] });
+    bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint: '4'.repeat(64), evidenceHash: '5'.repeat(64), author: '阿青', authorRef: 'https://www.douyin.com/user/u-1', context: '阿青 评论', timestamp: '', needsExpand: false }] });
     let asked = 0;
     const { world } = await make({ bridge, replyJournalFile: null, ask: async () => { asked++; return 'yes'; } });
     await run(world, 'browser_type', { index: 2, text: '不应发出的回复' });
@@ -472,7 +476,7 @@ describe('public write approval', () => {
     const bridge = new FakeBridge();
     const fingerprint = 'e'.repeat(64), evidenceHash = 'f'.repeat(64);
     bridge.box = element({ placeholder: '回复评论' });
-    bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint, evidenceHash, author: '阿青', context: '原评论', timestamp: '', needsExpand: false }] });
+    bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint, evidenceHash, author: '阿青', authorRef: 'https://www.douyin.com/user/u-1', context: '原评论', timestamp: '', needsExpand: false }] });
     let answer: (value: ApprovalAnswer) => void = () => {};
     let askedNow: () => void = () => {};
     const asked = new Promise<void>((resolve) => { askedNow = resolve; });
@@ -493,7 +497,7 @@ describe('public write approval', () => {
     const bridge = new FakeBridge();
     const fingerprint = '2'.repeat(64), evidenceHash = '3'.repeat(64);
     bridge.box = element({ placeholder: '回复评论' });
-    bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint, evidenceHash, author: '阿青', context: '阿青 评论', timestamp: '', needsExpand: true }] });
+    bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint, evidenceHash, author: '阿青', authorRef: 'https://www.douyin.com/user/u-1', context: '阿青 评论', timestamp: '', needsExpand: true }] });
     let asked = 0;
     const { world, taskJournalFile } = await make({ bridge, ask: async () => { asked++; return 'yes'; } });
     await run(world, 'browser_type', { index: 2, text: '先展开再回复' });
@@ -517,7 +521,7 @@ describe('public write approval', () => {
     const bridge = new FakeBridge();
     const fingerprint = '6'.repeat(64), evidenceHash = '7'.repeat(64);
     bridge.box = element({ placeholder: '回复评论' });
-    bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint, evidenceHash, author: '阿青', context: '阿青 评论', timestamp: '', needsExpand: false }], statusMessages: ['回复成功'] });
+    bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint, evidenceHash, author: '阿青', authorRef: 'https://www.douyin.com/user/u-1', context: '阿青 评论', timestamp: '', needsExpand: false }], statusMessages: ['回复成功'] });
     const { world, dir, taskJournalFile } = await make({ bridge, ask: yes });
     await run(world, 'browser_type', { index: 2, text: '另一条回复' });
     const out = await run(world, 'browser_press', { index: 2, key: 'Enter' });

@@ -7,7 +7,7 @@ import { renderWorldEnvPrompt } from 'cortico/core/prefix.ts';
 import type { BrowserTransport } from '../core/browser/bridge.ts';
 import { readSelfTime, SELF_TIME_DEFAULTS } from '../core/browser/config.ts';
 import { browserDefinition } from '../core/browser/definition.ts';
-import { clickRefusal, isSearchField, isWriteAction, typeRefusal } from '../core/browser/guard.ts';
+import { clickRefusal, isSearchField, isWriteAction, targetStateToggle, typeRefusal } from '../core/browser/guard.ts';
 import { selfTimeLine } from '../core/browser/model-text.ts';
 import { BrowserWorld } from '../core/browser/world.ts';
 import { coopanionPersona } from '../core/persona.ts';
@@ -17,9 +17,9 @@ type Page = {
   url: string; title: string; header: string; content: string; footer: string;
   video: null | { current: number; duration: number; paused: boolean; muted: boolean; volume: number; width: number; height: number; src: string };
   snapshotId?: string;
-  current?: { url: string; title: string } | null;
+  current?: { url: string; title: string; itemId?: string; authorRef?: string; authorLabel?: string; contentSnippet?: string; containerIdentity?: string; playing?: boolean; observedAt?: number } | null;
   account?: { ref: string; label: string } | null;
-  elements?: Array<{ id: number; label: string }>;
+  elements?: Array<{ id: number; label: string; pressed?: boolean }>;
 };
 
 const page = (overrides: Partial<Page> = {}): Page => ({
@@ -207,6 +207,8 @@ describe('browser guard', () => {
     expect(isWriteAction('分享')).toBe(true);
     expect(isWriteAction('播放')).toBe(false);
     expect(isWriteAction('删除评论')).toBe(true);
+    expect(targetStateToggle('点赞 12 · 点赞')).toBe('like');
+    expect(targetStateToggle('收藏夹')).toBeNull();
   });
 
   it('never clicks a delete control even while public actions are enabled', async () => {
@@ -223,6 +225,19 @@ describe('browser guard', () => {
     const out = await run(world, 'browser_click', { index: 3 });
     expect(out.failed).toBe(true);
     expect(out.text).toContain('删除或移除内容');
+    expect(bridge.calls.some((call) => call.op === 'click')).toBe(false);
+  });
+
+  it('recognizes final publishing controls on the main Douyin site and leaves them to the person', async () => {
+    const { world, bridge } = await make();
+    const douyin = page({ url: 'https://www.douyin.com/video/123', title: '视频' });
+    bridge.responses.open = douyin;
+    bridge.element = element({ id: 3, tag: 'button', label: '发布', text: '发布', title: '', snapshotId: douyin.snapshotId });
+    await run(world, 'browser_open', { url: douyin.url });
+
+    const out = await run(world, 'browser_click', { index: 3 });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('最终发布只能由你在浏览器窗口里亲自点击');
     expect(bridge.calls.some((call) => call.op === 'click')).toBe(false);
   });
 });
@@ -450,6 +465,135 @@ describe('browser World', () => {
       .toMatchObject({ fileId: 88, snapshotId: 'upload-snapshot', files: ['generated/cover.png'], expectedFiles: approvedFiles });
   });
 
+  it('keeps Douyin upload receipts open across reads until the page reports a durable result', async () => {
+    const { world, bridge, taskJournalFile } = await make({
+      self: { actions: false, mediaUpload: true },
+      ask: async () => 'yes',
+    });
+    let currentState = {
+      ...page({ url: 'https://creator.douyin.com/creator-micro/upload', title: '发布作品' }),
+      snapshotId: 'upload-snapshot',
+      account: { ref: 'creator-1', label: '测试账号' },
+      fileInputs: [{ id: 88, label: '上传视频', accept: 'video/mp4', multiple: false, disabled: false, visible: true }],
+      statusMessages: [] as string[],
+    };
+    const approvedFiles = [{ path: 'preview.mp4', bytes: 1234, digest: 'b'.repeat(64), mime: 'video/mp4' }];
+    bridge.responses.open = () => currentState;
+    bridge.responses.read = () => currentState;
+    bridge.responses['inspect-upload'] = {
+      url: currentState.url,
+      snapshotId: currentState.snapshotId,
+      accept: 'video/mp4',
+      multiple: false,
+      account: currentState.account,
+      files: approvedFiles,
+    };
+    bridge.responses['upload-media'] = () => ({ files: ['preview.mp4'], state: currentState });
+    bridge.responses['inspect-upload-progress'] = () => ({
+      url: currentState.url,
+      snapshotId: currentState.snapshotId,
+      account: currentState.account,
+      selection: { names: ['preview.mp4'], accept: 'video/mp4', multiple: false },
+      statusMessages: currentState.statusMessages,
+    });
+
+    await run(world, 'browser_open', { url: currentState.url });
+    expect((await run(world, 'browser_upload_media', { fileId: 88, files: ['preview.mp4'] })).failed).toBeUndefined();
+    let receipts = JSON.parse(readFileSync(taskJournalFile, 'utf8')) as Array<Record<string, unknown>>;
+    expect(receipts[0]).toMatchObject({ phase: 'acting', dispatchState: 'delivered', outcome: 'delivered' });
+    expect(receipts[0].evidence).toEqual(expect.arrayContaining([expect.objectContaining({
+      source: 'douyin-upload-state', status: 'file_selected',
+    })]));
+
+    currentState = { ...currentState, statusMessages: ['草稿已保存'] };
+    await run(world, 'browser_read', {});
+    receipts = JSON.parse(readFileSync(taskJournalFile, 'utf8')) as Array<Record<string, unknown>>;
+    expect(receipts[0]).toMatchObject({ phase: 'draft-ready', outcome: 'draft-ready' });
+
+    currentState = { ...currentState, statusMessages: ['草稿已保存', '作品已提交'] };
+    await run(world, 'browser_read', {});
+    receipts = JSON.parse(readFileSync(taskJournalFile, 'utf8')) as Array<Record<string, unknown>>;
+    expect(receipts[0]).toMatchObject({ phase: 'submitted', outcome: 'remote-acknowledged' });
+
+    currentState = { ...currentState, statusMessages: ['草稿已保存', '作品已提交', '作品审核中'] };
+    await run(world, 'browser_read', {});
+    receipts = JSON.parse(readFileSync(taskJournalFile, 'utf8')) as Array<Record<string, unknown>>;
+    expect(receipts[0]).toMatchObject({ phase: 'review-pending', outcome: 'review-pending' });
+
+    currentState = { ...currentState, statusMessages: ['草稿已保存', '作品已提交', '作品审核中', '作品已发布'] };
+    await run(world, 'browser_read', {});
+    receipts = JSON.parse(readFileSync(taskJournalFile, 'utf8')) as Array<Record<string, unknown>>;
+    expect(receipts[0]).toMatchObject({ phase: 'verified', outcome: 'verified' });
+    expect(bridge.calls.filter((call) => call.op === 'inspect-upload-progress')).toHaveLength(4);
+  });
+
+  it('keeps upload notices unattributed when account, URL, snapshot or selected files do not match', async () => {
+    const { world, bridge, taskJournalFile } = await make({
+      self: { actions: false, mediaUpload: true },
+      ask: async () => 'yes',
+    });
+    const uploadUrl = 'https://creator.douyin.com/creator-micro/upload';
+    let currentState = {
+      ...page({ url: uploadUrl, title: '发布作品' }),
+      snapshotId: 'upload-snapshot',
+      account: { ref: 'creator-1', label: '测试账号' },
+      fileInputs: [{ id: 88, label: '上传视频', accept: 'video/mp4', multiple: false, disabled: false, visible: true }],
+      statusMessages: [] as string[],
+    };
+    let reportedAccount = currentState.account;
+    let reportedUrl = uploadUrl;
+    let reportedSnapshot = currentState.snapshotId;
+    let selectionNames = ['preview.mp4'];
+    let observedMessages: string[] = [];
+    const approvedFiles = [{ path: 'preview.mp4', bytes: 1234, digest: 'c'.repeat(64), mime: 'video/mp4' }];
+    bridge.responses.open = () => currentState;
+    bridge.responses.read = () => currentState;
+    bridge.responses['inspect-upload'] = {
+      url: uploadUrl, snapshotId: currentState.snapshotId, accept: 'video/mp4', multiple: false,
+      account: currentState.account, files: approvedFiles,
+    };
+    bridge.responses['upload-media'] = () => ({ files: ['preview.mp4'], state: currentState });
+    bridge.responses['inspect-upload-progress'] = () => ({
+      url: reportedUrl, snapshotId: reportedSnapshot, account: reportedAccount,
+      selection: { names: selectionNames, accept: 'video/mp4', multiple: false }, statusMessages: observedMessages,
+    });
+
+    await run(world, 'browser_open', { url: uploadUrl });
+    await run(world, 'browser_upload_media', { fileId: 88, files: ['preview.mp4'] });
+    const progressCalls = () => bridge.calls.filter((call) => call.op === 'inspect-upload-progress').length;
+
+    reportedAccount = { ref: 'creator-2', label: '其他账号' };
+    await run(world, 'browser_read', {});
+    expect(progressCalls()).toBe(1);
+    expect((JSON.parse(readFileSync(taskJournalFile, 'utf8')) as Array<Record<string, unknown>>)[0])
+      .toMatchObject({ phase: 'acting', outcome: 'delivered' });
+    reportedAccount = currentState.account;
+
+    currentState = { ...currentState, url: `${uploadUrl}?step=other` };
+    await run(world, 'browser_read', {});
+    expect(progressCalls()).toBe(1);
+    currentState = { ...currentState, url: uploadUrl };
+
+    reportedSnapshot = 'stale-snapshot';
+    await run(world, 'browser_read', {});
+    expect(progressCalls()).toBe(2);
+    reportedSnapshot = currentState.snapshotId;
+
+    selectionNames = ['different.mp4'];
+    observedMessages = ['作品已发布'];
+    currentState = { ...currentState, statusMessages: observedMessages };
+    await run(world, 'browser_read', {});
+    const receipts = JSON.parse(readFileSync(taskJournalFile, 'utf8')) as Array<Record<string, unknown>>;
+    const evidence = receipts[0].evidence as Array<Record<string, unknown>>;
+    expect(receipts[0]).toMatchObject({ phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown' });
+    expect(evidence).toEqual(expect.arrayContaining([
+      expect.objectContaining({ source: 'douyin-upload-file-input', status: 'mismatch' }),
+      expect.objectContaining({ source: 'douyin-upload-notice', status: 'unattributed' }),
+      expect.objectContaining({ source: 'douyin-upload-state', status: 'unknown' }),
+    ]));
+    expect(evidence.some((item) => item.status === 'published_verified')).toBe(false);
+  });
+
   it('does not upload media when its separate permission is off, even if social actions are on', async () => {
     const { world, bridge } = await make({ self: { actions: true, mediaUpload: false } });
     bridge.responses.open = {
@@ -551,6 +695,53 @@ describe('browser World', () => {
     expect(approvalQuestion).toContain('测试账号');
     expect(approvalQuestion).toContain('BV1test');
     expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))[0].phase).toBe('verified');
+  });
+
+  it('requires a known inactive state before a Douyin like and never toggles an active one off', async () => {
+    let asked = 0;
+    const { world, bridge } = await make({ self: { actions: true }, ask: async () => { asked++; return 'yes'; } });
+    const video = {
+      url: 'https://www.douyin.com/video/123', title: '海边的下午', itemId: '123',
+      authorRef: 'https://www.douyin.com/user/creator-1', authorLabel: '阿青', contentSnippet: '海边的下午',
+      containerIdentity: 'article:video-card:123:article', playing: true, observedAt: Date.now(),
+    };
+    const account = { ref: 'https://www.douyin.com/user/1', label: '我的主页' };
+    const state = page({ url: video.url, snapshotId: 'douyin-like', current: video, account, elements: [{ id: 2, label: '点赞' }] });
+    bridge.responses.open = state;
+    bridge.responses.read = state;
+    await run(world, 'browser_open', { url: state.url });
+    bridge.element = element({ id: 2, tag: 'button', label: '点赞', text: '点赞', title: '', snapshotId: state.snapshotId });
+    const unknown = await run(world, 'browser_click', { index: 2 });
+    expect(unknown.failed).toBe(true);
+    expect(unknown.text).toContain('current toggle state');
+
+    bridge.element = element({ id: 2, tag: 'button', label: '点赞', text: '点赞', title: '', pressed: true, snapshotId: state.snapshotId });
+    const active = await run(world, 'browser_click', { index: 2 });
+    expect(active.failed).toBe(true);
+    expect(active.text).toContain('现在已经是');
+    expect(asked).toBe(0);
+    expect(bridge.calls.some((call) => call.op === 'click')).toBe(false);
+  });
+
+  it('confirms a Douyin like only after aria-pressed changes from false to true', async () => {
+    const { world, bridge, taskJournalFile } = await make({ self: { actions: true }, ask: async () => 'yes' });
+    const video = {
+      url: 'https://www.douyin.com/video/123', title: '海边的下午', itemId: '123',
+      authorRef: 'https://www.douyin.com/user/creator-1', authorLabel: '阿青', contentSnippet: '海边的下午',
+      containerIdentity: 'article:video-card:123:article', playing: true, observedAt: Date.now(),
+    };
+    const account = { ref: 'https://www.douyin.com/user/1', label: '我的主页' };
+    const before = page({ url: video.url, snapshotId: 'douyin-like-before', current: video, account, elements: [{ id: 2, label: '点赞', pressed: false }] });
+    const after = page({ url: video.url, snapshotId: 'douyin-like-after', current: video, account, elements: [{ id: 2, label: '点赞', pressed: true }] });
+    bridge.responses.open = before;
+    bridge.responses.read = before;
+    bridge.responses.click = { answer: { success: true }, state: after };
+    await run(world, 'browser_open', { url: before.url });
+    bridge.element = element({ id: 2, tag: 'button', label: '点赞', text: '点赞', title: '', pressed: false, snapshotId: before.snapshotId });
+
+    const out = await run(world, 'browser_click', { index: 2 });
+    expect(out.failed).toBeUndefined();
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))[0]).toMatchObject({ phase: 'verified', outcome: 'ui-observed' });
   });
 
   it('does not retry an approved toggle whose changed state could not be confirmed', async () => {

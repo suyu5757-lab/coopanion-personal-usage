@@ -7,11 +7,11 @@ import type { ActionRisk, ActionTargetEvidence, DesktopTargetEvidence } from './
 
 export type ActionIntent = 'platform-write' | 'clipboard-write' | 'image-generation' | 'image-saving' | 'media-upload' | 'computer-input' | 'file-write' | 'command-execution' | 'platform-api';
 export type BrowserTaskIntent = Extract<ActionIntent, 'platform-write' | 'clipboard-write' | 'image-generation' | 'image-saving' | 'media-upload'>;
-export type ActionReceiptPhase = 'planned' | 'awaiting-approval' | 'acting' | 'submitted' | 'review-pending' | 'verified' | 'unknown' | 'cancelled' | 'failed';
+export type ActionReceiptPhase = 'planned' | 'awaiting-approval' | 'acting' | 'draft-ready' | 'submitted' | 'review-pending' | 'verified' | 'unknown' | 'cancelled' | 'failed';
 export type BrowserTaskPhase = ActionReceiptPhase;
 export type BrowserTaskFile = { path: string; digest: string; bytes: number; mime: string };
 export type { ActionRisk } from './task-grants.ts';
-export type ActionReceiptOutcome = 'delivered' | 'ui-observed' | 'remote-acknowledged' | 'review-pending' | 'verified' | 'unknown' | 'cancelled' | 'failed';
+export type ActionReceiptOutcome = 'delivered' | 'ui-observed' | 'draft-ready' | 'remote-acknowledged' | 'review-pending' | 'verified' | 'unknown' | 'cancelled' | 'failed';
 export type ActionDispatchState = 'not-dispatched' | 'delivered' | 'unknown';
 export interface ActionReceiptEvidence {
   source: string;
@@ -22,9 +22,10 @@ export interface ActionReceiptEvidence {
 }
 interface ActionReceiptCompletionDetails {
   note: string;
-  evidence?: ActionReceiptEvidence;
+  evidence?: ActionReceiptEvidence | ActionReceiptEvidence[];
 }
 export type ActionReceiptCompletion =
+  | (ActionReceiptCompletionDetails & { phase: 'draft-ready'; dispatchState: 'delivered'; outcome: 'draft-ready' })
   | (ActionReceiptCompletionDetails & { phase: 'review-pending'; dispatchState: 'delivered'; outcome: 'review-pending' })
   | (ActionReceiptCompletionDetails & { phase: 'submitted'; dispatchState: 'delivered'; outcome: 'remote-acknowledged' })
   | (ActionReceiptCompletionDetails & { phase: 'acting'; dispatchState: 'delivered'; outcome: 'delivered' })
@@ -63,15 +64,22 @@ export interface ActionReceipt {
 export type BrowserTaskAction = ActionReceipt;
 export type NewActionReceipt = Omit<ActionReceipt, 'id' | 'actionId' | 'attemptId' | 'phase' | 'createdAt' | 'updatedAt' | 'risk' | 'dispatchState' | 'evidence' | 'action'>
   & Partial<Pick<ActionReceipt, 'actionId' | 'attemptId' | 'risk' | 'dispatchState' | 'evidence' | 'action'>>;
-const PHASES = new Set<ActionReceiptPhase>(['planned', 'awaiting-approval', 'acting', 'submitted', 'review-pending', 'verified', 'unknown', 'cancelled', 'failed']);
+const PHASES = new Set<ActionReceiptPhase>(['planned', 'awaiting-approval', 'acting', 'draft-ready', 'submitted', 'review-pending', 'verified', 'unknown', 'cancelled', 'failed']);
 const INTENTS = new Set<ActionIntent>(['platform-write', 'clipboard-write', 'image-generation', 'image-saving', 'media-upload', 'computer-input', 'file-write', 'command-execution', 'platform-api']);
-const UNRESOLVED = new Set<ActionReceiptPhase>(['planned', 'awaiting-approval', 'acting', 'submitted', 'review-pending', 'unknown']);
-const REVIEWABLE = new Set<ActionReceiptPhase>(['submitted', 'review-pending', 'unknown']);
+const UNRESOLVED = new Set<ActionReceiptPhase>(['planned', 'awaiting-approval', 'acting', 'draft-ready', 'submitted', 'review-pending', 'unknown']);
+const REVIEWABLE = new Set<ActionReceiptPhase>(['draft-ready', 'submitted', 'review-pending', 'unknown']);
 const MAX_RECENT_ACTIONS = 500;
 const RISKS = new Set<ActionRisk>(['READ_ONLY', 'REVERSIBLE_LOCAL', 'EXTERNAL_MUTATION', 'IRREVERSIBLE_OR_PUBLIC']);
 const DISPATCH_STATES = new Set<ActionDispatchState>(['not-dispatched', 'delivered', 'unknown']);
-const OUTCOMES = new Set<ActionReceiptOutcome>(['delivered', 'ui-observed', 'remote-acknowledged', 'review-pending', 'verified', 'unknown', 'cancelled', 'failed']);
+const OUTCOMES = new Set<ActionReceiptOutcome>(['delivered', 'ui-observed', 'draft-ready', 'remote-acknowledged', 'review-pending', 'verified', 'unknown', 'cancelled', 'failed']);
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+const usableEvidence = (item: unknown): item is ActionReceiptEvidence => {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return false;
+  const evidence = item as Record<string, unknown>;
+  return typeof evidence.source === 'string' && typeof evidence.status === 'string' && Number.isFinite(evidence.observedAt)
+    && (evidence.summary === undefined || typeof evidence.summary === 'string')
+    && (evidence.digest === undefined || (typeof evidence.digest === 'string' && /^[a-f0-9]{64}$/.test(evidence.digest)));
+};
 
 export const defaultActionRisk = (intent: ActionIntent): ActionRisk => intent === 'image-saving' || intent === 'file-write' || intent === 'clipboard-write'
   ? 'REVERSIBLE_LOCAL'
@@ -145,10 +153,7 @@ function usable(value: unknown): value is BrowserTaskAction {
       && /^[a-f0-9]{64}$/.test(file.digest) && Number.isSafeInteger(file.bytes) && file.bytes >= 0 && typeof file.mime === 'string')
     && (record.commentFingerprint === undefined || (typeof record.commentFingerprint === 'string' && /^[a-f0-9]{64}$/.test(record.commentFingerprint)))
     && (record.dispatchState === undefined || DISPATCH_STATES.has(record.dispatchState as ActionDispatchState))
-    && (evidence === undefined || (Array.isArray(evidence) && evidence.every((item) => !!item && typeof item.source === 'string'
-      && typeof item.status === 'string' && Number.isFinite(item.observedAt)
-      && (item.summary === undefined || typeof item.summary === 'string')
-      && (item.digest === undefined || (typeof item.digest === 'string' && /^[a-f0-9]{64}$/.test(item.digest))))))
+    && (evidence === undefined || (Array.isArray(evidence) && evidence.every(usableEvidence)))
     && (record.outcome === undefined || OUTCOMES.has(record.outcome as ActionReceiptOutcome))
     && typeof record.duplicateKey === 'string'
     && Number.isFinite(record.createdAt) && Number.isFinite(record.updatedAt);
@@ -195,7 +200,7 @@ export class ActionReceiptLedger {
     const action = this.actions.find((candidate) => candidate.id === id);
     const detail = note.trim();
     if (!action || !REVIEWABLE.has(action.phase) || !detail) return false;
-    if (decision === 'review-pending' && (action.target.surface !== 'browser' || action.intent !== 'platform-write')) return false;
+    if (decision === 'review-pending' && (action.target.surface !== 'browser' || !['platform-write', 'media-upload'].includes(action.intent))) return false;
     const evidence = {
       source: 'operator-review',
       status: decision,
@@ -286,6 +291,16 @@ export class ActionReceiptLedger {
     this.save();
   }
 
+  observe(id: string, evidence: ActionReceiptEvidence[], note?: string, now = Date.now()): boolean {
+    const action = this.actions.find((candidate) => candidate.id === id);
+    if (!action || !UNRESOLVED.has(action.phase) || !evidence.length || !evidence.every(usableEvidence)) return false;
+    action.evidence.push(...structuredClone(evidence));
+    if (note !== undefined) action.note = note.slice(0, 400);
+    action.updatedAt = now;
+    this.save();
+    return true;
+  }
+
   finish(
     id: string,
     phase: 'verified' | 'unknown' | 'cancelled',
@@ -320,7 +335,7 @@ export class ActionReceiptLedger {
     action.outcome = result.outcome;
     action.updatedAt = now;
     action.note = result.note.slice(0, 400);
-    if (result.evidence) action.evidence.push(result.evidence);
+    if (result.evidence) action.evidence.push(...(Array.isArray(result.evidence) ? result.evidence : [result.evidence]));
     this.save();
   }
 

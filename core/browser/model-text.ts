@@ -13,6 +13,20 @@ export interface VideoState {
   src: string;
 }
 
+/** Current-page identity required before any Douyin video write. */
+export interface DouyinVideoIdentity {
+  pageUrl: string;
+  sessionSnapshot: string;
+  videoUrl: string;
+  itemId: string;
+  authorRef: string;
+  authorLabel: string;
+  contentSnippet: string;
+  containerIdentity: string;
+  playing: boolean;
+  observedAt: number;
+}
+
 export interface PageState {
   url: string;
   title: string;
@@ -23,9 +37,19 @@ export interface PageState {
   /** Stable fingerprint of the observed DOM targets for this page state. */
   snapshotId?: string;
   /** Every numbered element's label at the moment of the read, for spotting a renumbered page. */
-  elements?: Array<{ id: number; label: string }>;
-  /** The playing video's own link and title, when the page carries one. */
-  current?: { url: string; title: string } | null;
+  elements?: Array<{ id: number; label: string; pressed?: boolean }>;
+  /** Public DOM evidence for the one current video and its recognized card. */
+  current?: {
+    url: string;
+    title: string;
+    itemId?: string;
+    authorRef?: string;
+    authorLabel?: string;
+    contentSnippet?: string;
+    containerIdentity?: string;
+    playing?: boolean;
+    observedAt?: number;
+  } | null;
   /** A unique logged-in profile link, when the page labels one as the current user's profile. */
   account?: { ref: string; label: string } | null;
   /** Exact timestamps exposed by visible semantic <time datetime> elements. */
@@ -35,7 +59,7 @@ export interface PageState {
   /** Visible accessibility live-region messages, read as status evidence only. */
   statusMessages?: string[];
   /** Reply boxes bound to one unique visible comment row. */
-  replyTargets?: Array<{ boxId: number; fingerprint: string; evidenceHash: string; author: string; context: string; timestamp: string; needsExpand: boolean }>;
+  replyTargets?: Array<{ boxId: number; fingerprint: string; evidenceHash: string; author: string; authorRef: string; context: string; timestamp: string; needsExpand: boolean }>;
 }
 
 export interface AgentElement {
@@ -49,6 +73,7 @@ export interface AgentElement {
   title: string;
   role: string;
   dataE2e: string;
+  pressed?: boolean;
   href: string;
   disabled: boolean;
   visible: boolean;

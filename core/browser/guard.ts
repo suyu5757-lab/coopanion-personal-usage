@@ -64,6 +64,17 @@ export function isWriteAction(label: string): boolean {
   return WRITE_ACTIONS_ZH.some((word) => text.includes(word)) || WRITE_ACTION_EN.test(text);
 }
 
+/** Toggle controls whose current pressed state must be read before a Douyin write. */
+export type TargetStateToggle = 'like' | 'favorite' | 'follow';
+export function targetStateToggle(label: string): TargetStateToggle | null {
+  for (const part of NORMAL(label).split(' · ')) {
+    if (/^(?:点赞|赞)(?:\s*\d+)?$|^likes?(?:\s+\d+)?$/.test(part)) return 'like';
+    if (/^(?:收藏)(?:\s*\d+)?$|^(?:save|favorites?|favourites?)(?:\s+\d+)?$/.test(part)) return 'favorite';
+    if (/^(?:关注)(?:\s*\d+)?$|^follows?(?:\s+\d+)?$/.test(part)) return 'follow';
+  }
+  return null;
+}
+
 /** A page control that copies a link into the local clipboard. */
 export function isClipboardCopyControl(label: string): boolean {
   return /(?:复制|拷贝)\s*(?:链接|地址)?|\bcopy(?:\s+(?:the\s+)?)?(?:link|url)\b/i.test(NORMAL(label));

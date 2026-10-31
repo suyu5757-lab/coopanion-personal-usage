@@ -23,9 +23,9 @@ import { BrowserTaskActionJournal, browserDuplicateKey } from './task-actions.ts
 import type { BrowserTargetEvidence, StepRequest } from '../task-grants.ts';
 import type { BrowserTransport } from './bridge.ts';
 import { CONTENT_MAX, SESSION_MAX_CALLS, TEXT_MAX, WATCH_FRAMES_DEFAULT, WATCH_FRAMES_MAX, WATCH_MAX, type SelfTimeConfig } from './config.ts';
-import { clickRefusal, isClipboardCopyControl, isFilePicker, isFinalPublishControl, isSearchField, isSendControl, isShareDismissControl, isShareDestinationControl, isWriteAction, removesState, typeRefusal } from './guard.ts';
-import { BROWSER_TEXT, type AgentElement, type BrowserText, type PageState, type VideoState } from './model-text.ts';
-import { clipboardCopyConfirmed, commentReplyConfirmed, submissionStatus } from './submission-status.ts';
+import { clickRefusal, isClipboardCopyControl, isFilePicker, isFinalPublishControl, isSearchField, isSendControl, isShareDismissControl, isShareDestinationControl, isWriteAction, removesState, targetStateToggle, typeRefusal } from './guard.ts';
+import { BROWSER_TEXT, type AgentElement, type BrowserText, type DouyinVideoIdentity, type PageState, type VideoState } from './model-text.ts';
+import { advanceDouyinUploadState, clipboardCopyConfirmed, commentReplyConfirmed, douyinUploadState, freshDouyinUploadMessages, submissionStatus, type DouyinUploadState } from './submission-status.ts';
 import { BROWSER_TOOL_DECLS } from './tools.ts';
 
 export const BROWSER_WORLD_ID = 'browser';
@@ -94,6 +94,25 @@ interface ClickAnswer { success?: boolean; message?: string }
 interface PlayAnswer { ok?: boolean; error?: string; video?: VideoState | null }
 
 const asRecord = (value: unknown): Record<string, unknown> | null => (value && typeof value === 'object' ? value as Record<string, unknown> : null);
+const normalizeUploadNotice = (value: string): string => value.replace(/\s+/g, ' ').trim().toLowerCase();
+const uploadNoticeDigest = (value: string): string => hashContent(normalizeUploadNotice(value));
+const fileInputId = (formId: string): number | null => {
+  const match = /^file:(\d+)$/.exec(formId);
+  return match && Number.isSafeInteger(Number(match[1])) ? Number(match[1]) : null;
+};
+const fileName = (value: string): string => value.split(/[\\/]/).at(-1) ?? value;
+
+function uploadCompletion(state: DouyinUploadState, evidence: ActionReceiptEvidence[]): ActionReceiptCompletion {
+  const note = `Douyin upload page state observed: ${state}`;
+  const delivered = { dispatchState: 'delivered' as const };
+  if (state === 'failed') return { phase: 'failed', ...delivered, outcome: 'failed', note, evidence };
+  if (state === 'draft_ready') return { phase: 'draft-ready', ...delivered, outcome: 'draft-ready', note, evidence };
+  if (state === 'platform_acknowledged') return { phase: 'submitted', ...delivered, outcome: 'remote-acknowledged', note, evidence };
+  if (state === 'review_pending') return { phase: 'review-pending', ...delivered, outcome: 'review-pending', note, evidence };
+  if (state === 'published_verified') return { phase: 'verified', ...delivered, outcome: 'verified', note, evidence };
+  if (state === 'unknown') return { phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown', note, evidence };
+  return { phase: 'acting', ...delivered, outcome: 'delivered', note, evidence };
+}
 
 /** When each frame is taken: the whole watch for one frame, both ends and even steps for more. */
 function watchTimes(seconds: number, frames: number): number[] {
@@ -144,7 +163,9 @@ const asState = (value: unknown): PageState | null => {
   const elements = Array.isArray(s.elements)
     ? s.elements.flatMap((raw) => {
       const e = asRecord(raw);
-      return e && typeof e.id === 'number' ? [{ id: e.id, label: typeof e.label === 'string' ? e.label : '' }] : [];
+      return e && typeof e.id === 'number'
+        ? [{ id: e.id, label: typeof e.label === 'string' ? e.label : '', ...(typeof e.pressed === 'boolean' ? { pressed: e.pressed } : {}) }]
+        : [];
     })
     : undefined;
   const current = asRecord(s.current);
@@ -189,6 +210,7 @@ const asState = (value: unknown): PageState | null => {
           fingerprint: value.fingerprint,
           evidenceHash: value.evidenceHash,
           author: value.author,
+          authorRef: typeof value.authorRef === 'string' ? value.authorRef : '',
           context: typeof value.context === 'string' ? value.context : '',
           timestamp: typeof value.timestamp === 'string' ? value.timestamp : '',
           needsExpand: value.needsExpand === true,
@@ -204,7 +226,17 @@ const asState = (value: unknown): PageState | null => {
     footer: typeof s.footer === 'string' ? s.footer : '',
     video: asVideo(s.video),
     ...(elements ? { elements } : {}),
-    current: current && typeof current.url === 'string' ? { url: current.url, title: typeof current.title === 'string' ? current.title : '' } : null,
+    current: current && typeof current.url === 'string' ? {
+      url: current.url,
+      title: typeof current.title === 'string' ? current.title : '',
+      ...(typeof current.itemId === 'string' ? { itemId: current.itemId } : {}),
+      ...(typeof current.authorRef === 'string' ? { authorRef: current.authorRef } : {}),
+      ...(typeof current.authorLabel === 'string' ? { authorLabel: current.authorLabel } : {}),
+      ...(typeof current.contentSnippet === 'string' ? { contentSnippet: current.contentSnippet } : {}),
+      ...(typeof current.containerIdentity === 'string' ? { containerIdentity: current.containerIdentity } : {}),
+      ...(typeof current.playing === 'boolean' ? { playing: current.playing } : {}),
+      ...(typeof current.observedAt === 'number' && Number.isFinite(current.observedAt) ? { observedAt: current.observedAt } : {}),
+    } : null,
     account: account && typeof account.ref === 'string' && typeof account.label === 'string'
       ? { ref: account.ref, label: account.label }
       : null,
@@ -231,6 +263,7 @@ const asElement = (value: unknown): AgentElement | null => {
     title: text('title'),
     role: text('role'),
     dataE2e: text('dataE2e'),
+    ...(typeof e.pressed === 'boolean' ? { pressed: e.pressed } : {}),
     href: text('href'),
     disabled: e.disabled === true,
     visible: e.visible !== false,
@@ -283,8 +316,40 @@ const isDouyinPage = (value: string): boolean => {
   try {
     const url = new URL(value);
     const host = url.hostname.toLowerCase();
-    return url.protocol === 'https:' && host === 'creator.douyin.com';
+    return url.protocol === 'https:' && ['douyin.com', 'www.douyin.com', 'creator.douyin.com'].includes(host);
   } catch { return false; }
+};
+
+const isDouyinCreatorPage = (value: string): boolean => {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.hostname.toLowerCase() === 'creator.douyin.com';
+  } catch { return false; }
+};
+
+const douyinVideoIdentity = (page: PageState | null, now = Date.now()): DouyinVideoIdentity | null => {
+  const current = page?.current;
+  if (!page?.snapshotId || !current || !current.itemId || !current.authorRef || !current.authorLabel
+    || !current.contentSnippet || !current.containerIdentity || typeof current.playing !== 'boolean'
+    || typeof current.observedAt !== 'number' || current.observedAt > now || now - current.observedAt > 30_000) return null;
+  try {
+    const pageUrl = new URL(page.url);
+    const videoUrl = new URL(current.url);
+    const pathItemId = videoUrl.pathname.match(/\/video\/([^/]+)/)?.[1] ?? videoUrl.searchParams.get('item_id') ?? '';
+    if (pageUrl.origin !== videoUrl.origin || current.itemId !== pathItemId) return null;
+  } catch { return null; }
+  return {
+    pageUrl: page.url,
+    sessionSnapshot: page.snapshotId,
+    videoUrl: current.url,
+    itemId: current.itemId,
+    authorRef: current.authorRef,
+    authorLabel: current.authorLabel,
+    contentSnippet: current.contentSnippet,
+    containerIdentity: current.containerIdentity,
+    playing: current.playing,
+    observedAt: current.observedAt,
+  };
 };
 
 export class BrowserWorld implements World {
@@ -740,6 +805,7 @@ export class BrowserWorld implements World {
     this.sharePanel = null;
     const state = asState(await this.call('open', { url, muted: !this.self.sound }, ctx.signal));
     if (!state) return this.toast(this.t.failed(tool, 'the browser returned no page'), true);
+    await this.observePendingDouyinUploads(state, ctx.signal);
     return this.toast(this.full(state, lead));
   }
 
@@ -749,8 +815,105 @@ export class BrowserWorld implements World {
       if (blocked) return blocked;
       const state = asState(await this.call('read', {}, ctx.signal));
       if (!state) return this.toast(this.t.failed('browser_read', 'the page returned no state'), true);
+      await this.observePendingDouyinUploads(state, ctx.signal);
       return this.toast(this.full(state));
     });
+  }
+
+  private recordDouyinUploadState(
+    receiptId: string,
+    selected: string[],
+    expected: string[],
+    messages: string[],
+    selectionDigest: string,
+  ): void {
+    const receipt = this.taskJournal?.listUnresolved().find((item) => item.id === receiptId);
+    if (!receipt || receipt.intent !== 'media-upload') return;
+    const normalizedSelected = selected.map((name) => name.trim());
+    const exactSelection = expected.length > 0 && normalizedSelected.length === expected.length
+      && normalizedSelected.every((name, index) => name === expected[index]);
+    const mismatchedSelection = normalizedSelected.length > 0 && !exactSelection;
+    const seen = new Set(receipt.evidence.filter((item) => item.source === 'douyin-upload-notice' && item.digest).map((item) => item.digest));
+    const freshMessages: string[] = [];
+    const noticeEvidence: ActionReceiptEvidence[] = [];
+    for (const message of messages) {
+      const normalized = normalizeUploadNotice(message);
+      if (!normalized) continue;
+      const digest = uploadNoticeDigest(normalized);
+      if (seen.has(digest)) continue;
+      seen.add(digest);
+      freshMessages.push(normalized);
+      noticeEvidence.push({
+        source: 'douyin-upload-notice',
+        status: mismatchedSelection ? 'unattributed' : 'observed',
+        digest,
+        observedAt: Date.now(),
+      });
+    }
+    if (!exactSelection && !mismatchedSelection && !freshMessages.length) return;
+    const observed: DouyinUploadState = mismatchedSelection
+      ? 'unknown'
+      : douyinUploadState({
+        selected: exactSelection ? normalizedSelected : [],
+        expected,
+        beforeMessages: [],
+        afterMessages: freshMessages,
+      });
+    if (observed === 'unknown' && !mismatchedSelection && !freshMessages.length) return;
+    const previous = [...receipt.evidence].reverse().find((item) => item.source === 'douyin-upload-state'
+      && item.status !== 'unknown' && ['file_selected', 'uploading', 'uploaded', 'processing', 'draft_ready', 'platform_acknowledged', 'review_pending', 'published_verified', 'failed'].includes(item.status))?.status as DouyinUploadState | undefined;
+    const state = mismatchedSelection ? 'unknown' : advanceDouyinUploadState(previous ?? null, observed);
+    const selectionStatus = exactSelection ? 'matched' : mismatchedSelection ? 'mismatch' : 'unavailable';
+    const latestSelectionEvidence = [...receipt.evidence].reverse().find((item) => item.source === 'douyin-upload-file-input');
+    const selectionEvidence: ActionReceiptEvidence[] = latestSelectionEvidence?.status === selectionStatus
+      && latestSelectionEvidence.digest === selectionDigest
+      ? []
+      : [{ source: 'douyin-upload-file-input', status: selectionStatus, digest: selectionDigest, observedAt: Date.now() }];
+    const latestState = [...receipt.evidence].reverse().find((item) => item.source === 'douyin-upload-state');
+    const stateEvidence: ActionReceiptEvidence[] = latestState?.status === state && !noticeEvidence.length
+      ? []
+      : [{
+        source: 'douyin-upload-state',
+        status: state,
+        summary: `the page and selected files were classified as ${state}`,
+        digest: hashContent(JSON.stringify([selectionDigest, expected])),
+        observedAt: Date.now(),
+      }];
+    const completion = uploadCompletion(state, [...noticeEvidence, ...selectionEvidence, ...stateEvidence]);
+    if (!noticeEvidence.length && !selectionEvidence.length && !stateEvidence.length && receipt.phase === completion.phase) return;
+    this.taskJournal?.complete(receiptId, completion);
+  }
+
+  private async observePendingDouyinUploads(page: PageState, signal?: AbortSignal): Promise<void> {
+    if (!this.taskJournal || !page.snapshotId || !page.account?.ref || !isDouyinCreatorPage(page.url)) return;
+    const candidates = this.taskJournal.listUnresolved().filter((item) => item.intent === 'media-upload'
+      && item.target.surface === 'browser' && item.target.url === page.url
+      && item.target.accountRef === page.account?.ref && fileInputId(item.target.formId) !== null);
+    if (candidates.length !== 1) return;
+    const receipt = candidates[0];
+    if (receipt.target.surface !== 'browser') return;
+    const id = fileInputId(receipt.target.formId);
+    if (id === null) return;
+    let observation: Record<string, unknown> | null;
+    try {
+      observation = asRecord(await this.call('inspect-upload-progress', { fileId: id }, signal));
+    } catch {
+      return;
+    }
+    const account = asRecord(observation?.account);
+    const selection = asRecord(observation?.selection);
+    if (!observation || observation.url !== page.url || observation.snapshotId !== page.snapshotId
+      || account?.ref !== receipt.target.accountRef) return;
+    const names = Array.isArray(selection?.names) && selection.names.every((name) => typeof name === 'string')
+      ? selection.names as string[]
+      : [];
+    if (selection && (!Array.isArray(selection.names) || !selection.names.every((name) => typeof name === 'string'))
+      || (selection && typeof selection.accept !== 'string') || (selection && typeof selection.multiple !== 'boolean')) return;
+    const expected = receipt.files.map((file) => fileName(file.path));
+    const selectionDigest = hashContent(JSON.stringify({ names, accept: selection?.accept ?? null, multiple: selection?.multiple ?? null }));
+    this.recordDouyinUploadState(receipt.id, names, expected, Array.isArray(observation.statusMessages)
+      ? observation.statusMessages.filter((message): message is string => typeof message === 'string').slice(0, 20)
+      : [], selectionDigest);
   }
 
   private async text(ctx: ToolCallContext): Promise<ToolOutcome> {
@@ -823,7 +986,7 @@ export class BrowserWorld implements World {
     if (!pageLabel) return this.toast(this.t.failed('browser_click', 'the live DOM target has no readable label; visual-only targets cannot be clicked'), true);
     const pageText = `${page.title} ${page.url}`;
     const sensitivePage = clickRefusal(pageText)
-      || isDouyinPage(page.url)
+      || isDouyinCreatorPage(page.url)
       || /(?:checkout|billing|payment|purchase|order|recharge|wallet|login|log-in|register|oauth|account|security|message|inbox|\bdm\b|\bchat\b|publish|upload|create-post|post\/create|new-post)/i.test(page.url);
     if (sensitivePage) return this.toast(this.t.failed('browser_click', 'screenshot clicks are unavailable on payment, login and account pages'), true);
     if (typeRefusal({
@@ -841,9 +1004,16 @@ export class BrowserWorld implements World {
       || isShareDestinationControl(pageLabel) || isShareDestinationControl(description)) {
       return this.toast(this.t.failed('browser_click', 'send, publish, share and clipboard controls require their dedicated verified path'), true);
     }
+    const toggle = targetStateToggle(pageLabel) || targetStateToggle(description);
+    if (toggle && target.pressed !== false) {
+      return this.toast(this.t.failed('browser_click', 'a screenshot target toggle must expose its current off state'), true);
+    }
     const write = isWriteAction(pageLabel) || isWriteAction(description);
     if (write && (!page.current?.url || !page.account?.ref || !page.account.label)) {
       return this.toast(this.t.sendTargetUnverified, true);
+    }
+    if (isDouyinPage(page.url) && write && !douyinVideoIdentity(page)) {
+      return this.toast(this.t.failed('browser_click', 'the current video identity is missing, ambiguous or stale'), true);
     }
     if (!this.allowed('platform-write', 'browser_click', `visual target: ${pageLabel || description}`)) {
       return this.toast(this.t.lookOnly(pageLabel || description), true);
@@ -900,7 +1070,7 @@ export class BrowserWorld implements World {
       this.taskJournal?.complete(approval.authorization.journalId, {
         phase: 'unknown', dispatchState: 'unknown', outcome: 'unknown',
         note: 'the screenshot click result was not received',
-        evidence: { source: 'browser-screenshot', status: 'visual-click-result-missing', summary: `capture ${captureId}`, observedAt: Date.now() },
+        evidence: [{ source: 'browser-screenshot', status: 'visual-click-result-missing', summary: `capture ${captureId}`, observedAt: Date.now() }],
       });
       this.lastVisualCapture = null;
       const detail = error instanceof Error ? error.message : String(error);
@@ -916,7 +1086,7 @@ export class BrowserWorld implements World {
     this.taskJournal?.complete(approval.authorization.journalId, {
       phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown',
       note: 'the screenshot click was dispatched without independent business-state verification',
-      evidence: { source: 'browser-screenshot', status: 'visual-click-dispatched', summary: `capture ${captureId}; target ${targetToken}`, observedAt: Date.now() },
+      evidence: [{ source: 'browser-screenshot', status: 'visual-click-dispatched', summary: `capture ${captureId}; target ${targetToken}`, observedAt: Date.now() }],
     });
     this.lastVisualCapture = null;
     if (!state) return this.toast(this.t.sendUnknown);
@@ -940,6 +1110,8 @@ export class BrowserWorld implements World {
         return this.clickScreenshotPoint(point, ctx);
       }
       let index: number | null = null;
+      let clickedElement: AgentElement | null = null;
+      let douyinToggleBefore: boolean | undefined;
       if (hasIndex) {
         index = this.indexArg(args.index);
         if (index === null) return this.toast(this.t.failed('browser_click', 'index must be a whole number of at least 0'), true);
@@ -969,11 +1141,22 @@ export class BrowserWorld implements World {
         if (!element) return this.toast(this.t.noElement(index), true);
         if (this.renumbered(index, element)) return this.toast(this.t.stale(index), true);
         if (isFilePicker(element)) return this.toast(this.t.fileChooserBlocked, true);
+        clickedElement = element;
         targetSnapshotId = element.snapshotId;
         label = this.labelOf(element);
         if (!label && (element.tag === 'button' || element.role === 'button')) {
           return this.toast(this.t.failed('browser_click', 'the button has no readable label'), true);
         }
+      }
+      if (isDouyinPage(this.lastState?.url ?? '') && targetStateToggle(label)) {
+        if (index === null || !clickedElement) {
+          return this.toast(this.t.failed('browser_click', 'a numbered toggle with a readable current state is required'), true);
+        }
+        if (clickedElement.pressed === true) return this.toast(this.t.alreadyDone(label), true);
+        if (clickedElement.pressed !== false) {
+          return this.toast(this.t.failed('browser_click', 'the page does not expose the current toggle state'), true);
+        }
+        douyinToggleBefore = false;
       }
       const page = this.lastState;
       const sharePanel = this.sharePanel && page?.url === this.sharePanel.url
@@ -985,6 +1168,10 @@ export class BrowserWorld implements World {
       const externalShare = !clipboardWrite && !isShareDismissControl(label)
         && (sharePanelAction || isShareDestinationControl(label));
       if (isDouyinPage(this.lastState?.url ?? '') && isFinalPublishControl(label)) return this.toast(this.t.manualPublish, true);
+      if (isDouyinPage(page?.url ?? '') && (isWriteAction(label) || clipboardWrite || externalShare)
+        && !douyinVideoIdentity(page)) {
+        return this.toast(this.t.failed('browser_click', 'the current video identity is missing, ambiguous or stale'), true);
+      }
       if (index === null && isSendControl(label)) return this.toast(this.t.sendTargetNeedsIndex, true);
       const refused = clickRefusal(label);
       if (removesState(label)) return this.toast(this.t.alreadyDone(label), true);
@@ -1099,12 +1286,15 @@ export class BrowserWorld implements World {
           if (completion.phase !== 'verified') return this.toast(this.t.sendUnknown, true);
           return this.toast(this.full(state, this.t.clicked(label || `#${index}`)));
         }
-        const after = state.elements?.find((candidate) => candidate.id === index)?.label ?? '';
+        const afterElement = state.elements?.find((candidate) => candidate.id === index);
+        const after = afterElement?.label ?? '';
         const currentVideo = page?.current;
         const currentAccount = page?.account;
         const verified = !!page && !!currentVideo && !!currentAccount && state.url === page.url
           && state.current?.url === currentVideo.url && state.account?.ref === currentAccount.ref
-          && !!after && !removesState(label) && removesState(after);
+          && (douyinToggleBefore === false
+            ? afterElement?.pressed === true
+            : !!after && !removesState(label) && removesState(after));
         this.taskJournal?.finish(authorization.journalId, verified ? 'verified' : 'unknown', verified
           ? `the page changed the control to ${after}`
           : 'the page did not confirm the requested toggle state');
@@ -1532,7 +1722,7 @@ export class BrowserWorld implements World {
       const blocked = this.begin('browser_upload_media');
       if (blocked) return blocked;
       const page = this.lastState;
-      if (!page || !isDouyinPage(page.url) || !page.snapshotId) return this.toast(this.t.failed('browser_upload_media', 'read the current Douyin page first'), true);
+      if (!page || !isDouyinCreatorPage(page.url) || !page.snapshotId) return this.toast(this.t.failed('browser_upload_media', 'read the current Douyin Creator Center page first'), true);
       const input = page.fileInputs?.find((candidate) => candidate.id === fileId);
       if (!input || input.disabled) return this.toast(this.t.failed('browser_upload_media', 'that file input is missing, disabled or from an older page read'), true);
       if (!input.multiple && files.length > 1) return this.toast(this.t.failed('browser_upload_media', 'the page input accepts one file at a time'), true);
@@ -1566,7 +1756,16 @@ export class BrowserWorld implements World {
         form,
         `Account: ${account.label} (${account.ref})\nOrigin: ${originOf(page.url)}\nForm: ${form}\nFiles (${approvedFiles.length}):\n${listed}`,
         ctx,
-        { accountRef: account.ref, files: approvedFiles },
+        {
+          accountRef: account.ref,
+          files: approvedFiles,
+          initialEvidence: (page.statusMessages ?? []).map((message) => ({
+            source: 'douyin-upload-notice',
+            status: 'baseline',
+            digest: uploadNoticeDigest(message),
+            observedAt: Date.now(),
+          })),
+        },
       );
       if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
         : decision.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly('Douyin media upload'), true);
@@ -1579,7 +1778,8 @@ export class BrowserWorld implements World {
         throw error;
       }
       if (!currentInspection || JSON.stringify(currentInspection.files) !== JSON.stringify(approvedFiles)
-        || currentInspection.snapshotId !== page.snapshotId || currentInspection.url !== page.url) {
+        || currentInspection.snapshotId !== page.snapshotId || currentInspection.url !== page.url
+        || asRecord(currentInspection.account)?.ref !== account.ref) {
         this.taskJournal?.finish(approval.journalId, 'cancelled', 'the page or media changed before upload');
         return this.toast(this.t.failed('browser_upload_media', 'the page or media changed after approval'), true);
       }
@@ -1600,8 +1800,23 @@ export class BrowserWorld implements World {
         this.taskJournal?.finish(approval.journalId, 'unknown', 'the selected files did not match the approved file list');
         return this.toast(this.t.failed('browser_upload_media', 'the browser did not confirm the selected media files'), true);
       }
-      this.taskJournal?.finish(approval.journalId, 'verified', 'the page confirmed the approved file list in its upload control');
       const state = asState(result?.state);
+      const uploadState = douyinUploadState({
+        selected,
+        expected: approvedFiles.map((file) => file.path),
+        beforeMessages: page.statusMessages ?? [],
+        afterMessages: state?.statusMessages ?? [],
+      });
+      this.recordDouyinUploadState(
+        approval.journalId,
+        selected,
+        approvedFiles.map((file) => file.path),
+        state?.statusMessages ?? [],
+        hashContent(JSON.stringify(selected)),
+      );
+      if (uploadState === 'failed') {
+        return this.toast(this.t.failed('browser_upload_media', 'the page reported an upload failure; inspect the form before deciding whether to continue'), true);
+      }
       return this.toast(state ? this.full(state, this.t.uploadedMedia(selected)) : this.t.uploadedMedia(selected));
     });
   }
@@ -1657,6 +1872,7 @@ export class BrowserWorld implements World {
       if (isReply && candidateReplies.length !== 1) return this.toast(this.t.sendReplyUnverified, true);
       const replyTarget = isReply ? candidateReplies[0] : undefined;
       if (replyTarget?.needsExpand) return this.toast(this.t.sendReplyNeedsExpand, true);
+      if (replyTarget && isDouyinPage(page?.url ?? '') && !replyTarget.authorRef) return this.toast(this.t.sendReplyUnverified, true);
       const previousReplyNotices = new Set((page?.statusMessages ?? [])
         .filter((message) => commentReplyConfirmed([message]))
         .map((message) => message.replace(/\s+/g, ' ').trim().toLowerCase()));
@@ -1687,13 +1903,14 @@ export class BrowserWorld implements World {
       };
       if (!target.videoUrl || !target.snapshotId) return this.toast(this.t.sendTargetUnverified, true);
       if (!target.accountRef || !target.accountLabel) return this.toast(this.t.sendAccountUnverified, true);
+      if (isDouyinPage(target.url) && !douyinVideoIdentity(page)) return this.toast(this.t.sendTargetUnverified, true);
       const contentDigest = hashContent(input.content);
       if (this.taskJournal?.hasLegacyTextCollision(target.videoUrl, contentDigest, replyTarget?.fingerprint)) {
         return this.toast(this.t.sendUnknown, true);
       }
       const where = [target.videoTitle, target.videoUrl].filter(Boolean).join(' — ');
       const approvalWhere = replyTarget
-        ? `${where}\n回复对象：${replyTarget.author}\n原评论：${replyTarget.context}`
+        ? `${where}\n回复对象：${replyTarget.author}${replyTarget.authorRef ? ` (${replyTarget.authorRef})` : ''}\n原评论：${replyTarget.context}`
         : where;
       const targetStillBound = async (): Promise<boolean> => {
         try {
