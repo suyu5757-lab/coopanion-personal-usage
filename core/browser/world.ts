@@ -16,7 +16,7 @@ import type { Language } from 'cortico/core/language.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import type { ModelLanguage } from '../language.ts';
 import { ActionGate, type Impact } from '../action-gate.ts';
-import { defaultActionRisk, type ActionReceiptCompletion, type ActionRisk, type BrowserTaskIntent } from '../action-receipts.ts';
+import { defaultActionRisk, type ActionReceiptCompletion, type ActionReceiptEvidence, type ActionRisk, type BrowserTaskIntent } from '../action-receipts.ts';
 import { coreText } from '../i18n/index.ts';
 import { ActionJournal, hashContent, originOf, ReplyJournal, type ActionTarget, type PublicAction } from './actions.ts';
 import { BrowserTaskActionJournal, browserDuplicateKey } from './task-actions.ts';
@@ -67,7 +67,26 @@ export interface BrowserWorldOptions {
 
 export type ApprovalAnswer = 'yes' | 'always' | 'no' | 'dismissed' | 'timeout' | 'unavailable';
 
-interface Shot { base64: string; width: number; height: number; state: PageState }
+interface Shot {
+  base64: string;
+  width: number;
+  height: number;
+  state: PageState;
+  captureId?: string;
+  viewportWidth?: number;
+  viewportHeight?: number;
+}
+interface VisualCapture {
+  captureId: string;
+  url: string;
+  snapshotId: string;
+  imageWidth: number;
+  imageHeight: number;
+  viewportWidth: number;
+  viewportHeight: number;
+  createdAt: number;
+  used: boolean;
+}
 interface BrowserActionAuthorization { journalId: string; grantDigest: string; approvedAt: number; expiresAt: number }
 type BrowserActionApproval = { approved: true; authorization: BrowserActionAuthorization } | { approved: false; reason: 'unavailable' | 'not-approved' | 'not-answered' | 'changed' | 'unknown' };
 interface SharePanelEvidence { url: string; snapshotId: string; targetUrl: string; targetTitle: string; accountRef: string }
@@ -211,6 +230,7 @@ const asElement = (value: unknown): AgentElement | null => {
     aria: text('aria'),
     title: text('title'),
     role: text('role'),
+    dataE2e: text('dataE2e'),
     href: text('href'),
     disabled: e.disabled === true,
     visible: e.visible !== false,
@@ -287,6 +307,8 @@ export class BrowserWorld implements World {
   private shownSnapshotId = '';
   /** The last page shown to the model: what a confirmation names as its target. */
   private lastState: PageState | null = null;
+  /** The only screenshot coordinate mapping that may authorize one visual click. */
+  private lastVisualCapture: VisualCapture | null = null;
   /** The share options returned by browser_share, scoped to their page snapshot. */
   private sharePanel: SharePanelEvidence | null = null;
   /** The unresolved public writes; a resolved one leaves the file as soon as it is written. */
@@ -357,6 +379,7 @@ export class BrowserWorld implements World {
     scope: {
       accountRef?: string;
       files?: Array<{ path: string; digest: string; bytes: number; mime: string }>;
+      initialEvidence?: ActionReceiptEvidence[];
       dedupeKey?: string;
       actionLabel?: string;
       payloadDigest?: string;
@@ -394,6 +417,7 @@ export class BrowserWorld implements World {
         target,
         payloadDigest,
         files,
+        ...(scope.initialEvidence?.length ? { evidence: scope.initialEvidence } : {}),
         ...(scope.commentFingerprint ? { commentFingerprint: scope.commentFingerprint } : {}),
         risk,
         duplicateKey,
@@ -660,6 +684,7 @@ export class BrowserWorld implements World {
     this.calls = 0;
     this.lastTyped = null;
     this.lastState = null;
+    this.lastVisualCapture = null;
     this.sharePanel = null;
     this.shown.clear();
     this.shownUrl = '';
@@ -762,20 +787,183 @@ export class BrowserWorld implements World {
     });
   }
 
+  private async clickScreenshotPoint(point: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    const capture = this.lastVisualCapture;
+    const captureId = typeof point.captureId === 'string' ? point.captureId : '';
+    const x = typeof point.x === 'number' ? point.x : Number.NaN;
+    const y = typeof point.y === 'number' ? point.y : Number.NaN;
+    const description = typeof point.description === 'string' ? point.description.trim().slice(0, 160) : '';
+    if (!capture || capture.used || capture.captureId !== captureId || Date.now() - capture.createdAt > 30_000
+      || !this.lastState || this.lastState.url !== capture.url || this.lastState.snapshotId !== capture.snapshotId) {
+      return this.toast(this.t.failed('browser_click', 'the screenshot target is stale; take a new screenshot'), true);
+    }
+    if (!(this.host?.modelFacts.accepts('image/jpeg') ?? true)) {
+      this.lastVisualCapture = null;
+      return this.toast(this.t.failed('browser_click', 'this model cannot see the screenshot'), true);
+    }
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= capture.imageWidth || y >= capture.imageHeight || !description) {
+      capture.used = true;
+      return this.toast(this.t.failed('browser_click', 'screenshot point needs in-image coordinates and a short target description'), true);
+    }
+    capture.used = true;
+
+    const pointResult = asRecord(await this.call('inspect-screenshot-point', {
+      captureId, x, y, snapshotId: capture.snapshotId,
+    }, ctx.signal));
+    const target = asRecord(pointResult?.target);
+    if (pointResult?.ok !== true || !target || typeof target.token !== 'string'
+      || target.snapshotId !== capture.snapshotId) {
+      return this.toast(this.t.failed('browser_click', typeof pointResult?.reason === 'string' ? pointResult.reason : 'the screenshot point is not a current interactive target'), true);
+    }
+    if (target.disabled === true) return this.toast(this.t.failed('browser_click', 'the screenshot target is disabled'), true);
+    if (target.filePicker === true) return this.toast(this.t.fileChooserBlocked, true);
+
+    const page = this.lastState;
+    const pageLabel = typeof target.label === 'string' ? target.label.trim() : '';
+    if (!pageLabel) return this.toast(this.t.failed('browser_click', 'the live DOM target has no readable label; visual-only targets cannot be clicked'), true);
+    const pageText = `${page.title} ${page.url}`;
+    const sensitivePage = clickRefusal(pageText)
+      || isDouyinPage(page.url)
+      || /(?:checkout|billing|payment|purchase|order|recharge|wallet|login|log-in|register|oauth|account|security|message|inbox|\bdm\b|\bchat\b|publish|upload|create-post|post\/create|new-post)/i.test(page.url);
+    if (sensitivePage) return this.toast(this.t.failed('browser_click', 'screenshot clicks are unavailable on payment, login and account pages'), true);
+    if (typeRefusal({
+      type: typeof target.type === 'string' ? target.type : '',
+      label: pageLabel,
+      placeholder: typeof target.placeholder === 'string' ? target.placeholder : '',
+    })) return this.toast(this.t.failed('browser_click', 'password and personal-information fields cannot be activated'), true);
+    if (/(?:sign in|log in|log-in|login|register|sign up|create account|登录|注册|创建账号|账号登录|账户登录)/i.test(`${pageLabel} ${description}`)) {
+      return this.toast(this.t.failed('browser_click', 'login and registration controls must be handled by the person'), true);
+    }
+    const guardRefusal = clickRefusal(pageLabel) ?? clickRefusal(description);
+    if (guardRefusal) return this.toast(this.t.refusedClick(pageLabel || description, guardRefusal), true);
+    if (isSendControl(pageLabel) || isSendControl(description) || isFinalPublishControl(pageLabel) || isFinalPublishControl(description)
+      || isClipboardCopyControl(pageLabel) || isClipboardCopyControl(description)
+      || isShareDestinationControl(pageLabel) || isShareDestinationControl(description)) {
+      return this.toast(this.t.failed('browser_click', 'send, publish, share and clipboard controls require their dedicated verified path'), true);
+    }
+    const write = isWriteAction(pageLabel) || isWriteAction(description);
+    if (write && (!page.current?.url || !page.account?.ref || !page.account.label)) {
+      return this.toast(this.t.sendTargetUnverified, true);
+    }
+    if (!this.allowed('platform-write', 'browser_click', `visual target: ${pageLabel || description}`)) {
+      return this.toast(this.t.lookOnly(pageLabel || description), true);
+    }
+
+    const targetToken = target.token;
+    const stableTarget = `${page.url}:${String(target.tag ?? '')}:${String(target.role ?? '')}:${normalLabel(pageLabel)}`;
+    const details = [
+      `Page: ${page.title} (${page.url})`,
+      `Screenshot capture: ${captureId}; image coordinates: ${x}, ${y} of ${capture.imageWidth}×${capture.imageHeight}`,
+      `Target identified in the live DOM: ${pageLabel || '(no readable name)'}`,
+      `Description from the screenshot: ${description}`,
+      'This approval authorizes one click only. The result will remain unknown until checked.',
+    ].join('\n');
+    const approval = await this.approveBrowserAction(
+      'platform-write',
+      `Click the screenshot target “${description}” once at (${x}, ${y}) on ${page.url}.`,
+      page,
+      'visual-screenshot-point',
+      `visual:${captureId}:${target.tag || 'element'}:${targetToken}`,
+      details,
+      ctx,
+      {
+        payloadDigest: hashContent(JSON.stringify([target.tag, target.role, normalLabel(pageLabel)])),
+        dedupeKey: `visual:${stableTarget}`,
+        risk: 'IRREVERSIBLE_OR_PUBLIC',
+      },
+    );
+    if (!approval.approved) {
+      this.lastVisualCapture = null;
+      return this.toast(approval.reason === 'unknown' ? this.t.sendUnknown
+        : approval.reason === 'changed' ? this.t.sendChanged
+          : approval.reason === 'not-answered' || approval.reason === 'unavailable' ? this.t.sendNotAnswered
+            : this.t.lookOnly(pageLabel || description), true);
+    }
+
+    const currentPoint = asRecord(await this.call('inspect-screenshot-point', {
+      captureId, x, y, snapshotId: capture.snapshotId,
+    }, ctx.signal));
+    const currentTarget = asRecord(currentPoint?.target);
+    if (currentPoint?.ok !== true || currentTarget?.token !== targetToken
+      || currentTarget?.snapshotId !== capture.snapshotId) {
+      this.taskJournal?.finish(approval.authorization.journalId, 'cancelled', 'the screenshot target changed after approval');
+      this.lastVisualCapture = null;
+      return this.toast(this.t.sendChanged, true);
+    }
+
+    let result: Record<string, unknown> | null;
+    try {
+      result = asRecord(await this.call('click-screenshot-point', {
+        captureId, x, y, snapshotId: capture.snapshotId, targetToken,
+      }, ctx.signal));
+    } catch (error) {
+      this.taskJournal?.complete(approval.authorization.journalId, {
+        phase: 'unknown', dispatchState: 'unknown', outcome: 'unknown',
+        note: 'the screenshot click result was not received',
+        evidence: { source: 'browser-screenshot', status: 'visual-click-result-missing', summary: `capture ${captureId}`, observedAt: Date.now() },
+      });
+      this.lastVisualCapture = null;
+      const detail = error instanceof Error ? error.message : String(error);
+      return this.toast(`${this.t.sendUnknown} ${detail}`);
+    }
+    const state = asState(result?.state);
+    const answer = asRecord(result?.answer) as ClickAnswer | null;
+    if (answer?.success === false) {
+      this.taskJournal?.finish(approval.authorization.journalId, 'cancelled', answer.message || 'the screenshot click was refused');
+      this.lastVisualCapture = null;
+      return this.toast(this.t.failed('browser_click', answer.message || 'the screenshot click was refused'), true);
+    }
+    this.taskJournal?.complete(approval.authorization.journalId, {
+      phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown',
+      note: 'the screenshot click was dispatched without independent business-state verification',
+      evidence: { source: 'browser-screenshot', status: 'visual-click-dispatched', summary: `capture ${captureId}; target ${targetToken}`, observedAt: Date.now() },
+    });
+    this.lastVisualCapture = null;
+    if (!state) return this.toast(this.t.sendUnknown);
+    return this.toast(this.full(state, this.t.visualClickUnknown(description)));
+  }
+
   private async click(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
     return this.run('browser_click', ctx, async () => {
       const hasIndex = args.index !== undefined;
       const text = typeof args.text === 'string' ? args.text.trim() : '';
-      if (hasIndex === !!text) return this.toast(this.t.failed('browser_click', 'give either an element number or its visible text'), true);
+      const hasLocator = args.locator !== undefined;
+      const hasPoint = args.point !== undefined;
+      if ([hasIndex, !!text, hasLocator, hasPoint].filter(Boolean).length !== 1) {
+        return this.toast(this.t.failed('browser_click', 'give exactly one of element number, visible text, locator, or a current screenshot point'), true);
+      }
+      const blocked = this.begin('browser_click');
+      if (blocked) return blocked;
+      if (hasPoint) {
+        const point = asRecord(args.point);
+        if (!point) return this.toast(this.t.failed('browser_click', 'screenshot point must include x, y, captureId and description'), true);
+        return this.clickScreenshotPoint(point, ctx);
+      }
       let index: number | null = null;
       if (hasIndex) {
         index = this.indexArg(args.index);
         if (index === null) return this.toast(this.t.failed('browser_click', 'index must be a whole number of at least 0'), true);
       }
-      const blocked = this.begin('browser_click');
-      if (blocked) return blocked;
       let label = text;
       let targetSnapshotId: string | undefined;
+      if (hasLocator) {
+        const expectedSnapshotId = this.shownSnapshotId;
+        if (!expectedSnapshotId) return this.toast(this.t.failed('browser_click', 'read the current page before using a locator'), true);
+        const resolved = asRecord(await this.call('resolveLocator', { locator: args.locator, expectedSnapshotId }, ctx.signal));
+        if (resolved?.ok !== true || this.indexArg(resolved.id) === null || resolved.snapshotId !== expectedSnapshotId) {
+          const reason = typeof resolved?.reason === 'string' ? resolved.reason : '';
+          const detail = reason === 'ambiguous'
+            ? 'the locator matched more than one target; add a unique container'
+            : reason === 'stale-snapshot'
+              ? 'the page changed; read it again before resolving the locator'
+              : reason === 'invalid'
+                ? 'the locator needs a supported role, name, or data-e2e field'
+                : 'the locator did not resolve to one current target';
+          return this.toast(this.t.failed('browser_click', detail), true);
+        }
+        index = this.indexArg(resolved.id);
+        targetSnapshotId = expectedSnapshotId;
+      }
       if (index !== null) {
         const element = asElement(await this.call('element', { index }, ctx.signal));
         if (!element) return this.toast(this.t.noElement(index), true);
@@ -794,6 +982,8 @@ export class BrowserWorld implements World {
       const clipboardWrite = isClipboardCopyControl(label);
       const sharePanelAction = !!sharePanel && !isShareDismissControl(label)
         && (clipboardWrite || isShareDestinationControl(label));
+      const externalShare = !clipboardWrite && !isShareDismissControl(label)
+        && (sharePanelAction || isShareDestinationControl(label));
       if (isDouyinPage(this.lastState?.url ?? '') && isFinalPublishControl(label)) return this.toast(this.t.manualPublish, true);
       if (index === null && isSendControl(label)) return this.toast(this.t.sendTargetNeedsIndex, true);
       const refused = clickRefusal(label);
@@ -818,8 +1008,6 @@ export class BrowserWorld implements World {
       }
       let authorization: BrowserActionAuthorization | null = null;
       let receiptIntent: BrowserTaskIntent | null = null;
-      const externalShare = !clipboardWrite && !isShareDismissControl(label)
-        && (sharePanelAction || isShareDestinationControl(label));
       if (isWriteAction(label) || clipboardWrite || externalShare) {
         const currentVideo = page?.current;
         const currentAccount = page?.account;
@@ -1097,6 +1285,7 @@ export class BrowserWorld implements World {
 
   private async watch(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
     return this.run('browser_watch', ctx, async () => {
+      this.lastVisualCapture = null;
       const seconds = typeof args.seconds === 'number' && Number.isFinite(args.seconds) ? Math.min(WATCH_MAX, Math.max(1, Math.round(args.seconds))) : 10;
       const asked = typeof args.frames === 'number' && Number.isFinite(args.frames) ? Math.round(args.frames) : WATCH_FRAMES_DEFAULT;
       const frames = Math.min(WATCH_FRAMES_MAX, Math.max(1, asked), seconds + 1);
@@ -1166,7 +1355,31 @@ export class BrowserWorld implements World {
       const shot = asRecord(await this.call('screenshot', {}, ctx.signal));
       const state = asState(shot?.state);
       if (!shot || !state || typeof shot.base64 !== 'string') return this.toast(this.t.failed('browser_screenshot', 'the page produced no image'), true);
-      return this.image({ base64: shot.base64, width: Number(shot.width) || 0, height: Number(shot.height) || 0, state }, this.t.screenshot);
+      const width = Number(shot.width) || 0;
+      const height = Number(shot.height) || 0;
+      const captureId = typeof shot.captureId === 'string' ? shot.captureId : '';
+      const viewportWidth = Number(shot.viewportWidth) || 0;
+      const viewportHeight = Number(shot.viewportHeight) || 0;
+      if (!(this.host?.modelFacts.accepts('image/jpeg') ?? true)) {
+        this.lastVisualCapture = null;
+        return this.image({ base64: shot.base64, width, height, state }, this.t.screenshot);
+      }
+      if (!captureId || width <= 0 || height <= 0 || viewportWidth <= 0 || viewportHeight <= 0 || !state.snapshotId) {
+        this.lastVisualCapture = null;
+        return this.toast(this.t.failed('browser_screenshot', 'the page could not bind the image to a stable one-use capture'), true);
+      }
+      this.lastVisualCapture = {
+        captureId,
+        url: state.url,
+        snapshotId: state.snapshotId,
+        imageWidth: width,
+        imageHeight: height,
+        viewportWidth,
+        viewportHeight,
+        createdAt: Date.now(),
+        used: false,
+      };
+      return this.image({ base64: shot.base64, width, height, state }, this.t.screenshotCapture(captureId, width, height));
     });
   }
 
@@ -1620,6 +1833,8 @@ export class BrowserWorld implements World {
 
   /** Remembers what each number meant on the page the model is about to read. */
   private seen(state: PageState): void {
+    if (this.lastVisualCapture && (state.url !== this.lastVisualCapture.url
+      || state.snapshotId !== this.lastVisualCapture.snapshotId)) this.lastVisualCapture = null;
     this.lastState = state;
     if (state.url !== this.shownUrl) {
       this.shownUrl = state.url;

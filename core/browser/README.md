@@ -1,4 +1,4 @@
-<!-- Owner: world.ts, guard.ts, actions.ts, task-actions.ts, ../action-receipts.ts, ../action-gate.ts, submission-status.ts, app/browser.cjs, app/browser-agent/entry.ts, app/browser-agent/comments.ts, app/browser-agent/chatgpt.ts -->
+<!-- Owner: world.ts, guard.ts, actions.ts, task-actions.ts, ../action-receipts.ts, ../action-gate.ts, submission-status.ts, app/browser.cjs, app/browser-visual-point.cjs, app/browser-agent/entry.ts, app/browser-agent/comments.ts, app/browser-agent/chatgpt.ts -->
 
 # core/browser
 
@@ -10,6 +10,7 @@ window has its own Chromium profile and logins.
 - `world.ts` exposes `browser_*` tools, reads the page through `app/browser-agent/entry.ts`, and refuses spending,
   private messages, account changes, passwords and personal details. A session has a time limit and a call budget.
 - `app/browser.cjs` owns the window, the persistent partition, the permission policy and the page script injection.
+- `browser_screenshot` returns a one-use `captureId` only when the model can see images. `app/browser-visual-point.cjs` maps the resized image pixels to the recorded CSS viewport. `browser_click.point` requires a readable DOM label, a one-step Core approval and a second target check before dispatch. Send, publish, share, clipboard, file-picker, delete, payment, login and account controls stay on their guarded paths. A dispatched visual click remains `unknown` until reviewed.
 - `browser_watch` takes a few frames over its wait and records the tab's audio for the same stretch. The Electron
   main process grants `getDisplayMedia` only during that call (`audio: request.frame`); `entry.ts` resamples the
   recording to 16 kHz mono WAV and `world.ts` hands it to the desktop pet's local speech model. `audio: false`

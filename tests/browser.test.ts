@@ -495,6 +495,33 @@ describe('browser World', () => {
     expect(out.text).toContain('添加音乐');
   });
 
+  it('resolves a structured locator against the latest snapshot before clicking', async () => {
+    const { world, bridge } = await make();
+    const snapshotId = 'locator-snapshot';
+    bridge.responses.open = page({ snapshotId, elements: [{ id: 9, label: 'Continue' }] });
+    bridge.responses['resolveLocator'] = (args: Record<string, unknown>) => ({ ok: true, id: 9, snapshotId: args.expectedSnapshotId });
+    bridge.element = element({ id: 9, tag: 'button', label: 'Continue', text: 'Continue', title: '', role: 'button', dataE2e: 'submit', snapshotId });
+    bridge.responses.click = { answer: { success: true }, state: page({ snapshotId: 'after-click', content: '[9]<button >Continue />' }) };
+    await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
+
+    const locator = { role: 'button', name: 'Continue', testId: 'submit', within: { role: 'article', name: 'Form A' } };
+    const out = await run(world, 'browser_click', { locator });
+    expect(out.failed).toBeUndefined();
+    expect(bridge.calls.find((call) => call.op === 'resolveLocator')?.args).toMatchObject({ locator, expectedSnapshotId: snapshotId });
+    expect(bridge.calls.find((call) => call.op === 'click')?.args).toMatchObject({ index: 9, snapshotId });
+  });
+
+  it('refuses an ambiguous structured locator before dispatch', async () => {
+    const { world, bridge } = await make();
+    bridge.responses.open = page({ snapshotId: 'locator-snapshot', elements: [{ id: 9, label: 'Continue' }] });
+    bridge.responses['resolveLocator'] = { ok: false, reason: 'ambiguous' };
+    await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
+
+    const out = await run(world, 'browser_click', { locator: { role: 'button', name: 'Continue' } });
+    expect(out.failed).toBe(true);
+    expect(bridge.calls.some((call) => call.op === 'click')).toBe(false);
+  });
+
   it('clicks a like and returns the page after it', async () => {
     let approvalQuestion = '';
     const { world, bridge, taskJournalFile } = await make({
@@ -678,13 +705,147 @@ describe('browser World', () => {
   it('takes a screenshot and attaches it when the model accepts images', async () => {
     const { world, bridge } = await make();
     bridge.responses.open = page();
-    bridge.responses.screenshot = { base64: Buffer.from('jpeg').toString('base64'), width: 1100, height: 732, state: page() };
+    const captured = page({ snapshotId: 'screenshot-snapshot' });
+    bridge.responses.screenshot = {
+      base64: Buffer.from('jpeg').toString('base64'), width: 1100, height: 732,
+      viewportWidth: 1100, viewportHeight: 732, captureId: 'capture-1', state: captured,
+    };
     await run(world, 'browser_open', { url: 'https://www.bilibili.com/' });
     const out = await run(world, 'browser_screenshot', {});
     expect(out.text).toContain('截图');
+    expect(out.text).toContain('capture-1');
     expect(out.blobs?.[0]).toMatchObject({ mime: 'image/jpeg' });
     expect(out.blobs?.[0]?.fallbackText).toContain('1100×732');
     expect(out.blobs?.[0]?.fallbackText).not.toContain('看不了');
+  });
+
+  it('requires one-step approval for a screenshot point and records the dispatched result as unknown', async () => {
+    const questions: string[] = [];
+    const state = page({ snapshotId: 'visual-snapshot' });
+    const { world, bridge, taskJournalFile } = await make({
+      self: { actions: true },
+      ask: async (question) => { questions.push(question); return 'yes'; },
+    });
+    bridge.responses.open = state;
+    bridge.responses.read = state;
+    bridge.responses.screenshot = {
+      base64: Buffer.from('jpeg').toString('base64'), width: 550, height: 366,
+      viewportWidth: 1100, viewportHeight: 732, captureId: 'capture-visual-1', state,
+    };
+    bridge.responses['inspect-screenshot-point'] = {
+      ok: true,
+      target: {
+        token: 'opaque-target-token', label: 'Open menu', tag: 'button', role: 'button', href: '',
+        disabled: false, filePicker: false, snapshotId: state.snapshotId,
+      },
+    };
+    bridge.responses['click-screenshot-point'] = {
+      answer: { success: true }, state: page({ snapshotId: 'visual-after-click' }),
+    };
+    await run(world, 'browser_open', { url: state.url });
+    await run(world, 'browser_screenshot', {});
+
+    const out = await run(world, 'browser_click', {
+      point: { x: 25, y: 40, captureId: 'capture-visual-1', description: 'the open menu button' },
+    });
+    expect(out.text).toContain('结果未知');
+    expect(out.text).toContain('不要重试');
+    expect(questions).toHaveLength(1);
+    expect(questions[0]).toContain('capture-visual-1');
+    expect(questions[0]).toContain('25, 40');
+    expect(bridge.calls.filter((call) => call.op === 'click-screenshot-point')).toHaveLength(1);
+    expect(bridge.calls.some((call) => call.op === 'click')).toBe(false);
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))[0]).toMatchObject({ phase: 'unknown', outcome: 'unknown' });
+
+    const reused = await run(world, 'browser_click', {
+      point: { x: 25, y: 40, captureId: 'capture-visual-1', description: 'the open menu button' },
+    });
+    expect(reused.failed).toBe(true);
+    expect(questions).toHaveLength(1);
+    expect(bridge.calls.filter((call) => call.op === 'click-screenshot-point')).toHaveLength(1);
+
+    const after = page({ snapshotId: 'visual-after-click' });
+    bridge.responses.screenshot = {
+      base64: Buffer.from('jpeg').toString('base64'), width: 550, height: 366,
+      viewportWidth: 1100, viewportHeight: 732, captureId: 'capture-visual-2', state: after,
+    };
+    bridge.responses['inspect-screenshot-point'] = {
+      ok: true,
+      target: {
+        token: 'new-element-token', label: 'Open menu', tag: 'button', role: 'button', href: '',
+        disabled: false, filePicker: false, snapshotId: after.snapshotId,
+      },
+    };
+    await run(world, 'browser_screenshot', {});
+    const duplicate = await run(world, 'browser_click', {
+      point: { x: 24, y: 39, captureId: 'capture-visual-2', description: 'the open menu button' },
+    });
+    expect(duplicate.text).toContain('没有重发');
+    expect(questions).toHaveLength(1);
+    expect(bridge.calls.filter((call) => call.op === 'click-screenshot-point')).toHaveLength(1);
+  });
+
+  it('refuses screenshot coordinates without a readable live DOM label', async () => {
+    const state = page({ snapshotId: 'visual-no-label' });
+    let asked = 0;
+    const { world, bridge } = await make({ self: { actions: true }, ask: async () => { asked++; return 'yes'; } });
+    bridge.responses.open = state;
+    bridge.responses.read = state;
+    bridge.responses.screenshot = {
+      base64: Buffer.from('jpeg').toString('base64'), width: 1100, height: 732,
+      viewportWidth: 1100, viewportHeight: 732, captureId: 'capture-no-label', state,
+    };
+    bridge.responses['inspect-screenshot-point'] = {
+      ok: true,
+      target: {
+        token: 'opaque-unlabelled-target', label: '', tag: 'canvas', role: 'generic', href: '',
+        disabled: false, filePicker: false, snapshotId: state.snapshotId,
+      },
+    };
+    await run(world, 'browser_open', { url: state.url });
+    await run(world, 'browser_screenshot', {});
+
+    const out = await run(world, 'browser_click', {
+      point: { x: 20, y: 20, captureId: 'capture-no-label', description: 'a button on the canvas' },
+    });
+    expect(out.failed).toBe(true);
+    expect(out.text).toContain('no readable label');
+    expect(asked).toBe(0);
+    expect(bridge.calls.some((call) => call.op === 'click-screenshot-point')).toBe(false);
+  });
+
+  it('keeps screenshot clicks out of destructive, personal-data and checkout targets', async () => {
+    for (const target of [
+      { label: 'Delete', type: '', description: 'the delete button' },
+      { label: 'Password', type: 'password', description: 'the password field' },
+      { label: 'Continue', type: '', description: 'the continue button', url: 'https://www.bilibili.com/checkout' },
+    ]) {
+      let asked = 0;
+      const state = page({ snapshotId: `visual-block-${target.type || target.label}`, ...(target.url ? { url: target.url } : {}) });
+      const { world, bridge } = await make({ self: { actions: true }, ask: async () => { asked++; return 'yes'; } });
+      bridge.responses.open = state;
+      bridge.responses.read = state;
+      bridge.responses.screenshot = {
+        base64: Buffer.from('jpeg').toString('base64'), width: 1100, height: 732,
+        viewportWidth: 1100, viewportHeight: 732, captureId: `capture-block-${target.type || target.label}`, state,
+      };
+      bridge.responses['inspect-screenshot-point'] = {
+        ok: true,
+        target: {
+          token: `target-${target.type || target.label}`, label: target.label, tag: target.type ? 'input' : 'button',
+          role: target.type ? 'textbox' : 'button', type: target.type, placeholder: '', href: '',
+          disabled: false, filePicker: false, snapshotId: state.snapshotId,
+        },
+      };
+      await run(world, 'browser_open', { url: state.url });
+      await run(world, 'browser_screenshot', {});
+      const out = await run(world, 'browser_click', {
+        point: { x: 20, y: 20, captureId: `capture-block-${target.type || target.label}`, description: target.description },
+      });
+      expect(out.failed).toBe(true);
+      expect(asked).toBe(0);
+      expect(bridge.calls.some((call) => call.op === 'click-screenshot-point')).toBe(false);
+    }
   });
 
   it('says the model cannot see images only when it does not accept them', async () => {

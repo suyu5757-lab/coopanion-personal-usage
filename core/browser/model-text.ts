@@ -48,6 +48,7 @@ export interface AgentElement {
   aria: string;
   title: string;
   role: string;
+  dataE2e: string;
   href: string;
   disabled: boolean;
   visible: boolean;
@@ -68,6 +69,8 @@ export interface BrowserText {
   scrolled(down: boolean, pages: number): string;
   played(paused: boolean): string;
   screenshot: string;
+  screenshotCapture(captureId: string, width: number, height: number): string;
+  visualClickUnknown(description: string): string;
   watched(seconds: number, frames: number, times: number[]): string;
   heard(text: string): string;
   noSpeech: string;
@@ -148,6 +151,8 @@ const zh: BrowserText = {
   scrolled: (down, pages) => `[浏览器] ${down ? '向下' : '向上'}翻了 ${pages} 屏`,
   played: (paused) => `[浏览器] ${paused ? '暂停' : '播放'}了视频`,
   screenshot: '[浏览器] 当前页面截图',
+  screenshotCapture: (captureId, width, height) => `[浏览器] 截图 captureId=${captureId}，图片尺寸 ${width}×${height}。坐标只能取自这张图，点击一次后该 captureId 失效。`,
+  visualClickUnknown: (description) => `[浏览器] 已对截图目标「${description}」发送一次点击，但没有独立确认业务结果；结果未知。先检查页面或未决回执，不要重试。`,
   watched: (seconds, frames, times) => `[浏览器] 看了 ${seconds} 秒,截了 ${frames} 帧(第 ${times.join('、')} 秒)`,
   heard: (text) => `[浏览器] 声音里听到:${text}`,
   noSpeech: '[浏览器] 这段声音里没有听清的话。',
@@ -237,6 +242,8 @@ const en: BrowserText = {
   scrolled: (down, pages) => `[browser] Scrolled ${down ? 'down' : 'up'} ${pages} screen${pages === 1 ? '' : 's'}`,
   played: (paused) => `[browser] ${paused ? 'Paused' : 'Played'} the video`,
   screenshot: '[browser] Screenshot of the page',
+  screenshotCapture: (captureId, width, height) => `[browser] Screenshot captureId=${captureId}, image size ${width}×${height}. Coordinates must come from this image; this captureId expires after one click attempt.`,
+  visualClickUnknown: (description) => `[browser] Sent one click to the screenshot target "${description}", but did not independently verify the business result; outcome is unknown. Check the page or unresolved receipt before any retry.`,
   watched: (seconds, frames, times) => `[browser] Watched ${seconds} seconds; ${frames} frames at ${times.join(', ')}s`,
   heard: (text) => `[browser] Heard: ${text}`,
   noSpeech: '[browser] No clear speech in this stretch of audio.',

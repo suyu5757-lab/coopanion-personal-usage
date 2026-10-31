@@ -55,12 +55,38 @@ export const BROWSER_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'browser_click',
     tags: ['act'],
-    description: 'Click an element by the number from the latest page read, or by its visible text when it has no number (for example the 添加音乐 button beside a video preview). Use it to open a video, play or pause, like, favorite, follow or open a comment box. Spending money, private messages, account changes and destructive delete/remove controls are refused. Read the page again after it changes. A send or publish control that would post text you typed is confirmed by the person first.',
+    description: 'Click an element by number, unique visible text, or a strict role/name/data-e2e locator. If those cannot identify the target, a vision-capable model may use one coordinate from the latest browser_screenshot captureId. Screenshot clicks always require a separate one-step approval, are refused for send, publish, share, clipboard, destructive and file-picker targets, and return an unknown outcome until reviewed. Spending money, private messages and account changes are refused. Read the page again after it changes.',
     parameters: {
       type: 'object',
       properties: {
         index: { type: 'integer', minimum: 0, description: 'The number in front of the element, e.g. 12 for [12]. Omit when using text.' },
         text: { type: 'string', description: 'The visible text of an element that has no number, e.g. 添加音乐. Omit when using index.' },
+        locator: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            role: { type: 'string', description: 'Exact ARIA role, such as button or link.' },
+            name: { type: 'string', description: 'Exact name from aria-label, aria-labelledby, native labels, button value or text; title, placeholder and name are fallbacks.' },
+            testId: { type: 'string', description: 'Exact data-e2e value.' },
+            within: {
+              type: 'object', additionalProperties: false,
+              properties: {
+                role: { type: 'string' },
+                name: { type: 'string' },
+                testId: { type: 'string' },
+              },
+            },
+          },
+        },
+        point: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            x: { type: 'number', minimum: 0, description: 'The horizontal pixel coordinate in the exact screenshot image.' },
+            y: { type: 'number', minimum: 0, description: 'The vertical pixel coordinate in the exact screenshot image.' },
+            captureId: { type: 'string', minLength: 1, description: 'The one-use captureId returned with the latest browser_screenshot image.' },
+            description: { type: 'string', minLength: 1, maxLength: 160, description: 'A short visible description of the intended target.' },
+          },
+          required: ['x', 'y', 'captureId', 'description'],
+        },
       },
       required: [],
     },
@@ -149,7 +175,7 @@ export const BROWSER_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'browser_screenshot',
     tags: ['read', 'snapshot'],
-    description: 'Take a screenshot of the current page, for layout, images or a player control the element tree does not show.',
+    description: 'Take a screenshot of the current page for layout, images or a control the element list does not show. When the model can see images, the result includes a one-use captureId for coordinates measured in that exact image.',
     parameters: { type: 'object', properties: {}, required: [] },
   },
   {
