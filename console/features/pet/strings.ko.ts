@@ -92,6 +92,8 @@ export const S: Partial<typeof en> = {
   selfTimeImageSavingHint: '현재 ChatGPT 페이지의 생성 이미지를 로컬 미디어 폴더에 저장할 수 있습니다.',
   selfTimeMediaUpload: '미디어 업로드 허용',
   selfTimeMediaUploadHint: '조건에 맞는 미디어 파일을 페이지의 업로드 입력란에 넣을 수 있습니다. 게시되지는 않습니다.',
+  selfTimeMediaDownload: '미디어 다운로드 허용',
+  selfTimeMediaDownloadHint: '한 번 확인한 뒤 선택한 공개 이미지나 기존 동영상을 이미 존재하는 로컬 폴더에 다운로드할 수 있습니다.',
   selfTimeTopics: '허용된 웹 탐색 주제',
   selfTimeTopicsHint: '한 줄에 주제 하나를 입력하세요. 비워 두면 웹 탐색을 멈춥니다. 세션은 최대 20분, 브라우저 도구 80회입니다.',
   selfTimeTopicsPlaceholder: '예: 수채화, 해양 생물, 베이킹',

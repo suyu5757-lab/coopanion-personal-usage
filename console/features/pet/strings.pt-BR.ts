@@ -92,6 +92,8 @@ export const S: Partial<typeof en> = {
   selfTimeImageSavingHint: 'Permite salvar uma imagem gerada da página atual do ChatGPT na pasta local de mídia.',
   selfTimeMediaUpload: 'Permitir envio de mídia',
   selfTimeMediaUploadHint: 'Permite colocar arquivos de mídia aceitos em um campo de envio da página; isso não publica a postagem.',
+  selfTimeMediaDownload: 'Permitir downloads de mídia',
+  selfTimeMediaDownloadHint: 'Após uma confirmação única, permite baixar uma imagem pública ou um vídeo existente selecionado para uma pasta local já existente.',
   selfTimeTopics: 'Temas web permitidos',
   selfTimeTopicsHint: 'Um tema por linha. Deixe vazio para pausar a exploração web. Cada sessão dura no máximo 20 minutos e 80 chamadas ao navegador.',
   selfTimeTopicsPlaceholder: 'Por exemplo: aquarela, vida marinha, confeitaria',

@@ -92,6 +92,8 @@ export const S: Partial<typeof en> = {
   selfTimeImageSavingHint: '現在のChatGPTページにある生成画像をローカルのメディアフォルダに保存できます。',
   selfTimeMediaUpload: 'メディアアップロードを許可',
   selfTimeMediaUploadHint: '対象のメディアをページのアップロード欄に入れられます。この操作で投稿は公開されません。',
+  selfTimeMediaDownload: 'メディアのダウンロードを許可',
+  selfTimeMediaDownloadHint: '一度確認した後、選択した公開画像または既存動画を、すでにあるローカルフォルダへダウンロードできます。',
   selfTimeTopics: '許可するウェブ探索テーマ',
   selfTimeTopicsHint: '1 行に 1 テーマ。空欄ならウェブ探索を停止します。1 回は最大 20 分、ブラウザー操作は 80 回です。',
   selfTimeTopicsPlaceholder: '例：水彩画、海洋生物、お菓子作り',

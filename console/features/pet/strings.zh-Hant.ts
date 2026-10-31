@@ -92,6 +92,8 @@ export const S: Partial<typeof en> = {
   selfTimeImageSavingHint: '允許將目前 ChatGPT 頁面的生成圖片儲存到本機素材目錄。',
   selfTimeMediaUpload: '允許素材上傳',
   selfTimeMediaUploadHint: '允許將符合條件的素材放入網頁上傳欄位；這一步不會發布作品。',
+  selfTimeMediaDownload: '允許下載素材',
+  selfTimeMediaDownloadHint: '經單次確認後，將所選的公開圖片或現有影片下載到已存在的本機資料夾。',
   selfTimeTopics: '允許探索的網頁主題',
   selfTimeTopicsHint: '每行一個主題；留白會暫停網頁探索。每段自己的時間最多 20 分鐘、80 次瀏覽器工具呼叫。',
   selfTimeTopicsPlaceholder: '例如：水彩畫、海洋生物、烘焙技巧',

@@ -22,6 +22,7 @@ beforeEach(async () => {
     'companion.selfTime.imageGeneration': false,
     'companion.selfTime.imageSaving': false,
     'companion.selfTime.mediaUpload': false,
+    'companion.selfTime.mediaDownload': false,
   };
   available = true;
   rejectWrites = false;
@@ -88,22 +89,27 @@ async function mount(loaded = true) {
   return { root, section, enabled, control, grant, level };
 }
 
-it('saves image and upload preferences independently from the legacy social-actions preference', async () => {
+it('saves image, media download and upload preferences independently from social actions', async () => {
   const { root } = await mount();
   const inputFor = (label) => [...root.querySelectorAll('label')].find((el) => el.textContent.includes(label)).querySelector('input');
   const imageGeneration = inputFor(PetS.selfTimeImageGeneration);
   const imageSaving = inputFor(PetS.selfTimeImageSaving);
   const mediaUpload = inputFor(PetS.selfTimeMediaUpload);
+  const mediaDownload = inputFor(PetS.selfTimeMediaDownload);
   expect(companionValues['companion.selfTime.actions']).toBe(true);
   expect(imageGeneration.checked).toBe(false);
   expect(imageSaving.checked).toBe(false);
   expect(mediaUpload.checked).toBe(false);
+  expect(mediaDownload.checked).toBe(false);
   imageGeneration.click();
   await vi.waitFor(() => expect(companionValues['companion.selfTime.imageGeneration']).toBe(true));
   expect(companionValues['companion.selfTime.actions']).toBe(true);
   imageSaving.click();
   await vi.waitFor(() => expect(companionValues['companion.selfTime.imageSaving']).toBe(true));
   expect(companionValues['companion.selfTime.mediaUpload']).toBe(false);
+  mediaDownload.click();
+  await vi.waitFor(() => expect(companionValues['companion.selfTime.mediaDownload']).toBe(true));
+  expect(companionValues['companion.selfTime.actions']).toBe(true);
 });
 
 it('restores the last saved switches and permission after a rejected write', async () => {
