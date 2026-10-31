@@ -17,10 +17,7 @@
 
 ## 权限
 
-- 它要写文件或跑命令时,会发 `opencode.permission`,里面有原命令、路径和可选项。
-- 必须用 `pet_ask` 把命令和路径原样转述给人,不要改写;选项用「允许一次 / 总是允许 / 拒绝」。
-- 人回答后调用 `opencode_answer`,`taskId` 用事件里的,`choice` 用 once、always 或 reject。
-- 你永远不能替人批准。人没回答时,任务会自己停下。
+{{opencode.permissionFlow}}
 
 ## 工作目录
 

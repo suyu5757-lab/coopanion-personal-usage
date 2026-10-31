@@ -4,13 +4,17 @@ import { OPENCODE_DEFAULTS, type OpencodeConfigSection } from './config.ts';
 import { describeEvents } from './describe.ts';
 import { OPENCODE_TOOL_DECLS } from './tools.ts';
 import type { ModelLanguage } from './model-text.ts';
-import { OpencodeWorld, OPENCODE_ID, type OpencodeGuestState } from './world.ts';
+import { OpencodeWorld, OPENCODE_ID, type OpencodeActionAuthorization, type OpencodeActionRequest, type OpencodeGuestState } from './world.ts';
 
 export interface OpencodeAssembly {
   /** The model-text language, read at each use; Chinese when absent. */
   modelLanguage?: () => ModelLanguage;
   /** The app's guest avatar channel. */
   onState?: (state: OpencodeGuestState) => void;
+  /** Core authorizes one workspace write or command through its shared action ledger. */
+  authorizeAction?: (request: OpencodeActionRequest, confirmInCoreUi: () => Promise<boolean>) => Promise<OpencodeActionAuthorization | null>;
+  /** The app's own confirmation UI for workspace operations. */
+  confirmAction?: (request: OpencodeActionRequest) => Promise<boolean>;
 }
 
 const SUMMARIES = {
@@ -52,6 +56,8 @@ export function opencodeDefinition(assembly: OpencodeAssembly = {}): WorldDefini
       timezone: ctx.timezone,
       modelLanguage: () => assembly.modelLanguage?.() ?? 'zh',
       onState: (state) => assembly.onState?.(state),
+      ...(assembly.authorizeAction ? { authorizeAction: assembly.authorizeAction } : {}),
+      ...(assembly.confirmAction ? { confirmAction: assembly.confirmAction } : {}),
     }),
     describe: DESCRIBE,
   };
