@@ -986,6 +986,9 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
 
   const result = async (message) => {
     const op = message.op;
+    if (!['state', 'screenshot', 'inspect-screenshot-point', 'click-screenshot-point', 'element', 'active', 'read', 'find', 'resolveLocator'].includes(op)) {
+      activeVisualCapture = null;
+    }
     if (op === 'open') return open(message);
     if (op === 'chatgpt-composer') {
       if (!win || !isChatGPTPageUrl(win.webContents.getURL())) throw new Error('open chatgpt.com in this browser first');
@@ -1038,6 +1041,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     if (op === 'read') { await ensureAgent(); return state(); }
     if (op === 'text') { await ensureAgent(); return agentCall('text'); }
     if (op === 'element') { await ensureAgent(); return agentCall('element', [message.index]); }
+    if (op === 'resolveLocator') { await ensureAgent(); return agentCall('resolveLocator', [message.locator, message.expectedSnapshotId]); }
     if (op === 'active') { await ensureAgent(); return agentCall('active'); }
     if (op === 'share') {
       await ensureAgent();
@@ -1049,7 +1053,6 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       const opened = async () => {
         for (let i = 0; i < 20; i++) {
           if (await agentCall('shareOpen')) return true;
-    if (op === 'resolveLocator') { await ensureAgent(); return agentCall('resolveLocator', [message.locator, message.expectedSnapshotId]); }
           await sleep(100);
         }
         return false;
@@ -1080,6 +1083,11 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
         try {
           win.webContents.sendInputEvent({ type: 'mouseMove', x, y });
           await sleep(200);
+          const currentPoint = await agentCall('textCenter', [message.text.trim()]);
+          if (!currentPoint?.ok || currentPoint.snapshotId !== point.snapshotId
+            || Math.abs(currentPoint.x - point.x) > 0.5 || Math.abs(currentPoint.y - point.y) > 0.5) {
+            throw new Error('the target changed or became blocked before the click; read the page again');
+          }
           win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
           win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
           await sleep(250);
@@ -1091,11 +1099,6 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       await agentCall('setAgentAction', [true]);
       try {
         const answer = await agentCall('click', [message.index, message.snapshotId]);
-          const currentPoint = await agentCall('textCenter', [message.text.trim()]);
-          if (!currentPoint?.ok || currentPoint.snapshotId !== point.snapshotId
-            || Math.abs(currentPoint.x - point.x) > 0.5 || Math.abs(currentPoint.y - point.y) > 0.5) {
-            throw new Error('the target changed or became blocked before the click; read the page again');
-          }
         if (answer?.success === false) throw new Error(answer.message || 'click refused');
         return { answer, state: await settle() };
       } finally {
@@ -1129,17 +1132,6 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       const answer = await agentCall('scroll', [{ down: message.down !== false, numPages: Number(message.pages) || 1, ...(Number.isInteger(message.index) ? { index: message.index } : {}) }, message.snapshotId]);
       return { answer, state: await settle() };
     }
-    if (op === 'press') {
-      await ensureAgent();
-      await agentCall('setAgentAction', [true]);
-      try {
-        await press(message.key, message.index, message.snapshotId);
-      } finally {
-        await agentCall('setAgentAction', [false]).catch(() => undefined);
-      }
-      return { state: await settle() };
-    }
-    if (op === 'play') {
     if (op === 'inspect-screenshot-point') {
       return inspectVisualPoint(message);
     }
@@ -1187,6 +1179,17 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       try { return { answer: { success: true, message: 'screenshot target clicked once' }, state: await settle() }; }
       catch { return { answer: { success: true, message: 'click dispatched; page result unavailable' }, state: null }; }
     }
+    if (op === 'press') {
+      await ensureAgent();
+      await agentCall('setAgentAction', [true]);
+      try {
+        await press(message.key, message.index, message.snapshotId);
+      } finally {
+        await agentCall('setAgentAction', [false]).catch(() => undefined);
+      }
+      return { state: await settle() };
+    }
+    if (op === 'play') {
       await ensureAgent();
       const answer = await agentCall('play', [message.pause === true]);
       await sleep(200);
@@ -1198,6 +1201,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     if (op === 'back') {
       if (!win.webContents.navigationHistory.canGoBack()) return { back: false, state: await state() };
       injected = false;
+      resetFrameState();
+      activeVisualCapture = null;
       navigating = true;
       win.webContents.navigationHistory.goBack();
       await sleep(1200);
@@ -1209,8 +1214,6 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
 
   return {
     async handle(message) {
-      resetFrameState();
-      activeVisualCapture = null;
       if (!message || typeof message.id !== 'number') return;
       try {
         const value = await result(message);
