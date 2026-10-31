@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ActionReceiptLedger, actionReceiptDuplicateKey } from '../core/action-receipts.ts';
 import { hashContent } from '../core/browser/actions.ts';
+import { browserDuplicateKey } from '../core/browser/task-actions.ts';
 import type { BrowserTargetEvidence, DesktopTargetEvidence, FileSystemTargetEvidence } from '../core/task-grants.ts';
 
 let dir = '';
@@ -13,6 +14,40 @@ afterEach(() => {
 });
 
 describe('shared ActionReceiptLedger', () => {
+  it('retains an unresolved clipboard write across restart and blocks another copy', () => {
+    dir = mkdtempSync(join(tmpdir(), 'coopanion-action-receipts-'));
+    const file = join(dir, 'receipts.json');
+    const ledger = new ActionReceiptLedger(file);
+    const target: BrowserTargetEvidence = {
+      surface: 'browser', instanceId: 'browser-1', origin: 'https://www.example.test',
+      url: 'https://www.example.test/item/1', accountRef: 'account-1', snapshotId: 'page-1',
+      formId: 'clipboard:https://www.example.test/item/1', control: 'clipboard-copy',
+    };
+    const payloadDigest = hashContent('https://www.example.test/item/1');
+    const duplicateKey = browserDuplicateKey('clipboard-write', target, payloadDigest, undefined, []);
+    const receipt = ledger.begin({
+      taskId: 'browser-call-copy', intent: 'clipboard-write', action: 'clipboard-copy',
+      risk: 'REVERSIBLE_LOCAL', target, payloadDigest, files: [], duplicateKey,
+    }, 500);
+    ledger.awaitingApproval(receipt.id, 501);
+    ledger.acting(receipt.id, 'f'.repeat(64), 502, 30_000, 503);
+    ledger.complete(receipt.id, {
+      phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown',
+      note: 'the page did not confirm whether the link was copied',
+    }, 504);
+
+    const reopened = new ActionReceiptLedger(file);
+    expect(reopened.hasUnresolved(duplicateKey)).toBe(true);
+    const retryTarget = { ...target, instanceId: 'browser-2' };
+    const retryKey = browserDuplicateKey('clipboard-write', retryTarget, payloadDigest, undefined, []);
+    expect(retryKey).toBe(duplicateKey);
+    expect(() => reopened.begin({
+      taskId: 'browser-call-copy-retry', intent: 'clipboard-write', action: 'clipboard-copy',
+      risk: 'REVERSIBLE_LOCAL', target: retryTarget,
+      payloadDigest, files: [], duplicateKey: retryKey,
+    }, 505)).toThrow(/needs review/);
+  });
+
   it('persists Browser and desktop receipts with common IDs and distinct evidence states', () => {
     dir = mkdtempSync(join(tmpdir(), 'coopanion-action-receipts-'));
     const file = join(dir, 'receipts.json');

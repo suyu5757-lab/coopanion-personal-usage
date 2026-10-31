@@ -64,6 +64,20 @@ export function isWriteAction(label: string): boolean {
   return WRITE_ACTIONS_ZH.some((word) => text.includes(word)) || WRITE_ACTION_EN.test(text);
 }
 
+/** A page control that copies a link into the local clipboard. */
+export function isClipboardCopyControl(label: string): boolean {
+  return /(?:复制|拷贝)\s*(?:链接|地址)?|\bcopy(?:\s+(?:the\s+)?)?(?:link|url)\b/i.test(NORMAL(label));
+}
+
+/** A destination option offered inside the page's share panel. */
+export function isShareDestinationControl(label: string): boolean {
+  return /(?:微信|朋友圈|QQ|微博|动态|分享到|分享给|转发)|\b(?:facebook|instagram|whatsapp|messenger|telegram|wechat|weibo|twitter|line|share to|send to)\b/i.test(NORMAL(label));
+}
+
+export function isShareDismissControl(label: string): boolean {
+  return /^(?:关闭|取消|返回|close|cancel|back)$/i.test(NORMAL(label));
+}
+
 /**
  * A control that is already in the state a click would remove: 取消收藏, 已关注, unlike, unfollow.
  * Clicking it takes something back, so the World reports the state and leaves it alone.

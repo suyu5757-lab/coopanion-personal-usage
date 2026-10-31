@@ -5,8 +5,8 @@ import { dirname, isAbsolute } from 'node:path';
 import { writeState } from './state-file.ts';
 import type { ActionRisk, ActionTargetEvidence, DesktopTargetEvidence } from './task-grants.ts';
 
-export type ActionIntent = 'platform-write' | 'image-generation' | 'image-saving' | 'media-upload' | 'computer-input' | 'file-write' | 'command-execution' | 'platform-api';
-export type BrowserTaskIntent = Extract<ActionIntent, 'platform-write' | 'image-generation' | 'image-saving' | 'media-upload'>;
+export type ActionIntent = 'platform-write' | 'clipboard-write' | 'image-generation' | 'image-saving' | 'media-upload' | 'computer-input' | 'file-write' | 'command-execution' | 'platform-api';
+export type BrowserTaskIntent = Extract<ActionIntent, 'platform-write' | 'clipboard-write' | 'image-generation' | 'image-saving' | 'media-upload'>;
 export type ActionReceiptPhase = 'planned' | 'awaiting-approval' | 'acting' | 'submitted' | 'review-pending' | 'verified' | 'unknown' | 'cancelled' | 'failed';
 export type BrowserTaskPhase = ActionReceiptPhase;
 export type BrowserTaskFile = { path: string; digest: string; bytes: number; mime: string };
@@ -64,7 +64,7 @@ export type BrowserTaskAction = ActionReceipt;
 export type NewActionReceipt = Omit<ActionReceipt, 'id' | 'actionId' | 'attemptId' | 'phase' | 'createdAt' | 'updatedAt' | 'risk' | 'dispatchState' | 'evidence' | 'action'>
   & Partial<Pick<ActionReceipt, 'actionId' | 'attemptId' | 'risk' | 'dispatchState' | 'evidence' | 'action'>>;
 const PHASES = new Set<ActionReceiptPhase>(['planned', 'awaiting-approval', 'acting', 'submitted', 'review-pending', 'verified', 'unknown', 'cancelled', 'failed']);
-const INTENTS = new Set<ActionIntent>(['platform-write', 'image-generation', 'image-saving', 'media-upload', 'computer-input', 'file-write', 'command-execution', 'platform-api']);
+const INTENTS = new Set<ActionIntent>(['platform-write', 'clipboard-write', 'image-generation', 'image-saving', 'media-upload', 'computer-input', 'file-write', 'command-execution', 'platform-api']);
 const UNRESOLVED = new Set<ActionReceiptPhase>(['planned', 'awaiting-approval', 'acting', 'submitted', 'review-pending', 'unknown']);
 const REVIEWABLE = new Set<ActionReceiptPhase>(['submitted', 'review-pending', 'unknown']);
 const MAX_RECENT_ACTIONS = 500;
@@ -73,7 +73,7 @@ const DISPATCH_STATES = new Set<ActionDispatchState>(['not-dispatched', 'deliver
 const OUTCOMES = new Set<ActionReceiptOutcome>(['delivered', 'ui-observed', 'remote-acknowledged', 'review-pending', 'verified', 'unknown', 'cancelled', 'failed']);
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 
-export const defaultActionRisk = (intent: ActionIntent): ActionRisk => intent === 'image-saving' || intent === 'file-write'
+export const defaultActionRisk = (intent: ActionIntent): ActionRisk => intent === 'image-saving' || intent === 'file-write' || intent === 'clipboard-write'
   ? 'REVERSIBLE_LOCAL'
   : 'EXTERNAL_MUTATION';
 

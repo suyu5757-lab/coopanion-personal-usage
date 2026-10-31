@@ -16,16 +16,16 @@ import type { Language } from 'cortico/core/language.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import type { ModelLanguage } from '../language.ts';
 import { ActionGate, type Impact } from '../action-gate.ts';
-import { defaultActionRisk, type ActionReceiptCompletion, type ActionRisk } from '../action-receipts.ts';
+import { defaultActionRisk, type ActionReceiptCompletion, type ActionRisk, type BrowserTaskIntent } from '../action-receipts.ts';
 import { coreText } from '../i18n/index.ts';
 import { ActionJournal, hashContent, originOf, ReplyJournal, type ActionTarget, type PublicAction } from './actions.ts';
 import { BrowserTaskActionJournal, browserDuplicateKey } from './task-actions.ts';
 import type { BrowserTargetEvidence, StepRequest } from '../task-grants.ts';
 import type { BrowserTransport } from './bridge.ts';
 import { CONTENT_MAX, SESSION_MAX_CALLS, TEXT_MAX, WATCH_FRAMES_DEFAULT, WATCH_FRAMES_MAX, WATCH_MAX, type SelfTimeConfig } from './config.ts';
-import { clickRefusal, isFilePicker, isFinalPublishControl, isSearchField, isSendControl, isWriteAction, removesState, typeRefusal } from './guard.ts';
+import { clickRefusal, isClipboardCopyControl, isFilePicker, isFinalPublishControl, isSearchField, isSendControl, isShareDismissControl, isShareDestinationControl, isWriteAction, removesState, typeRefusal } from './guard.ts';
 import { BROWSER_TEXT, type AgentElement, type BrowserText, type PageState, type VideoState } from './model-text.ts';
-import { commentReplyConfirmed, submissionStatus } from './submission-status.ts';
+import { clipboardCopyConfirmed, commentReplyConfirmed, submissionStatus } from './submission-status.ts';
 import { BROWSER_TOOL_DECLS } from './tools.ts';
 
 export const BROWSER_WORLD_ID = 'browser';
@@ -70,6 +70,7 @@ export type ApprovalAnswer = 'yes' | 'always' | 'no' | 'dismissed' | 'timeout' |
 interface Shot { base64: string; width: number; height: number; state: PageState }
 interface BrowserActionAuthorization { journalId: string; grantDigest: string; approvedAt: number; expiresAt: number }
 type BrowserActionApproval = { approved: true; authorization: BrowserActionAuthorization } | { approved: false; reason: 'unavailable' | 'not-approved' | 'not-answered' | 'changed' | 'unknown' };
+interface SharePanelEvidence { url: string; snapshotId: string; targetUrl: string; targetTitle: string; accountRef: string }
 interface ClickAnswer { success?: boolean; message?: string }
 interface PlayAnswer { ok?: boolean; error?: string; video?: VideoState | null }
 
@@ -286,6 +287,8 @@ export class BrowserWorld implements World {
   private shownSnapshotId = '';
   /** The last page shown to the model: what a confirmation names as its target. */
   private lastState: PageState | null = null;
+  /** The share options returned by browser_share, scoped to their page snapshot. */
+  private sharePanel: SharePanelEvidence | null = null;
   /** The unresolved public writes; a resolved one leaves the file as soon as it is written. */
   private actions: PublicAction[] = [];
   private journal: ActionJournal | null = null;
@@ -359,6 +362,7 @@ export class BrowserWorld implements World {
       payloadDigest?: string;
       commentFingerprint?: string;
       risk?: ActionRisk;
+      intent?: BrowserTaskIntent;
     } = {},
   ): Promise<BrowserActionApproval> {
     if (!this.ensureTaskJournal() || !this.taskJournal) return { approved: false, reason: 'unavailable' };
@@ -378,13 +382,14 @@ export class BrowserWorld implements World {
     const files = scope.files ?? [];
     const payloadDigest = scope.payloadDigest ?? hashContent(taskText);
     const risk = scope.risk ?? defaultActionRisk(impact);
-    const duplicateKey = browserDuplicateKey(impact, target, payloadDigest, scope.dedupeKey, files);
+    const intent: BrowserTaskIntent = scope.intent ?? impact;
+    const duplicateKey = browserDuplicateKey(intent, target, payloadDigest, scope.dedupeKey, files);
     if (this.taskJournal.hasUnresolved(duplicateKey)) return { approved: false, reason: 'unknown' };
     let action: ReturnType<BrowserTaskActionJournal['begin']>;
     try {
       action = this.taskJournal.begin({
         taskId,
-        intent: impact,
+        intent,
         action: `${impact}:${control}`,
         target,
         payloadDigest,
@@ -655,6 +660,7 @@ export class BrowserWorld implements World {
     this.calls = 0;
     this.lastTyped = null;
     this.lastState = null;
+    this.sharePanel = null;
     this.shown.clear();
     this.shownUrl = '';
     if (close) void this.opts.bridge.call('close').catch(() => undefined);
@@ -706,6 +712,7 @@ export class BrowserWorld implements World {
   private async openUrl(url: string, lead: string, ctx: ToolCallContext, tool: string): Promise<ToolOutcome> {
     const blocked = this.begin(tool);
     if (blocked) return blocked;
+    this.sharePanel = null;
     const state = asState(await this.call('open', { url, muted: !this.self.sound }, ctx.signal));
     if (!state) return this.toast(this.t.failed(tool, 'the browser returned no page'), true);
     return this.toast(this.full(state, lead));
@@ -780,11 +787,18 @@ export class BrowserWorld implements World {
           return this.toast(this.t.failed('browser_click', 'the button has no readable label'), true);
         }
       }
+      const page = this.lastState;
+      const sharePanel = this.sharePanel && page?.url === this.sharePanel.url
+        ? this.sharePanel
+        : null;
+      const clipboardWrite = isClipboardCopyControl(label);
+      const sharePanelAction = !!sharePanel && !isShareDismissControl(label)
+        && (clipboardWrite || isShareDestinationControl(label));
       if (isDouyinPage(this.lastState?.url ?? '') && isFinalPublishControl(label)) return this.toast(this.t.manualPublish, true);
       if (index === null && isSendControl(label)) return this.toast(this.t.sendTargetNeedsIndex, true);
       const refused = clickRefusal(label);
       if (removesState(label)) return this.toast(this.t.alreadyDone(label), true);
-      if (!this.allowed(refused ? 'sensitive' : isWriteAction(label) ? 'platform-write' : 'read', 'browser_click', label)) {
+      if (!this.allowed(refused ? 'sensitive' : (isWriteAction(label) || clipboardWrite || sharePanelAction || isShareDestinationControl(label)) ? 'platform-write' : 'read', 'browser_click', label)) {
         return this.toast(refused ? this.t.refusedClick(label, refused) : this.t.lookOnly(label), true);
       }
       // A send control publishes the text Coo typed: the person confirms that exact text first.
@@ -803,25 +817,60 @@ export class BrowserWorld implements World {
         return this.toast(this.t.sendDraftMissing, true);
       }
       let authorization: BrowserActionAuthorization | null = null;
-      const page = this.lastState;
-      if (isWriteAction(label)) {
+      let receiptIntent: BrowserTaskIntent | null = null;
+      const externalShare = !clipboardWrite && !isShareDismissControl(label)
+        && (sharePanelAction || isShareDestinationControl(label));
+      if (isWriteAction(label) || clipboardWrite || externalShare) {
         const currentVideo = page?.current;
         const currentAccount = page?.account;
-        if (index === null || !page?.snapshotId || !currentVideo?.url || !currentAccount?.ref || !currentAccount.label
-          || targetSnapshotId !== page.snapshotId) return this.toast(this.t.sendTargetUnverified, true);
+        const shareSnapshotMatches = !!sharePanel && sharePanel.snapshotId === page?.snapshotId;
+        const actionTargetUrl = shareSnapshotMatches ? sharePanel!.targetUrl : currentVideo?.url ?? page?.url;
+        const actionTargetTitle = shareSnapshotMatches ? sharePanel!.targetTitle : currentVideo?.title ?? page?.title ?? '';
+        if (!page?.snapshotId || !actionTargetUrl || (targetSnapshotId && targetSnapshotId !== page.snapshotId)) {
+          return this.toast(this.t.sendTargetUnverified, true);
+        }
+        if ((clipboardWrite || externalShare) && (index === null || targetSnapshotId !== page.snapshotId)) {
+          return this.toast(this.t.sendTargetNeedsIndex, true);
+        }
+        if (isWriteAction(label) && !clipboardWrite && !externalShare
+          && (!currentVideo?.url || !currentAccount?.ref || !currentAccount.label)) return this.toast(this.t.sendTargetUnverified, true);
+        const accountRef = currentAccount?.ref ?? sharePanel?.accountRef ?? this.instanceId;
+        const accountDisplay = currentAccount?.label ? `${currentAccount.label} (${accountRef})` : accountRef;
+        const intent: BrowserTaskIntent = clipboardWrite ? 'clipboard-write' : 'platform-write';
+        const targetUrl = (() => {
+          try { const url = new URL(actionTargetUrl); url.search = ''; url.hash = ''; return url.href; }
+          catch { return actionTargetUrl.slice(0, 400); }
+        })();
+        const taskText = clipboardWrite
+          ? `Copy the share link for ${targetUrl} to the local clipboard once.`
+          : externalShare
+            ? `Share ${targetUrl} through “${label || 'the selected destination'}” once.`
+            : `Perform “${label}” once on ${actionTargetTitle || targetUrl} (${targetUrl}).`;
+        const browserActionText = coreText(this.opts.language?.() ?? 'zh').browserAction;
+        const details = clipboardWrite
+          ? browserActionText.clipboardDetails(accountDisplay, `${actionTargetTitle || targetUrl} (${targetUrl})`)
+          : externalShare
+            ? browserActionText.externalShareDetails(accountDisplay, `${actionTargetTitle || targetUrl} (${targetUrl})`, label)
+            : `Account: ${currentAccount!.label} (${accountRef})\nContent: ${actionTargetTitle || targetUrl} (${targetUrl})\nAction: ${label}`;
         const decision = await this.approveBrowserAction(
           'platform-write',
-          `Perform “${label}” once on ${currentVideo.title || page.title} (${currentVideo.url}).`,
+          taskText,
           page,
-          `video:${currentVideo.url}`,
-          label,
-          `Account: ${currentAccount.label} (${currentAccount.ref})\nContent: ${currentVideo.title || currentVideo.url} (${currentVideo.url})\nAction: ${label}`,
+          `${clipboardWrite ? 'clipboard' : externalShare ? 'share' : 'video'}:${actionTargetUrl}`,
+          clipboardWrite ? 'clipboard-copy' : externalShare ? `share:${label || 'destination'}` : label,
+          details,
           ctx,
-          { accountRef: currentAccount.ref },
+          {
+            accountRef,
+            ...((clipboardWrite || externalShare) ? { payloadDigest: hashContent(JSON.stringify([actionTargetUrl, label, intent])) } : {}),
+            ...(clipboardWrite ? { risk: 'REVERSIBLE_LOCAL' as const, intent, actionLabel: browserActionText.clipboardWrite } : {}),
+            ...(externalShare ? { risk: 'IRREVERSIBLE_OR_PUBLIC' as const, actionLabel: browserActionText.externalShare } : {}),
+          },
         );
         if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
           : decision.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly(label), true);
         authorization = decision.authorization;
+        receiptIntent = intent;
       }
       let result: Record<string, unknown> | null;
       try {
@@ -841,6 +890,27 @@ export class BrowserWorld implements World {
         return this.toast(this.t.failed('browser_click', 'the page did not answer after the click'), true);
       }
       if (authorization) {
+        if (receiptIntent === 'clipboard-write') {
+          const verified = state.url === page?.url && clipboardCopyConfirmed(state.statusMessages ?? []);
+          this.taskJournal?.complete(authorization.journalId, verified
+            ? { phase: 'verified', dispatchState: 'delivered', outcome: 'ui-observed', note: 'the page confirmed that the link was copied', evidence: { source: 'browser-page-status', status: 'clipboard-copy-confirmed', observedAt: Date.now() } }
+            : { phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown', note: 'the page did not confirm whether the link was copied', evidence: { source: 'browser-page-status', status: 'clipboard-copy-unconfirmed', observedAt: Date.now() } });
+          if (!verified) return this.toast(this.t.sendUnknown, true);
+          return this.toast(this.full(state, this.t.clicked(label || `#${index}`)));
+        }
+        if (externalShare) {
+          const status = submissionStatus(state.statusMessages ?? []);
+          const completion: ActionReceiptCompletion = status === 'pending-review'
+            ? { phase: 'review-pending', dispatchState: 'delivered', outcome: 'review-pending', note: 'the page shows the share action under review' }
+            : status === 'published'
+              ? { phase: 'verified', dispatchState: 'delivered', outcome: 'verified', note: 'the page confirms the share action completed' }
+              : status === 'submitted'
+                ? { phase: 'submitted', dispatchState: 'delivered', outcome: 'remote-acknowledged', note: 'the page acknowledges the share action without a final status' }
+                : { phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown', note: 'the page did not confirm the share result' };
+          this.taskJournal?.complete(authorization.journalId, completion);
+          if (completion.phase !== 'verified') return this.toast(this.t.sendUnknown, true);
+          return this.toast(this.full(state, this.t.clicked(label || `#${index}`)));
+        }
         const after = state.elements?.find((candidate) => candidate.id === index)?.label ?? '';
         const currentVideo = page?.current;
         const currentAccount = page?.account;
@@ -883,6 +953,13 @@ export class BrowserWorld implements World {
       const result = asRecord(await this.call('share', {}, ctx.signal));
       const state = asState(result?.state);
       if (!state) return this.toast(this.t.failed('browser_share', 'the page did not answer after opening the share panel'), true);
+      this.sharePanel = state.snapshotId ? {
+        url: state.url,
+        snapshotId: state.snapshotId,
+        targetUrl: state.current?.url ?? state.url,
+        targetTitle: state.current?.title ?? state.title,
+        accountRef: state.account?.ref ?? this.instanceId,
+      } : null;
       return this.toast(this.full(state, this.t.shared));
     });
   }

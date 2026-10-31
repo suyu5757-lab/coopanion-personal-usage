@@ -78,7 +78,7 @@ export const BROWSER_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'browser_share',
     tags: ['act'],
-    description: 'Open the share panel of the current page or video and return the page with its numbered options. Then click 复制链接 or a destination. Refused while browsing is read-only.',
+    description: 'Open the share panel of the current page or video and return the page with its numbered options. Copying a link or choosing a destination requires a separate one-time Core approval and action receipt. Refused while browsing is read-only.',
     parameters: { type: 'object', properties: {}, required: [] },
   },
   {

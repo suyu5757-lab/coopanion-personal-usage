@@ -1,4 +1,4 @@
-<!-- Owner: world.ts, guard.ts, actions.ts, submission-status.ts, app/browser.cjs, app/browser-agent/entry.ts, app/browser-agent/comments.ts, app/browser-agent/chatgpt.ts -->
+<!-- Owner: world.ts, guard.ts, actions.ts, task-actions.ts, ../action-receipts.ts, ../action-gate.ts, submission-status.ts, app/browser.cjs, app/browser-agent/entry.ts, app/browser-agent/comments.ts, app/browser-agent/chatgpt.ts -->
 
 # core/browser
 
@@ -20,6 +20,9 @@ window has its own Chromium profile and logins.
   `app/browser-agent/LICENSE`. Icon-only share controls are given an index and the name 分享 for one extraction
   pass, because the controller skips them inside a highlighted scroll container. `browser_share` hovers that
   control: Bilibili and Douyin open their share panel on hover, not on a click.
+- Clicking a share-panel destination and copying a link use the shared ActionGate and receipt ledger. External
+  share actions use a one-time approval and remain unresolved when the page gives no result. Link-copy receipts
+  use only visible page notices; the browser never reads the system clipboard.
 - ChatGPT image prompts are entered through the visible ChatGPT page in this profile; they do not use an OpenAI
   API key or Codex image generation. A dedicated save action accepts a verified PNG, JPEG or WebP download into
   `<data>/video/media`. Douyin uploads use an explicit list from `video_list_media` and the current page's file

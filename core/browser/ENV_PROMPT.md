@@ -4,7 +4,7 @@
 
 - `browser_open` / `browser_search`:打开网页,或在网上、B站、抖音搜索。B站、抖音和任何 http(s) 页面都可以。
 - `browser_read`:读页面:标题、地址、滚动位置,和带编号的可点元素。编号就是 `browser_click`、`browser_type` 用的。
-- `browser_text`:读整页正文;`browser_find`:在长页里找词。`browser_click`:按编号点开视频、播放、点赞、收藏、关注、打开评论框或分享面板里的选项;没有编号的按钮(例如视频发布页右侧的「添加音乐」)用 text 点。`browser_hover`:把鼠标移到元素上;只在悬停后出现的按钮(例如选音乐的「使用」、视频页的分享)先 hover 再 read,然后点。`browser_share`:打开视频或页面的分享面板,再点「复制链接」或要分享到的地方。`browser_type` 后接 `browser_press`:输入搜索词、弹幕或评论,再按 Enter 发送。表单很长时先 `browser_scroll`,发布页的音乐、位置和声明在表单下方。
+- `browser_text`:读整页正文;`browser_find`:在长页里找词。`browser_click`:按编号点开视频、播放、点赞、收藏、关注、打开评论框或分享面板里的选项;没有编号的按钮(例如视频发布页右侧的「添加音乐」)用 text 点。`browser_hover`:把鼠标移到元素上;只在悬停后出现的按钮(例如选音乐的「使用」、视频页的分享)先 hover 再 read,然后点。`browser_share`:打开视频或页面的分享面板。复制链接或选择分享去向前，先等 Core 气泡批准这一次；结果不清楚时停止重试并查看动作回执。不要读取剪贴板内容。`browser_type` 后接 `browser_press`:输入搜索词、弹幕或评论,再按 Enter 发送。表单很长时先 `browser_scroll`,发布页的音乐、位置和声明在表单下方。
 - 点赞、收藏、关注等公开写操作前，先核对账号、当前作品和控件，并等 Core 气泡批准这一次操作。评论或回复按下面的全文审批流程。结果不明确时报告未知，不再次点击。
 - `browser_scroll`:翻一屏;`browser_play`:播放或暂停视频;`browser_watch`:看一会儿、截几帧,并把这一段声音转成文字;动作快或变化快时把 frames 调大,不想听声音时带 audio: false;`browser_screenshot`:看版面;`browser_close`:逛完关掉。
 - `browser_chatgpt_generate_image`、`browser_save_chatgpt_image` 和 `browser_upload_media` 分别受网页生图、保存生成图片和素材上传权限控制；只有 `browser.actions` 明确显示对应权限已开启时才调用。旧的常规互动权限不会开启这些能力。

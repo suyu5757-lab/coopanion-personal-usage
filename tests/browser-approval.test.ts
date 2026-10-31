@@ -56,6 +56,7 @@ class FakeBridge implements BrowserTransport {
     if (op === 'active') return this.box;
     if (op === 'draft') return this.draft;
     if (op === 'open' || op === 'read') return this.state;
+    if (op === 'share') return { state: this.state };
     if (op === 'input') { this.draft = String(args.text ?? ''); return { answer: { success: true }, state: this.state }; }
     if (op === 'press' || op === 'click') {
       if (this.failOn === op) { this.failOn = null; throw new Error('the page did not answer'); }
@@ -301,6 +302,107 @@ describe('public write approval', () => {
     expect(out.text).toContain('无法绑定账号');
     expect(asked).toBe(0);
     expect(bridge.calls.some((call) => call.op === 'press')).toBe(false);
+  });
+
+  it('approves a share-link copy and records only the page-visible confirmation', async () => {
+    const bridge = new FakeBridge();
+    bridge.state = page({
+      url: 'https://www.douyin.com/video/123',
+      title: '抖音',
+      content: '[3]<button >复制链接 />',
+      elements: [{ id: 2, label: '' }, { id: 3, label: '复制链接' }],
+      statusMessages: ['链接复制成功'],
+    });
+    bridge.button = element({ id: 3, tag: 'button', role: 'button', label: '复制链接', text: '复制链接', placeholder: '' });
+    const prompts: string[] = [];
+    const { world, taskJournalFile } = await make({ bridge, ask: async (question) => { prompts.push(question); return 'yes'; } });
+    const panel = await run(world, 'browser_share', {});
+    expect(panel.failed).toBeUndefined();
+    expect(prompts).toHaveLength(0);
+
+    const result = await run(world, 'browser_click', { index: 3 });
+    expect(result.failed).toBeUndefined();
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain('剪贴板');
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))).toMatchObject([{
+      intent: 'clipboard-write',
+      risk: 'REVERSIBLE_LOCAL',
+      phase: 'verified',
+      dispatchState: 'delivered',
+      outcome: 'ui-observed',
+    }]);
+  });
+
+  it('blocks a second share-link copy when the page does not confirm the first', async () => {
+    const bridge = new FakeBridge();
+    bridge.state = page({
+      url: 'https://www.douyin.com/video/123',
+      title: '抖音',
+      content: '[3]<button >复制链接 />',
+      elements: [{ id: 2, label: '' }, { id: 3, label: '复制链接' }],
+      statusMessages: [],
+    });
+    bridge.button = element({ id: 3, tag: 'button', role: 'button', label: '复制链接', text: '复制链接', placeholder: '' });
+    let prompts = 0;
+    const { world, taskJournalFile } = await make({ bridge, ask: async () => { prompts++; return 'yes'; } });
+    await run(world, 'browser_share', {});
+    const first = await run(world, 'browser_click', { index: 3 });
+    expect(first.failed).toBe(true);
+    expect(prompts).toBe(1);
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))).toMatchObject([{ intent: 'clipboard-write', phase: 'unknown' }]);
+
+    const retry = await run(world, 'browser_click', { index: 3 });
+    expect(retry.failed).toBe(true);
+    expect(prompts).toBe(1);
+    expect(bridge.calls.filter((call) => call.op === 'click')).toHaveLength(1);
+  });
+
+  it('requires a numbered page snapshot for a clipboard write', async () => {
+    const bridge = new FakeBridge();
+    bridge.state = page({
+      url: 'https://www.douyin.com/video/123',
+      title: '抖音',
+      content: '[3]<button >复制链接 />',
+      elements: [{ id: 2, label: '' }, { id: 3, label: '复制链接' }],
+    });
+    bridge.button = element({ id: 3, tag: 'button', role: 'button', label: '复制链接', text: '复制链接', placeholder: '' });
+    let prompts = 0;
+    const { world } = await make({ bridge, ask: async () => { prompts++; return 'yes'; } });
+    await run(world, 'browser_share', {});
+    const result = await run(world, 'browser_click', { text: '复制链接' });
+    expect(result.failed).toBe(true);
+    expect(result.text).toContain('编号');
+    expect(prompts).toBe(0);
+    expect(bridge.calls.filter((call) => call.op === 'click')).toHaveLength(0);
+  });
+
+  it('treats a share destination as a public action and keeps an acknowledgment unresolved', async () => {
+    const bridge = new FakeBridge();
+    bridge.state = page({
+      url: 'https://www.douyin.com/video/123',
+      title: '抖音',
+      content: '[3]<button >微信好友 />',
+      elements: [{ id: 2, label: '' }, { id: 3, label: '微信好友' }],
+      statusMessages: ['分享成功'],
+    });
+    bridge.button = element({ id: 3, tag: 'button', role: 'button', label: '微信好友', text: '微信好友', placeholder: '' });
+    let prompts = 0;
+    const { world, taskJournalFile } = await make({ bridge, ask: async () => { prompts++; return 'yes'; } });
+    await run(world, 'browser_share', {});
+    const result = await run(world, 'browser_click', { index: 3 });
+    expect(result.failed).toBe(true);
+    expect(prompts).toBe(1);
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))).toMatchObject([{
+      intent: 'platform-write',
+      risk: 'IRREVERSIBLE_OR_PUBLIC',
+      phase: 'submitted',
+      dispatchState: 'delivered',
+      outcome: 'remote-acknowledged',
+    }]);
+    const retry = await run(world, 'browser_click', { index: 3 });
+    expect(retry.failed).toBe(true);
+    expect(prompts).toBe(1);
+    expect(bridge.calls.filter((call) => call.op === 'click')).toHaveLength(1);
   });
 
   it('keeps an unbound comment reply as a draft', async () => {
