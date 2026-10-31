@@ -7,7 +7,7 @@
  *
  * The window has its own Chromium profile (`persist:coo-browser`), so signing in on ChatGPT, Bilibili or Douyin does
  * not touch the person's browser. It is shown without focus, denies camera, microphone, location and
- * notification permission, refuses downloads except one checked ChatGPT image save into the video media folder,
+ * notification permission, accepts only approved ChatGPT image staging or a snapshot-bound public media download,
  * keeps public http(s) navigation in this one window, and
  * closes when the app quits. A page's `target=_blank` link is loaded here as well, not in a second window.
  * The app uses Electron's internal debugger only to set a validated media selection on a page file input; it
@@ -17,8 +17,8 @@
  * and non-proxied WebRTC UDP are blocked.
  */
 const { app, BrowserWindow, screen, session } = require('electron');
-const { randomUUID } = require('node:crypto');
-const { constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync } = require('node:fs');
+const { createHmac, randomBytes, randomUUID } = require('node:crypto');
+const { closeSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync } = require('node:fs');
 const { dirname, join } = require('node:path');
 const { MAX_IMAGE_BYTES, generatedImagePath, isChatGPTImageDownloadUrl, isChatGPTPageUrl, verifyGeneratedImage } = require('./browser-image-download.cjs');
 const { acceptsUpload, isDouyinPageUrl, resolveUploadFiles } = require('./browser-upload.cjs');
@@ -26,6 +26,16 @@ const { imagePointToViewport } = require('./browser-visual-point.cjs');
 const { compositeSnapshotId, inspectFrameHost, mapFramePointToMain: mapFramePoint } = require('./browser-frame-bridge.cjs');
 const { createBrowserEgressProxy } = require('./browser-egress-proxy.cjs');
 const { httpUrl, isPublicHttp, isPublicResolvedHost, isWebSocketRequest } = require('./browser-network-policy.cjs');
+const {
+  MAX_MEDIA_DOWNLOAD_BYTES,
+  existingDirectory,
+  isMediaDownloadUrl,
+  mediaDownloadRedirectsAllowed,
+  reserveMediaTemporaryFile,
+  safeMediaFilename,
+  verifyMediaFile,
+  publishWithoutOverwrite,
+} = require('./browser-media-download.cjs');
 const { setFileInputFiles } = require('./browser-cdp-upload.cjs');
 
 const PARTITION = 'persist:coo-browser';
@@ -33,6 +43,7 @@ const AGENT_FILE = ['build', 'browser-agent.js'];
 const LOAD_TIMEOUT_MS = 25_000;
 const SCRIPT_TIMEOUT_MS = 12_000;
 const SETTLE_MS = 500;
+const MEDIA_TARGET_TOKEN_TTL_MS = 5 * 60_000;
 const WINDOW_WIDTH = 1100;
 const WINDOW_HEIGHT = 760;
 /** The largest screenshot sent to the model, whatever the window's device scale factor. */
@@ -48,6 +59,11 @@ function userAgent() {
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const mediaDownloadError = (status, message, dispatchState = 'not-dispatched') => {
+  const code = status === 'not-dispatched' ? 'MEDIA_DOWNLOAD_NOT_DISPATCHED'
+    : status === 'failed' ? 'MEDIA_DOWNLOAD_FAILED' : 'MEDIA_DOWNLOAD_UNKNOWN';
+  return new Error(`${code}:${dispatchState}:${message}`);
+};
 /** A tab recording decodes its audio in the page after the stop; give that call more room than a page read. */
 const AUDIO_TIMEOUT_MS = 30_000;
 const IMAGE_DOWNLOAD_TIMEOUT_MS = 120_000;
@@ -59,6 +75,18 @@ function within(work, ms, what) {
     work(),
     new Promise((_, fail) => { timer = setTimeout(() => fail(new Error(`${what} timed out`)), ms); }),
   ]).finally(() => clearTimeout(timer));
+}
+
+function normalizedMediaRequestUrl(value) {
+  try {
+    const url = new URL(value);
+    url.hash = '';
+    return url.href;
+  } catch { return ''; }
+}
+
+function sameMediaRequestUrl(left, right) {
+  return !!normalizedMediaRequestUrl(left) && normalizedMediaRequestUrl(left) === normalizedMediaRequestUrl(right);
 }
 
 function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () => null, partition = PARTITION, resolveHostForUrl }) {
@@ -75,6 +103,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
   let agent = null;
   /** One verified ChatGPT image download requested by Coo's image-save tool. */
   let pendingImageDownload = null;
+  /** One user-approved C02 transfer; a Browser Session accepts no other download. */
+  let pendingMediaDownload = null;
   let egressProxy = null;
   let networkReady = null;
   let creatingWindow = null;
@@ -86,6 +116,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
   let activeTextFrame = null;
   const frameTargetIds = new Map();
   const frameTargets = new Map();
+  const mediaTargetSecret = randomBytes(32);
+  const mediaTargetRecords = new Map();
   /** Images downloaded for hash review but not yet approved for the media folder. */
   const stagedChatGPTImages = new Map();
   const clearStagedChatGPTImages = () => {
@@ -111,6 +143,228 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     }
     if (error) pending.reject(error instanceof Error ? error : new Error(String(error)));
     else pending.resolve(value);
+  };
+
+  const finishMediaDownload = (pending, error, value) => {
+    if (pendingMediaDownload !== pending || pending.finished) return;
+    pending.finished = true;
+    pendingMediaDownload = null;
+    clearTimeout(pending.timer);
+    clearTimeout(pending.cancelTimer);
+    if (error) {
+      for (const file of [pending.temporaryPath, pending.publishedPath]) {
+        if (file) { try { unlinkSync(file); } catch { /* only this task's paths are removed */ } }
+      }
+      const message = pending.safeError || 'the download did not produce a verified file';
+      pending.reject(mediaDownloadError(pending.errorKind ?? (pending.seen ? 'failed' : 'not-dispatched'), message,
+        pending.errorKind === 'unknown' ? (pending.dispatched ? 'delivered' : 'unknown') : pending.dispatched ? 'delivered' : 'not-dispatched'));
+    } else pending.resolve(value);
+  };
+
+  const cancelMediaDownload = (id, error = new Error('download was cancelled'), status = 'unknown') => {
+    const pending = pendingMediaDownload;
+    if (!pending || (id !== undefined && pending.id !== id) || pending.finished) return false;
+    pending.cancelError ??= error;
+    pending.errorKind ??= status;
+    pending.safeError ??= status === 'unknown' ? 'the download was interrupted; inspect the target before retrying' : 'the download did not complete within the approved limits';
+    if (!pending.item) {
+      finishMediaDownload(pending, pending.cancelError);
+      return true;
+    }
+    if (!pending.itemDone) {
+      try { pending.item.cancel(); } catch { /* the item may have just completed */ }
+      pending.cancelTimer ??= setTimeout(() => finishMediaDownload(pending, pending.cancelError), 5_000);
+    }
+    return true;
+  };
+
+  const handleMediaDownload = (event, item, contents) => {
+    const pending = pendingMediaDownload;
+    if (!pending || pending.seen) {
+      event.preventDefault();
+      try { item.cancel(); } catch { /* Electron may already have stopped the item */ }
+      if (pending) cancelMediaDownload(pending.id, new Error('the page started an unexpected second download'));
+      return;
+    }
+    pending.dispatched = true;
+    const pageUrl = contents === win?.webContents ? contents.getURL() : '';
+    let responseUrl;
+    try { responseUrl = new URL(item.getURL()); } catch { responseUrl = null; }
+    if (contents !== win?.webContents || pageUrl !== pending.pageUrl || responseUrl?.origin !== pending.sourceOrigin
+      || !isMediaDownloadUrl(item.getURL())) {
+      event.preventDefault();
+      try { item.cancel(); } catch { /* Electron may already have stopped the item */ }
+      pending.errorKind = 'failed';
+      pending.safeError = 'the download did not match the approved page and source';
+      finishMediaDownload(pending, new Error('the source did not match approval'));
+      return;
+    }
+    const initialBytes = Number(item.getTotalBytes());
+    if (Number.isFinite(initialBytes) && initialBytes > pending.maxBytes) {
+      event.preventDefault();
+      try { item.cancel(); } catch { /* Electron may already have stopped the item */ }
+      pending.errorKind = 'failed';
+      pending.safeError = 'the source exceeds the approved size limit';
+      finishMediaDownload(pending, new Error('source exceeds limit'));
+      return;
+    }
+    try {
+      pending.temporaryPath = reserveMediaTemporaryFile(pending.directory);
+      item.setSavePath(pending.temporaryPath);
+      pending.item = item;
+      pending.seen = true;
+      pending.stages.push({ status: 'downloading', observedAt: Date.now() });
+    } catch {
+      event.preventDefault();
+      try { item.cancel(); } catch { /* Electron may already have stopped the item */ }
+      pending.errorKind = 'failed';
+      pending.safeError = 'the download could not be started in the approved directory';
+      finishMediaDownload(pending, new Error('download path was rejected'));
+      return;
+    }
+    item.on('updated', () => {
+      if (item.getReceivedBytes() > pending.maxBytes || item.getTotalBytes() > pending.maxBytes) {
+        cancelMediaDownload(pending.id, new Error('the source exceeded the approved size limit'), 'failed');
+      }
+    });
+    item.once('done', (_doneEvent, state) => {
+      pending.itemDone = true;
+      if (pending.cancelError) return finishMediaDownload(pending, pending.cancelError);
+      if (state !== 'completed') {
+        pending.errorKind = pending.errorKind ?? 'failed';
+        pending.safeError = pending.safeError ?? 'the Browser did not complete the selected download';
+        return finishMediaDownload(pending, new Error('download did not complete'));
+      }
+      void (async () => {
+        try {
+          const chain = item.getURLChain();
+          if (!mediaDownloadRedirectsAllowed(pending.sourceUrl, chain)) throw new Error('the redirect chain left the approved source');
+          pending.stages.push({ status: 'saved_unverified', observedAt: Date.now() });
+          const mime = String(item.getMimeType() || 'application/octet-stream').toLowerCase().split(';')[0].trim();
+          const staged = await verifyMediaFile(pending.temporaryPath, {
+            filename: pending.filename,
+            mime,
+            maxBytes: pending.maxBytes,
+            expectedType: pending.mediaType,
+          });
+          if (pending.cancelError || !win || win.isDestroyed() || win.webContents.getURL() !== pending.pageUrl) {
+            throw pending.cancelError ?? new Error('the approved page changed during the download');
+          }
+          const targetPath = publishWithoutOverwrite(pending.temporaryPath, pending.directory, pending.filename);
+          pending.temporaryPath = '';
+          pending.publishedPath = targetPath;
+          const saved = await verifyMediaFile(targetPath, {
+            filename: pending.filename,
+            mime,
+            maxBytes: pending.maxBytes,
+            expectedType: pending.mediaType,
+          });
+          if (saved.bytes !== staged.bytes || saved.digest !== staged.digest || saved.format !== staged.format) {
+            throw new Error('the published file did not match the verified download');
+          }
+          pending.stages.push({ status: 'download_verified', observedAt: Date.now() });
+          finishMediaDownload(pending, null, {
+            status: 'download_verified',
+            file: pending.filename,
+            path: targetPath,
+            sourceHost: pending.sourceHost,
+            mediaType: saved.mediaType,
+            mime: saved.mime,
+            bytes: saved.bytes,
+            digest: saved.digest,
+            startedAt: pending.startedAt,
+            completedAt: Date.now(),
+            stages: pending.stages,
+          });
+        } catch (error) {
+          pending.errorKind = pending.errorKind ?? 'failed';
+          pending.safeError = pending.safeError ?? 'the downloaded file did not pass verification or the no-overwrite check';
+          finishMediaDownload(pending, error instanceof Error ? error : new Error('file verification failed'));
+        }
+      })();
+    });
+  };
+
+  const downloadMedia = async (message) => {
+    if (!win || win.isDestroyed() || navigating) throw mediaDownloadError('not-dispatched', 'the Browser page is unavailable');
+    if (pendingImageDownload || pendingMediaDownload) throw mediaDownloadError('not-dispatched', 'another Browser download is in progress');
+    const index = Number.isInteger(message.index) && message.index >= 0 ? message.index : null;
+    const snapshotId = typeof message.snapshotId === 'string' ? message.snapshotId : '';
+    const token = typeof message.token === 'string' ? message.token : '';
+    if (index === null || !snapshotId || !token) throw mediaDownloadError('not-dispatched', 'a current media target and page snapshot are required');
+    let page;
+    try { page = await state(); }
+    catch { throw mediaDownloadError('not-dispatched', 'the current page could not be verified'); }
+    const record = mediaTargetRecords.get(token);
+    if (!record || record.expiresAt <= Date.now() || record.compositeSnapshotId !== snapshotId
+      || page?.snapshotId !== snapshotId || page.url !== record.pageUrl) {
+      throw mediaDownloadError('not-dispatched', 'the selected media target or page snapshot changed; read the page again');
+    }
+    const selected = page.mediaTargets?.[index];
+    if (!selected || selected.token !== token) throw mediaDownloadError('not-dispatched', 'the selected media target no longer matches the page read');
+    let fresh;
+    try {
+      fresh = record.frame
+        ? await frameAgentCall(record.frame, 'mediaTarget', [record.targetId, record.agentSnapshotId])
+        : await rootAgentCall('mediaTarget', [record.targetId, record.agentSnapshotId]);
+    } catch { throw mediaDownloadError('not-dispatched', 'the selected media source could not be rechecked'); }
+    if (!fresh || fresh.url !== record.sourceUrl || fresh.mediaType !== record.mediaType || !isMediaDownloadUrl(fresh.url)) {
+      throw mediaDownloadError('not-dispatched', 'the selected media source changed; read the page again');
+    }
+    let directory, filename, name;
+    try {
+      directory = existingDirectory(message.directory);
+      filename = safeMediaFilename(message.filename).name;
+      name = safeMediaFilename(filename);
+    } catch { throw mediaDownloadError('not-dispatched', 'the selected existing directory or safe filename could not be verified'); }
+    const imageFormats = new Set(['avif', 'gif', 'jpeg', 'png', 'webp']);
+    if ((record.mediaType === 'image') !== imageFormats.has(name.format)) throw mediaDownloadError('not-dispatched', 'the filename type does not match the selected media');
+    const maxBytes = Number(message.maxBytes);
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_MEDIA_DOWNLOAD_BYTES) {
+      throw mediaDownloadError('not-dispatched', 'the approved size limit must be from 1 byte to 1 GiB');
+    }
+    let source;
+    try { source = new URL(record.sourceUrl); } catch { throw mediaDownloadError('not-dispatched', 'the selected source is invalid'); }
+    let resolve, reject;
+    const promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
+    const pending = {
+      id: message.id,
+      pageUrl: record.pageUrl,
+      sourceUrl: record.sourceUrl,
+      sourceOrigin: source.origin,
+      sourceHost: source.host,
+      mediaType: record.mediaType,
+      directory,
+      filename,
+      maxBytes,
+      startedAt: Date.now(),
+      stages: [],
+      resolve,
+      reject,
+      seen: false,
+      dispatched: false,
+      item: null,
+      itemDone: false,
+      finished: false,
+      timer: null,
+      cancelTimer: null,
+      temporaryPath: '',
+      publishedPath: '',
+      cancelError: null,
+      errorKind: null,
+      safeError: '',
+      allowedRedirectUrls: new Set([normalizedMediaRequestUrl(record.sourceUrl)]),
+      rejectedRedirect: '',
+    };
+    pending.timer = setTimeout(() => cancelMediaDownload(message.id, new Error('the download result is unknown; inspect the target before retrying')), IMAGE_DOWNLOAD_TIMEOUT_MS);
+    pendingMediaDownload = pending;
+    try { win.webContents.downloadURL(record.sourceUrl); }
+    catch {
+      pending.errorKind = 'unknown';
+      pending.safeError = 'the Browser did not confirm whether the selected download started';
+      finishMediaDownload(pending, new Error('download start was not confirmed'));
+    }
+    return promise;
   };
 
   const waitForImageDownload = (mediaDir) => {
@@ -345,6 +599,59 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     const snapshotId = compositeSnapshotId(root.snapshotId, evidence) ?? root.snapshotId;
     const elements = Array.isArray(root.elements) ? [...root.elements] : [];
     const content = [typeof root.content === 'string' ? root.content : ''];
+    const nextMediaTargetRecords = new Map();
+    const mediaTargets = [];
+    const mediaTargetEpoch = Math.floor(Date.now() / MEDIA_TARGET_TOKEN_TTL_MS);
+    const pageUrl = typeof root.url === 'string' ? root.url : '';
+    const candidateSets = [
+      { frame: null, frameToken: 'main', agentSnapshotId: root.snapshotId, targets: root.mediaTargets },
+      ...frames.map(({ frame, state: frameState }) => ({
+        frame, frameToken: frame.frameToken, agentSnapshotId: frameState.snapshotId, targets: frameState.mediaTargets,
+      })),
+    ];
+    for (const candidateSet of candidateSets) {
+      for (const raw of Array.isArray(candidateSet.targets) ? candidateSet.targets : []) {
+        if (!Number.isInteger(raw?.id) || !['image', 'video'].includes(raw?.mediaType)
+          || typeof raw.url !== 'string' || !isMediaDownloadUrl(raw.url)) continue;
+        let source;
+        try { source = new URL(raw.url); } catch { continue; }
+        const token = createHmac('sha256', mediaTargetSecret)
+          .update(JSON.stringify([mediaTargetEpoch, snapshotId, candidateSet.frameToken, raw.id, raw.mediaType, raw.url]))
+          .digest('hex');
+        const rawHint = typeof raw.filenameHint === 'string' ? raw.filenameHint : '';
+        let filenameHint = '';
+        try { filenameHint = safeMediaFilename(rawHint).name; } catch { /* some pages do not name their media files */ }
+        const label = (typeof raw.label === 'string' ? raw.label : '')
+          .replace(/https?:\/\/\S+/gi, '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120)
+          || (raw.mediaType === 'image' ? 'Image' : 'Video');
+        const entry = {
+          token,
+          mediaType: raw.mediaType,
+          label,
+          host: source.host,
+          filenameHint,
+        };
+        mediaTargets.push({ index: mediaTargets.length, ...entry });
+        nextMediaTargetRecords.set(token, {
+          frame: candidateSet.frame,
+          frameToken: candidateSet.frameToken,
+          targetId: raw.id,
+          agentSnapshotId: candidateSet.agentSnapshotId,
+          compositeSnapshotId: snapshotId,
+          pageUrl,
+          sourceUrl: raw.url,
+          sourceOrigin: source.origin,
+          mediaType: raw.mediaType,
+          expiresAt: (mediaTargetEpoch + 1) * MEDIA_TARGET_TOKEN_TTL_MS,
+        });
+        if (mediaTargets.length >= 40) break;
+      }
+      if (mediaTargets.length >= 40) break;
+    }
+    mediaTargetRecords.clear();
+    for (const [token, record] of nextMediaTargetRecords) {
+      mediaTargetRecords.set(token, record);
+    }
     for (const [id, target] of frameTargets) {
       if (target.compositeSnapshotId !== snapshotId) frameTargets.delete(id);
     }
@@ -371,7 +678,9 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
         elements.push({ id, label: record.label, ...(typeof element.pressed === 'boolean' ? { pressed: element.pressed } : {}) });
       }
     }
-    const value = { ...root, content: content.join('\n\n'), elements, snapshotId };
+    const { mediaTargets: _rootMediaTargets, ...publicRoot } = root;
+    const publicVideo = root.video && typeof root.video === 'object' ? { ...root.video, src: '' } : root.video;
+    const value = { ...publicRoot, video: publicVideo, content: content.join('\n\n'), elements, snapshotId, mediaTargets };
     compositeStateCache = { root, frames, evidence, state: value, snapshotId };
     return value;
   };
@@ -630,6 +939,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
 
   const closeWindow = () => {
     if (pendingImageDownload) finishImageDownload(pendingImageDownload, new Error('browser window closed'));
+    if (pendingMediaDownload) cancelMediaDownload(pendingMediaDownload.id, new Error('browser window closed during download'));
     clearStagedChatGPTImages();
     if (win && !win.isDestroyed()) win.destroy();
     win = null;
@@ -701,13 +1011,39 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
         callback({ audio: frame });
       });
       ses.setDevicePermissionHandler(() => false);
-      ses.on('will-download', handleImageDownload);
+      ses.on('will-download', (event, item, contents) => {
+        if (pendingImageDownload) handleImageDownload(event, item, contents);
+        else handleMediaDownload(event, item, contents);
+      });
       // Check the session's resolved endpoints before every HTTP request, including frame subresources.
       ses.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*', 'ws://*/*', 'wss://*/*'] }, (details, callback) => {
         if (isWebSocketRequest(details)) { callback({ cancel: true }); return; }
+        const pending = pendingMediaDownload;
+        // A direct download can redirect before `will-download`; reject its cross-origin follow-up request here.
+        if (pending && pending.rejectedRedirect && sameMediaRequestUrl(details.url, pending.rejectedRedirect)) {
+            pending.dispatched = true;
+            callback({ cancel: true });
+            pending.errorKind = 'failed';
+            pending.safeError = 'the redirect left the approved source host';
+            if (pending.item) cancelMediaDownload(pending.id, new Error('redirect source changed'), 'failed');
+            else finishMediaDownload(pending, new Error('redirect source changed'));
+            return;
+        }
         void isPublicDestination(details.url)
           .then((allowed) => callback({ cancel: !allowed }))
           .catch(() => callback({ cancel: true }));
+      });
+      ses.webRequest.onBeforeRedirect({ urls: ['http://*/*', 'https://*/*'] }, (details) => {
+        const pending = pendingMediaDownload;
+        if (!pending || ![...pending.allowedRedirectUrls].some((url) => sameMediaRequestUrl(details.url, url))) return;
+        let redirectOrigin = '';
+        try { redirectOrigin = new URL(details.redirectURL).origin; } catch { /* the next request is refused by the URL guard */ }
+        if (!isMediaDownloadUrl(details.redirectURL) || redirectOrigin !== pending.sourceOrigin) {
+          pending.rejectedRedirect = details.redirectURL;
+          return;
+        }
+        const normalized = normalizedMediaRequestUrl(details.redirectURL);
+        if (normalized) pending.allowedRedirectUrls.add(normalized);
       });
       win = new BrowserWindow({
         width, height,
@@ -746,7 +1082,10 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
         if (event.isMainFrame || /^about:(blank|srcdoc)$/.test(event.url)) return;
         if (!isPublicHttp(event.url)) event.preventDefault();
       });
-      wc.on('did-navigate-in-page', () => { activeVisualCapture = null; });
+      wc.on('did-navigate-in-page', () => {
+        activeVisualCapture = null;
+        if (pendingMediaDownload) cancelMediaDownload(pendingMediaDownload.id, new Error('the Browser page changed during download'));
+      });
       wc.on('will-attach-webview', (event) => event.preventDefault());
       wc.on('will-prevent-unload', (event) => event.preventDefault());
       // a page does not take the whole screen from the person; video stays in Coo's window
@@ -754,6 +1093,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       // only a new main document replaces the page script; iframes and in-page routes keep it
       wc.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
         if (!isMainFrame || isInPlace) return;
+        if (pendingMediaDownload) cancelMediaDownload(pendingMediaDownload.id, new Error('the Browser page changed during download'));
         injected = false;
         navigating = true;
         resetFrameState();
@@ -775,6 +1115,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       });
       win.once('ready-to-show', () => win?.showInactive());
       win.on('closed', () => {
+        if (pendingMediaDownload) cancelMediaDownload(pendingMediaDownload.id, new Error('browser window closed during download'));
         clearStagedChatGPTImages();
         win = null;
         injected = false;
@@ -832,10 +1173,11 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     }
 
     const outcome = await agentCall('chatGPTSubmission', [fullPrompt]);
+    const page = await state().catch(() => null);
     const screenshot = await capture().catch(() => null);
     return {
       submitted: outcome?.submitted === true,
-      state: outcome?.state ?? await state(),
+      state: page,
       ...(screenshot ?? {}),
     };
   };
@@ -1038,6 +1380,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     if (op === 'stage-chatgpt-image') return stageChatGPTImage(message);
     if (op === 'commit-staged-chatgpt-image') return commitStagedChatGPTImage(message);
     if (op === 'discard-staged-chatgpt-image') return discardStagedChatGPTImage(message);
+    if (op === 'download-media') return downloadMedia(message);
     if (op === 'inspect-upload') return inspectUpload(message);
     if (op === 'inspect-upload-progress') return inspectUploadProgress(message);
     if (op === 'upload-media') return uploadMedia(message);
@@ -1229,7 +1572,10 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       await ensureAgent();
       const answer = await agentCall('play', [message.pause === true]);
       await sleep(200);
-      return { answer, state: await state() };
+      const safeAnswer = answer && typeof answer === 'object' && answer.video && typeof answer.video === 'object'
+        ? { ...answer, video: { ...answer.video, src: '' } }
+        : answer;
+      return { answer: safeAnswer, state: await state() };
     }
     if (op === 'screenshot') {
       return captureForVisualClick();
@@ -1257,6 +1603,9 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       } catch (error) {
         send?.({ type: 'companion:browser-result', id: message.id, ok: false, error: String(error?.message ?? error) });
       }
+    },
+    cancel(id) {
+      cancelMediaDownload(id, new Error('the Browser download was interrupted'));
     },
     close() {
       closeWindow();

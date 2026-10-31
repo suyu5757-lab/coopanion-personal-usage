@@ -324,6 +324,7 @@ const browser = createBrowserHost({
   mediaDir: () => core.dataDir ? join(core.dataDir, 'video', 'media') : null,
 });
 core.on('browser', (msg) => void browser.handle(msg));
+core.on('browser-cancel', (id) => browser.cancel(id));
 
 let settings = null;
 /** The route the settings window showed when it was last closed, where it opens next unless asked for another. */

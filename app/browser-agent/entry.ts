@@ -12,6 +12,7 @@ import { chatGPTComposer, isChatGPTImageSaveTarget, isChatGPTPage } from './chat
 import { replyTargetForBox } from './comments.ts';
 import { installFileChooserGuard } from './safety.ts';
 import { accessibleRole, composedElements, composedParentElement } from './accessible-name.ts';
+import { discoverMediaTargets, type AgentMediaTarget } from './media.ts';
 import { actionabilityPoint, currentElementLabel, findLocatorTarget, findPointTarget, findTextTarget, isFileChooserTarget, type ActionabilityFailure, type TargetLocator } from './targets.ts';
 
 interface AgentElement {
@@ -45,6 +46,7 @@ interface AgentState {
   video: VideoState | null;
   elements: AgentElementLite[];
   current: ReturnType<typeof videoEvidence>;
+  mediaTargets: AgentMediaTarget[];
   account: { ref: string; label: string } | null;
   timestamps: Array<{ text: string; datetime: string; context: string }>;
   fileInputs: Array<{ id: number; label: string; accept: string; multiple: boolean; disabled: boolean; visible: boolean }>;
@@ -107,6 +109,7 @@ if (!host[KEY]) {
     if (id === undefined) { id = nextDocumentId++; documentIds.set(owner, id); }
     return id;
   };
+  const mediaTargets = (): AgentMediaTarget[] => discoverMediaTargets(document, 40, [...composedElements(document)]);
   const elementAt = (index: number): HTMLElement | null => {
     const element = internals.selectorMap?.get(index)?.ref;
     return element?.isConnected ? element : null;
@@ -198,10 +201,11 @@ if (!host[KEY]) {
     const files = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'))
       .map((input) => [elementId(input), input.accept, input.multiple, input.disabled])
       .sort((a, b) => Number(a[0]) - Number(b[0]));
+    const media = mediaTargets().map((target) => [target.id, target.mediaType, target.label, target.url]);
     const source = JSON.stringify([location.href, current && [
       current.url, current.title, current.itemId, current.authorRef, current.authorLabel,
       current.contentSnippet, current.containerIdentity, current.playing,
-    ], account, scrollOffsets(), rows, files]);
+    ], account, scrollOffsets(), rows, files, media]);
     let a = 2166136261, b = 2246822519;
     for (let index = 0; index < source.length; index++) {
       const code = source.charCodeAt(index);
@@ -447,7 +451,7 @@ if (!host[KEY]) {
     const lastTurn = turns.at(-1)?.innerText ?? turns.at(-1)?.textContent ?? '';
     const norm = (value: string) => value.replace(/\s+/g, ' ').trim();
     const visiblePrompt = norm(lastTurn) === norm(prompt) || (!turns.length && (document.body?.innerText ?? '').includes(prompt));
-    return { submitted: isChatGPTPage(location.href) && !draft.trim() && visiblePrompt, state: { ...page, elements: elements(), current: videoEvidence(document), account: accountEvidence(document), timestamps: timestamps(), fileInputs: fileInputs(), replyTargets: await replyTargets(), statusMessages: statusMessages(), snapshotId: snapshotId(), video: video() } };
+    return { submitted: isChatGPTPage(location.href) && !draft.trim() && visiblePrompt, state: { ...page, elements: elements(), current: videoEvidence(document), account: accountEvidence(document), timestamps: timestamps(), fileInputs: fileInputs(), replyTargets: await replyTargets(), statusMessages: statusMessages(), snapshotId: snapshotId(), video: video(), mediaTargets: mediaTargets() } };
   };
 
   const active = (): AgentElement | null => {
@@ -640,7 +644,7 @@ if (!host[KEY]) {
       applyMute();
       const page = await readPage();
       const current = videoEvidence(document), account = accountEvidence(document);
-      return { ...page, elements: elements(), current, account, timestamps: timestamps(), fileInputs: fileInputs(), replyTargets: await replyTargets(), statusMessages: statusMessages(), snapshotId: snapshotId(), video: video() };
+      return { ...page, elements: elements(), current, account, timestamps: timestamps(), fileInputs: fileInputs(), replyTargets: await replyTargets(), statusMessages: statusMessages(), snapshotId: snapshotId(), video: video(), mediaTargets: mediaTargets() };
     },
     text: async (): Promise<{ url: string; title: string; text: string; video: VideoState | null }> =>
       ({ url: location.href, title: document.title, text: pageText(), video: video() }),
@@ -796,6 +800,11 @@ if (!host[KEY]) {
         : { ok: false, reason: point.reason };
     },
     snapshot: async (): Promise<string> => { await readPage(); return snapshotId(); },
+    mediaTarget: async (id: number, expectedSnapshotId: string): Promise<AgentMediaTarget | null> => {
+      await readPage();
+      if (!expectedSnapshotId || snapshotId() !== expectedSnapshotId) return null;
+      return mediaTargets().find((target) => target.id === id) ?? null;
+    },
     element: async (index: number): Promise<AgentElement | null> => { await readPage(); return describe(index); },
     resolveLocator: async (locator: TargetLocator, expectedSnapshotId?: string): Promise<
       | { ok: true; id: number; snapshotId: string }

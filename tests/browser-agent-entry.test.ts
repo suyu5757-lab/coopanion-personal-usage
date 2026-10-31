@@ -43,13 +43,14 @@ vi.mock('@page-agent/page-controller', () => ({
 }));
 
 const agent = () => (window as unknown as { __cooBrowserAgent: {
-  state(): Promise<{ snapshotId: string; elements: Array<{ id: number; label: string; pressed?: boolean }>; timestamps: Array<{ text: string; datetime: string; context: string }> }>;
+  state(): Promise<{ snapshotId: string; elements: Array<{ id: number; label: string; pressed?: boolean }>; timestamps: Array<{ text: string; datetime: string; context: string }>; mediaTargets: Array<{ id: number; mediaType: 'image' | 'video'; label: string; filenameHint: string; url: string }> }>;
   element(index: number): Promise<{ label: string; snapshotId: string; dataE2e: string; pressed?: boolean } | null>;
   resolveLocator(locator: { role?: string; name?: string; testId?: string; within?: { role?: string; name?: string; testId?: string } }, snapshotId?: string): Promise<{ ok: true; id: number; snapshotId: string } | { ok: false; reason: string }>;
   fileInputTarget(id: number, snapshotId?: string): Promise<{ ok: true; token: string; accept: string; multiple: boolean; snapshotId: string } | { ok: false; reason: string }>;
   releaseFileInput(token: string): void;
   click(index: number, snapshotId?: string): Promise<{ success: boolean; message: string }>;
   snapshot(): Promise<string>;
+  mediaTarget(id: number, snapshotId: string): Promise<{ id: number; mediaType: 'image' | 'video'; label: string; filenameHint: string; url: string } | null>;
   textCenter(query: string): Promise<{ ok: true; x: number; y: number; snapshotId: string } | { ok: false; reason: string }>;
   pointTarget(x: number, y: number, snapshotId?: string): Promise<{ ok: true; target: { token: string; label: string; tag: string; role: string; snapshotId: string } } | { ok: false; reason: string }>;
 } }).__cooBrowserAgent;
@@ -67,6 +68,22 @@ beforeEach(() => {
 });
 
 describe('browser page target snapshots', () => {
+  it('discovers visible direct media and file links, and binds their sources to the page snapshot', async () => {
+    document.body.innerHTML = '<img src="https://cdn.example.test/images/whale.png?token=secret" alt="Blue whale"><video src="https://cdn.example.test/video/clip.mp4"></video><a href="https://cdn.example.test/downloads/another.mov">Download clip</a><img src="blob:https://cdn.example.test/asset">';
+    await import('../app/browser-agent/entry.ts');
+    const first = await agent().state();
+
+    expect(first.mediaTargets.map(({ id, mediaType, label, filenameHint }) => ({ id, mediaType, label, filenameHint }))).toEqual([
+      { id: 0, mediaType: 'image', label: 'Blue whale', filenameHint: 'whale.png' },
+      { id: 1, mediaType: 'video', label: 'Video', filenameHint: 'clip.mp4' },
+      { id: 2, mediaType: 'video', label: 'Download clip', filenameHint: 'another.mov' },
+    ]);
+    expect(await agent().mediaTarget(0, first.snapshotId)).toMatchObject({ url: 'https://cdn.example.test/images/whale.png?token=secret' });
+
+    document.querySelector('img')!.setAttribute('src', 'https://cdn.example.test/images/new.png');
+    expect(await agent().mediaTarget(0, first.snapshotId)).toBeNull();
+  });
+
   it('sees a reused reply button become Delete and refuses the old index', async () => {
     document.body.innerHTML = '<button>回复</button>';
     await import('../app/browser-agent/entry.ts');
