@@ -22,6 +22,8 @@ export interface SelfTimeConfig {
   imageSaving: boolean;
   /** Allow placing approved media into a page's upload control. Off by default. */
   mediaUpload: boolean;
+  /** Allow a separately approved public image or video download. Off by default. */
+  mediaDownload: boolean;
 }
 
 export const SELF_TIME_DEFAULTS: SelfTimeConfig = {
@@ -35,6 +37,7 @@ export const SELF_TIME_DEFAULTS: SelfTimeConfig = {
   imageGeneration: false,
   imageSaving: false,
   mediaUpload: false,
+  mediaDownload: false,
 };
 
 /** The settings as the live config has them, with a hand-edited value outside its range clamped to it. */
@@ -58,6 +61,7 @@ export function readSelfTime(config: unknown): SelfTimeConfig {
     imageGeneration: bool(raw?.imageGeneration, SELF_TIME_DEFAULTS.imageGeneration),
     imageSaving: bool(raw?.imageSaving, SELF_TIME_DEFAULTS.imageSaving),
     mediaUpload: bool(raw?.mediaUpload, SELF_TIME_DEFAULTS.mediaUpload),
+    mediaDownload: bool(raw?.mediaDownload, SELF_TIME_DEFAULTS.mediaDownload),
   };
 }
 

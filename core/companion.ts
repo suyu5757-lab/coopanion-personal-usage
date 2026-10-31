@@ -172,6 +172,7 @@ function companionGroup(language: Language): ConfigGroup {
         'companion.selfTime.imageGeneration': { type: 'boolean', title: s.selfTime.imageGeneration, description: s.selfTime.imageGenerationDescription, 'x-hot': true },
         'companion.selfTime.imageSaving': { type: 'boolean', title: s.selfTime.imageSaving, description: s.selfTime.imageSavingDescription, 'x-hot': true },
         'companion.selfTime.mediaUpload': { type: 'boolean', title: s.selfTime.mediaUpload, description: s.selfTime.mediaUploadDescription, 'x-hot': true },
+        'companion.selfTime.mediaDownload': { type: 'boolean', title: s.selfTime.mediaDownload, description: s.selfTime.mediaDownloadDescription, 'x-hot': true },
         'companion.growth.enabled': { type: 'boolean', title: s.growth.title, description: s.growth.description, 'x-hot': true },
         'companion.growth.everyDays': { type: 'integer', title: s.growth.every, minimum: 1, maximum: 60, 'x-suffix': s.growth.days, description: s.growth.everyDescription, 'x-hot': true },
       },
@@ -467,6 +468,7 @@ export async function main(): Promise<void> {
     imageGeneration: () => readSelfTime(config).imageGeneration,
     imageSaving: () => readSelfTime(config).imageSaving,
     mediaUpload: () => readSelfTime(config).mediaUpload,
+    mediaDownload: () => readSelfTime(config).mediaDownload,
     computerInput: () => getByPath((config ?? {}) as unknown as Record<string, unknown>, 'worlds.desktop-pet.cua.control') === true,
     desktopTargetAllowed: isSupportedCuaTarget,
     fileSystemActionAllowed: (target, action) => {

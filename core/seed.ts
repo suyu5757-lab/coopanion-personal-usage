@@ -74,7 +74,7 @@ export function seed(home: string, language: Language): void {
       providerSchemaVersion: 3,
       web: { port: TEST_CHANNEL ? 0 : CONSOLE_PORT },
       worlds: { 'desktop-pet': { cua: { control: false, permission: CUA_ASK } } },
-      companion: { selfTime: { actions: false, imageGeneration: false, imageSaving: false, mediaUpload: false } },
+      companion: { selfTime: { actions: false, imageGeneration: false, imageSaving: false, mediaUpload: false, mediaDownload: false } },
     });
   }
   const configured = appLanguage((JSON.parse(readFileSync(config, 'utf8')) as { language?: unknown }).language);
@@ -91,6 +91,37 @@ export function seed(home: string, language: Language): void {
     moveTerminalToConsole(deploy, config);
   }
   migrateActionPermissions(config);
+  migrateMediaDownloadPermission(config);
+}
+
+/** Add the C02 permission to existing installs without changing another explicit setting. */
+function migrateMediaDownloadPermission(file: string): void {
+  const marker = join(dirname(file), 'media-download-permission-v1.json');
+  const applied = readState(marker, (value) => {
+    const record = asRecord(value);
+    if (record.v !== 1 || record.applied !== true) throw new InvalidState('unknown media download permission migration');
+    return true;
+  });
+  const config = asRecord(JSON.parse(readFileSync(file, 'utf8')));
+  const companionValue = config.companion;
+  if (companionValue !== undefined && (typeof companionValue !== 'object' || companionValue === null || Array.isArray(companionValue))) {
+    throw new InvalidState('companion config is not an object');
+  }
+  const companion = companionValue as Record<string, unknown> | undefined ?? {};
+  const selfTimeValue = companion.selfTime;
+  if (selfTimeValue !== undefined && (typeof selfTimeValue !== 'object' || selfTimeValue === null || Array.isArray(selfTimeValue))) {
+    throw new InvalidState('selfTime config is not an object');
+  }
+  const selfTime = { ...(selfTimeValue as Record<string, unknown> | undefined) };
+  if (typeof selfTime.mediaDownload === 'boolean') {
+    if (!applied) writeState(marker, JSON.stringify({ v: 1, applied: true }));
+    return;
+  }
+  selfTime.mediaDownload = false;
+  companion.selfTime = selfTime;
+  config.companion = companion;
+  writeFileSync(file, JSON.stringify(config, null, 2) + '\n');
+  if (!applied) writeState(marker, JSON.stringify({ v: 1, applied: true }));
 }
 
 /** Keep legacy social actions while explicitly closing newer browser and desktop capabilities. */

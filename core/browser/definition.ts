@@ -55,6 +55,7 @@ const SUMMARIES = {
   browser_screenshot: { zh: '截当前页面。', en: 'Takes a screenshot of the page.' },
   browser_chatgpt_generate_image: { zh: '通过已登录的 ChatGPT 网页提交一条图片生成提示。', en: 'Submits one image-generation prompt through the signed-in ChatGPT website.' },
   browser_save_chatgpt_image: { zh: '把 ChatGPT 网页上的生成图片保存到视频素材目录。确认框会先暂存图片，再显示文件哈希供最终确认。', en: 'Saves a generated image from the ChatGPT page into the video media folder after showing its verified file hash for final approval.' },
+  browser_download_media: { zh: '下载当前页面摘要中选定的公开图片或现成视频；每次确认来源、既有目录、文件名和大小上限。', en: 'Downloads one selected public image or existing video from the current page after one-time approval of its source, existing directory, filename and size limit.' },
   browser_upload_media: { zh: '从视频素材目录选择文件，放进抖音页面的投稿控件。', en: 'Places selected files from the video media folder into a Douyin page upload control.' },
   browser_back: { zh: '回到上一页。', en: 'Goes back a page.' },
   browser_close: { zh: '关上她的浏览器窗口。', en: 'Closes her browser window.' },

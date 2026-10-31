@@ -14,6 +14,19 @@ afterEach(() => {
 });
 
 describe('shared ActionReceiptLedger', () => {
+  it('records a media download as a reversible local write', () => {
+    dir = mkdtempSync(join(tmpdir(), 'coopanion-action-receipts-'));
+    const ledger = new ActionReceiptLedger(join(dir, 'receipts.json'));
+    const receipt = ledger.begin({
+      taskId: 'browser-download-1', intent: 'media-download', target: {
+        surface: 'browser', instanceId: 'browser-1', origin: 'https://example.com',
+        url: 'https://example.com/page', accountRef: 'browser-1', snapshotId: 'snapshot-1',
+        formId: `media:${'a'.repeat(64)}`, control: `image:${'a'.repeat(64)}`,
+      }, payloadDigest: hashContent('asset.png'), files: [], duplicateKey: 'download-1',
+    }, 3_000);
+    expect(receipt).toMatchObject({ intent: 'media-download', risk: 'REVERSIBLE_LOCAL', phase: 'planned' });
+  });
+
   it('persists non-mutating observations while a media receipt stays unresolved', () => {
     dir = mkdtempSync(join(tmpdir(), 'coopanion-action-receipts-'));
     const file = join(dir, 'receipts.json');

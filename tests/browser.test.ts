@@ -1,6 +1,6 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ToolCallContext, ToolOutcome, WorldHost } from 'cortico/core/types.ts';
 import { renderWorldEnvPrompt } from 'cortico/core/prefix.ts';
@@ -17,6 +17,7 @@ type Page = {
   url: string; title: string; header: string; content: string; footer: string;
   video: null | { current: number; duration: number; paused: boolean; muted: boolean; volume: number; width: number; height: number; src: string };
   snapshotId?: string;
+  mediaTargets?: Array<{ index: number; token: string; mediaType: 'image' | 'video'; label: string; host: string; filenameHint: string }>;
   current?: { url: string; title: string; itemId?: string; authorRef?: string; authorLabel?: string; contentSnippet?: string; containerIdentity?: string; playing?: boolean; observedAt?: number } | null;
   account?: { ref: string; label: string } | null;
   elements?: Array<{ id: number; label: string; pressed?: boolean }>;
@@ -131,8 +132,9 @@ describe('selfTime settings', () => {
     expect(SELF_TIME_DEFAULTS.imageGeneration).toBe(false);
     expect(SELF_TIME_DEFAULTS.imageSaving).toBe(false);
     expect(SELF_TIME_DEFAULTS.mediaUpload).toBe(false);
+    expect(SELF_TIME_DEFAULTS.mediaDownload).toBe(false);
     expect(readSelfTime({ companion: { selfTime: { enabled: true, afterMinutes: 999, sessionMinutes: 1, sessionUnlimited: true, sound: true, actions: false } } }))
-      .toEqual({ enabled: true, afterMinutes: 240, sessionMinutes: 5, sessionUnlimited: true, sound: true, topics: '', actions: false, imageGeneration: false, imageSaving: false, mediaUpload: false });
+      .toEqual({ enabled: true, afterMinutes: 240, sessionMinutes: 5, sessionUnlimited: true, sound: true, topics: '', actions: false, imageGeneration: false, imageSaving: false, mediaUpload: false, mediaDownload: false });
     expect(readSelfTime({ companion: { selfTime: { afterMinutes: 0, sessionMinutes: 999 } } }))
       .toEqual({ ...SELF_TIME_DEFAULTS, afterMinutes: 1, sessionMinutes: 60 });
     expect(readSelfTime({ companion: { selfTime: { enabled: true } }, worlds: { browser: { enabled: false } } }).enabled).toBe(false);
@@ -605,6 +607,69 @@ describe('browser World', () => {
     const out = await run(world, 'browser_upload_media', { fileId: 88, files: ['preview.mp4'] });
     expect(out.failed).toBe(true);
     expect(bridge.calls.some((call) => call.op === 'upload-media')).toBe(false);
+  });
+
+  it('keeps media downloads off independently of upload and social-action settings', async () => {
+    const { world, bridge } = await make({ self: { actions: true, mediaUpload: true, mediaDownload: false } });
+    bridge.responses.open = page({
+      snapshotId: 'media-snapshot',
+      mediaTargets: [{ index: 0, token: 'a'.repeat(64), mediaType: 'image', label: 'Blue whale', host: 'cdn.example.com', filenameHint: 'whale.png' }],
+    });
+    await run(world, 'browser_open', { url: 'https://www.example.com/' });
+    const out = await run(world, 'browser_download_media', {
+      index: 0, directory: '/tmp', filename: 'whale.png', maxBytes: 1024,
+    });
+    expect(out.failed).toBe(true);
+    expect(bridge.calls.some((call) => call.op === 'download-media')).toBe(false);
+  });
+
+  it('binds a one-time media download approval to the current opaque target and records file verification', async () => {
+    const { world, bridge, taskJournalFile } = await make({
+      self: { mediaDownload: true },
+      ask: async () => 'yes',
+    });
+    const mediaTarget = {
+      index: 0, token: 'a'.repeat(64), mediaType: 'image' as const, label: 'Blue whale', host: 'cdn.example.com',
+      filenameHint: 'whale.png', url: 'https://cdn.example.com/whale.png?token=secret',
+    } as NonNullable<Page['mediaTargets']>[number];
+    const snapshot = page({
+      url: 'https://www.example.com/page',
+      snapshotId: 'media-snapshot',
+      mediaTargets: [mediaTarget],
+    });
+    bridge.responses.open = snapshot;
+    bridge.responses.read = snapshot;
+    const directory = dirname(taskJournalFile);
+    const path = join(directory, 'whale.png');
+    bridge.responses['download-media'] = ({ token }: Record<string, unknown>) => ({
+      status: 'download_verified', file: 'whale.png', path, sourceHost: 'cdn.example.com',
+      mediaType: 'image', mime: 'image/png', bytes: 9, digest: 'b'.repeat(64),
+      stages: [
+        { status: 'downloading', observedAt: 10 },
+        { status: 'saved_unverified', observedAt: 20 },
+        { status: 'download_verified', observedAt: 30 },
+      ],
+      token,
+    });
+    const opened = await run(world, 'browser_open', { url: snapshot.url });
+    expect(opened.text).toContain('Blue whale');
+    expect(opened.text).not.toContain('token=secret');
+    const out = await run(world, 'browser_download_media', {
+      index: 0, directory, filename: 'whale.png', maxBytes: 1024,
+    });
+
+    expect(out.failed).toBeFalsy();
+    expect(out.text).toContain(path);
+    const downloadCall = bridge.calls.find((call) => call.op === 'download-media');
+    expect(downloadCall?.args).toMatchObject({ index: 0, token: 'a'.repeat(64), snapshotId: 'media-snapshot', directory, filename: 'whale.png', maxBytes: 1024 });
+    expect(JSON.stringify(bridge.calls)).not.toContain('token=secret');
+    const receipts = JSON.parse(readFileSync(taskJournalFile, 'utf8')) as Array<Record<string, unknown>>;
+    expect(receipts[0]).toMatchObject({ intent: 'media-download', risk: 'REVERSIBLE_LOCAL', phase: 'verified', outcome: 'verified' });
+    expect(receipts[0].evidence).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: 'downloading' }),
+      expect.objectContaining({ status: 'saved_unverified' }),
+      expect.objectContaining({ status: 'download_verified', digest: 'b'.repeat(64) }),
+    ]));
   });
 
   it('refuses a payment control before calling the page', async () => {

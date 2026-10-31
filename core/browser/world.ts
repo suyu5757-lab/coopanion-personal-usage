@@ -11,12 +11,13 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { basename, dirname, isAbsolute, resolve } from 'node:path';
 import type { ToolCallContext, ToolDef, ToolOutcome, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 import type { Language } from 'cortico/core/language.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import type { ModelLanguage } from '../language.ts';
 import { ActionGate, type Impact } from '../action-gate.ts';
-import { defaultActionRisk, type ActionReceiptCompletion, type ActionReceiptEvidence, type ActionRisk, type BrowserTaskIntent } from '../action-receipts.ts';
+import { defaultActionRisk, type ActionDispatchState, type ActionReceiptCompletion, type ActionReceiptEvidence, type ActionRisk, type BrowserTaskIntent } from '../action-receipts.ts';
 import { coreText } from '../i18n/index.ts';
 import { ActionJournal, hashContent, originOf, ReplyJournal, type ActionTarget, type PublicAction } from './actions.ts';
 import { BrowserTaskActionJournal, browserDuplicateKey } from './task-actions.ts';
@@ -24,7 +25,7 @@ import type { BrowserTargetEvidence, StepRequest } from '../task-grants.ts';
 import type { BrowserTransport } from './bridge.ts';
 import { CONTENT_MAX, SESSION_MAX_CALLS, TEXT_MAX, WATCH_FRAMES_DEFAULT, WATCH_FRAMES_MAX, WATCH_MAX, type SelfTimeConfig } from './config.ts';
 import { clickRefusal, isClipboardCopyControl, isFilePicker, isFinalPublishControl, isSearchField, isSendControl, isShareDismissControl, isShareDestinationControl, isWriteAction, removesState, targetStateToggle, typeRefusal } from './guard.ts';
-import { BROWSER_TEXT, type AgentElement, type BrowserText, type DouyinVideoIdentity, type PageState, type VideoState } from './model-text.ts';
+import { BROWSER_TEXT, type AgentElement, type BrowserMediaTarget, type BrowserText, type DouyinVideoIdentity, type PageState, type VideoState } from './model-text.ts';
 import { advanceDouyinUploadState, clipboardCopyConfirmed, commentReplyConfirmed, douyinUploadState, freshDouyinUploadMessages, submissionStatus, type DouyinUploadState } from './submission-status.ts';
 import { BROWSER_TOOL_DECLS } from './tools.ts';
 
@@ -200,6 +201,22 @@ const asState = (value: unknown): PageState | null => {
   const statusMessages = Array.isArray(s.statusMessages)
     ? s.statusMessages.filter((message): message is string => typeof message === 'string').slice(0, 20)
     : undefined;
+  const mediaTargets = Array.isArray(s.mediaTargets)
+    ? s.mediaTargets.flatMap((raw): BrowserMediaTarget[] => {
+      const value = asRecord(raw);
+      return value && Number.isInteger(value.index) && typeof value.token === 'string' && /^[a-f0-9]{64}$/.test(value.token)
+        && (value.mediaType === 'image' || value.mediaType === 'video') && typeof value.host === 'string'
+        ? [{
+          index: Number(value.index),
+          token: value.token,
+          mediaType: value.mediaType,
+          label: typeof value.label === 'string' ? value.label : value.mediaType,
+          host: value.host.slice(0, 255),
+          filenameHint: typeof value.filenameHint === 'string' ? value.filenameHint : '',
+        }]
+        : [];
+    })
+    : undefined;
   const replyTargets = Array.isArray(s.replyTargets)
     ? s.replyTargets.flatMap((raw) => {
       const value = asRecord(raw);
@@ -243,6 +260,7 @@ const asState = (value: unknown): PageState | null => {
     ...(timestamps ? { timestamps } : {}),
     ...(fileInputs ? { fileInputs } : {}),
     ...(statusMessages ? { statusMessages } : {}),
+    ...(mediaTargets ? { mediaTargets } : {}),
     ...(replyTargets ? { replyTargets } : {}),
     ...(typeof s.snapshotId === 'string' ? { snapshotId: s.snapshotId } : {}),
   };
@@ -422,6 +440,7 @@ export class BrowserWorld implements World {
       imageGeneration: () => this.self.imageGeneration,
       imageSaving: () => this.self.imageSaving,
       mediaUpload: () => this.self.mediaUpload,
+      mediaDownload: () => this.self.mediaDownload,
       computerInput: () => true,
       desktopTargetAllowed: () => false,
     }));
@@ -434,7 +453,7 @@ export class BrowserWorld implements World {
 
   /** A Core UI grant binds one browser action to its current page, account or profile, and control. */
   private async approveBrowserAction(
-    impact: Extract<Impact, 'platform-write' | 'image-generation' | 'image-saving' | 'media-upload'>,
+    impact: Extract<Impact, 'platform-write' | 'image-generation' | 'image-saving' | 'media-upload' | 'media-download'>,
     taskText: string,
     page: PageState,
     formId: string,
@@ -510,7 +529,7 @@ export class BrowserWorld implements World {
           return false;
         }
         answer = await askUnlessAborted(
-          this.opts.ask(text.question(scope.actionLabel ?? text[impact === 'platform-write' ? 'platformWrite' : impact === 'image-generation' ? 'imageGeneration' : impact === 'image-saving' ? 'imageSaving' : 'mediaUpload'], `${page.title} (${target.origin})`, details), [text.yes, text.no]),
+          this.opts.ask(text.question(scope.actionLabel ?? text[impact === 'platform-write' ? 'platformWrite' : impact === 'image-generation' ? 'imageGeneration' : impact === 'image-saving' ? 'imageSaving' : impact === 'media-download' ? 'mediaDownload' : 'mediaUpload'], `${page.title} (${target.origin})`, details), [text.yes, text.no]),
           ctx.signal,
         );
         return answer === 'yes';
@@ -662,11 +681,13 @@ export class BrowserWorld implements World {
       st.actions ? 'social actions are enabled' : 'social actions are disabled',
       st.imageGeneration ? 'ChatGPT image prompt submission is enabled' : 'ChatGPT image prompt submission is disabled',
       st.imageSaving ? 'saving generated ChatGPT images is enabled' : 'saving generated ChatGPT images is disabled',
+      st.mediaDownload ? 'one-time approved media downloads are enabled' : 'media downloads are disabled',
       st.mediaUpload ? 'placing eligible media into upload controls is enabled' : 'placing media into upload controls is disabled',
     ] : [
       st.actions ? '常规互动已开启' : '常规互动已关闭',
       st.imageGeneration ? '网页生图已开启' : '网页生图已关闭',
       st.imageSaving ? '保存生成图片已开启' : '保存生成图片已关闭',
+      st.mediaDownload ? '素材下载已开启' : '素材下载已关闭',
       st.mediaUpload ? '素材上传已开启' : '素材上传已关闭',
     ];
     return {
@@ -696,6 +717,7 @@ export class BrowserWorld implements World {
       browser_screenshot: (_args, ctx) => this.screenshot(ctx),
       browser_chatgpt_generate_image: (args, ctx) => this.generateChatGPTImage(args, ctx),
       browser_save_chatgpt_image: (args, ctx) => this.saveChatGPTImage(args, ctx),
+      browser_download_media: (args, ctx) => this.downloadMedia(args, ctx),
       browser_upload_media: (args, ctx) => this.uploadMedia(args, ctx),
       browser_back: (_args, ctx) => this.back(ctx),
       browser_close: (_args, _ctx) => this.close(),
@@ -1711,6 +1733,106 @@ export class BrowserWorld implements World {
     });
   }
 
+  private async downloadMedia(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.run('browser_download_media', ctx, async () => {
+      const index = this.indexArg(args.index);
+      const directory = typeof args.directory === 'string' ? args.directory.trim() : '';
+      const filename = typeof args.filename === 'string' ? args.filename.trim() : '';
+      const maxBytes = Number(args.maxBytes);
+      if (index === null || !directory || !filename || !isAbsolute(directory)
+        || filename.length > 240 || filename !== basename(filename) || /[\\/:*?"<>|\u0000-\u001f\u007f]/.test(filename)
+        || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1024 * 1024 * 1024) {
+        return this.toast(this.t.failed('browser_download_media', 'choose one listed target, an existing absolute directory, a safe filename and a size limit from 1 byte to 1 GiB'), true);
+      }
+      const blocked = this.begin('browser_download_media');
+      if (blocked) return blocked;
+      const page = this.lastState;
+      if (!page?.snapshotId) return this.toast(this.t.failed('browser_download_media', 'read the current page and its media list first'), true);
+      const target = page.mediaTargets?.find((candidate) => candidate.index === index);
+      if (!target) return this.toast(this.t.failed('browser_download_media', 'that media index is missing or belongs to an older page read'), true);
+      if (!this.allowed('media-download', 'browser_download_media', `${target.mediaType} from ${target.host}`)) {
+        return this.toast(this.t.lookOnly('download media'), true);
+      }
+      const actionText = coreText(this.opts.language?.() ?? 'zh').browserAction;
+      const payloadDigest = hashContent(JSON.stringify([target.token, target.mediaType, target.host, directory, filename, maxBytes]));
+      const taskText = `Download one ${target.mediaType} from ${target.host} to ${resolve(directory)}/${filename}; maximum ${maxBytes} bytes.`;
+      const decision = await this.approveBrowserAction(
+        'media-download',
+        taskText,
+        page,
+        `media:${target.token}`,
+        `${target.mediaType}:${target.token}`,
+        actionText.mediaDownloadDetails(target.label, target.mediaType, target.host, resolve(directory), filename, maxBytes),
+        ctx,
+        { actionLabel: actionText.mediaDownload, payloadDigest, dedupeKey: `${target.token}:${resolve(directory)}:${filename}:${maxBytes}`, risk: 'REVERSIBLE_LOCAL' },
+      );
+      if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
+        : decision.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly('download media'), true);
+      const approval = decision.authorization;
+      let result: Record<string, unknown> | null;
+      try {
+        result = asRecord(await this.call('download-media', {
+          index, token: target.token, snapshotId: page.snapshotId, directory, filename, maxBytes,
+        }, ctx.signal));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const boundary = /^MEDIA_DOWNLOAD_(NOT_DISPATCHED|FAILED|UNKNOWN):([^:]+):/.exec(message);
+        if (boundary) {
+          const status = boundary[1] === 'NOT_DISPATCHED' ? 'not_dispatched' : boundary[1] === 'FAILED' ? 'failed' : 'unknown';
+          const dispatchState: ActionDispatchState = boundary[2] === 'delivered' ? 'delivered' : boundary[2] === 'unknown' ? 'unknown' : 'not-dispatched';
+          const note = status === 'unknown' ? 'the Browser download result is unknown; inspect the destination before retrying'
+            : status === 'not_dispatched' ? 'the approved target or destination changed before any download was dispatched'
+              : 'the Browser download failed; review the destination before deciding whether to try again';
+          const evidence = { source: 'browser-media-download', status, summary: `${target.mediaType} from ${target.host} to ${filename}`, observedAt: Date.now() };
+          if (status === 'unknown') {
+            this.taskJournal?.complete(approval.journalId, { phase: 'unknown', dispatchState, outcome: 'unknown', note, evidence });
+          } else {
+            this.taskJournal?.complete(approval.journalId, { phase: 'failed', dispatchState, outcome: 'failed', note, evidence });
+          }
+          return this.toast(this.t.failed('browser_download_media', note), true);
+        }
+        this.taskJournal?.finish(approval.journalId, 'unknown', 'the Browser download result was not received; inspect the destination before retrying', Date.now(), 'unknown', {
+          source: 'browser-media-download', status: 'unknown', summary: `${target.mediaType} from ${target.host} to ${filename}`, observedAt: Date.now(),
+        });
+        return this.toast(this.t.failed('browser_download_media', 'the download result is unknown; inspect the destination before retrying'), true);
+      }
+      const path = typeof result?.path === 'string' ? result.path : '';
+      const file = typeof result?.file === 'string' ? result.file : '';
+      const mime = typeof result?.mime === 'string' ? result.mime : '';
+      const digest = typeof result?.digest === 'string' ? result.digest : '';
+      const bytes = Number(result?.bytes);
+      const mediaType = typeof result?.mediaType === 'string' ? result.mediaType : '';
+      const sourceHost = typeof result?.sourceHost === 'string' ? result.sourceHost : '';
+      const stageStates = Array.isArray(result?.stages) ? result.stages.map((stage) => String(asRecord(stage)?.status ?? '')) : [];
+      const allowedMime = new Set(['application/octet-stream', 'image/avif', 'image/gif', 'image/jpeg', 'image/png', 'image/webp',
+        'video/mp4', 'video/quicktime', 'video/webm', 'video/x-matroska', 'video/x-msvideo']);
+      const verified = result?.status === 'download_verified' && isAbsolute(path) && dirname(path) === resolve(directory)
+        && basename(path) === filename && file === filename && sourceHost === target.host && mediaType === target.mediaType
+        && Number.isSafeInteger(bytes) && bytes > 0 && bytes <= maxBytes && /^[a-f0-9]{64}$/.test(digest)
+        && allowedMime.has(mime.toLowerCase().split(';')[0].trim())
+        && ['downloading', 'saved_unverified', 'download_verified'].every((stage) => stageStates.includes(stage));
+      if (!verified || !result) {
+        this.taskJournal?.finish(approval.journalId, 'unknown', 'the returned file evidence did not match the approved target');
+        return this.toast(this.t.failed('browser_download_media', 'the downloaded file did not match the approved target or verification result'), true);
+      }
+      for (const raw of result.stages as unknown[]) {
+        const stage = asRecord(raw);
+        if (!stage || !['downloading', 'saved_unverified', 'download_verified'].includes(String(stage.status))) continue;
+        this.taskJournal?.observe(approval.journalId, [{
+          source: 'browser-media-download',
+          status: String(stage.status),
+          summary: `${target.mediaType} from ${target.host} to ${filename}`,
+          ...(stage.status === 'download_verified' ? { digest } : {}),
+          observedAt: Number(stage.observedAt) || Date.now(),
+        }]);
+      }
+      this.taskJournal?.finish(approval.journalId, 'verified', `saved ${path} (${bytes} bytes, ${mime}, sha256 ${digest})`, Date.now(), 'verified', {
+        source: 'browser-media-download', status: 'download_verified', summary: `${sourceHost} → ${path} (${bytes} bytes, ${mime})`, digest, observedAt: Date.now(),
+      });
+      return this.toast(this.t.mediaDownloaded(file, path, sourceHost, mediaType, mime, bytes, digest));
+    });
+  }
+
   private async uploadMedia(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
     return this.run('browser_upload_media', ctx, async () => {
       const fileId = this.indexArg(args.fileId);
@@ -2085,12 +2207,12 @@ export class BrowserWorld implements World {
     const content = state.content.replace(/^(\s*)\*\[/gm, '$1[');
     const body = content.length > CONTENT_MAX ? `${content.slice(0, CONTENT_MAX)}\n${this.t.truncated}` : content;
     const header = state.header.length > 1600 ? `${state.header.slice(0, 1600)}…` : state.header;
-    return [lead, header, body, state.footer.slice(0, 400), this.currentVideo(state), this.t.timestamps(state.timestamps ?? []), this.t.fileInputs(state.fileInputs ?? []), this.t.replyTargets(state.replyTargets ?? []), state.statusMessages?.length ? `Page status: ${state.statusMessages.join(' · ')}` : '', this.t.video(state.video)].filter(Boolean).join('\n');
+    return [lead, header, body, state.footer.slice(0, 400), this.currentVideo(state), this.t.timestamps(state.timestamps ?? []), this.t.fileInputs(state.fileInputs ?? []), this.t.replyTargets(state.replyTargets ?? []), this.t.mediaTargets(state.mediaTargets ?? []), state.statusMessages?.length ? `Page status: ${state.statusMessages.join(' · ')}` : '', this.t.video(state.video)].filter(Boolean).join('\n');
   }
 
   private brief(state: PageState, lead = ''): string {
     this.seen(state);
-    return [lead, this.t.pageLine(state.title, state.url), this.currentVideo(state), this.t.video(state.video)].filter(Boolean).join('\n');
+    return [lead, this.t.pageLine(state.title, state.url), this.currentVideo(state), this.t.mediaTargets(state.mediaTargets ?? []), this.t.video(state.video)].filter(Boolean).join('\n');
   }
 
   /** The playing video's own address, when the page names one. */

@@ -34,6 +34,8 @@ export interface PageState {
   content: string;
   footer: string;
   video: VideoState | null;
+  /** Visible, downloadable page media; each token is opaque and valid only for this page snapshot. */
+  mediaTargets?: BrowserMediaTarget[];
   /** Stable fingerprint of the observed DOM targets for this page state. */
   snapshotId?: string;
   /** Every numbered element's label at the moment of the read, for spotting a renumbered page. */
@@ -60,6 +62,15 @@ export interface PageState {
   statusMessages?: string[];
   /** Reply boxes bound to one unique visible comment row. */
   replyTargets?: Array<{ boxId: number; fingerprint: string; evidenceHash: string; author: string; authorRef: string; context: string; timestamp: string; needsExpand: boolean }>;
+}
+
+export interface BrowserMediaTarget {
+  index: number;
+  token: string;
+  mediaType: 'image' | 'video';
+  label: string;
+  host: string;
+  filenameHint: string;
 }
 
 export interface AgentElement {
@@ -146,6 +157,8 @@ export interface BrowserText {
   fileChooserBlocked: string;
   fileInputs(values: NonNullable<PageState['fileInputs']>): string;
   replyTargets(values: NonNullable<PageState['replyTargets']>): string;
+  mediaTargets(values: NonNullable<PageState['mediaTargets']>): string;
+  mediaDownloaded(file: string, path: string, host: string, mediaType: string, mime: string, bytes: number, digest: string): string;
   uploadedMedia(files: string[]): string;
   chatGPTImageSubmitted: string;
   chatGPTImageUnknown: string;
@@ -240,6 +253,10 @@ const zh: BrowserText = {
   replyTargets: (values) => values.length
     ? `可核对的评论回复框：\n${values.map((value) => `- boxId=${value.boxId} · 作者=${value.author} · 时间=${value.timestamp || '页面未提供精确时间'} · 需先展开回复=${value.needsExpand} · 评论及上下文=${value.context}`).join('\n')}`
     : '',
+  mediaTargets: (values) => values.length
+    ? `当前页可下载素材（只显示类型、标签、来源主机和文件名提示；序号绑定本次页面快照）：\n${values.map((value) => `- [${value.index}] ${value.mediaType === 'image' ? '图片' : '视频'} · ${value.label} · ${value.host}${value.filenameHint ? ` · ${value.filenameHint}` : ''}`).join('\n')}`
+    : '',
+  mediaDownloaded: (file, path, host, mediaType, mime, bytes, digest) => `[浏览器] 已验证下载 ${mediaType}：${host} → ${path}\n文件：${file} · 类型：${mime} · 大小：${bytes} 字节 · SHA-256：${digest}`,
   uploadedMedia: (files) => `[浏览器] 已将以下素材放入网页投稿控件：\n${files.map((file) => `- ${file}`).join('\n')}\n请检查页面预览、数量和顺序；这一步没有提交作品。`,
   chatGPTImageSubmitted: '[浏览器] 已通过 ChatGPT 网页提交图片提示词。生成可能需要几分钟；查看页面结果后再保存，不要重复提交这条提示词。',
   chatGPTImageUnknown: '[浏览器] ChatGPT 页面没有给出可核验的提交结果。先重新读取页面确认状态，不要再次提交相同提示词。',
@@ -331,6 +348,10 @@ const en: BrowserText = {
   replyTargets: (values) => values.length
     ? `Reply boxes bound to unique visible comment rows:\n${values.map((value) => `- boxId=${value.boxId} · author=${value.author} · time=${value.timestamp || 'not provided exactly'} · expand replies first=${value.needsExpand} · comment and context=${value.context}`).join('\n')}`
     : '',
+  mediaTargets: (values) => values.length
+    ? `Downloadable media on this page (type, label, source host and filename hint only; indexes belong to this page snapshot):\n${values.map((value) => `- [${value.index}] ${value.mediaType} · ${value.label} · ${value.host}${value.filenameHint ? ` · ${value.filenameHint}` : ''}`).join('\n')}`
+    : '',
+  mediaDownloaded: (file, path, host, mediaType, mime, bytes, digest) => `[browser] Verified ${mediaType} download: ${host} → ${path}\nFile: ${file} · type: ${mime} · size: ${bytes} bytes · SHA-256: ${digest}`,
   uploadedMedia: (files) => `[browser] Added these media files to the page's upload control:\n${files.map((file) => `- ${file}`).join('\n')}\nCheck the page preview, count and order; this did not publish the post.`,
   chatGPTImageSubmitted: '[browser] The image prompt was submitted through the ChatGPT website. Generation may take a few minutes; read the result and save it when ready. Do not submit the prompt again.',
   chatGPTImageUnknown: '[browser] The ChatGPT page did not confirm whether the prompt was submitted. Read the page before deciding; do not submit the same prompt again.',

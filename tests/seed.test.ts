@@ -26,7 +26,7 @@ describe('first-run seed', () => {
         activeProvider: endpoint,
         language,
         worlds: { 'desktop-pet': { cua: { control: false } } },
-        companion: { selfTime: { actions: false, imageGeneration: false, imageSaving: false, mediaUpload: false } },
+        companion: { selfTime: { actions: false, imageGeneration: false, imageSaving: false, mediaUpload: false, mediaDownload: false } },
       });
       // the next start, in another system language, leaves a new install's language and computer-use asking as seeded
       seed(home, language === 'zh' ? 'en' : 'zh');
@@ -120,7 +120,7 @@ describe('first-run seed', () => {
     writeFileSync(cfg, JSON.stringify(original));
 
     seed(home, 'zh');
-    expect(read(cfg).companion).toEqual({ selfTime: { enabled: true, actions: true, imageGeneration: false, imageSaving: false, mediaUpload: false } });
+    expect(read(cfg).companion).toEqual({ selfTime: { enabled: true, actions: true, imageGeneration: false, imageSaving: false, mediaUpload: false, mediaDownload: false } });
     expect(read(`${cfg}.pre-action-permissions-v1`)).toEqual(original);
     expect(read(join(home, DEPLOYMENT, 'action-permissions-v1.json'))).toEqual({ v: 1, applied: true });
     expect(read(cfg).worlds).toMatchObject({ 'desktop-pet': { cua: { control: false } } });
@@ -129,14 +129,14 @@ describe('first-run seed', () => {
     migrated.companion = { selfTime: { enabled: true, actions: true, imageGeneration: true, imageSaving: false, mediaUpload: false } };
     writeFileSync(cfg, JSON.stringify(migrated));
     seed(home, 'zh');
-    expect((read(cfg).companion as Record<string, unknown>).selfTime).toEqual({ enabled: true, actions: true, imageGeneration: true, imageSaving: false, mediaUpload: false });
+    expect((read(cfg).companion as Record<string, unknown>).selfTime).toEqual({ enabled: true, actions: true, imageGeneration: true, imageSaving: false, mediaUpload: false, mediaDownload: false });
   });
 
   it('normalizes missing or invalid permission values to false and preserves explicit booleans', () => {
     for (const selfTime of [
       { actions: false },
       { actions: 'true', imageGeneration: 'yes', imageSaving: 1, mediaUpload: null },
-      { actions: true, imageGeneration: true, imageSaving: false, mediaUpload: true },
+      { actions: true, imageGeneration: true, imageSaving: false, mediaUpload: true, mediaDownload: true },
     ]) {
       const home = mkdtempSync(join(tmpdir(), 'cc-seed-'));
       mkdirSync(join(home, DEPLOYMENT), { recursive: true });
@@ -148,6 +148,7 @@ describe('first-run seed', () => {
       expect(migrated.imageGeneration).toBe(typeof selfTime.imageGeneration === 'boolean' ? selfTime.imageGeneration : false);
       expect(migrated.imageSaving).toBe(typeof selfTime.imageSaving === 'boolean' ? selfTime.imageSaving : false);
       expect(migrated.mediaUpload).toBe(typeof selfTime.mediaUpload === 'boolean' ? selfTime.mediaUpload : false);
+      expect(migrated.mediaDownload).toBe(typeof selfTime.mediaDownload === 'boolean' ? selfTime.mediaDownload : false);
     }
   });
 

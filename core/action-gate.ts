@@ -13,7 +13,7 @@ import { TaskGrantRegistry, type ActionRisk, type ActionTargetEvidence, type Des
  * refused whatever is switched on. Exact-action approval remains a World-level check.
  */
 export type Surface = 'browser' | 'desktop' | 'filesystem';
-export type Impact = 'read' | 'platform-write' | 'image-generation' | 'image-saving' | 'media-upload' | 'computer-input' | 'file-write' | 'command-execution' | 'platform-api' | 'sensitive';
+export type Impact = 'read' | 'platform-write' | 'image-generation' | 'image-saving' | 'media-upload' | 'media-download' | 'computer-input' | 'file-write' | 'command-execution' | 'platform-api' | 'sensitive';
 export type Refusal = 'read-only' | 'sensitive' | 'not-armed' | 'unverified-target';
 
 export interface ActionRequest {
@@ -95,6 +95,8 @@ export interface GatePolicy {
   imageSaving: () => boolean;
   /** `companion.selfTime.mediaUpload`. */
   mediaUpload: () => boolean;
+  /** `companion.selfTime.mediaDownload`; absent policy defaults to off. */
+  mediaDownload?: () => boolean;
   /** `worlds.desktop-pet.cua.control`: the mouse and keyboard on the person's screen. */
   computerInput: () => boolean;
   /** The desktop World owns the supported native app and input-route rules. */
@@ -138,6 +140,11 @@ export class ActionGate {
       return this.policy.mediaUpload()
         ? { allow: true }
         : { allow: false, refusal: 'not-armed', detail: `${request.tool}${describeTarget(request)} selects media while uploads are off` };
+    }
+    if (request.surface === 'browser' && request.impact === 'media-download') {
+      return (this.policy.mediaDownload?.() ?? false)
+        ? { allow: true }
+        : { allow: false, refusal: 'not-armed', detail: `${request.tool}${describeTarget(request)} downloads media while media downloads are off` };
     }
     if (request.surface === 'desktop' && request.impact === 'computer-input') {
       if (!this.policy.computerInput()) {
@@ -282,6 +289,7 @@ export class ActionGate {
       if (impact === 'image-generation') return this.policy.imageGeneration();
       if (impact === 'image-saving') return this.policy.imageSaving();
       if (impact === 'media-upload') return this.policy.mediaUpload();
+      if (impact === 'media-download') return this.policy.mediaDownload?.() ?? false;
       return false;
     }
     if (surface === 'desktop') {
@@ -297,6 +305,7 @@ export class ActionGate {
     return JSON.stringify([
       this.policy.platformWrites(), this.policy.imageGeneration(), this.policy.imageSaving(),
       this.policy.mediaUpload(), this.policy.computerInput(), this.policy.fileSystemPermissionGeneration?.() ?? '',
+      this.policy.mediaDownload?.() ?? false,
     ]);
   }
 

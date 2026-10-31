@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { ActionGate } from '../core/action-gate.ts';
 
-const gate = (policy: { writes: boolean; imageGeneration?: boolean; imageSaving?: boolean; mediaUpload?: boolean; input?: boolean }) => new ActionGate({
+const gate = (policy: { writes: boolean; imageGeneration?: boolean; imageSaving?: boolean; mediaUpload?: boolean; mediaDownload?: boolean; input?: boolean }) => new ActionGate({
   platformWrites: () => policy.writes,
   imageGeneration: () => policy.imageGeneration ?? false,
   imageSaving: () => policy.imageSaving ?? false,
   mediaUpload: () => policy.mediaUpload ?? false,
+  mediaDownload: () => policy.mediaDownload ?? false,
   computerInput: () => policy.input ?? true,
   desktopTargetAllowed: () => false,
 });
@@ -43,6 +44,15 @@ describe('action gate', () => {
     expect(g.check({ surface: 'browser', tool: 'browser_upload_media', impact: 'media-upload' }).allow).toBe(true);
     policy.imageSaving = true;
     expect(g.check({ surface: 'browser', tool: 'browser_save_chatgpt_image', impact: 'image-saving' }).allow).toBe(true);
+  });
+
+  it('keeps media downloads separately disabled until their own setting is enabled', () => {
+    const policy = { writes: true, mediaUpload: true, mediaDownload: false };
+    const g = gate(policy);
+    expect(g.check({ surface: 'browser', tool: 'browser_download_media', impact: 'media-download' }))
+      .toMatchObject({ allow: false, refusal: 'not-armed' });
+    policy.mediaDownload = true;
+    expect(g.check({ surface: 'browser', tool: 'browser_download_media', impact: 'media-download' })).toEqual({ allow: true });
   });
 
   it('reads the live settings at each check instead of caching the first answer', () => {

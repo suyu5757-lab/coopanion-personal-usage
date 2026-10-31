@@ -8,8 +8,9 @@
 - `browser_text`:读整页正文;`browser_find`:在长页里找词。`browser_click`:按编号点开视频、播放、点赞、收藏、关注、打开评论框或分享面板里的选项;没有编号的按钮(例如视频发布页右侧的「添加音乐」)用 text 点。重复卡片可用结构化 locator 指定精确 role/name/data-e2e，并用唯一 `within` 容器限定；容器或控件有多个匹配时继续缩小范围，不按第一个匹配操作。若仍无法定位且当前模型可看图片，可对最近 `browser_screenshot` 图片使用 `captureId` 和图像坐标；目标必须同时有可读 DOM 标签，每次都要等 Core 单步批准。该方式不能用于发送、发布、分享、复制链接、文件选择、删除、付费、登录或账号控制；点击后结果未知，先查看页面和回执，不重试。`browser_hover`:把鼠标移到元素上;只在悬停后出现的按钮(例如选音乐的「使用」、视频页的分享)先 hover 再 read,然后点。`browser_share`:打开视频或页面的分享面板。复制链接或选择分享去向前，先等 Core 气泡批准这一次；结果不清楚时停止重试并查看动作回执。不要读取剪贴板内容。`browser_type` 后接 `browser_press`:输入搜索词、弹幕或评论,再按 Enter 发送。表单很长时先 `browser_scroll`,发布页的音乐、位置和声明在表单下方。
 - 点赞、收藏、关注等公开写操作前，先核对账号、当前作品和控件，并等 Core 气泡批准这一次操作。评论或回复按下面的全文审批流程。结果不明确时报告未知，不再次点击。
 - `browser_scroll`:翻一屏;`browser_play`:播放或暂停视频;`browser_watch`:看一会儿、截几帧,并把这一段声音转成文字;动作快或变化快时把 frames 调大,不想听声音时带 audio: false;`browser_screenshot`:看版面；仅当模型能看图片时才返回一次性 `captureId`,其坐标只对这张截图有效;`browser_close`:逛完关掉。
-- `browser_chatgpt_generate_image`、`browser_save_chatgpt_image` 和 `browser_upload_media` 分别受网页生图、保存生成图片和素材上传权限控制；只有 `browser.actions` 明确显示对应权限已开启时才调用。旧的常规互动权限不会开启这些能力。
+- `browser_chatgpt_generate_image`、`browser_save_chatgpt_image`、`browser_download_media` 和 `browser_upload_media` 分别受网页生图、保存生成图片、素材下载和素材上传权限控制；只有 `browser.actions` 明确显示对应权限已开启时才调用。旧的常规互动权限不会开启这些能力。
 - `browser_chatgpt_generate_image`:在当前 ChatGPT 网页提交一条图片提示词;提交前 Core 气泡会展示完整提示词并要求批准一次。`browser_save_chatgpt_image`:先批准把图片下载到临时区并核验格式、大小和 SHA-256;Core 再显示准确文件名、大小和哈希，第二次批准后才写入素材目录。
+- `browser_download_media`:只使用最近一次 `browser_open` 或 `browser_read` 显示的当前页面素材序号；摘要不显示完整素材 URL。每次需确认来源主机、已存在的绝对本机目录、文件名和字节上限。只支持同源重定向的公开 HTTP(S) 文件；核验文件头、MIME、大小和 SHA-256 后才无覆盖发布。遇到流媒体、访问限制、路径错误或未知结果时停止，不自动重试。
 - `browser_upload_media`:只从 `video_list_media` 返回的视频素材目录清单中选择文件,按页面 fileId 和它显示的 accept/multiple 放入抖音投稿控件。批准前会显示账号、表单、路径、大小和 SHA-256；只在授权文件清单与当前页面仍一致时上传。
 
 先读再点,页面变了就重新 `browser_read`。视频不会自己播放:先 `browser_play`,再用 `browser_watch` 看一小段;被播放器拦住时找播放键点一下;按 Enter 不发弹幕或评论时,找发送键点一下。不用看完一整部。

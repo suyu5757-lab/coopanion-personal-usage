@@ -201,6 +201,22 @@ export const BROWSER_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
     },
   },
   {
+    name: 'browser_download_media',
+    tags: ['act'],
+    interruptible: true,
+    description: 'Download one visible image or direct video file from the latest browser_read or browser_open media list. Requires the separate mediaDownload permission and a one-time Core approval bound to the current page snapshot, source, existing destination directory, filename and byte limit. Only public HTTP(S) files are supported; redirects must remain on the selected origin. The file is checked by its response MIME, extension, signature, size and SHA-256 before it is published without overwriting. Does not bypass sign-in, DRM, paywalls or site restrictions.',
+    parameters: {
+      type: 'object',
+      properties: {
+        index: { type: 'integer', minimum: 0, description: 'The [index] in the downloadable media list returned by the latest browser_read or browser_open.' },
+        directory: { type: 'string', minLength: 1, maxLength: 4096, description: 'An existing absolute local directory selected by the user. It may not contain symlink components.' },
+        filename: { type: 'string', minLength: 1, maxLength: 240, description: 'A single filename with an image or video extension that matches the selected media type.' },
+        maxBytes: { type: 'integer', minimum: 1, maximum: 1073741824, description: 'The maximum number of bytes this one download may write.' },
+      },
+      required: ['index', 'directory', 'filename', 'maxBytes'],
+    },
+  },
+  {
     name: 'browser_upload_media',
     tags: ['act'],
     interruptible: true,
