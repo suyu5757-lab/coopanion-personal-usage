@@ -910,6 +910,7 @@ export async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     clearInterval(rhythmTimer);
+    clearInterval(growthTimer);
     journal.stop();
     affinitySync.stop();
     const done = await Promise.race([
