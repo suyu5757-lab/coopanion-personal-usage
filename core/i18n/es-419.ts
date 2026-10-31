@@ -61,6 +61,7 @@ const es419: Translation<CoreText> = {
 
   browserAction: {
     platformWrite: 'dar me gusta, guardar o seguir', imageGeneration: 'generar una imagen', imageSaving: 'guardar una imagen generada',
+    imageGenerationDetails: (prompt: string) => `Se enviará un solo prompt. Esto puede consumir la cuota de la cuenta de ChatGPT o generar cargos.\n\nPrompt:\n${prompt}`,
     imageStaging: 'preparar temporalmente una imagen generada para revisarla',
     imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `Archivo: ${file}\nTamaño: ${bytes} bytes\nTipo: ${mime}\nSHA-256: ${digest}\nGuardar en: carpeta local de medios`,
     mediaUpload: 'subir medios',

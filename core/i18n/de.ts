@@ -61,6 +61,7 @@ const de: Translation<CoreText> = {
 
   browserAction: {
     platformWrite: 'liken, favorisieren oder folgen', imageGeneration: 'ein Bild erzeugen', imageSaving: 'ein erzeugtes Bild speichern',
+    imageGenerationDetails: (prompt: string) => `Es wird ein einzelner Prompt gesendet. Dadurch kann ChatGPT-Kontingent verbraucht werden oder es können Kosten entstehen.\n\nPrompt:\n${prompt}`,
     imageStaging: 'ein erzeugtes Bild vorübergehend zur Prüfung ablegen',
     imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `Datei: ${file}\nGröße: ${bytes} Byte\nTyp: ${mime}\nSHA-256: ${digest}\nSpeicherort: lokaler Medienordner`,
     mediaUpload: 'Medien hochladen',

@@ -182,11 +182,21 @@ export const BROWSER_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
     name: 'browser_chatgpt_generate_image',
     tags: ['act'],
     interruptible: true,
-    description: 'Submit one image prompt through the visible composer on the signed-in ChatGPT website in this browser. This uses the ChatGPT webpage, not an API or Codex. If the result is unclear, read the page and do not send the prompt again.',
+    description: 'Submit one approved image prompt through the visible composer on the signed-in ChatGPT website in this browser. Only one unresolved image task may run at a time. Returns a one-use task id and prompt digest after matching the newly added user turn. Poll browser_chatgpt_image_status to identify only an assistant image after that turn. Never retry an unknown task.',
     parameters: {
       type: 'object',
       properties: { prompt: { type: 'string', minLength: 1, maxLength: 2000, description: 'The image-generation prompt to send through ChatGPT.' } },
       required: ['prompt'],
+    },
+  },
+  {
+    name: 'browser_chatgpt_image_status',
+    tags: ['read'],
+    description: 'Read the state of one ChatGPT image task by its task id. Reports not_dispatched, prompt_submitted, generating, image_available, unknown or failed from the action receipt and exact user turn evidence. This never resubmits a prompt.',
+    parameters: {
+      type: 'object',
+      properties: { taskId: { type: 'string', minLength: 36, maxLength: 36, description: 'The task id returned by browser_chatgpt_generate_image.' } },
+      required: ['taskId'],
     },
   },
   {
@@ -204,7 +214,7 @@ export const BROWSER_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
     name: 'browser_download_media',
     tags: ['act'],
     interruptible: true,
-    description: 'Download one visible image or direct video file from the latest browser_read or browser_open media list. Requires the separate mediaDownload permission and a one-time Core approval bound to the current page snapshot, source, existing destination directory, filename and byte limit. Only public HTTP(S) files are supported; redirects must remain on the selected origin. The file is checked by its response MIME, extension, signature, size and SHA-256 before it is published without overwriting. Does not bypass sign-in, DRM, paywalls or site restrictions.',
+    description: 'Download one visible image or direct video file from the latest browser_read or browser_open media list. Requires the separate mediaDownload permission and a one-time Core approval bound to the current page snapshot, source, existing destination directory, filename and byte limit. For a C01 generated image, also pass its verified taskId; the Browser rechecks that the selected loaded image belongs to that exact assistant turn. Only public HTTP(S) files are supported; redirects must remain on the selected origin. The file is checked by its response MIME, extension, signature, size and SHA-256 before it is published without overwriting. Does not bypass sign-in, DRM, paywalls or site restrictions.',
     parameters: {
       type: 'object',
       properties: {
@@ -212,6 +222,7 @@ export const BROWSER_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
         directory: { type: 'string', minLength: 1, maxLength: 4096, description: 'An existing absolute local directory selected by the user. It may not contain symlink components.' },
         filename: { type: 'string', minLength: 1, maxLength: 240, description: 'A single filename with an image or video extension that matches the selected media type.' },
         maxBytes: { type: 'integer', minimum: 1, maximum: 1073741824, description: 'The maximum number of bytes this one download may write.' },
+        taskId: { type: 'string', minLength: 36, maxLength: 36, description: 'Optional verified C01 ChatGPT image task id; when supplied, only an image from that task can be downloaded.' },
       },
       required: ['index', 'directory', 'filename', 'maxBytes'],
     },

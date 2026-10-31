@@ -70,6 +70,7 @@ const en: CoreText = {
 
   browserAction: {
     platformWrite: 'like, favorite or follow', imageGeneration: 'generate an image', imageSaving: 'save a generated image',
+    imageGenerationDetails: (prompt: string) => `One prompt will be submitted. This may use ChatGPT account quota or incur charges.\n\nPrompt:\n${prompt}`,
     imageStaging: 'temporarily stage a generated image for review',
     imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `File: ${file}\nSize: ${bytes} bytes\nType: ${mime}\nSHA-256: ${digest}\nSave to: local media folder`,
     mediaUpload: 'upload media',

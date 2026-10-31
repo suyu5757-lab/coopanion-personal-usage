@@ -196,6 +196,11 @@ export class ActionReceiptLedger {
       .sort((a, b) => b.updatedAt - a.updatedAt));
   }
 
+  findByTaskId(taskId: string): ActionReceipt | null {
+    const action = [...this.actions].reverse().find((candidate) => candidate.taskId === taskId);
+    return action ? structuredClone(action) : null;
+  }
+
   reconcile(id: string, decision: ActionReceiptReviewDecision, note: string, now = Date.now()): boolean {
     const action = this.actions.find((candidate) => candidate.id === id);
     const detail = note.trim();
@@ -232,6 +237,12 @@ export class ActionReceiptLedger {
         action.dispatchState = 'unknown';
         action.outcome = 'unknown';
         action.note = 'the app stopped while the action result was unresolved';
+        action.updatedAt = now;
+        changed = true;
+      } else if (action.intent === 'image-generation' && action.phase === 'submitted') {
+        action.phase = 'unknown';
+        action.outcome = 'unknown';
+        action.note = 'the app stopped before the generated image result could be verified';
         action.updatedAt = now;
         changed = true;
       } else if (action.phase === 'planned' || action.phase === 'awaiting-approval') {

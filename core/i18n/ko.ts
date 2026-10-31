@@ -61,6 +61,7 @@ const ko: Translation<CoreText> = {
 
   browserAction: {
     platformWrite: '좋아요, 저장 또는 팔로우', imageGeneration: '이미지 생성', imageSaving: '생성된 이미지 저장',
+    imageGenerationDetails: (prompt: string) => `이미지 프롬프트 1개를 제출합니다. ChatGPT 계정 사용량이 차감되거나 요금이 발생할 수 있습니다.\n\n프롬프트:\n${prompt}`,
     imageStaging: '생성 이미지를 임시 보관해 확인',
     imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `파일: ${file}\n크기: ${bytes}바이트\n형식: ${mime}\nSHA-256: ${digest}\n저장 위치: 로컬 미디어 폴더`,
     mediaUpload: '미디어 업로드',

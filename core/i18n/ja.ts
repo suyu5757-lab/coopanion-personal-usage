@@ -61,6 +61,7 @@ const ja: Translation<CoreText> = {
 
   browserAction: {
     platformWrite: 'いいね、保存、またはフォロー', imageGeneration: '画像を生成する', imageSaving: '生成画像を保存する',
+    imageGenerationDetails: (prompt: string) => `プロンプトを 1 件送信します。ChatGPT アカウントの利用枠を使うか、料金が発生する場合があります。\n\nプロンプト：\n${prompt}`,
     imageStaging: '生成画像を一時保存して確認する',
     imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `ファイル：${file}\nサイズ：${bytes} バイト\n種類：${mime}\nSHA-256：${digest}\n保存先：ローカルメディアフォルダ`,
     mediaUpload: 'メディアをアップロードする',

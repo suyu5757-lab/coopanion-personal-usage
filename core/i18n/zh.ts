@@ -69,6 +69,7 @@ export default {
 
   browserAction: {
     platformWrite: '点赞、收藏或关注', imageGeneration: '网页生图', imageSaving: '保存生成图片',
+    imageGenerationDetails: (prompt: string) => `本次提交 1 条提示词，可能使用 ChatGPT 账号额度或产生费用。\n\n提示词：\n${prompt}`,
     imageStaging: '暂存生成图片并核验',
     imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `文件：${file}\n大小：${bytes} 字节\n类型：${mime}\nSHA-256：${digest}\n保存到：本地素材目录`,
     mediaUpload: '上传素材',

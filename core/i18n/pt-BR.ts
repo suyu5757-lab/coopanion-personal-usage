@@ -61,6 +61,7 @@ const ptBR: Translation<CoreText> = {
 
   browserAction: {
     platformWrite: 'curtir, favoritar ou seguir', imageGeneration: 'gerar uma imagem', imageSaving: 'salvar uma imagem gerada',
+    imageGenerationDetails: (prompt: string) => `Um prompt será enviado. Isso pode usar a cota da conta ChatGPT ou gerar cobranças.\n\nPrompt:\n${prompt}`,
     imageStaging: 'preparar temporariamente uma imagem gerada para revisão',
     imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `Arquivo: ${file}\nTamanho: ${bytes} bytes\nTipo: ${mime}\nSHA-256: ${digest}\nSalvar em: pasta local de mídia`,
     mediaUpload: 'enviar mídia',

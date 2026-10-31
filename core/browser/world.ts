@@ -93,6 +93,15 @@ type BrowserActionApproval = { approved: true; authorization: BrowserActionAutho
 interface SharePanelEvidence { url: string; snapshotId: string; targetUrl: string; targetTitle: string; accountRef: string }
 interface ClickAnswer { success?: boolean; message?: string }
 interface PlayAnswer { ok?: boolean; error?: string; video?: VideoState | null }
+type ChatGPTImageTaskStatus = 'not_dispatched' | 'prompt_submitted' | 'generating' | 'image_available' | 'unknown' | 'failed';
+interface ChatGPTImageTask {
+  taskId: string;
+  journalId: string;
+  promptDigest: string;
+  status: Exclude<ChatGPTImageTaskStatus, 'not_dispatched'>;
+  imageCount: number;
+  lastEvidenceDigest: string;
+}
 
 const asRecord = (value: unknown): Record<string, unknown> | null => (value && typeof value === 'object' ? value as Record<string, unknown> : null);
 const normalizeUploadNotice = (value: string): string => value.replace(/\s+/g, ' ').trim().toLowerCase();
@@ -399,6 +408,8 @@ export class BrowserWorld implements World {
   private journal: ActionJournal | null = null;
   private replyJournal: ReplyJournal | null = null;
   private taskJournal: BrowserTaskActionJournal | null = null;
+  /** Only digests and Browser-confirmed task states are retained in Core memory. */
+  private readonly chatGPTImageTasks = new Map<string, ChatGPTImageTask>();
   /** One public write at a time: a second Enter while the first awaits an answer is refused. */
   private publishing = false;
   /** What Coo last typed, so a send control knows which text it would publish. */
@@ -466,6 +477,7 @@ export class BrowserWorld implements World {
       initialEvidence?: ActionReceiptEvidence[];
       dedupeKey?: string;
       actionLabel?: string;
+      taskId?: string;
       payloadDigest?: string;
       commentFingerprint?: string;
       risk?: ActionRisk;
@@ -485,7 +497,7 @@ export class BrowserWorld implements World {
       control,
     };
     const text = coreText(this.opts.language?.() ?? 'zh').browserAction;
-    const taskId = ctx.callId ? `${ctx.role}:${ctx.callId}` : `${ctx.role}:${ctx.round ?? 'direct'}:${randomUUID()}`;
+    const taskId = scope.taskId ?? (ctx.callId ? `${ctx.role}:${ctx.callId}` : `${ctx.role}:${ctx.round ?? 'direct'}:${randomUUID()}`);
     const files = scope.files ?? [];
     const payloadDigest = scope.payloadDigest ?? hashContent(taskText);
     const risk = scope.risk ?? defaultActionRisk(impact);
@@ -716,6 +728,7 @@ export class BrowserWorld implements World {
       browser_watch: (args, ctx) => this.watch(args, ctx),
       browser_screenshot: (_args, ctx) => this.screenshot(ctx),
       browser_chatgpt_generate_image: (args, ctx) => this.generateChatGPTImage(args, ctx),
+      browser_chatgpt_image_status: (args, ctx) => this.chatGPTImageStatus(args, ctx),
       browser_save_chatgpt_image: (args, ctx) => this.saveChatGPTImage(args, ctx),
       browser_download_media: (args, ctx) => this.downloadMedia(args, ctx),
       browser_upload_media: (args, ctx) => this.uploadMedia(args, ctx),
@@ -765,6 +778,7 @@ export class BrowserWorld implements World {
 
   private finish(close: boolean): void {
     const active = this.started !== null;
+    if (close) this.markChatGPTImageTasksUnknown('the Browser session ended before the image result was confirmed');
     if (this.timer) { clearTimeout(this.timer); this.timer = null; }
     this.started = null;
     this.ended = true;
@@ -781,8 +795,22 @@ export class BrowserWorld implements World {
     }
   }
 
+  private markChatGPTImageTasksUnknown(note: string): void {
+    for (const action of this.taskJournal?.listUnresolved() ?? []) {
+      if (action.intent !== 'image-generation' || action.phase !== 'submitted') continue;
+      const evidence: ActionReceiptEvidence = {
+        source: 'chatgpt-image-task', status: 'unknown', digest: action.payloadDigest,
+        summary: `task=${action.taskId}; prompt_digest=${action.payloadDigest}; image_count=0`, observedAt: Date.now(),
+      };
+      this.taskJournal?.finish(action.id, 'unknown', note, Date.now(), 'unknown', evidence);
+      const task = this.chatGPTImageTasks.get(action.taskId);
+      if (task) task.status = 'unknown';
+    }
+  }
+
   private async windowClosed(): Promise<void> {
     const wasOpen = this.started !== null && !this.ended;
+    this.markChatGPTImageTasksUnknown('the Browser window closed before the image result was confirmed');
     this.finish(false);
     if (!wasOpen || !this.host) return;
     await this.host.pushEvent({
@@ -1610,35 +1638,140 @@ export class BrowserWorld implements World {
       if (!composerId || !composerSnapshot || composerSnapshot !== page.snapshotId) {
         return this.toast(this.t.failed('browser_chatgpt_generate_image', 'the current image composer does not match the page read'), true);
       }
+      const taskId = randomUUID();
+      const promptDigest = hashContent(prompt);
+      if (this.ensureTaskJournal() && this.taskJournal?.listUnresolved().some((action) => action.intent === 'image-generation')) {
+        return this.toast(this.t.sendUnknown, true);
+      }
       const decision = await this.approveBrowserAction(
         'image-generation',
         `Submit this image prompt once through ChatGPT:\n${prompt}`,
         page,
         composerId,
         'ChatGPT image prompt composer',
-        prompt,
+        coreText(this.opts.language?.() ?? 'zh').browserAction.imageGenerationDetails(prompt),
         ctx,
+        { taskId, payloadDigest: promptDigest },
       );
-      if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
-        : decision.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly('ChatGPT image prompt'), true);
+      if (!decision.approved) return this.toast(this.t.chatGPTImageTaskStatus(taskId, 'not_dispatched', 0, promptDigest), true);
       const approval = decision.authorization;
       let result: Record<string, unknown> | null;
       try {
-        result = asRecord(await this.call('chatgpt-generate-image', { prompt, composerId, snapshotId: composerSnapshot }, ctx.signal));
+        result = asRecord(await this.call('chatgpt-generate-image', { prompt, promptDigest, taskId, composerId, snapshotId: composerSnapshot }, ctx.signal));
       } catch (error) {
-        this.taskJournal?.finish(approval.journalId, 'unknown', 'the ChatGPT page did not answer after the approved prompt');
+        this.taskJournal?.finish(approval.journalId, 'unknown', 'the ChatGPT page did not answer after the approved prompt', Date.now(), 'unknown', {
+          source: 'chatgpt-image-task', status: 'unknown', digest: promptDigest, summary: 'submission result could not be read; do not retry', observedAt: Date.now(),
+        });
         throw error;
       }
       const state = asState(result?.state);
-      const submitted = result?.submitted === true;
-      this.taskJournal?.finish(approval.journalId, submitted ? 'verified' : 'unknown', submitted ? 'the ChatGPT page confirmed the submitted prompt' : 'the page did not confirm whether the prompt was submitted');
-      const lead = submitted ? this.t.chatGPTImageSubmitted : this.t.chatGPTImageUnknown;
+      const task = asRecord(result?.task);
+      const submitted = result?.submitted === true
+        && task?.taskId === taskId
+        && task.promptDigest === promptDigest
+        && task.status === 'prompt_submitted'
+        && typeof task.userTurnDigest === 'string' && /^[a-f0-9]{64}$/.test(task.userTurnDigest)
+        && typeof task.evidenceDigest === 'string' && /^[a-f0-9]{64}$/.test(task.evidenceDigest);
+      if (submitted) {
+        const evidence: ActionReceiptEvidence = {
+          source: 'chatgpt-image-task', status: 'prompt_submitted', digest: task.evidenceDigest as string,
+          summary: `task=${taskId}; prompt_digest=${promptDigest}; expected_images=1`, observedAt: Date.now(),
+        };
+        this.taskJournal?.complete(approval.journalId, {
+          phase: 'submitted', dispatchState: 'delivered', outcome: 'remote-acknowledged',
+          note: 'the exact newly-added user turn matched the approved image prompt; awaiting its assistant image result', evidence,
+        });
+        this.chatGPTImageTasks.set(taskId, {
+          taskId, journalId: approval.journalId, promptDigest, status: 'prompt_submitted', imageCount: 0,
+          lastEvidenceDigest: task.evidenceDigest as string,
+        });
+      } else {
+        const evidence: ActionReceiptEvidence = {
+          source: 'chatgpt-image-task', status: 'unknown', digest: promptDigest,
+          summary: 'the exact new user turn and current page identity could not both be verified; do not retry', observedAt: Date.now(),
+        };
+        this.taskJournal?.finish(approval.journalId, 'unknown', 'the prompt dispatch or its page identity could not be confirmed', Date.now(), 'unknown', evidence);
+      }
+      const lead = submitted ? this.t.chatGPTImageSubmitted(taskId, promptDigest) : this.t.chatGPTImageUnknown;
       if (state && typeof result?.base64 === 'string') {
         const shot = { base64: result.base64, width: Number(result.width) || 0, height: Number(result.height) || 0, state };
         return submitted ? this.image(shot, lead) : { ...this.image(shot, lead), failed: true };
       }
       if (state) return submitted ? this.toast(this.full(state, lead)) : this.toast(this.full(state, lead), true);
       return this.toast(lead, !submitted);
+    });
+  }
+
+  private async chatGPTImageStatus(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.run('browser_chatgpt_image_status', ctx, async () => {
+      const taskId = typeof args.taskId === 'string' ? args.taskId : '';
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(taskId)) {
+        return this.toast(this.t.failed('browser_chatgpt_image_status', 'taskId must be the id returned by the image task'), true);
+      }
+      const blocked = this.begin('browser_chatgpt_image_status');
+      if (blocked) return blocked;
+      const receipt = this.taskJournal?.findByTaskId(taskId);
+      if (!receipt || receipt.intent !== 'image-generation') {
+        return this.toast(this.t.chatGPTImageTaskStatus(taskId, 'unknown', 0, 'unavailable'), true);
+      }
+      const storedEvidence = [...receipt.evidence].reverse().find((item) => item.source === 'chatgpt-image-task');
+      const terminal = receipt.phase === 'cancelled' && receipt.dispatchState === 'not-dispatched' ? 'not_dispatched'
+        : storedEvidence?.status === 'image_available' ? 'image_available'
+        : receipt.phase === 'failed' ? 'failed'
+          : receipt.phase === 'verified' ? 'image_available'
+            : receipt.phase === 'unknown' || receipt.phase === 'cancelled' ? 'unknown' : null;
+      if (terminal) {
+        const count = Number(/image_count=(\d+)/.exec(storedEvidence?.summary ?? '')?.[1] ?? 0);
+        return this.toast(this.t.chatGPTImageTaskStatus(taskId, terminal, count, receipt.payloadDigest), terminal === 'unknown' || terminal === 'failed');
+      }
+      if (receipt.phase !== 'submitted') {
+        return this.toast(this.t.chatGPTImageTaskStatus(taskId, 'unknown', 0, receipt.payloadDigest), true);
+      }
+
+      let task = this.chatGPTImageTasks.get(taskId);
+      if (!task) {
+        const previousStatus = [...receipt.evidence].reverse().find((item) => item.source === 'chatgpt-image-task'
+          && ['prompt_submitted', 'generating'].includes(item.status))?.status;
+        task = {
+          taskId, journalId: receipt.id, promptDigest: receipt.payloadDigest,
+          status: previousStatus === 'generating' ? 'generating' : 'prompt_submitted', imageCount: 0, lastEvidenceDigest: '',
+        };
+        this.chatGPTImageTasks.set(taskId, task);
+      }
+      let observation: Record<string, unknown> | null;
+      try {
+        observation = asRecord(await this.call('chatgpt-image-status', { taskId, promptDigest: task.promptDigest }, ctx.signal));
+      } catch {
+        observation = null;
+      }
+      const statuses = new Set<ChatGPTImageTaskStatus>(['prompt_submitted', 'generating', 'image_available', 'unknown', 'failed']);
+      const observedStatus = observation?.taskId === taskId && observation.promptDigest === task.promptDigest
+        && statuses.has(observation.status as ChatGPTImageTaskStatus)
+        ? observation.status as Exclude<ChatGPTImageTaskStatus, 'not_dispatched'>
+        : 'unknown';
+      const status = task.status === 'generating' && observedStatus === 'prompt_submitted' ? 'unknown' : observedStatus;
+      const imageCount = Number.isSafeInteger(observation?.imageCount) && Number(observation?.imageCount) >= 0 ? Number(observation?.imageCount) : 0;
+      const evidenceDigest = typeof observation?.evidenceDigest === 'string' && /^[a-f0-9]{64}$/.test(observation.evidenceDigest)
+        ? observation.evidenceDigest : hashContent(JSON.stringify([taskId, task.promptDigest, status, imageCount]));
+      const evidence: ActionReceiptEvidence = {
+        source: 'chatgpt-image-task', status, digest: evidenceDigest,
+        summary: `task=${taskId}; prompt_digest=${task.promptDigest}; image_count=${imageCount}`,
+        observedAt: Date.now(),
+      };
+      const previousEvidenceDigest = task.lastEvidenceDigest;
+      task.status = status;
+      task.imageCount = imageCount;
+      task.lastEvidenceDigest = evidenceDigest;
+      if (status === 'prompt_submitted' || status === 'generating') {
+        if (evidenceDigest !== previousEvidenceDigest) this.taskJournal?.observe(task.journalId, [evidence], `ChatGPT image task state: ${status}`);
+      } else if (status === 'image_available') {
+        this.taskJournal?.finish(task.journalId, 'verified', 'a loaded image appeared in the assistant turn after the exact submitted user turn', Date.now(), 'verified', evidence);
+      } else if (status === 'failed') {
+        this.taskJournal?.complete(task.journalId, { phase: 'failed', dispatchState: 'delivered', outcome: 'failed', note: 'ChatGPT displayed a generation error after the exact submitted user turn', evidence });
+      } else {
+        this.taskJournal?.finish(task.journalId, 'unknown', 'the image result could not be tied to the exact task page and user turn', Date.now(), 'unknown', evidence);
+      }
+      return this.toast(this.t.chatGPTImageTaskStatus(taskId, status, imageCount, task.promptDigest), status === 'unknown' || status === 'failed');
     });
   }
 
@@ -1739,6 +1872,10 @@ export class BrowserWorld implements World {
       const directory = typeof args.directory === 'string' ? args.directory.trim() : '';
       const filename = typeof args.filename === 'string' ? args.filename.trim() : '';
       const maxBytes = Number(args.maxBytes);
+      const imageTaskId = typeof args.taskId === 'string' ? args.taskId.trim() : '';
+      if (args.taskId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(imageTaskId)) {
+        return this.toast(this.t.failed('browser_download_media', 'taskId must be a verified ChatGPT image task id'), true);
+      }
       if (index === null || !directory || !filename || !isAbsolute(directory)
         || filename.length > 240 || filename !== basename(filename) || /[\\/:*?"<>|\u0000-\u001f\u007f]/.test(filename)
         || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1024 * 1024 * 1024) {
@@ -1750,21 +1887,29 @@ export class BrowserWorld implements World {
       if (!page?.snapshotId) return this.toast(this.t.failed('browser_download_media', 'read the current page and its media list first'), true);
       const target = page.mediaTargets?.find((candidate) => candidate.index === index);
       if (!target) return this.toast(this.t.failed('browser_download_media', 'that media index is missing or belongs to an older page read'), true);
+      if (imageTaskId) {
+        const imageTask = this.taskJournal?.findByTaskId(imageTaskId);
+        const imageEvidence = imageTask && [...imageTask.evidence].reverse().find((item) => item.source === 'chatgpt-image-task');
+        if (!isChatGPTPage(page.url) || target.mediaType !== 'image' || imageTask?.intent !== 'image-generation'
+          || imageTask.phase !== 'verified' || imageEvidence?.status !== 'image_available') {
+          return this.toast(this.t.failed('browser_download_media', 'the selected image task has no verified generated image'), true);
+        }
+      }
       if (!this.allowed('media-download', 'browser_download_media', `${target.mediaType} from ${target.host}`)) {
         return this.toast(this.t.lookOnly('download media'), true);
       }
       const actionText = coreText(this.opts.language?.() ?? 'zh').browserAction;
-      const payloadDigest = hashContent(JSON.stringify([target.token, target.mediaType, target.host, directory, filename, maxBytes]));
-      const taskText = `Download one ${target.mediaType} from ${target.host} to ${resolve(directory)}/${filename}; maximum ${maxBytes} bytes.`;
+      const payloadDigest = hashContent(JSON.stringify([target.token, target.mediaType, target.host, imageTaskId, directory, filename, maxBytes]));
+      const taskText = `Download one ${target.mediaType} from ${target.host}${imageTaskId ? ` for ChatGPT task ${imageTaskId}` : ''} to ${resolve(directory)}/${filename}; maximum ${maxBytes} bytes.`;
       const decision = await this.approveBrowserAction(
         'media-download',
         taskText,
         page,
         `media:${target.token}`,
         `${target.mediaType}:${target.token}`,
-        actionText.mediaDownloadDetails(target.label, target.mediaType, target.host, resolve(directory), filename, maxBytes),
+        actionText.mediaDownloadDetails(imageTaskId ? `${target.label} · ChatGPT task ${imageTaskId}` : target.label, target.mediaType, target.host, resolve(directory), filename, maxBytes),
         ctx,
-        { actionLabel: actionText.mediaDownload, payloadDigest, dedupeKey: `${target.token}:${resolve(directory)}:${filename}:${maxBytes}`, risk: 'REVERSIBLE_LOCAL' },
+        { actionLabel: actionText.mediaDownload, payloadDigest, dedupeKey: `${target.token}:${imageTaskId}:${resolve(directory)}:${filename}:${maxBytes}`, risk: 'REVERSIBLE_LOCAL' },
       );
       if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
         : decision.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly('download media'), true);
@@ -1773,6 +1918,7 @@ export class BrowserWorld implements World {
       try {
         result = asRecord(await this.call('download-media', {
           index, token: target.token, snapshotId: page.snapshotId, directory, filename, maxBytes,
+          ...(imageTaskId ? { imageTaskId } : {}),
         }, ctx.signal));
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

@@ -27,6 +27,37 @@ describe('shared ActionReceiptLedger', () => {
     expect(receipt).toMatchObject({ intent: 'media-download', risk: 'REVERSIBLE_LOCAL', phase: 'planned' });
   });
 
+  it('keeps an interrupted ChatGPT image task unknown and blocks replay after restart', () => {
+    dir = mkdtempSync(join(tmpdir(), 'coopanion-action-receipts-'));
+    const file = join(dir, 'receipts.json');
+    const ledger = new ActionReceiptLedger(file);
+    const prompt = 'private image prompt text';
+    const promptDigest = hashContent(prompt);
+    const receipt = ledger.begin({
+      taskId: 'b6148ab8-839e-4b04-9b0c-32456b9e83c6', intent: 'image-generation',
+      target: {
+        surface: 'browser', instanceId: 'browser-1', origin: 'https://chatgpt.com',
+        url: 'https://chatgpt.com/c/example', accountRef: 'browser-1', snapshotId: 'snapshot-1',
+        formId: 'composer-1', control: 'ChatGPT image prompt composer',
+      },
+      payloadDigest: promptDigest, files: [], duplicateKey: 'image-task-1',
+    }, 1_000);
+    ledger.awaitingApproval(receipt.id, 1_001);
+    ledger.acting(receipt.id, 'a'.repeat(64), 1_002, 30_000, 1_003);
+    ledger.complete(receipt.id, {
+      phase: 'submitted', dispatchState: 'delivered', outcome: 'remote-acknowledged', note: 'task submitted',
+    }, 1_004);
+
+    const reopened = new ActionReceiptLedger(file);
+    expect(reopened.findByTaskId(receipt.taskId)).toMatchObject({ phase: 'submitted', payloadDigest: promptDigest });
+    expect(reopened.recoverInterrupted(2_000)).toBe(1);
+    expect(reopened.findByTaskId(receipt.taskId)).toMatchObject({
+      phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown', payloadDigest: promptDigest,
+    });
+    expect(readFileSync(file, 'utf8')).not.toContain(prompt);
+    expect(reopened.hasUnresolved('image-task-1')).toBe(true);
+  });
+
   it('persists non-mutating observations while a media receipt stays unresolved', () => {
     dir = mkdtempSync(join(tmpdir(), 'coopanion-action-receipts-'));
     const file = join(dir, 'receipts.json');

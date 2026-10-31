@@ -67,6 +67,7 @@ const ru: Translation<CoreText> = {
 
   browserAction: {
     platformWrite: 'поставить отметку, сохранить или подписаться', imageGeneration: 'создать изображение', imageSaving: 'сохранить созданное изображение',
+    imageGenerationDetails: (prompt: string) => `Будет отправлен один запрос. Он может расходовать лимит аккаунта ChatGPT или повлечь расходы.\n\nЗапрос:\n${prompt}`,
     imageStaging: 'временно подготовить созданное изображение для проверки',
     imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `Файл: ${file}\nРазмер: ${bytes} байт\nТип: ${mime}\nSHA-256: ${digest}\nСохранить в: локальная папка медиа`,
     mediaUpload: 'загрузить медиафайлы',

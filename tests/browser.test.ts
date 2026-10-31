@@ -301,9 +301,90 @@ describe('browser World', () => {
     };
     await run(world, 'browser_open', { url: 'https://chatgpt.com/' });
     const out = await run(world, 'browser_chatgpt_generate_image', { prompt: 'A cozy little whale beside a window' });
+    const retry = await run(world, 'browser_chatgpt_generate_image', { prompt: 'A cozy little whale beside a window' });
     expect(out.failed).toBe(true);
     expect(out.text).toContain('不要再次提交');
+    expect(retry.failed).toBe(true);
+    expect(retry.text).toContain('没有重发');
     expect(bridge.calls.filter((call) => call.op === 'chatgpt-generate-image')).toHaveLength(1);
+  });
+
+  it('tracks a one-shot image task from the exact prompt turn through a newly observed assistant image', async () => {
+    const prompt = 'A small whale reading beside a rainy window';
+    const questions: string[] = [];
+    const { world, bridge, taskJournalFile } = await make({
+      self: { actions: true, imageGeneration: true, mediaDownload: true },
+      ask: async (question) => { questions.push(question); return 'yes'; },
+    });
+    const chatgpt = { ...page({ url: 'https://chatgpt.com/c/abc', title: 'ChatGPT', content: 'Message' }), snapshotId: 'chatgpt-snapshot' };
+    bridge.responses.open = chatgpt;
+    bridge.responses.read = chatgpt;
+    bridge.responses['chatgpt-composer'] = { id: 'composer-1', snapshotId: 'chatgpt-snapshot' };
+    bridge.responses['chatgpt-generate-image'] = (args: Record<string, unknown>) => ({
+      submitted: true,
+      task: {
+        taskId: args.taskId, promptDigest: args.promptDigest, status: 'prompt_submitted',
+        userTurnDigest: 'b'.repeat(64), evidenceDigest: 'c'.repeat(64),
+      },
+      state: chatgpt,
+      base64: Buffer.from('page').toString('base64'), width: 640, height: 480,
+    });
+    let polls = 0;
+    bridge.responses['chatgpt-image-status'] = (args: Record<string, unknown>) => ({
+      taskId: args.taskId, promptDigest: args.promptDigest,
+      status: ++polls === 1 ? 'generating' : 'image_available',
+      imageCount: polls === 1 ? 0 : 1, evidenceDigest: (polls === 1 ? 'd' : 'e').repeat(64),
+    });
+
+    await run(world, 'browser_open', { url: chatgpt.url });
+    const submitted = await run(world, 'browser_chatgpt_generate_image', { prompt });
+    expect(submitted.failed).toBeUndefined();
+    expect(submitted.text).toContain('prompt_submitted');
+    expect(questions[0]).toContain(prompt);
+    expect(questions[0]).toContain('额度');
+    const journalAfterSubmit = JSON.parse(readFileSync(taskJournalFile, 'utf8')) as Array<{ taskId: string; phase: string; payloadDigest: string }>;
+    const action = journalAfterSubmit.at(-1)!;
+    expect(action.taskId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(action.phase).toBe('submitted');
+    expect(action.payloadDigest).toMatch(/^[a-f0-9]{64}$/);
+    expect(JSON.stringify(journalAfterSubmit)).not.toContain(prompt);
+    const overlapping = await run(world, 'browser_chatgpt_generate_image', { prompt: 'A different image request' });
+    expect(overlapping.failed).toBe(true);
+    expect(bridge.calls.filter((call) => call.op === 'chatgpt-generate-image')).toHaveLength(1);
+    const directory = dirname(taskJournalFile);
+    const mediaPage = {
+      ...chatgpt,
+      mediaTargets: [{ index: 0, token: 'a'.repeat(64), mediaType: 'image' as const, label: 'Generated whale', host: 'files.oaiusercontent.com', filenameHint: 'generated.png' }],
+    };
+    bridge.responses.read = mediaPage;
+    await run(world, 'browser_read', {});
+    const beforeImage = await run(world, 'browser_download_media', {
+      index: 0, directory, filename: 'generated.png', maxBytes: 1024, taskId: action.taskId,
+    });
+    expect(beforeImage.failed).toBe(true);
+    expect(bridge.calls.some((call) => call.op === 'download-media')).toBe(false);
+
+    const generating = await run(world, 'browser_chatgpt_image_status', { taskId: action.taskId });
+    expect(generating.text).toContain('generating');
+    const available = await run(world, 'browser_chatgpt_image_status', { taskId: action.taskId });
+    expect(available.text).toContain('image_available');
+    expect(available.text).toContain('1');
+    const journalAfterImage = JSON.parse(readFileSync(taskJournalFile, 'utf8')) as Array<{ taskId: string; phase: string; evidence: Array<{ status: string }> }>;
+    expect(journalAfterImage.at(-1)).toMatchObject({ taskId: action.taskId, phase: 'verified' });
+    expect(journalAfterImage.at(-1)?.evidence.map((item) => item.status)).toContain('image_available');
+
+    bridge.responses['download-media'] = {
+      status: 'download_verified', file: 'generated.png', path: join(directory, 'generated.png'), sourceHost: 'files.oaiusercontent.com',
+      mediaType: 'image', mime: 'image/png', bytes: 512, digest: 'f'.repeat(64),
+      stages: ['downloading', 'saved_unverified', 'download_verified'].map((status) => ({ status, observedAt: Date.now() })),
+    };
+    const downloaded = await run(world, 'browser_download_media', {
+      index: 0, directory, filename: 'generated.png', maxBytes: 1024, taskId: action.taskId,
+    });
+    expect(downloaded.failed, downloaded.text).toBeUndefined();
+    expect(downloaded.text).toContain('SHA-256');
+    expect(bridge.calls.find((call) => call.op === 'download-media')?.args).toMatchObject({ imageTaskId: action.taskId });
+    expect(questions[1]).toContain(action.taskId);
   });
 
   it('requires the Core approval bubble to submit an image prompt', async () => {
@@ -315,6 +396,7 @@ describe('browser World', () => {
     await run(world, 'browser_open', { url: 'https://chatgpt.com/' });
     const out = await run(world, 'browser_chatgpt_generate_image', { prompt: 'A blue whale' });
     expect(out.failed).toBe(true);
+    expect(out.text).toContain('not_dispatched');
     expect(bridge.calls.some((call) => call.op === 'chatgpt-generate-image')).toBe(false);
   });
 

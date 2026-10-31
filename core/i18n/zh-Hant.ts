@@ -61,6 +61,7 @@ const zhHant: Translation<CoreText> = {
 
   browserAction: {
     platformWrite: '按讚、收藏或追蹤', imageGeneration: '網頁生圖', imageSaving: '儲存生成圖片',
+    imageGenerationDetails: (prompt: string) => `本次提交 1 條提示詞，可能使用 ChatGPT 帳號額度或產生費用。\n\n提示詞：\n${prompt}`,
     imageStaging: '暫存生成圖片並核驗',
     imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `檔案：${file}\n大小：${bytes} 位元組\n類型：${mime}\nSHA-256：${digest}\n儲存至：本機素材目錄`,
     mediaUpload: '上傳素材',

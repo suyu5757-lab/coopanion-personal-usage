@@ -160,8 +160,9 @@ export interface BrowserText {
   mediaTargets(values: NonNullable<PageState['mediaTargets']>): string;
   mediaDownloaded(file: string, path: string, host: string, mediaType: string, mime: string, bytes: number, digest: string): string;
   uploadedMedia(files: string[]): string;
-  chatGPTImageSubmitted: string;
+  chatGPTImageSubmitted(taskId: string, promptDigest: string): string;
   chatGPTImageUnknown: string;
+  chatGPTImageTaskStatus(taskId: string, status: 'not_dispatched' | 'prompt_submitted' | 'generating' | 'image_available' | 'unknown' | 'failed', imageCount: number, promptDigest: string): string;
   chatGPTImageSaved(file: string, bytes: number): string;
   draftUnreadable: string;
   unresolved(count: number): string;
@@ -258,8 +259,9 @@ const zh: BrowserText = {
     : '',
   mediaDownloaded: (file, path, host, mediaType, mime, bytes, digest) => `[浏览器] 已验证下载 ${mediaType}：${host} → ${path}\n文件：${file} · 类型：${mime} · 大小：${bytes} 字节 · SHA-256：${digest}`,
   uploadedMedia: (files) => `[浏览器] 已将以下素材放入网页投稿控件：\n${files.map((file) => `- ${file}`).join('\n')}\n请检查页面预览、数量和顺序；这一步没有提交作品。`,
-  chatGPTImageSubmitted: '[浏览器] 已通过 ChatGPT 网页提交图片提示词。生成可能需要几分钟；查看页面结果后再保存，不要重复提交这条提示词。',
+  chatGPTImageSubmitted: (taskId, digest) => `[浏览器] 已通过 ChatGPT 网页提交一次图片任务。任务：${taskId} · 提示词摘要 SHA-256：${digest} · 状态：prompt_submitted。用 browser_chatgpt_image_status 查看这次任务，不要重新提交。`,
   chatGPTImageUnknown: '[浏览器] ChatGPT 页面没有给出可核验的提交结果。先重新读取页面确认状态，不要再次提交相同提示词。',
+  chatGPTImageTaskStatus: (taskId, status, imageCount, digest) => `[浏览器] ChatGPT 图片任务状态：${status} · 任务：${taskId} · 可见新图数量：${imageCount} · 提示词摘要 SHA-256：${digest}`,
   chatGPTImageSaved: (file, bytes) => `[浏览器] 已将 ChatGPT 生成图片保存到视频素材目录：${file}（${Math.ceil(bytes / 1024)} KB）。`,
   draftUnreadable: '[浏览器] 读不到输入框里现在的内容,没有按发送。',
   unresolved: (count) => `[浏览器] 上次有 ${count} 条内容不知道有没有发出去;去网页上确认一下,不要直接重发。`,
@@ -353,8 +355,9 @@ const en: BrowserText = {
     : '',
   mediaDownloaded: (file, path, host, mediaType, mime, bytes, digest) => `[browser] Verified ${mediaType} download: ${host} → ${path}\nFile: ${file} · type: ${mime} · size: ${bytes} bytes · SHA-256: ${digest}`,
   uploadedMedia: (files) => `[browser] Added these media files to the page's upload control:\n${files.map((file) => `- ${file}`).join('\n')}\nCheck the page preview, count and order; this did not publish the post.`,
-  chatGPTImageSubmitted: '[browser] The image prompt was submitted through the ChatGPT website. Generation may take a few minutes; read the result and save it when ready. Do not submit the prompt again.',
+  chatGPTImageSubmitted: (taskId, digest) => `[browser] One image task was submitted through the ChatGPT website. Task: ${taskId} · prompt digest SHA-256: ${digest} · state: prompt_submitted. Use browser_chatgpt_image_status to inspect this task; do not submit it again.`,
   chatGPTImageUnknown: '[browser] The ChatGPT page did not confirm whether the prompt was submitted. Read the page before deciding; do not submit the same prompt again.',
+  chatGPTImageTaskStatus: (taskId, status, imageCount, digest) => `[browser] ChatGPT image task state: ${status} · task: ${taskId} · visible new images: ${imageCount} · prompt digest SHA-256: ${digest}`,
   chatGPTImageSaved: (file, bytes) => `[browser] Saved the ChatGPT image in the video media folder: ${file} (${Math.ceil(bytes / 1024)} KB).`,
   draftUnreadable: '[browser] The box\'s current text could not be read, so nothing was submitted.',
   unresolved: (count) => `[browser] ${count} earlier item${count === 1 ? '' : 's'} may or may not have been sent; check the page and do not send again blindly.`,
