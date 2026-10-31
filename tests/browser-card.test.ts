@@ -83,10 +83,27 @@ describe('share target', () => {
 });
 
 describe('current video evidence', () => {
-  it('names the playing video\'s own link and title', () => {
-    document.body.innerHTML = '<article id="card"><a href="https://www.douyin.com/video/123" aria-label="海边的下午"></a></article>';
+  it('binds the playing video to its item, author and semantic card evidence', () => {
+    document.body.innerHTML = '<article id="card"><a href="https://www.douyin.com/video/123" aria-label="海边的下午"></a><a href="/user/creator-1">阿青</a></article>';
     document.getElementById('card')!.prepend(video(true));
-    expect(videoEvidence(document)).toEqual({ url: 'https://www.douyin.com/video/123', title: '海边的下午' });
+    const evidence = videoEvidence(document);
+    expect(evidence).toMatchObject({
+      url: 'https://www.douyin.com/video/123',
+      title: '海边的下午',
+      itemId: '123',
+      authorRef: `${location.origin}/user/creator-1`,
+      authorLabel: '阿青',
+      contentSnippet: '海边的下午',
+      containerIdentity: 'article::card:',
+      playing: true,
+    });
+    expect(evidence?.observedAt).toEqual(expect.any(Number));
+  });
+
+  it('leaves author identity empty when a card has multiple profile links', () => {
+    document.body.innerHTML = '<article id="card"><a href="https://www.douyin.com/video/123" aria-label="海边的下午"></a><a href="/user/a">阿青</a><a href="/user/b">小鱼</a></article>';
+    document.getElementById('card')!.prepend(video(true));
+    expect(videoEvidence(document)?.authorRef).toBe('');
   });
 
   it('claims no link when the page carries none, rather than the page address', () => {

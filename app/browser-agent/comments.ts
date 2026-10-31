@@ -44,6 +44,7 @@ function textOutsideControls(row: HTMLElement): string {
 interface RowEvidence {
   identity: string;
   author: string;
+  authorRef: string;
   commentText: string;
   context: string;
   timestamp: string;
@@ -63,6 +64,19 @@ function rowEvidence(row: HTMLElement, postUrl: string): RowEvidence | null {
   const authors = [...new Set(candidates)];
   if (authors.length !== 1) return null;
   const author = authors[0]!;
+
+  const authorRefs = Array.from(row.querySelectorAll<HTMLAnchorElement>('a[href]'))
+    .filter((anchor) => visible(anchor) && insideThisRow(anchor, row) && !anchor.closest(REPLY_CONTAINERS))
+    .flatMap((anchor) => {
+      try {
+        const url = new URL(anchor.getAttribute('href') || anchor.href, post);
+        if (url.origin !== new URL(post).origin || !/^\/user\/[^/]+\/?$/.test(url.pathname)) return [];
+        return [`${url.origin}${url.pathname.replace(/\/$/, '')}`];
+      } catch { return []; }
+    });
+  const uniqueAuthorRefs = [...new Set(authorRefs)];
+  const authorRef = uniqueAuthorRefs.length === 1 ? uniqueAuthorRefs[0]! : '';
+  if (/^(?:www\.)?douyin\.com$/i.test(new URL(post).hostname) && !authorRef) return null;
 
   const semanticText = Array.from(row.querySelectorAll<HTMLElement>(
     '[data-e2e*="comment-content" i], [data-e2e*="comment-text" i], [class*="comment-content" i], [class*="comment-text" i]',
@@ -86,14 +100,14 @@ function rowEvidence(row: HTMLElement, postUrl: string): RowEvidence | null {
   const needsExpand = controls.some((control) => EXPAND_REPLIES.test(clean(control.innerText || control.textContent || '')));
   const stableId = row.getAttribute('data-comment-id') || row.getAttribute('data-id');
   const identity = stableId
-    ? JSON.stringify(['id', post, stableId, author])
-    : JSON.stringify(['text', post, author, body, timestamp]);
-  return { identity, author, commentText: body, context, timestamp, needsExpand };
+    ? JSON.stringify(['id', post, stableId, authorRef || author])
+    : JSON.stringify(['text', post, authorRef || author, body, timestamp]);
+  return { identity, author, authorRef, commentText: body, context, timestamp, needsExpand };
 }
 
 /** Binds a visible reply editor only when its comment row has one readable author and unique evidence. */
 export async function replyTargetForBox(doc: Document, box: HTMLElement, boxId: number, postUrl: string): Promise<{
-  boxId: number; fingerprint: string; evidenceHash: string; author: string; context: string; timestamp: string; needsExpand: boolean;
+  boxId: number; fingerprint: string; evidenceHash: string; author: string; authorRef: string; context: string; timestamp: string; needsExpand: boolean;
 } | null> {
   if (!visible(box) || !REPLY_BOX.test([box.getAttribute('aria-label'), box.getAttribute('placeholder'), box.getAttribute('data-placeholder')].filter(Boolean).join(' '))) return null;
   const row = box.closest<HTMLElement>(ROW);
@@ -110,9 +124,9 @@ export async function replyTargetForBox(doc: Document, box: HTMLElement, boxId: 
   try {
     const [fingerprint, evidenceHash] = await Promise.all([
       hash(evidence.identity),
-      hash(JSON.stringify([evidence.author, evidence.context, evidence.timestamp, evidence.needsExpand])),
+      hash(JSON.stringify([evidence.author, evidence.authorRef, evidence.context, evidence.timestamp, evidence.needsExpand])),
     ]);
-    return { boxId, fingerprint, evidenceHash, author: evidence.author, context: evidence.context, timestamp: evidence.timestamp, needsExpand: evidence.needsExpand };
+    return { boxId, fingerprint, evidenceHash, author: evidence.author, authorRef: evidence.authorRef, context: evidence.context, timestamp: evidence.timestamp, needsExpand: evidence.needsExpand };
   } catch {
     return null;
   }

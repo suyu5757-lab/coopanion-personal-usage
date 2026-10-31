@@ -17,7 +17,7 @@ describe('comment reply targets', () => {
     const row = document.querySelector('article')!;
     const box = row.querySelector('textarea')!;
     const target = await replyTargetForBox(document, box, 4, 'https://www.douyin.com/video/123');
-    expect(target).toMatchObject({ boxId: 4, author: '阿青', timestamp: '2026-10-28T03:00:00Z', needsExpand: false });
+    expect(target).toMatchObject({ boxId: 4, author: '阿青', authorRef: 'https://www.douyin.com/user/u-1', timestamp: '2026-10-28T03:00:00Z', needsExpand: false });
     expect(target?.fingerprint).toMatch(/^[a-f0-9]{64}$/);
     expect(target?.evidenceHash).toMatch(/^[a-f0-9]{64}$/);
     expect(target?.context).toContain('这段配色好舒服');

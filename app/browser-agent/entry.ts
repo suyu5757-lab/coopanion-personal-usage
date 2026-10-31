@@ -30,10 +30,11 @@ interface AgentElement {
   visible: boolean;
   filePicker: boolean;
   snapshotId: string;
+  pressed?: boolean;
 }
 
 /** An element's number and the label it was read with, so a renumbered page can be spotted. */
-interface AgentElementLite { id: number; label: string }
+interface AgentElementLite { id: number; label: string; pressed?: boolean }
 
 interface AgentState {
   url: string;
@@ -43,11 +44,11 @@ interface AgentState {
   footer: string;
   video: VideoState | null;
   elements: AgentElementLite[];
-  current: { url: string; title: string } | null;
+  current: ReturnType<typeof videoEvidence>;
   account: { ref: string; label: string } | null;
   timestamps: Array<{ text: string; datetime: string; context: string }>;
   fileInputs: Array<{ id: number; label: string; accept: string; multiple: boolean; disabled: boolean; visible: boolean }>;
-  replyTargets: Array<{ boxId: number; fingerprint: string; evidenceHash: string; author: string; context: string; timestamp: string; needsExpand: boolean }>;
+  replyTargets: Array<{ boxId: number; fingerprint: string; evidenceHash: string; author: string; authorRef: string; context: string; timestamp: string; needsExpand: boolean }>;
   statusMessages: string[];
   snapshotId: string;
 }
@@ -146,7 +147,7 @@ if (!host[KEY]) {
 
   /** Changes when the live page reuses, reorders or scrolls an indexed target. */
   const snapshotId = (): string => {
-    const current = videoEvidence(document)?.url ?? '';
+    const current = videoEvidence(document);
     const account = accountEvidence(document)?.ref ?? '';
     const scopeCache = new WeakMap<HTMLElement, unknown[]>();
     const scopeEvidenceFor = (element: HTMLElement): unknown[] => {
@@ -197,7 +198,10 @@ if (!host[KEY]) {
     const files = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'))
       .map((input) => [elementId(input), input.accept, input.multiple, input.disabled])
       .sort((a, b) => Number(a[0]) - Number(b[0]));
-    const source = JSON.stringify([location.href, current, account, scrollOffsets(), rows, files]);
+    const source = JSON.stringify([location.href, current && [
+      current.url, current.title, current.itemId, current.authorRef, current.authorLabel,
+      current.contentSnippet, current.containerIdentity, current.playing,
+    ], account, scrollOffsets(), rows, files]);
     let a = 2166136261, b = 2246822519;
     for (let index = 0; index < source.length; index++) {
       const code = source.charCodeAt(index);
@@ -325,6 +329,9 @@ if (!host[KEY]) {
       visible: !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length),
       filePicker: isFileChooserTarget(element),
       snapshotId: snapshotId(),
+      ...((element.getAttribute('aria-pressed') === 'true' || element.getAttribute('aria-pressed') === 'false')
+        ? { pressed: element.getAttribute('aria-pressed') === 'true' }
+        : {}),
     };
   };
 
@@ -338,7 +345,8 @@ if (!host[KEY]) {
       const label = currentElementLabel(element)
         || (shareMarked.has(element) ? '分享' : '')
         || (internals.elementTextMap?.get(index) ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
-      list.push({ id: index, label });
+      const pressed = element.getAttribute('aria-pressed');
+      list.push({ id: index, label, ...((pressed === 'true' || pressed === 'false') ? { pressed: pressed === 'true' } : {}) });
     }
     return list;
   };
@@ -404,6 +412,20 @@ if (!host[KEY]) {
     const input = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]')).find((candidate) => elementId(candidate) === id);
     if (!input || !input.isConnected) return null;
     return { names: Array.from(input.files ?? []).map((file) => file.name), accept: input.accept, multiple: input.multiple };
+  };
+
+  const uploadObservation = async (id: number) => {
+    await readPage();
+    const input = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]')).find((candidate) => elementId(candidate) === id);
+    return {
+      url: location.href,
+      snapshotId: snapshotId(),
+      account: accountEvidence(document),
+      statusMessages: statusMessages(),
+      selection: input?.isConnected
+        ? { names: Array.from(input.files ?? []).map((file) => file.name), accept: input.accept, multiple: input.multiple }
+        : null,
+    };
   };
 
   const chatGPTComposerTarget = async (): Promise<{ ok: true; id: number; snapshotId: string } | { ok: false; reason: string }> => {
@@ -709,7 +731,7 @@ if (!host[KEY]) {
     shareOpen: (): boolean => sharePanelOpen(document),
     viewport: (): { width: number; height: number } => ({ width: window.innerWidth, height: window.innerHeight }),
     pointTarget: async (x: number, y: number, expectedSnapshotId?: string): Promise<
-      | { ok: true; target: { token: string; label: string; tag: string; role: string; type: string; placeholder: string; href: string; disabled: boolean; filePicker: boolean; snapshotId: string } }
+      | { ok: true; target: { token: string; label: string; tag: string; role: string; type: string; placeholder: string; href: string; disabled: boolean; filePicker: boolean; snapshotId: string; pressed?: boolean } }
       | { ok: false; reason: ActionabilityFailure | 'invalid' | 'none' | 'file' | 'stale-snapshot' }
     > => {
       await readPage();
@@ -741,6 +763,9 @@ if (!host[KEY]) {
         disabled: element.matches(':disabled') || element.getAttribute('aria-disabled') === 'true',
         filePicker: isFileChooserTarget(element),
         snapshotId: snapshotId(),
+        ...((element.getAttribute('aria-pressed') === 'true' || element.getAttribute('aria-pressed') === 'false')
+          ? { pressed: element.getAttribute('aria-pressed') === 'true' }
+          : {}),
       };
       return { ok: true, target };
     },
@@ -790,6 +815,7 @@ if (!host[KEY]) {
     fileInputTarget,
     releaseFileInput,
     fileInputSelection,
+    uploadObservation,
     chatGPTImageSaveTarget: async (index: number, expectedSnapshotId?: string): Promise<boolean> => {
       await readPage();
       if (!isChatGPTPage(location.href) || (expectedSnapshotId && snapshotId() !== expectedSnapshotId)) return false;

@@ -984,6 +984,13 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     };
   };
 
+  const inspectUploadProgress = async (message) => {
+    if (!win || !isDouyinPageUrl(win.webContents.getURL())) throw new Error('open a Douyin Creator Center upload page first');
+    if (!Number.isInteger(message.fileId) || message.fileId < 0) throw new Error('a current file input id is required');
+    await ensureAgent();
+    return agentCall('uploadObservation', [message.fileId]);
+  };
+
   const result = async (message) => {
     const op = message.op;
     if (!['state', 'screenshot', 'inspect-screenshot-point', 'click-screenshot-point', 'element', 'active', 'read', 'find', 'resolveLocator'].includes(op)) {
@@ -1004,6 +1011,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     if (op === 'commit-staged-chatgpt-image') return commitStagedChatGPTImage(message);
     if (op === 'discard-staged-chatgpt-image') return discardStagedChatGPTImage(message);
     if (op === 'inspect-upload') return inspectUpload(message);
+    if (op === 'inspect-upload-progress') return inspectUploadProgress(message);
     if (op === 'upload-media') return uploadMedia(message);
     if (op === 'close') { closeWindow(); return { closed: true }; }
     if (op === 'state') return { open: !!win && !win.isDestroyed(), url: win?.webContents.getURL() ?? '', title: win?.getTitle() ?? '' };

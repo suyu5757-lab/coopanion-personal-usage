@@ -91,7 +91,19 @@ export function shareTarget(doc: Document): ShareTarget {
 }
 
 /** The video's own link and title, when the page carries one near the playing video. */
-export function videoEvidence(doc: Document): { url: string; title: string } | null {
+export interface VideoIdentityEvidence {
+  url: string;
+  title: string;
+  itemId: string;
+  authorRef: string;
+  authorLabel: string;
+  contentSnippet: string;
+  containerIdentity: string;
+  playing: boolean;
+  observedAt: number;
+}
+
+export function videoEvidence(doc: Document): VideoIdentityEvidence | null {
   const choice = chosenVideo(doc);
   if (!choice.ok) return null;
   const card = videoCard(choice.video);
@@ -102,7 +114,40 @@ export function videoEvidence(doc: Document): { url: string; title: string } | n
   const link = links[0]!;
   const title = (link.getAttribute('aria-label') || link.getAttribute('title') || link.innerText || '')
     .replace(/\s+/g, ' ').trim().slice(0, 120);
-  return { url: link.href.slice(0, 500), title };
+  let itemId = '';
+  try {
+    const url = new URL(link.href);
+    itemId = url.pathname.match(/\/video\/([^/]+)/)?.[1] ?? url.searchParams.get('item_id') ?? '';
+  } catch { /* the anchor's href is still preserved below */ }
+  const authors = Array.from(card.querySelectorAll<HTMLAnchorElement>('a[href]'))
+    .filter(visible)
+    .flatMap((anchor) => {
+      try {
+        const url = new URL(anchor.href);
+        if (url.origin !== doc.location.origin || !/^\/user\/[^/]+\/?$/.test(url.pathname)) return [];
+        return [{
+          ref: `${url.origin}${url.pathname.replace(/\/$/, '')}`,
+          label: (anchor.getAttribute('aria-label') || anchor.getAttribute('title') || anchor.innerText || anchor.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+        }];
+      } catch { return []; }
+    });
+  const uniqueAuthors = [...new Map(authors.map((author) => [author.ref, author])).values()];
+  const author = uniqueAuthors.length === 1 ? uniqueAuthors[0]! : null;
+  const containerIdentity = [
+    card.tagName.toLowerCase(), card.getAttribute('data-e2e') ?? '', card.id, card.getAttribute('role') ?? '',
+  ].join(':');
+  const contentSnippet = title.slice(0, 240);
+  return {
+    url: link.href.slice(0, 500),
+    title,
+    itemId,
+    authorRef: author?.ref ?? '',
+    authorLabel: author?.label ?? '',
+    contentSnippet,
+    containerIdentity,
+    playing: !choice.video.paused && choice.video.currentTime > 0,
+    observedAt: Date.now(),
+  };
 }
 
 /** A logged-in account link only when the page names it explicitly and the destination is unique. */

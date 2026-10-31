@@ -43,8 +43,8 @@ vi.mock('@page-agent/page-controller', () => ({
 }));
 
 const agent = () => (window as unknown as { __cooBrowserAgent: {
-  state(): Promise<{ snapshotId: string; elements: Array<{ id: number; label: string }>; timestamps: Array<{ text: string; datetime: string; context: string }> }>;
-  element(index: number): Promise<{ label: string; snapshotId: string; dataE2e: string } | null>;
+  state(): Promise<{ snapshotId: string; elements: Array<{ id: number; label: string; pressed?: boolean }>; timestamps: Array<{ text: string; datetime: string; context: string }> }>;
+  element(index: number): Promise<{ label: string; snapshotId: string; dataE2e: string; pressed?: boolean } | null>;
   resolveLocator(locator: { role?: string; name?: string; testId?: string; within?: { role?: string; name?: string; testId?: string } }, snapshotId?: string): Promise<{ ok: true; id: number; snapshotId: string } | { ok: false; reason: string }>;
   fileInputTarget(id: number, snapshotId?: string): Promise<{ ok: true; token: string; accept: string; multiple: boolean; snapshotId: string } | { ok: false; reason: string }>;
   releaseFileInput(token: string): void;
@@ -111,6 +111,15 @@ describe('browser page target snapshots', () => {
     expect(second.snapshotId).not.toBe(first.snapshotId);
   });
 
+  it('reports aria-pressed state with both element and page evidence', async () => {
+    document.body.innerHTML = '<article aria-label="Video A"><button aria-label="Like" aria-pressed="false">Like</button></article>';
+    await import('../app/browser-agent/entry.ts');
+    const state = await agent().state();
+    const index = state.elements.find((item) => item.label === 'Like')!.id;
+
+    expect(await agent().element(index)).toMatchObject({ pressed: false });
+    expect(state.elements.find((item) => item.id === index)).toMatchObject({ pressed: false });
+  });
 
   it('exposes a stable page attribute and refuses a covered indexed click before dispatch', async () => {
     document.body.innerHTML = '<button data-e2e="submit">Continue</button><div id="overlay"></div>';
