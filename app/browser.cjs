@@ -12,10 +12,11 @@
  * closes when the app quits. A page's `target=_blank` link is loaded here as well, not in a second window.
  * The app uses Electron's internal debugger only to set a validated media selection on a page file input; it
  * does not open a remote debugging port.
- * Requests to this machine and the local network are cancelled, so a page cannot reach the Core's console
- * or the pet's server. WebSocket requests are refused until their network peer can be checked.
+ * Its loopback proxy resolves each named destination, rejects non-public answers, and opens TCP sockets to the
+ * checked numeric address. The Browser session does not use the macOS system HTTP/HTTPS proxy. WebSocket requests
+ * and non-proxied WebRTC UDP are blocked.
  */
-const { BrowserWindow, screen, session } = require('electron');
+const { app, BrowserWindow, screen, session } = require('electron');
 const { randomUUID } = require('node:crypto');
 const { constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync } = require('node:fs');
 const { dirname, join } = require('node:path');
@@ -23,7 +24,8 @@ const { MAX_IMAGE_BYTES, generatedImagePath, isChatGPTImageDownloadUrl, isChatGP
 const { acceptsUpload, isDouyinPageUrl, resolveUploadFiles } = require('./browser-upload.cjs');
 const { imagePointToViewport } = require('./browser-visual-point.cjs');
 const { compositeSnapshotId, inspectFrameHost, mapFramePointToMain: mapFramePoint } = require('./browser-frame-bridge.cjs');
-const { isPublicResolvedHost, isWebSocketRequest } = require('./browser-network-policy.cjs');
+const { createBrowserEgressProxy } = require('./browser-egress-proxy.cjs');
+const { httpUrl, isPublicHttp, isPublicResolvedHost, isWebSocketRequest } = require('./browser-network-policy.cjs');
 const { setFileInputFiles } = require('./browser-cdp-upload.cjs');
 
 const PARTITION = 'persist:coo-browser';
@@ -44,30 +46,6 @@ function userAgent() {
       : 'X11; Linux x86_64';
   return `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${process.versions.chrome} Safari/537.36`;
 }
-
-const httpUrl = (value) => {
-  try {
-    const url = new URL(String(value));
-    return url.protocol === 'http:' || url.protocol === 'https:' ? url : null;
-  } catch { return null; }
-};
-
-/**
- * Public pages only: the window must not reach the Core's own console, the pet server or another
- * service on this machine or the local network. URL checks are followed by resolved-address checks.
- */
-const PRIVATE_V4 = /^(?:10\.|127\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/;
-const LOCAL_NAMES = ['.localhost', '.local', '.internal', '.lan', '.home'];
-const isPublicHttp = (value) => {
-  const url = httpUrl(value);
-  if (!url) return false;
-  const host = url.hostname.toLowerCase();
-  if (host === 'localhost' || host === '0.0.0.0' || host.startsWith('[')) return false;
-  // public sites are named: a single label is an intranet name, and an IP literal is not needed
-  if (!host.includes('.') || /^[0-9.]+$/.test(host)) return false;
-  if (LOCAL_NAMES.some((suffix) => host === suffix.slice(1) || host.endsWith(suffix))) return false;
-  return !PRIVATE_V4.test(host);
-};
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 /** A tab recording decodes its audio in the page after the stop; give that call more room than a page read. */
@@ -97,6 +75,10 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
   let agent = null;
   /** One verified ChatGPT image download requested by Coo's image-save tool. */
   let pendingImageDownload = null;
+  let egressProxy = null;
+  let networkReady = null;
+  let creatingWindow = null;
+  let proxyLoginHandler = null;
   /** The latest screenshot's one-use viewport mapping. */
   let activeVisualCapture = null;
   let compositeStateCache = null;
@@ -656,121 +638,166 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     activeVisualCapture = null;
   };
 
-  const ensureWindow = () => {
+  const ensureNetworkRoute = (ses) => {
+    if (networkReady) return networkReady;
+    const username = 'coopanion-browser';
+    const password = randomUUID();
+    const proxy = createBrowserEgressProxy({
+      resolveHost: (hostname) => ses.resolveHost(hostname, { cacheUsage: 'allowed' }),
+      username,
+      password,
+    });
+    egressProxy = proxy;
+    networkReady = (async () => {
+      const { port } = await proxy.listen();
+      proxyLoginHandler = (event, contents, _details, authInfo, callback) => {
+        if (!authInfo?.isProxy || authInfo.host !== '127.0.0.1' || authInfo.port !== port
+          || contents?.session !== ses) return;
+        event.preventDefault();
+        callback(username, password);
+      };
+      app.on('login', proxyLoginHandler);
+      await ses.setProxy({
+        mode: 'fixed_servers',
+        proxyRules: `http=127.0.0.1:${port};https=127.0.0.1:${port}`,
+      });
+      await ses.closeAllConnections();
+    })().catch(async (error) => {
+      networkReady = null;
+      egressProxy = null;
+      if (proxyLoginHandler) app.removeListener('login', proxyLoginHandler);
+      proxyLoginHandler = null;
+      await proxy.close();
+      throw error;
+    });
+    return networkReady;
+  };
+
+  const ensureWindow = async () => {
     if (win && !win.isDestroyed()) return win;
-    const area = screen.getPrimaryDisplay().workArea;
-    const width = Math.min(WINDOW_WIDTH, Math.max(680, area.width - 160));
-    const height = Math.min(WINDOW_HEIGHT, Math.max(520, area.height - 200));
-    const ses = session.fromPartition(partition);
-    ses.setSpellCheckerEnabled(false);
-    // only the page script's own recording may ask for display media; everything else stays denied
-    const capturePermission = (permission, details) => {
-      if (!audioCaptureRequested) return false;
-      if (permission === 'display-capture') return true;
-      if (permission !== 'media') return false;
-      // getDisplayMedia asks with no media types; a direct getUserMedia names audio or video
-      const types = details && details.mediaTypes;
-      return !Array.isArray(types) || types.length === 0;
-    };
-    ses.setPermissionRequestHandler((_contents, permission, callback, details) => callback(capturePermission(permission, details)));
-    ses.setPermissionCheckHandler((_contents, permission) => audioCaptureRequested && (permission === 'display-capture' || permission === 'media'));
-    ses.setDisplayMediaRequestHandler((request, callback) => {
-      const frame = request.frame;
-      if (!audioCaptureRequested || !frame) { callback({}); return; }
-      // the whole tab's audio, not this machine's or another window's; echo off keeps it silent
-      callback({ audio: frame });
-    });
-    ses.setDevicePermissionHandler(() => false);
-    ses.on('will-download', handleImageDownload);
-    // Check the session's resolved endpoints before every HTTP request, including frame subresources.
-    ses.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*', 'ws://*/*', 'wss://*/*'] }, (details, callback) => {
-      if (isWebSocketRequest(details)) { callback({ cancel: true }); return; }
-      void isPublicDestination(details.url)
-        .then((allowed) => callback({ cancel: !allowed }))
-        .catch(() => callback({ cancel: true }));
-    });
-    win = new BrowserWindow({
-      width, height,
-      x: Math.max(area.x, area.x + area.width - width - 48),
-      // leave the bottom of the screen to the pet
-      y: Math.max(area.y, area.y + area.height - height - 120),
-      minWidth: 640, minHeight: 480,
-      title: 'Coo', icon,
-      show: false,
-      autoHideMenuBar: true,
-      backgroundColor: '#0f1115',
-      webPreferences: {
-        partition,
-        contextIsolation: true,
-        nodeIntegration: false,
-        sandbox: true,
-        spellcheck: false,
-        backgroundThrottling: false,
-        webviewTag: false,
-        navigateOnDragDrop: false,
-      },
-    });
-    const wc = win.webContents;
-    wc.setUserAgent(userAgent());
-    wc.setAudioMuted(muted);
-    wc.setWindowOpenHandler(({ url }) => {
-      if (isPublicHttp(url)) void load(url).catch((error) => log.warn('[browser] popup load failed', error.message));
-      return { action: 'deny' };
-    });
-    const onlyPublic = (event, url) => { if (!isPublicHttp(url)) event.preventDefault(); };
-    wc.on('will-navigate', onlyPublic);
-    wc.on('will-redirect', onlyPublic);
-    wc.on('will-frame-navigate', (event) => {
-      activeVisualCapture = null;
-      if (event.isMainFrame || /^about:(blank|srcdoc)$/.test(event.url)) return;
-      if (!isPublicHttp(event.url)) event.preventDefault();
-    });
-    wc.on('did-navigate-in-page', () => { activeVisualCapture = null; });
-    wc.on('will-attach-webview', (event) => event.preventDefault());
-    wc.on('will-prevent-unload', (event) => event.preventDefault());
-    // a page does not take the whole screen from the person; video stays in Coo's window
-    wc.on('enter-html-full-screen', () => { if (win && !win.isDestroyed()) win.setFullScreen(false); });
-    // only a new main document replaces the page script; iframes and in-page routes keep it
-    wc.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
-      if (!isMainFrame || isInPlace) return;
-      injected = false;
-      navigating = true;
-      resetFrameState();
-      activeVisualCapture = null;
-      audioCaptureRequested = false;
-      restoreMute();
-    });
-    wc.on('did-finish-load', () => { injected = false; navigating = false; });
-    wc.on('did-fail-load', (_event, code, description, url, isMainFrame) => {
-      if (!isMainFrame) return;
-      navigating = false;
-      if (code !== -3) log.warn('[browser] page failed', { code, description, url });
-    });
-    wc.on('render-process-gone', (_event, details) => log.warn('[browser] renderer gone', details));
-    wc.on('page-title-updated', (event, title) => {
-      event.preventDefault();
-      const shown = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 80);
-      win?.setTitle(shown ? `Coo · ${shown}` : 'Coo');
-    });
-    win.once('ready-to-show', () => win?.showInactive());
-    win.on('closed', () => {
-      clearStagedChatGPTImages();
-      win = null;
-      injected = false;
-      resetFrameState();
-      activeVisualCapture = null;
-      navigating = false;
-      audioCaptureRequested = false;
-      send?.({ type: 'companion:browser-event', event: 'closed' });
-    });
-    return win;
+    if (creatingWindow) return creatingWindow;
+    creatingWindow = (async () => {
+      const area = screen.getPrimaryDisplay().workArea;
+      const width = Math.min(WINDOW_WIDTH, Math.max(680, area.width - 160));
+      const height = Math.min(WINDOW_HEIGHT, Math.max(520, area.height - 200));
+      const ses = session.fromPartition(partition);
+      await ensureNetworkRoute(ses);
+      ses.setSpellCheckerEnabled(false);
+      // only the page script's own recording may ask for display media; everything else stays denied
+      const capturePermission = (permission, details) => {
+        if (!audioCaptureRequested) return false;
+        if (permission === 'display-capture') return true;
+        if (permission !== 'media') return false;
+        // getDisplayMedia asks with no media types; a direct getUserMedia names audio or video
+        const types = details && details.mediaTypes;
+        return !Array.isArray(types) || types.length === 0;
+      };
+      ses.setPermissionRequestHandler((_contents, permission, callback, details) => callback(capturePermission(permission, details)));
+      ses.setPermissionCheckHandler((_contents, permission) => audioCaptureRequested && (permission === 'display-capture' || permission === 'media'));
+      ses.setDisplayMediaRequestHandler((request, callback) => {
+        const frame = request.frame;
+        if (!audioCaptureRequested || !frame) { callback({}); return; }
+        // the whole tab's audio, not this machine's or another window's; echo off keeps it silent
+        callback({ audio: frame });
+      });
+      ses.setDevicePermissionHandler(() => false);
+      ses.on('will-download', handleImageDownload);
+      // Check the session's resolved endpoints before every HTTP request, including frame subresources.
+      ses.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*', 'ws://*/*', 'wss://*/*'] }, (details, callback) => {
+        if (isWebSocketRequest(details)) { callback({ cancel: true }); return; }
+        void isPublicDestination(details.url)
+          .then((allowed) => callback({ cancel: !allowed }))
+          .catch(() => callback({ cancel: true }));
+      });
+      win = new BrowserWindow({
+        width, height,
+        x: Math.max(area.x, area.x + area.width - width - 48),
+        // leave the bottom of the screen to the pet
+        y: Math.max(area.y, area.y + area.height - height - 120),
+        minWidth: 640, minHeight: 480,
+        title: 'Coo', icon,
+        show: false,
+        autoHideMenuBar: true,
+        backgroundColor: '#0f1115',
+        webPreferences: {
+          partition,
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: true,
+          spellcheck: false,
+          backgroundThrottling: false,
+          webviewTag: false,
+          navigateOnDragDrop: false,
+        },
+      });
+      const wc = win.webContents;
+      wc.setWebRTCIPHandlingPolicy('disable_non_proxied_udp');
+      wc.setUserAgent(userAgent());
+      wc.setAudioMuted(muted);
+      wc.setWindowOpenHandler(({ url }) => {
+        if (isPublicHttp(url)) void load(url).catch((error) => log.warn('[browser] popup load failed', error.message));
+        return { action: 'deny' };
+      });
+      const onlyPublic = (event, url) => { if (!isPublicHttp(url)) event.preventDefault(); };
+      wc.on('will-navigate', onlyPublic);
+      wc.on('will-redirect', onlyPublic);
+      wc.on('will-frame-navigate', (event) => {
+        activeVisualCapture = null;
+        if (event.isMainFrame || /^about:(blank|srcdoc)$/.test(event.url)) return;
+        if (!isPublicHttp(event.url)) event.preventDefault();
+      });
+      wc.on('did-navigate-in-page', () => { activeVisualCapture = null; });
+      wc.on('will-attach-webview', (event) => event.preventDefault());
+      wc.on('will-prevent-unload', (event) => event.preventDefault());
+      // a page does not take the whole screen from the person; video stays in Coo's window
+      wc.on('enter-html-full-screen', () => { if (win && !win.isDestroyed()) win.setFullScreen(false); });
+      // only a new main document replaces the page script; iframes and in-page routes keep it
+      wc.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+        if (!isMainFrame || isInPlace) return;
+        injected = false;
+        navigating = true;
+        resetFrameState();
+        activeVisualCapture = null;
+        audioCaptureRequested = false;
+        restoreMute();
+      });
+      wc.on('did-finish-load', () => { injected = false; navigating = false; });
+      wc.on('did-fail-load', (_event, code, description, url, isMainFrame) => {
+        if (!isMainFrame) return;
+        navigating = false;
+        if (code !== -3) log.warn('[browser] page failed', { code, description, url });
+      });
+      wc.on('render-process-gone', (_event, details) => log.warn('[browser] renderer gone', details));
+      wc.on('page-title-updated', (event, title) => {
+        event.preventDefault();
+        const shown = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+        win?.setTitle(shown ? `Coo · ${shown}` : 'Coo');
+      });
+      win.once('ready-to-show', () => win?.showInactive());
+      win.on('closed', () => {
+        clearStagedChatGPTImages();
+        win = null;
+        injected = false;
+        resetFrameState();
+        activeVisualCapture = null;
+        navigating = false;
+        audioCaptureRequested = false;
+        send?.({ type: 'companion:browser-event', event: 'closed' });
+      });
+      return win;
+    })();
+    try {
+      return await creatingWindow;
+    } finally {
+      creatingWindow = null;
+    }
   };
 
   const open = async (message) => {
     if (typeof message.muted === 'boolean') muted = message.muted;
     const target = httpUrl(message.url);
     if (!target || !await isPublicDestination(target.href)) throw new Error('only public http and https pages are opened');
-    ensureWindow();
+    await ensureWindow();
     if (win.isMinimized()) win.restore();
     if (!win.isVisible()) win.showInactive();
     win.webContents.setAudioMuted(muted);
@@ -1233,6 +1260,9 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     },
     close() {
       closeWindow();
+      if (proxyLoginHandler) app.removeListener('login', proxyLoginHandler);
+      proxyLoginHandler = null;
+      void egressProxy?.close();
     },
     get open() { return !!win && !win.isDestroyed(); },
   };

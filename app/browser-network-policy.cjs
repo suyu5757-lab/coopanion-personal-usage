@@ -1,5 +1,27 @@
 const { isIP } = require('node:net');
 
+const PRIVATE_V4 = /^(?:10\.|127\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/;
+const LOCAL_NAMES = ['.localhost', '.local', '.internal', '.lan', '.home'];
+
+function httpUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+function isPublicHttp(value) {
+  const url = httpUrl(value);
+  if (!url || url.username || url.password) return false;
+  const host = url.hostname.toLowerCase();
+  if (host === 'localhost' || host === '0.0.0.0' || host.startsWith('[')) return false;
+  if (!host.includes('.') || /^[0-9.]+$/.test(host)) return false;
+  if (LOCAL_NAMES.some((suffix) => host === suffix.slice(1) || host.endsWith(suffix))) return false;
+  return !PRIVATE_V4.test(host);
+}
+
 const IPV4_BLOCKED = [
   [0x00000000, 8],
   [0x0a000000, 8],
@@ -56,9 +78,12 @@ function ipv6Number(address) {
   return groups.reduce((number, group) => (number << 16n) | BigInt(`0x${group}`), 0n);
 }
 
+const IPV6_IETF_PROTOCOL_PREFIX = ipv6Number('2001::') >> 105n;
+
 function blockedIpv6(address) {
   const value = ipv6Number(address);
   if (value === null) return true;
+  if (value >> 105n === IPV6_IETF_PROTOCOL_PREFIX) return true;
   if (value >> 32n === 0xffffn) return blockedIpv4(Number(value & 0xffffffffn).toString(16).padStart(8, '0').match(/.{2}/g).map((part) => parseInt(part, 16)).join('.'));
   if (value >> 32n === 0n) return true;
   if (value >> 125n !== 1n) return true;
@@ -88,4 +113,20 @@ function isWebSocketRequest(details) {
   }
 }
 
-module.exports = { isPublicResolvedHost, isWebSocketRequest };
+function sameAddress(left, right) {
+  const leftFamily = isIP(String(left ?? '').split('%')[0]);
+  const rightFamily = isIP(String(right ?? '').split('%')[0]);
+  if (!leftFamily || !rightFamily) return false;
+  const leftV4 = leftFamily === 4 ? ipv4Number(left) : mappedIpv4(ipv6Number(left));
+  const rightV4 = rightFamily === 4 ? ipv4Number(right) : mappedIpv4(ipv6Number(right));
+  if (leftV4 !== null && rightV4 !== null) return leftV4 === rightV4;
+  if (leftFamily !== 6 || rightFamily !== 6) return false;
+  return ipv6Number(left) === ipv6Number(right);
+}
+
+function mappedIpv4(value) {
+  if (value === null || value >> 32n !== 0xffffn) return null;
+  return Number(value & 0xffffffffn);
+}
+
+module.exports = { httpUrl, isPublicHttp, isPublicResolvedHost, isWebSocketRequest, sameAddress };
