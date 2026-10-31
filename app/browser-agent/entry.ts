@@ -11,7 +11,8 @@ import { accountEvidence, sharePanelOpen, shareTarget, videoEvidence } from './c
 import { chatGPTComposer, isChatGPTImageSaveTarget, isChatGPTPage } from './chatgpt.ts';
 import { replyTargetForBox } from './comments.ts';
 import { installFileChooserGuard } from './safety.ts';
-import { currentElementLabel, findTextTarget, isFileChooserTarget } from './targets.ts';
+import { accessibleRole, composedElements, composedParentElement } from './accessible-name.ts';
+import { actionabilityPoint, currentElementLabel, findLocatorTarget, findPointTarget, findTextTarget, isFileChooserTarget, type ActionabilityFailure, type TargetLocator } from './targets.ts';
 
 interface AgentElement {
   id: number;
@@ -23,6 +24,7 @@ interface AgentElement {
   aria: string;
   title: string;
   role: string;
+  dataE2e: string;
   href: string;
   disabled: boolean;
   visible: boolean;
@@ -98,23 +100,48 @@ if (!host[KEY]) {
     return id;
   };
   const elementAt = (index: number): HTMLElement | null => {
+  const documentIds = new WeakMap<Document, number>();
+  let nextDocumentId = 1;
+  const documentId = (owner: Document): number => {
+    let id = documentIds.get(owner);
+    if (id === undefined) { id = nextDocumentId++; documentIds.set(owner, id); }
+    return id;
+  };
     const element = internals.selectorMap?.get(index)?.ref;
     return element?.isConnected ? element : null;
   };
 
-  const scrollOffsets = (): Array<[number, number, number]> => {
+  const framePathForDocument = (initial: Document): unknown[] => {
+    const path: unknown[] = [];
+    const seen = new Set<Document>();
+    let owner = initial;
+    while (owner !== document && !seen.has(owner) && path.length < 8) {
+      seen.add(owner);
+      const frame = owner.defaultView?.frameElement;
+      if (!frame || frame.nodeType !== 1) return [...path, 'unbound-frame'];
+      const host = frame as HTMLElement;
+      path.push([elementId(host), documentId(owner), host.getAttribute('src') ?? '', owner.URL]);
+      owner = host.ownerDocument;
+    }
+    return path.reverse();
+  };
+  const framePath = (element: HTMLElement): unknown[] => framePathForDocument(element.ownerDocument);
+
+  const scrollOffsets = (): unknown[] => {
     const scrollable = new Set<HTMLElement>();
     for (const node of internals.selectorMap?.values() ?? []) {
-      for (let parent = node.ref?.parentElement ?? null; parent && parent !== document.body; parent = parent.parentElement) {
+    const documents = new Set<Document>([document]);
+      if (node.ref) documents.add(node.ref.ownerDocument);
+      for (let parent = node.ref ? composedParentElement(node.ref) : null; parent; parent = composedParentElement(parent)) {
         if (parent.scrollHeight > parent.clientHeight || parent.scrollWidth > parent.clientWidth) scrollable.add(parent);
       }
     }
-    const root = document.scrollingElement;
-    const offsets: Array<[number, number, number]> = [
-      [0, window.scrollX || root?.scrollLeft || 0, window.scrollY || root?.scrollTop || 0],
-      ...[...scrollable].map((element) => [elementId(element), element.scrollLeft, element.scrollTop] as [number, number, number]),
+    const offsets: unknown[] = [
+      ...[...documents].map((owner) => [framePathForDocument(owner), owner.defaultView?.scrollX || owner.scrollingElement?.scrollLeft || 0,
+        owner.defaultView?.scrollY || owner.scrollingElement?.scrollTop || 0]),
+      ...[...scrollable].map((element) => [framePath(element), elementId(element), element.scrollLeft, element.scrollTop]),
     ];
-    return offsets.sort((a, b) => a[0] - b[0]);
+    return offsets.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
   };
 
   /** Changes when the live page reuses, reorders or scrolls an indexed target. */
@@ -122,11 +149,38 @@ if (!host[KEY]) {
     const current = videoEvidence(document)?.url ?? '';
     const account = accountEvidence(document)?.ref ?? '';
     const rows = [...(internals.selectorMap?.entries() ?? [])]
+    const scopeCache = new WeakMap<HTMLElement, unknown[]>();
+    const scopeEvidenceFor = (element: HTMLElement): unknown[] => {
+      const isScope = (candidate: HTMLElement): boolean => candidate.matches('article, [role], li, [data-e2e]');
+      const semanticParent = (candidate: HTMLElement): HTMLElement | null => {
+        for (let parent = composedParentElement(candidate); parent; parent = composedParentElement(parent)) {
+          if (isScope(parent)) return parent;
+        }
+        return null;
+      };
+      const nearest = semanticParent(element);
+      if (!nearest) return [];
+      const cached = scopeCache.get(nearest);
+      if (cached) return cached;
+      const evidence: unknown[] = [];
+      let scope: HTMLElement | null = nearest;
+      while (scope && evidence.length < 3) {
+        evidence.push([
+          elementId(scope), scope.tagName.toLowerCase(),
+          currentElementLabel(scope).replace(/\s+/g, ' ').trim().toLowerCase(),
+          scope.getAttribute('role') ?? '', scope.getAttribute('data-e2e') ?? '',
+          (scope.innerText || scope.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 240),
+        ]);
+        scope = semanticParent(scope);
+      }
+      scopeCache.set(nearest, evidence);
+      return evidence;
+    };
       .map(([index, node]) => {
         const element = node.ref;
         if (!element) return [index, ''];
         const label = currentElementLabel(element) || (shareMarked.has(element) ? '分享' : '');
-        return [index, elementId(element), element.isConnected, element.tagName.toLowerCase(),
+        return [index, elementId(element), framePath(element), element.isConnected, element.tagName.toLowerCase(),
           label.replace(/\s+/g, ' ').trim().toLowerCase(),
           (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200),
           element instanceof HTMLAnchorElement ? element.href : '',
@@ -137,7 +191,7 @@ if (!host[KEY]) {
           element.getAttribute('placeholder') ?? '', element.getAttribute('name') ?? '',
           element.getAttribute('data-e2e') ?? '', element.getAttribute('data-state') ?? '',
           element.getAttribute('datetime') ?? '', element.getAttribute('accept') ?? '',
-          element.hasAttribute('multiple'), (element as HTMLButtonElement).disabled === true];
+          element.hasAttribute('multiple'), (element as HTMLButtonElement).disabled === true, scopeEvidenceFor(element)];
       })
       .sort((a, b) => Number(a[0]) - Number(b[0]));
     const files = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]'))
@@ -160,6 +214,60 @@ if (!host[KEY]) {
    * Share controls are often icon-only and carry neither a title nor a click handler of their own, so the
    * controller leaves them out when they sit inside a highlighted scroll container. They are marked for one
    * extraction pass so each one gets an index and the name 分享; the page is restored afterwards.
+  const nextFrame = (timeoutMs = 100): Promise<boolean> => new Promise((resolve) => {
+    let settled = false;
+    const finish = (receivedFrame: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve(receivedFrame);
+    };
+    const timeout = setTimeout(() => finish(false), timeoutMs);
+    if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(() => finish(true));
+    else queueMicrotask(() => finish(true));
+  });
+
+  /** Requires the same page snapshot and hit target across two animation frames. */
+  const stableActionPoint = async (element: HTMLElement, expectedSnapshotId: string): Promise<
+    | { ok: true; x: number; y: number }
+    | { ok: false; reason: ActionabilityFailure | 'stale-snapshot' | 'unstable' }
+  > => {
+    let previous: string | undefined;
+    let domChanged = false;
+    const markChanged = (): void => { domChanged = true; };
+    const observer = new MutationObserver(markChanged);
+    const roots = new Set<Node>([document.documentElement]);
+    const observedFrames: HTMLIFrameElement[] = [];
+    try {
+      for (const element of composedElements(document)) {
+        if (element.shadowRoot) roots.add(element.shadowRoot);
+        if (element.ownerDocument.documentElement) roots.add(element.ownerDocument.documentElement);
+        if (element.localName.toLowerCase() === 'iframe') {
+          const frame = element as HTMLIFrameElement;
+          frame.addEventListener('load', markChanged);
+          observedFrames.push(frame);
+        }
+      }
+      for (const root of roots) observer.observe(root, { attributes: true, childList: true, characterData: true, subtree: true });
+      for (let frame = 0; frame < 4; frame++) {
+        if (domChanged) return { ok: false, reason: 'dom-changed' };
+        if (snapshotId() !== expectedSnapshotId) return { ok: false, reason: 'stale-snapshot' };
+        const point = actionabilityPoint(document, element);
+        if (!point.ok) return point;
+        if (domChanged) return { ok: false, reason: 'dom-changed' };
+        if (snapshotId() !== expectedSnapshotId) return { ok: false, reason: 'stale-snapshot' };
+        const geometry = `${point.left},${point.top},${point.right},${point.bottom}`;
+        if (geometry === previous) return { ok: true, x: point.x, y: point.y };
+        previous = geometry;
+        if (!await nextFrame()) return { ok: false, reason: 'wait-timeout' };
+      }
+    } finally {
+      observer.disconnect();
+      for (const frame of observedFrames) frame.removeEventListener('load', markChanged);
+    }
+    return { ok: false, reason: 'unstable' };
+  };
+
    */
   /** The share control of the video being played, not the first one in document order. */
   const shareControl = (): HTMLElement | null => {
@@ -215,6 +323,7 @@ if (!host[KEY]) {
       disabled: (element as HTMLButtonElement).disabled === true,
       visible: !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length),
       filePicker: isFileChooserTarget(element),
+      dataE2e: attr('data-e2e'),
       snapshotId: snapshotId(),
     };
   };
@@ -329,7 +438,8 @@ if (!host[KEY]) {
       text: (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200),
       label: '', type: element.getAttribute('type') ?? '', placeholder: element.getAttribute('placeholder') ?? '',
       aria: element.getAttribute('aria-label') ?? '', title: element.getAttribute('title') ?? '',
-      role: element.getAttribute('role') ?? '', href: element instanceof HTMLAnchorElement ? element.href.slice(0, 500) : '',
+      role: element.getAttribute('role') ?? '', dataE2e: element.getAttribute('data-e2e') ?? '',
+      href: element instanceof HTMLAnchorElement ? element.href.slice(0, 500) : '',
       disabled: (element as HTMLButtonElement).disabled === true, visible: true,
       filePicker: isFileChooserTarget(element),
       snapshotId: snapshotId(),
@@ -541,8 +651,25 @@ if (!host[KEY]) {
       return true;
     },
     scroll: async (options: { down: boolean; numPages: number; index?: number }, expectedSnapshotId?: string): Promise<ActionResult> => {
+      const point = await stableActionPoint(element, expected);
+      if (!point.ok) return { success: false, message: `target is not actionable: ${point.reason}` };
+      if (snapshotId() !== expected) return { success: false, message: 'stale snapshot' };
       await readPage();
-      if (expectedSnapshotId && snapshotId() !== expectedSnapshotId) return { success: false, message: 'stale snapshot' };
+      const expected = expectedSnapshotId ?? snapshotId();
+    actionPoint: async (index: number, expectedSnapshotId?: string): Promise<
+      | { ok: true; x: number; y: number; snapshotId: string }
+      | { ok: false; reason: ActionabilityFailure | 'stale-snapshot' | 'none' | 'unstable' }
+    > => {
+      await readPage();
+      if (!expectedSnapshotId || snapshotId() !== expectedSnapshotId) return { ok: false, reason: 'stale-snapshot' };
+      const element = elementAt(index);
+      if (!element) return { ok: false, reason: 'none' };
+      const point = await stableActionPoint(element, expectedSnapshotId);
+      return point.ok
+        ? { ok: true, x: point.x, y: point.y, snapshotId: expectedSnapshotId }
+        : { ok: false, reason: point.reason };
+    },
+      if (snapshotId() !== expected) return { success: false, message: 'stale snapshot' };
       return controller.scroll(options);
     },
     select: (index: number, text: string): Promise<ActionResult> => controller.selectOption(index, text),
@@ -557,12 +684,15 @@ if (!host[KEY]) {
       if (expectedSnapshotId && snapshotId() !== expectedSnapshotId) return null;
       const element = elementAt(index);
       if (!element) return null;
-      element.scrollIntoView({ block: 'center', inline: 'nearest' });
-      const rect = element.getBoundingClientRect();
-      return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+      const expected = expectedSnapshotId ?? snapshotId();
+      const point = await stableActionPoint(element, expected);
+      return point.ok ? { x: point.x, y: point.y } : null;
     },
     /** The share control's viewport center; the host hovers it because Douyin and Bilibili open the panel on hover. */
-    shareCenter: async (): Promise<{ ok: true; x: number; y: number; snapshotId: string } | { ok: false; reason: 'none' | 'ambiguous' }> => {
+    shareCenter: async (): Promise<
+      | { ok: true; x: number; y: number; snapshotId: string }
+      | { ok: false; reason: 'none' | 'ambiguous' | ActionabilityFailure | 'stale-snapshot' | 'unstable' }
+    > => {
       await readPage();
       const target = shareTarget(document);
       if (!target.ok) return target;
@@ -571,23 +701,37 @@ if (!host[KEY]) {
       if (before.top < 0 || before.left < 0 || before.bottom > window.innerHeight || before.right > window.innerWidth) {
         element.scrollIntoView({ block: 'center', inline: 'nearest' });
       }
-      const rect = element.getBoundingClientRect();
-      return { ok: true, x: rect.x + rect.width / 2, y: rect.y + rect.height / 2, snapshotId: snapshotId() };
+      const currentSnapshotId = snapshotId();
+      const point = await stableActionPoint(element, currentSnapshotId);
+      return point.ok ? { ok: true, x: point.x, y: point.y, snapshotId: currentSnapshotId } : { ok: false, reason: point.reason };
     },
     /** Whether a visible share panel or its copy-link option is on the page after the pointer moved there. */
     shareOpen: (): boolean => sharePanelOpen(document),
     /** The viewport center of the smallest visible element with this text, for controls the element map misses. */
-    textCenter: async (query: string): Promise<{ ok: true; x: number; y: number; snapshotId: string } | { ok: false; reason: 'none' | 'ambiguous' | 'file' }> => {
+    textCenter: async (query: string): Promise<
+      | { ok: true; x: number; y: number; snapshotId: string }
+      | { ok: false; reason: 'none' | 'ambiguous' | 'file' | ActionabilityFailure | 'stale-snapshot' | 'unstable' }
+    > => {
       await readPage();
       const target = findTextTarget(document, query);
       if (!target.ok) return target;
       const element = target.element;
       element.scrollIntoView({ block: 'center', inline: 'nearest' });
-      const rect = element.getBoundingClientRect();
-      const x = rect.x + rect.width / 2, y = rect.y + rect.height / 2;
-      const top = document.elementFromPoint(x, y);
-      if (!top || !(top === element || element.contains(top) || top.contains(element))) return { ok: false, reason: 'none' };
-      return { ok: true, x, y, snapshotId: snapshotId() };
+      const visited = new Set<Document>();
+      let owner = element.ownerDocument;
+      while (owner !== document) {
+        if (visited.has(owner) || visited.size >= 8) return { ok: false, reason: 'unsupported-frame' };
+        visited.add(owner);
+        const frame = owner.defaultView?.frameElement as HTMLIFrameElement | null;
+        if (!frame || frame.contentDocument !== owner) return { ok: false, reason: 'unsupported-frame' };
+        frame.scrollIntoView({ block: 'center', inline: 'nearest' });
+        owner = frame.ownerDocument;
+      }
+      const currentSnapshotId = snapshotId();
+      const point = await stableActionPoint(element, currentSnapshotId);
+      return point.ok
+        ? { ok: true, x: point.x, y: point.y, snapshotId: currentSnapshotId }
+        : { ok: false, reason: point.reason };
     },
     snapshot: async (): Promise<string> => { await readPage(); return snapshotId(); },
     element: async (index: number): Promise<AgentElement | null> => { await readPage(); return describe(index); },
@@ -598,6 +742,43 @@ if (!host[KEY]) {
     fileInputSelection,
     chatGPTImageSaveTarget: async (index: number, expectedSnapshotId?: string): Promise<boolean> => {
       await readPage();
+    viewport: (): { width: number; height: number } => ({ width: window.innerWidth, height: window.innerHeight }),
+    pointTarget: async (x: number, y: number, expectedSnapshotId?: string): Promise<
+      | { ok: true; target: { token: string; label: string; tag: string; role: string; type: string; placeholder: string; href: string; disabled: boolean; filePicker: boolean; snapshotId: string } }
+      | { ok: false; reason: ActionabilityFailure | 'invalid' | 'none' | 'file' | 'stale-snapshot' }
+    > => {
+      await readPage();
+      if (expectedSnapshotId && snapshotId() !== expectedSnapshotId) return { ok: false, reason: 'stale-snapshot' };
+      const found = findPointTarget(document, x, y);
+      if (!found.ok) return found;
+      const element = found.element;
+      const rect = element.getBoundingClientRect();
+      const label = currentElementLabel(element);
+      const tokenSource = JSON.stringify([
+        elementId(element), element.localName.toLowerCase(), rect.left, rect.top, rect.right, rect.bottom,
+        element.getAttribute('data-e2e') ?? '', element.getAttribute('type') ?? '',
+        element.getAttribute('placeholder') ?? '', element.getAttribute('href') ?? '', label,
+      ]);
+      let tokenA = 2166136261, tokenB = 2246822519;
+      for (let index = 0; index < tokenSource.length; index++) {
+        const code = tokenSource.charCodeAt(index);
+        tokenA = Math.imul(tokenA ^ code, 16777619);
+        tokenB = Math.imul(tokenB ^ code, 3266489917);
+      }
+      const target = {
+        token: `${(tokenA >>> 0).toString(16).padStart(8, '0')}${(tokenB >>> 0).toString(16).padStart(8, '0')}`,
+        label,
+        tag: element.localName.toLowerCase(),
+        role: accessibleRole(element),
+        type: element.getAttribute('type') ?? '',
+        placeholder: element.getAttribute('placeholder') ?? '',
+        href: element.getAttribute('href') ?? '',
+        disabled: element.matches(':disabled') || element.getAttribute('aria-disabled') === 'true',
+        filePicker: isFileChooserTarget(element),
+        snapshotId: snapshotId(),
+      };
+      return { ok: true, target };
+    },
       if (!isChatGPTPage(location.href) || (expectedSnapshotId && snapshotId() !== expectedSnapshotId)) return false;
       const element = elementAt(index);
       return !!element && isChatGPTImageSaveTarget(document, location.href, element);
@@ -613,6 +794,19 @@ if (!host[KEY]) {
     },
     active: async (): Promise<AgentElement | null> => { await readPage(); return active(); },
     video,
+    resolveLocator: async (locator: TargetLocator, expectedSnapshotId?: string): Promise<
+      | { ok: true; id: number; snapshotId: string }
+      | { ok: false; reason: 'invalid' | 'none' | 'ambiguous' | 'stale-snapshot' }
+    > => {
+      await readPage();
+      if (!expectedSnapshotId || snapshotId() !== expectedSnapshotId) return { ok: false, reason: 'stale-snapshot' };
+      const found = findLocatorTarget(document, locator);
+      if (!found.ok) return found;
+      const id = [...(internals.selectorMap?.entries() ?? [])].find(([, node]) => node.ref === found.element)?.[0];
+      if (id === undefined || !found.element.isConnected) return { ok: false, reason: 'none' };
+      if (snapshotId() !== expectedSnapshotId) return { ok: false, reason: 'stale-snapshot' };
+      return { ok: true, id, snapshotId: expectedSnapshotId };
+    },
     play,
     startAudio,
     stopAudio,

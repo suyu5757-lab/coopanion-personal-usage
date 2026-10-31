@@ -16,10 +16,14 @@
  * or the pet's server.
  */
 const { BrowserWindow, screen, session } = require('electron');
+const { randomUUID } = require('node:crypto');
 const { constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync } = require('node:fs');
 const { dirname, join } = require('node:path');
 const { MAX_IMAGE_BYTES, generatedImagePath, isChatGPTImageDownloadUrl, isChatGPTPageUrl, verifyGeneratedImage } = require('./browser-image-download.cjs');
 const { acceptsUpload, isDouyinPageUrl, resolveUploadFiles } = require('./browser-upload.cjs');
+const { imagePointToViewport } = require('./browser-visual-point.cjs');
+const { compositeSnapshotId, inspectFrameHost, mapFramePointToMain: mapFramePoint } = require('./browser-frame-bridge.cjs');
+const { isPublicResolvedHost } = require('./browser-network-policy.cjs');
 const { setFileInputFiles } = require('./browser-cdp-upload.cjs');
 
 const PARTITION = 'persist:coo-browser';
@@ -50,7 +54,7 @@ const httpUrl = (value) => {
 
 /**
  * Public pages only: the window must not reach the Core's own console, the pet server or another
- * service on this machine or the local network. IPv6 literals are refused outright; public sites use names.
+ * service on this machine or the local network. URL checks are followed by resolved-address checks.
  */
 const PRIVATE_V4 = /^(?:10\.|127\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/;
 const LOCAL_NAMES = ['.localhost', '.local', '.internal', '.lan', '.home'];
@@ -79,7 +83,7 @@ function within(work, ms, what) {
   ]).finally(() => clearTimeout(timer));
 }
 
-function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () => null, partition = PARTITION }) {
+function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () => null, partition = PARTITION, resolveHostForUrl }) {
   /** @type {import('electron').BrowserWindow | null} */
   let win = null;
   /** Whether the page script is present in the current document. */
@@ -93,6 +97,13 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
   let agent = null;
   /** One verified ChatGPT image download requested by Coo's image-save tool. */
   let pendingImageDownload = null;
+  /** The latest screenshot's one-use viewport mapping. */
+  let activeVisualCapture = null;
+  let compositeStateCache = null;
+  let nextFrameTargetId = 2_000_000_000;
+  let activeTextFrame = null;
+  const frameTargetIds = new Map();
+  const frameTargets = new Map();
   /** Images downloaded for hash review but not yet approved for the media folder. */
   const stagedChatGPTImages = new Map();
   const clearStagedChatGPTImages = () => {
@@ -187,12 +198,125 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     return agent;
   };
 
-  const agentCall = async (method, args = [], timeout = SCRIPT_TIMEOUT_MS) => {
+  const isPublicDestination = async (value) => {
+    const target = httpUrl(value);
+    if (!target || !isPublicHttp(value)) return false;
+    try {
+      const resolver = resolveHostForUrl
+        ? () => resolveHostForUrl(target.hostname)
+        : () => session.fromPartition(partition).resolveHost(target.hostname, { cacheUsage: 'allowed' });
+      const resolved = await within(resolver, 2500, 'public destination check');
+      return isPublicResolvedHost(resolved);
+    } catch {
+      return false;
+    }
+  };
+
+  const frameAgentCall = async (frame, method, args = [], timeout = SCRIPT_TIMEOUT_MS) => {
     if (!win || win.isDestroyed()) throw new Error('browser window is closed');
     if (!injected) throw new Error('browser page is not ready; open a page or read it again');
+    if (!frame || frame.isDestroyed() || frame.detached) throw new Error('browser frame is no longer attached');
     const expression = `window.__cooBrowserAgent.${method}(${args.map((a) => JSON.stringify(a)).join(',')})`;
-    // the arguments are strings, numbers and plain option objects
-    return within(() => win.webContents.executeJavaScript(expression, true), timeout, method);
+    return within(() => frame.executeJavaScript(expression, true), timeout, method);
+  };
+
+  const rootAgentCall = async (method, args = [], timeout = SCRIPT_TIMEOUT_MS) => {
+    if (!win || win.isDestroyed()) throw new Error('browser window is closed');
+    if (!injected) throw new Error('browser page is not ready; open a page or read it again');
+    return frameAgentCall(win.webContents.mainFrame, method, args, timeout);
+  };
+
+  const crossOriginFrame = async (frame) => {
+    if (!frame?.parent || frame.isDestroyed() || frame.detached) return false;
+    try {
+      return await within(() => frame.executeJavaScript(`(() => {
+        try { void window.parent.location.href; return false; }
+        catch { return true; }
+      })()`, true), 1000, 'frame origin check') === true;
+    } catch { return false; }
+  };
+
+  const ensureFrameAgent = async (frame) => {
+    if (!frame || frame.isDestroyed() || frame.detached) throw new Error('browser frame is no longer attached');
+    const ready = await frame.executeJavaScript("window.__cooBrowserAgent?.version === 1", true).catch(() => false);
+    if (!ready) await within(() => frame.executeJavaScript(readAgent(), true), SCRIPT_TIMEOUT_MS, 'frame page script');
+    await frame.executeJavaScript(`window.__cooBrowserAgent.setMuted(${JSON.stringify(muted)})`, true);
+  };
+
+  const mapFramePointToMain = async (frame, localPoint) => {
+    const main = win?.webContents.mainFrame;
+    if (!main || !frame || !localPoint || !Number.isFinite(localPoint.x) || !Number.isFinite(localPoint.y)) {
+      return { ok: false, reason: 'invalid' };
+    }
+    let current = frame;
+    let point = { x: localPoint.x, y: localPoint.y };
+    const hops = [];
+    while (current !== main && hops.length < 8) {
+      const geometry = await inspectFrameHost(current.parent, current, point);
+      if (!geometry) return { ok: false, reason: 'unsupported-frame' };
+      const mapped = mapFramePoint(point, [geometry]);
+      if (!mapped.ok) return mapped;
+      hops.push({ frameToken: current.frameToken, frameTreeNodeId: current.frameTreeNodeId,
+        parentFrameToken: current.parent?.frameToken ?? '', url: current.url, parentUrl: current.parent?.url ?? '',
+        ...geometry });
+      point = { x: mapped.x, y: mapped.y };
+      current = current.parent;
+    }
+    if (current !== main) return { ok: false, reason: 'unsupported-frame' };
+    return { ok: true, ...point, hops };
+  };
+
+  const frameTargetId = (frame, localId) => {
+    const key = `${frame.frameTreeNodeId}:${frame.frameToken}:${localId}`;
+    let id = frameTargetIds.get(key);
+    if (id === undefined) { id = nextFrameTargetId++; frameTargetIds.set(key, id); }
+    return id;
+  };
+
+  const visibleCrossFrameStates = async () => {
+    const main = win?.webContents.mainFrame;
+    if (!main) return [];
+    const frames = main.framesInSubtree.filter((frame) => frame !== main && frame.parent);
+    const results = [];
+    for (const frame of frames) {
+      if (!await crossOriginFrame(frame)) continue;
+      try {
+        const frameUrl = frame.url;
+        if (!httpUrl(frameUrl) || !await isPublicDestination(frameUrl)) continue;
+        await ensureFrameAgent(frame);
+        const viewport = await frameAgentCall(frame, 'viewport');
+        if (!Number.isFinite(viewport?.width) || !Number.isFinite(viewport?.height) || viewport.width <= 0 || viewport.height <= 0) continue;
+        const center = { x: viewport.width / 2, y: viewport.height / 2 };
+        const position = await mapFramePointToMain(frame, center);
+        if (!position.ok) continue;
+        const value = await frameAgentCall(frame, 'state');
+        if (!value?.snapshotId) continue;
+        results.push({ frame, state: value, viewport, position });
+      } catch {
+        // A frame that navigates or stops responding during inspection is omitted.
+      }
+    }
+    return results;
+  };
+
+  const agentCall = async (method, args = [], timeout = SCRIPT_TIMEOUT_MS) => {
+    if (method === 'state') return state();
+    if (method === 'snapshot') return (await state())?.snapshotId ?? '';
+    if (method === 'resolveLocator') return resolveLocator(args[0], args[1]);
+    if (method === 'element') return frameElement(args[0]);
+    if (method === 'textCenter') return frameTextCenter(args[0]);
+    if (method === 'click') return frameClick(args[0], args[1]);
+    if (method === 'pointTarget') return framePointTarget(args[0], args[1], args[2]);
+    if (method === 'center') return frameMethod('center', args[0], args[1]);
+    if (method === 'focus' || method === 'prepareInput') return frameMethod(method, args[0], args[1]);
+    if (method === 'scroll') return frameScroll(args[0], args[1]);
+    if (method === 'setAgentAction') {
+      const value = await rootAgentCall(method, args, timeout);
+      if (activeTextFrame) await frameAgentCall(activeTextFrame, method, args, timeout).catch(() => undefined);
+      if (args[0] === false) activeTextFrame = null;
+      return value;
+    }
+    return rootAgentCall(method, args, timeout);
   };
 
   const ensureAgent = async () => {
@@ -221,10 +345,218 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     return state();
   };
 
+  const collectState = async () => {
+    const root = await rootAgentCall('state');
+    if (!root?.snapshotId) return root;
+    const frames = await visibleCrossFrameStates();
+    const evidence = frames.map(({ frame, state: frameState, viewport, position }) => ({
+      frameTreeNodeId: frame.frameTreeNodeId,
+      frameToken: frame.frameToken,
+      url: frame.url,
+      parentFrameToken: frame.parent?.frameToken ?? '',
+      parentUrl: frame.parent?.url ?? '',
+      childSnapshotId: frameState.snapshotId,
+      viewportWidth: viewport.width,
+      viewportHeight: viewport.height,
+      hops: position.hops,
+    }));
+    const snapshotId = compositeSnapshotId(root.snapshotId, evidence) ?? root.snapshotId;
+    const elements = Array.isArray(root.elements) ? [...root.elements] : [];
+    const content = [typeof root.content === 'string' ? root.content : ''];
+    for (const [id, target] of frameTargets) {
+      if (target.compositeSnapshotId !== snapshotId) frameTargets.delete(id);
+    }
+    for (const { frame, state: frameState, viewport, position } of frames) {
+      const recordBase = {
+        frame,
+        frameToken: frame.frameToken,
+        frameTreeNodeId: frame.frameTreeNodeId,
+        frameSnapshotId: frameState.snapshotId,
+        compositeSnapshotId: snapshotId,
+        viewport,
+        hops: position.hops,
+      };
+      const title = String(frameState.title ?? '').trim();
+      const url = String(frameState.url ?? frame.url);
+      if (typeof frameState.content === 'string' && frameState.content.trim()) {
+        content.push(`[Embedded frame: ${title || url}]\n${frameState.content}`);
+      }
+      for (const element of Array.isArray(frameState.elements) ? frameState.elements : []) {
+        if (!Number.isInteger(element.id)) continue;
+        const id = frameTargetId(frame, element.id);
+        const record = { ...recordBase, id, localId: element.id, label: String(element.label ?? '') };
+        frameTargets.set(id, record);
+        elements.push({ id, label: record.label, ...(typeof element.pressed === 'boolean' ? { pressed: element.pressed } : {}) });
+      }
+    }
+    const value = { ...root, content: content.join('\n\n'), elements, snapshotId };
+    compositeStateCache = { root, frames, evidence, state: value, snapshotId };
+    return value;
+  };
+
+  const state = async () => collectState();
+
+  const resolveLocator = async (locator, expectedSnapshotId) => {
+    const current = await state();
+    if (!expectedSnapshotId || current?.snapshotId !== expectedSnapshotId || !compositeStateCache) {
+      return { ok: false, reason: 'stale-snapshot' };
+    }
+    const matches = [];
+    const rootResult = await rootAgentCall('resolveLocator', [locator, compositeStateCache.root.snapshotId]);
+    if (rootResult?.reason === 'ambiguous') return { ok: false, reason: 'ambiguous' };
+    if (rootResult?.ok === true) matches.push({ id: rootResult.id });
+    for (const { frame, state: frameState, viewport, position } of compositeStateCache.frames) {
+      let result;
+      try { result = await frameAgentCall(frame, 'resolveLocator', [locator, frameState.snapshotId]); }
+      catch { continue; }
+      if (result?.reason === 'ambiguous') return { ok: false, reason: 'ambiguous' };
+      if (result?.ok !== true) continue;
+      const id = frameTargetId(frame, result.id);
+      frameTargets.set(id, {
+        frame,
+        frameToken: frame.frameToken,
+        frameTreeNodeId: frame.frameTreeNodeId,
+        frameSnapshotId: frameState.snapshotId,
+        compositeSnapshotId: current.snapshotId,
+        viewport,
+        hops: position.hops,
+        id,
+        localId: result.id,
+        locator,
+      });
+      matches.push({ id });
+    }
+    if (matches.length > 1) return { ok: false, reason: 'ambiguous' };
+    if (!matches.length) return { ok: false, reason: rootResult?.reason === 'invalid' ? 'invalid' : 'none' };
+    return { ok: true, id: matches[0].id, snapshotId: current.snapshotId };
+  };
+
+  const frameElement = async (id) => {
+    const prior = compositeStateCache;
+    if (!prior) return null;
+    const current = await state();
+    if (!prior || current?.snapshotId !== prior.snapshotId) return null;
+    const frameTarget = frameTargets.get(id);
+    try {
+      const value = frameTarget
+        ? await frameAgentCall(frameTarget.frame, 'element', [frameTarget.localId])
+        : await rootAgentCall('element', [id]);
+      if (!value) return null;
+      return { ...value, id, snapshotId: current.snapshotId };
+    } catch { return null; }
+  };
+
+  const frameMethod = async (method, id, expectedSnapshotId) => {
+    const prior = compositeStateCache;
+    if (!prior) return method === 'center' ? null : false;
+    const current = await state();
+    if (current?.snapshotId !== prior.snapshotId || (expectedSnapshotId && expectedSnapshotId !== prior.snapshotId)) {
+      return method === 'center' ? null : false;
+    }
+    const target = frameTargets.get(id);
+    if (!target) return rootAgentCall(method, [id, compositeStateCache.root.snapshotId]);
+    let result;
+    try { result = await frameAgentCall(target.frame, method, [target.localId, target.frameSnapshotId]); }
+    catch { return method === 'center' ? null : false; }
+    if (method !== 'center' || !result) return result;
+    const mapped = await mapFramePointToMain(target.frame, result);
+    if (!mapped.ok) return null;
+    const after = await state();
+    return after?.snapshotId === prior.snapshotId ? { x: mapped.x, y: mapped.y } : null;
+  };
+
+  const frameScroll = async (options, expectedSnapshotId) => {
+    const prior = compositeStateCache;
+    if (!prior) return { success: false, message: 'stale snapshot' };
+    const current = await state();
+    if (current?.snapshotId !== prior.snapshotId || (expectedSnapshotId && expectedSnapshotId !== prior.snapshotId)) {
+      return { success: false, message: 'stale snapshot' };
+    }
+    const index = Number.isInteger(options?.index) ? options.index : null;
+    const target = index === null ? null : frameTargets.get(index);
+    if (!target) return rootAgentCall('scroll', [options, compositeStateCache.root.snapshotId]);
+    return frameAgentCall(target.frame, 'scroll', [{ ...options, index: target.localId }, target.frameSnapshotId]);
+  };
+
+  const framePointTarget = async (x, y, expectedSnapshotId) => {
+    const current = await state();
+    if (!current?.snapshotId || current.snapshotId !== expectedSnapshotId || !compositeStateCache) {
+      return { ok: false, reason: 'stale-snapshot' };
+    }
+    const root = await rootAgentCall('pointTarget', [x, y, compositeStateCache.root.snapshotId]);
+    if (root?.ok === true) return { ...root, target: { ...root.target, snapshotId: current.snapshotId } };
+    return root;
+  };
+
+  const frameTextCenter = async (query) => {
+    const before = await state();
+    if (!before?.snapshotId || !compositeStateCache) return { ok: false, reason: 'stale-snapshot' };
+    const matches = [];
+    const root = await rootAgentCall('textCenter', [query]);
+    if (root?.ok === true) matches.push({ point: root, frame: null });
+    else if (root?.reason === 'ambiguous') return { ok: false, reason: 'ambiguous' };
+    for (const { frame, state: frameState } of compositeStateCache.frames) {
+      let point;
+      try { point = await frameAgentCall(frame, 'textCenter', [query]); }
+      catch { continue; }
+      if (point?.reason === 'ambiguous') return { ok: false, reason: 'ambiguous' };
+      if (point?.ok !== true) continue;
+      const mapped = await mapFramePointToMain(frame, point);
+      if (mapped.ok) matches.push({ point: mapped, frame, frameSnapshotId: frameState.snapshotId });
+    }
+    const after = await state();
+    if (after?.snapshotId !== before.snapshotId) return { ok: false, reason: 'stale-snapshot' };
+    if (matches.length > 1) return { ok: false, reason: 'ambiguous' };
+    if (!matches.length) return { ok: false, reason: root?.reason || 'none' };
+    activeTextFrame = matches[0].frame;
+    return { ok: true, x: matches[0].point.x, y: matches[0].point.y, snapshotId: before.snapshotId };
+  };
+
+  const frameClick = async (id, expectedSnapshotId) => {
+    const before = await state();
+    if (!before?.snapshotId || before.snapshotId !== expectedSnapshotId || !compositeStateCache) {
+      return { success: false, message: 'stale snapshot' };
+    }
+    const target = frameTargets.get(id);
+    if (!target) return rootAgentCall('click', [id, compositeStateCache.root.snapshotId]);
+    if (target.compositeSnapshotId !== before.snapshotId || target.frame.isDestroyed() || target.frame.detached
+      || target.frame.frameToken !== target.frameToken) return { success: false, message: 'stale snapshot' };
+    const point = await frameAgentCall(target.frame, 'actionPoint', [target.localId, target.frameSnapshotId]);
+    if (point?.ok !== true) return { success: false, message: point?.reason || 'target is not actionable' };
+    const mapped = await mapFramePointToMain(target.frame, point);
+    if (!mapped.ok) return { success: false, message: mapped.reason || 'unsupported frame' };
+    const after = await state();
+    if (after?.snapshotId !== before.snapshotId || target.frame.isDestroyed() || target.frame.detached) {
+      return { success: false, message: 'stale snapshot' };
+    }
+    let dispatched = false;
+    try {
+      await frameAgentCall(target.frame, 'setAgentAction', [true]);
+      const x = Math.round(mapped.x), y = Math.round(mapped.y);
+      win.webContents.sendInputEvent({ type: 'mouseMove', x, y });
+      win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+      win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+      dispatched = true;
+      return { success: true, message: 'click dispatched through the current frame point' };
+    } catch (error) {
+      return { success: dispatched, message: String(error?.message ?? error) };
+    } finally {
+      await frameAgentCall(target.frame, 'setAgentAction', [false]).catch(() => undefined);
+    }
+  };
+
+  const resetFrameState = () => {
+    compositeStateCache = null;
+    frameTargets.clear();
+    activeTextFrame = null;
+  };
+
   const load = async (url, settleMs = SETTLE_MS) => {
     const target = httpUrl(url);
-    if (!target || !isPublicHttp(url)) throw new Error('only public http and https pages are opened');
+    if (!target || !await isPublicDestination(target.href)) throw new Error('only public http and https pages are opened');
     injected = false;
+    resetFrameState();
+    activeVisualCapture = null;
     navigating = true;
     const loaded = win.webContents.loadURL(target.href)
       .then(() => { navigating = false; })
@@ -232,11 +564,6 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     await waitForLoad(loaded, settleMs);
     await ensureAgent();
     return state();
-  };
-
-  const state = async () => {
-    const value = await agentCall('state');
-    return value;
   };
 
   const capture = async () => {
@@ -252,6 +579,58 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     return { base64: jpeg.toString('base64'), width: shown.getSize().width, height: shown.getSize().height };
   };
 
+  const captureForVisualClick = async () => {
+    await ensureAgent();
+    const before = await state();
+    const viewport = await agentCall('viewport');
+    if (!before?.snapshotId || !Number.isFinite(viewport?.width) || !Number.isFinite(viewport?.height)
+      || viewport.width <= 0 || viewport.height <= 0) throw new Error('the page has no stable screenshot viewport');
+    const image = await capture();
+    const after = await state();
+    const currentViewport = await agentCall('viewport');
+    if (!after?.snapshotId || after.snapshotId !== before.snapshotId || after.url !== before.url
+      || currentViewport?.width !== viewport.width || currentViewport?.height !== viewport.height) {
+      throw new Error('the page changed while the screenshot was taken; read it again');
+    }
+    const captureId = randomUUID();
+    activeVisualCapture = {
+      captureId,
+      url: after.url,
+      snapshotId: after.snapshotId,
+      viewportWidth: viewport.width,
+      viewportHeight: viewport.height,
+      imageWidth: image.width,
+      imageHeight: image.height,
+      createdAt: Date.now(),
+      used: false,
+    };
+    return { ...image, state: after, captureId, viewportWidth: viewport.width, viewportHeight: viewport.height };
+  };
+
+  const inspectVisualPoint = async (message, allowUsed = false) => {
+    const capture = activeVisualCapture;
+    const x = Number(message.x), y = Number(message.y);
+    if (!capture || message.captureId !== capture.captureId || (capture.used && !allowUsed)
+      || Date.now() - capture.createdAt > 30_000) throw new Error('the screenshot capture expired; take a new screenshot');
+    if (message.snapshotId !== undefined && message.snapshotId !== capture.snapshotId) throw new Error('the screenshot snapshot does not match');
+    const mapped = imagePointToViewport(capture, { x, y });
+    if (!mapped) throw new Error('the screenshot point is outside the captured image');
+    if (!win || win.isDestroyed() || win.webContents.getURL() !== capture.url) throw new Error('the page changed after the screenshot');
+    await ensureAgent();
+    const page = await state();
+    const viewport = await agentCall('viewport');
+    if (page?.snapshotId !== capture.snapshotId || page.url !== capture.url
+      || viewport?.width !== capture.viewportWidth || viewport?.height !== capture.viewportHeight) {
+      throw new Error('the page or viewport changed after the screenshot');
+    }
+    const { x: cssX, y: cssY } = mapped;
+    const point = await agentCall('pointTarget', [cssX, cssY, capture.snapshotId]);
+    if (point?.ok !== true || !point.target?.token || point.target.snapshotId !== capture.snapshotId) {
+      throw new Error(point?.reason || 'the screenshot point is not a current interactive target');
+    }
+    return { capture, cssX, cssY, target: point.target };
+  };
+
   const press = async (key, index, expectedSnapshotId) => {
     if (expectedSnapshotId && await agentCall('snapshot') !== expectedSnapshotId) throw new Error('the page changed; read it again');
     if (index !== undefined) {
@@ -262,6 +641,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     const code = codes[key];
     if (!code) throw new Error(`key ${key} is not one of ${Object.keys(codes).join(', ')}`);
     win.webContents.sendInputEvent({ type: 'keyDown', keyCode: code });
+    if (key === 'Enter') win.webContents.sendInputEvent({ type: 'char', keyCode: code });
     win.webContents.sendInputEvent({ type: 'keyUp', keyCode: code });
     await sleep(250);
   };
@@ -272,6 +652,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     if (win && !win.isDestroyed()) win.destroy();
     win = null;
     injected = false;
+    resetFrameState();
+    activeVisualCapture = null;
   };
 
   const ensureWindow = () => {
@@ -300,8 +682,12 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     });
     ses.setDevicePermissionHandler(() => false);
     ses.on('will-download', handleImageDownload);
-    // no request of this window reaches this machine or the local network, not even a subresource
-    ses.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*'] }, (details, callback) => callback({ cancel: !isPublicHttp(details.url) }));
+    // Check the session's resolved endpoints before every HTTP request, including frame subresources.
+    ses.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*'] }, (details, callback) => {
+      void isPublicDestination(details.url)
+        .then((allowed) => callback({ cancel: !allowed }))
+        .catch(() => callback({ cancel: true }));
+    });
     win = new BrowserWindow({
       width, height,
       x: Math.max(area.x, area.x + area.width - width - 48),
@@ -334,9 +720,11 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     wc.on('will-navigate', onlyPublic);
     wc.on('will-redirect', onlyPublic);
     wc.on('will-frame-navigate', (event) => {
+      activeVisualCapture = null;
       if (event.isMainFrame || /^about:(blank|srcdoc)$/.test(event.url)) return;
       if (!isPublicHttp(event.url)) event.preventDefault();
     });
+    wc.on('did-navigate-in-page', () => { activeVisualCapture = null; });
     wc.on('will-attach-webview', (event) => event.preventDefault());
     wc.on('will-prevent-unload', (event) => event.preventDefault());
     // a page does not take the whole screen from the person; video stays in Coo's window
@@ -346,6 +734,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       if (!isMainFrame || isInPlace) return;
       injected = false;
       navigating = true;
+      resetFrameState();
+      activeVisualCapture = null;
       audioCaptureRequested = false;
       restoreMute();
     });
@@ -366,6 +756,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       clearStagedChatGPTImages();
       win = null;
       injected = false;
+      resetFrameState();
+      activeVisualCapture = null;
       navigating = false;
       audioCaptureRequested = false;
       send?.({ type: 'companion:browser-event', event: 'closed' });
@@ -376,7 +768,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
   const open = async (message) => {
     if (typeof message.muted === 'boolean') muted = message.muted;
     const target = httpUrl(message.url);
-    if (!target || !isPublicHttp(message.url)) throw new Error('only public http and https pages are opened');
+    if (!target || !await isPublicDestination(target.href)) throw new Error('only public http and https pages are opened');
     ensureWindow();
     if (win.isMinimized()) win.restore();
     if (!win.isVisible()) win.showInactive();
@@ -657,6 +1049,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       const opened = async () => {
         for (let i = 0; i < 20; i++) {
           if (await agentCall('shareOpen')) return true;
+    if (op === 'resolveLocator') { await ensureAgent(); return agentCall('resolveLocator', [message.locator, message.expectedSnapshotId]); }
           await sleep(100);
         }
         return false;
@@ -698,6 +1091,11 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       await agentCall('setAgentAction', [true]);
       try {
         const answer = await agentCall('click', [message.index, message.snapshotId]);
+          const currentPoint = await agentCall('textCenter', [message.text.trim()]);
+          if (!currentPoint?.ok || currentPoint.snapshotId !== point.snapshotId
+            || Math.abs(currentPoint.x - point.x) > 0.5 || Math.abs(currentPoint.y - point.y) > 0.5) {
+            throw new Error('the target changed or became blocked before the click; read the page again');
+          }
         if (answer?.success === false) throw new Error(answer.message || 'click refused');
         return { answer, state: await settle() };
       } finally {
@@ -742,14 +1140,60 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       return { state: await settle() };
     }
     if (op === 'play') {
+    if (op === 'inspect-screenshot-point') {
+      return inspectVisualPoint(message);
+    }
+    if (op === 'click-screenshot-point') {
+      let before;
+      try {
+        before = await inspectVisualPoint(message);
+        if (before.target.token !== message.targetToken) throw new Error('the screenshot target changed before approval');
+      } catch (error) {
+        return { answer: { success: false, message: String(error?.message ?? error) }, state: await state().catch(() => null) };
+      }
+      const capture = before.capture;
+      capture.used = true;
+      let dispatched = false;
+      try {
+        await agentCall('setAgentAction', [true]);
+      } catch (error) {
+        activeVisualCapture = null;
+        return { answer: { success: false, message: String(error?.message ?? error) }, state: await state().catch(() => null) };
+      }
+      try {
+        const x = Math.round(before.cssX), y = Math.round(before.cssY);
+        win.webContents.sendInputEvent({ type: 'mouseMove', x, y });
+        await sleep(120);
+        let current;
+        try { current = await inspectVisualPoint(message, true); }
+        catch (error) {
+          return { answer: { success: false, message: String(error?.message ?? error) }, state: await state().catch(() => null) };
+        }
+        if (current.target.token !== before.target.token
+          || Math.abs(current.cssX - before.cssX) > 0.5 || Math.abs(current.cssY - before.cssY) > 0.5) {
+          return { answer: { success: false, message: 'the target changed after pointer movement; take a new screenshot' }, state: await state().catch(() => null) };
+        }
+        dispatched = true;
+        win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+        win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+        await sleep(250);
+      } catch (error) {
+        if (dispatched) return { answer: { success: true, message: 'click dispatched; page result unavailable' }, state: null };
+        return { answer: { success: false, message: String(error?.message ?? error) }, state: await state().catch(() => null) };
+      } finally {
+        await agentCall('setAgentAction', [false]).catch(() => undefined);
+        if (activeVisualCapture === capture) activeVisualCapture = null;
+      }
+      try { return { answer: { success: true, message: 'screenshot target clicked once' }, state: await settle() }; }
+      catch { return { answer: { success: true, message: 'click dispatched; page result unavailable' }, state: null }; }
+    }
       await ensureAgent();
       const answer = await agentCall('play', [message.pause === true]);
       await sleep(200);
       return { answer, state: await state() };
     }
     if (op === 'screenshot') {
-      await ensureAgent();
-      return { ...(await capture()), state: await state() };
+      return captureForVisualClick();
     }
     if (op === 'back') {
       if (!win.webContents.navigationHistory.canGoBack()) return { back: false, state: await state() };
@@ -765,6 +1209,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
 
   return {
     async handle(message) {
+      resetFrameState();
+      activeVisualCapture = null;
       if (!message || typeof message.id !== 'number') return;
       try {
         const value = await result(message);

@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { chatGPTComposer, isChatGPTImageSaveTarget, isChatGPTPage } from '../app/browser-agent/chatgpt.ts';
+import { composedTextNodes } from '../app/browser-agent/accessible-name.ts';
+import { findTextTarget } from '../app/browser-agent/targets.ts';
 
 vi.mock('@page-agent/page-controller', () => ({
   PageController: class {
@@ -9,7 +11,13 @@ vi.mock('@page-agent/page-controller', () => ({
 
     async getBrowserState() {
       this.selectorMap.clear();
-      Array.from(document.querySelectorAll<HTMLElement>('button, a, input, textarea, [role="button"], [contenteditable="true"]'))
+      const elements: HTMLElement[] = [];
+      const visit = (root: Document | ShadowRoot): void => {
+        elements.push(...Array.from(root.querySelectorAll<HTMLElement>('button, a, input, textarea, [role="button"], [contenteditable="true"]')));
+        for (const host of Array.from(root.querySelectorAll<HTMLElement>('*'))) if (host.shadowRoot) visit(host.shadowRoot);
+      };
+      visit(document);
+      elements
         .forEach((element, index) => {
           this.selectorMap.set(index, { ref: element });
           // Match a controller cache that did not refresh its text for a reused DOM node.
@@ -36,14 +44,20 @@ vi.mock('@page-agent/page-controller', () => ({
 
 const agent = () => (window as unknown as { __cooBrowserAgent: {
   state(): Promise<{ snapshotId: string; elements: Array<{ id: number; label: string }>; timestamps: Array<{ text: string; datetime: string; context: string }> }>;
-  element(index: number): Promise<{ label: string; snapshotId: string } | null>;
+  element(index: number): Promise<{ label: string; snapshotId: string; dataE2e: string } | null>;
+  resolveLocator(locator: { role?: string; name?: string; testId?: string; within?: { role?: string; name?: string; testId?: string } }, snapshotId?: string): Promise<{ ok: true; id: number; snapshotId: string } | { ok: false; reason: string }>;
   fileInputTarget(id: number, snapshotId?: string): Promise<{ ok: true; token: string; accept: string; multiple: boolean; snapshotId: string } | { ok: false; reason: string }>;
   releaseFileInput(token: string): void;
   click(index: number, snapshotId?: string): Promise<{ success: boolean; message: string }>;
   snapshot(): Promise<string>;
+  textCenter(query: string): Promise<{ ok: true; x: number; y: number; snapshotId: string } | { ok: false; reason: string }>;
+  pointTarget(x: number, y: number, snapshotId?: string): Promise<{ ok: true; target: { token: string; label: string; tag: string; role: string; snapshotId: string } } | { ok: false; reason: string }>;
 } }).__cooBrowserAgent;
 
+const nativeGetComputedStyle = window.getComputedStyle.bind(window);
 beforeEach(() => {
+  Object.defineProperty(window, 'getComputedStyle', { configurable: true, value: (element: Element, pseudo?: string) =>
+    pseudo ? { content: 'none' } as CSSStyleDeclaration : nativeGetComputedStyle(element) });
   document.body.innerHTML = '';
   document.title = 'Douyin';
   Object.defineProperty(HTMLElement.prototype, 'offsetWidth', { configurable: true, get: () => 100 });
@@ -85,6 +99,244 @@ describe('browser page target snapshots', () => {
     await import('../app/browser-agent/entry.ts');
     const state = await agent().state();
     expect(state.timestamps).toEqual([{ text: '3 天前', datetime: '2026-10-28T04:20:00Z', context: 'Comment body3 天前' }]);
+  });
+
+  it('invalidates the target snapshot when its semantic container changes', async () => {
+    document.body.innerHTML = '<article aria-label="Video A"><button data-e2e="like">Like</button></article>';
+    await import('../app/browser-agent/entry.ts');
+    const first = await agent().state();
+    document.querySelector('article')!.setAttribute('aria-label', 'Video B');
+    const second = await agent().state();
+
+    expect(second.snapshotId).not.toBe(first.snapshotId);
+  });
+
+
+  it('exposes a stable page attribute and refuses a covered indexed click before dispatch', async () => {
+    document.body.innerHTML = '<button data-e2e="submit">Continue</button><div id="overlay"></div>';
+    const button = document.querySelector('button')!;
+    const overlay = document.getElementById('overlay')!;
+    Object.defineProperty(button, 'getBoundingClientRect', { configurable: true, value: () => ({
+      x: 20, y: 20, left: 20, top: 20, right: 120, bottom: 50, width: 100, height: 30, toJSON: () => ({}),
+    }) });
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => overlay });
+    let clicks = 0;
+    button.addEventListener('click', () => { clicks++; });
+
+    await import('../app/browser-agent/entry.ts');
+    const first = await agent().state();
+    const index = first.elements.find((item) => item.label === 'Continue')!.id;
+    expect(await agent().element(index)).toMatchObject({ dataE2e: 'submit', snapshotId: first.snapshotId });
+    await expect(agent().click(index, first.snapshotId)).resolves.toMatchObject({ success: false, message: 'target is not actionable: covered' });
+    expect(clicks).toBe(0);
+  });
+
+  it('refuses an action when an unrelated DOM mutation occurs during bounded settling', async () => {
+    document.body.innerHTML = '<button data-e2e="continue">Continue</button>';
+    const button = document.querySelector('button')!;
+    Object.defineProperty(button, 'getBoundingClientRect', { configurable: true, value: () => ({
+      x: 20, y: 20, left: 20, top: 20, right: 120, bottom: 50, width: 100, height: 30, toJSON: () => ({}),
+    }) });
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => button });
+    let clicks = 0;
+    button.addEventListener('click', () => { clicks++; });
+    const original = Object.getOwnPropertyDescriptor(window, 'requestAnimationFrame');
+    let frames = 0;
+    Object.defineProperty(window, 'requestAnimationFrame', {
+      configurable: true,
+      value: (callback: FrameRequestCallback) => {
+        frames++;
+        queueMicrotask(() => {
+          if (frames === 1) document.body.setAttribute('data-unmapped-change', '1');
+          callback(0);
+        });
+        return frames;
+      },
+    });
+
+    try {
+      await import('../app/browser-agent/entry.ts');
+      const page = await agent().state();
+      const index = page.elements.find((item) => item.label === 'Continue')!.id;
+      const result = await agent().click(index, page.snapshotId);
+      expect(result).toMatchObject({ success: false, message: 'target is not actionable: dom-changed' });
+      expect(clicks).toBe(0);
+      expect(await agent().snapshot()).toBe(page.snapshotId);
+    } finally {
+      Object.defineProperty(window, 'requestAnimationFrame', original ?? { configurable: true, writable: true, value: undefined });
+    }
+  });
+
+  it('bounds actionability settling when animation frames stop', async () => {
+    document.body.innerHTML = '<button data-e2e="continue">Continue</button>';
+    const button = document.querySelector('button')!;
+    Object.defineProperty(button, 'getBoundingClientRect', { configurable: true, value: () => ({
+      x: 20, y: 20, left: 20, top: 20, right: 120, bottom: 50, width: 100, height: 30, toJSON: () => ({}),
+    }) });
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => button });
+    let clicks = 0;
+    button.addEventListener('click', () => { clicks++; });
+    const original = Object.getOwnPropertyDescriptor(window, 'requestAnimationFrame');
+    Object.defineProperty(window, 'requestAnimationFrame', { configurable: true, value: () => 1 });
+
+    try {
+      await import('../app/browser-agent/entry.ts');
+      const page = await agent().state();
+      const index = page.elements.find((item) => item.label === 'Continue')!.id;
+      const startedAt = Date.now();
+      const result = await agent().click(index, page.snapshotId);
+      expect(Date.now() - startedAt).toBeLessThan(500);
+      expect(result).toMatchObject({ success: false, message: 'target is not actionable: wait-timeout' });
+      expect(clicks).toBe(0);
+    } finally {
+      Object.defineProperty(window, 'requestAnimationFrame', original ?? { configurable: true, writable: true, value: undefined });
+    }
+  });
+
+  it('resolves one matching control inside the requested semantic container', async () => {
+    document.body.innerHTML = '<article aria-label="Video A"><button aria-label="Like" data-e2e="like">Like</button></article><article aria-label="Video B"><button aria-label="Like" data-e2e="like">Like</button></article>';
+    const buttons = Array.from(document.querySelectorAll('button'));
+    buttons.forEach((button, index) => Object.defineProperty(button, 'getBoundingClientRect', { configurable: true, value: () => ({
+      x: 20 + index * 120, y: 20, left: 20 + index * 120, top: 20, right: 120 + index * 120, bottom: 50, width: 100, height: 30, toJSON: () => ({}),
+    }) }));
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => buttons[1] });
+
+    await import('../app/browser-agent/entry.ts');
+    const page = await agent().state();
+    const resolved = await agent().resolveLocator(
+      { role: 'button', name: 'Like', testId: 'like', within: { role: 'article', name: 'Video B' } },
+      page.snapshotId,
+    );
+    expect(resolved.ok).toBe(true);
+    if (!resolved.ok) return;
+    const result = await agent().click(resolved.id, resolved.snapshotId);
+    expect(result.success).toBe(true);
+  });
+
+  it('resolves and clicks an open-shadow target through the PageController index', async () => {
+    document.body.innerHTML = '<article aria-label="Clip A"><x-toolbar></x-toolbar></article>';
+    const shadow = document.querySelector('x-toolbar')!.attachShadow({ mode: 'open' });
+    shadow.innerHTML = '<button aria-label="Follow"></button>';
+    const button = shadow.querySelector('button')!;
+    const clicked = vi.fn();
+    button.addEventListener('click', clicked);
+    Object.defineProperty(button, 'getBoundingClientRect', { configurable: true, value: () => ({
+      x: 20, y: 20, left: 20, top: 20, right: 120, bottom: 50, width: 100, height: 30, toJSON: () => ({}),
+    }) });
+    const host = document.querySelector('x-toolbar')!;
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => host });
+    Object.defineProperty(shadow, 'elementFromPoint', { configurable: true, value: () => button });
+
+    await import('../app/browser-agent/entry.ts');
+    const page = await agent().state();
+    const resolved = await agent().resolveLocator({
+      role: 'button', name: 'Follow', within: { role: 'article', name: 'Clip A' },
+    }, page.snapshotId);
+    expect(resolved.ok).toBe(true);
+    if (!resolved.ok) return;
+    const result = await agent().click(resolved.id, resolved.snapshotId);
+    expect(result.success).toBe(true);
+    expect(clicked).toHaveBeenCalledOnce();
+  });
+
+  it('binds screenshot points to the exact live DOM target and snapshot', async () => {
+    document.body.innerHTML = '<button aria-label="Play">Play</button>';
+    const button = document.querySelector('button')!;
+    Object.defineProperty(button, 'getBoundingClientRect', { configurable: true, value: () => ({
+      x: 20, y: 20, left: 20, top: 20, right: 120, bottom: 50, width: 100, height: 30, toJSON: () => ({}),
+    }) });
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => button });
+
+    await import('../app/browser-agent/entry.ts');
+    const page = await agent().state();
+    const target = await agent().pointTarget(70, 35, page.snapshotId);
+    expect(target).toMatchObject({ ok: true, target: { label: 'Play', tag: 'button', role: 'button', snapshotId: page.snapshotId } });
+    button.setAttribute('aria-label', 'Pause');
+    expect(await agent().pointTarget(70, 35, page.snapshotId)).toEqual({ ok: false, reason: 'stale-snapshot' });
+  });
+});
+
+describe('browser text targets', () => {
+  it('finds a text control in a same-origin frame and scrolls its frame into view', async () => {
+    document.body.innerHTML = '<iframe></iframe>';
+    const frame = document.querySelector('iframe')!;
+    let frameTop = 900;
+    let frameWasScrolled = false;
+    Object.defineProperty(frame, 'clientWidth', { configurable: true, get: () => 100 });
+    Object.defineProperty(frame, 'clientHeight', { configurable: true, get: () => 100 });
+    Object.defineProperty(frame, 'offsetHeight', { configurable: true, get: () => 100 });
+    Object.defineProperty(frame, 'getBoundingClientRect', { configurable: true, value: () => ({
+      x: 20, y: frameTop, left: 20, top: frameTop, right: 120, bottom: frameTop + 100, width: 100, height: 100, toJSON: () => ({}),
+    }) });
+    Object.defineProperty(frame, 'scrollIntoView', { configurable: true, value: () => { frameWasScrolled = true; frameTop = 100; } });
+    const childDocument = frame.contentDocument!;
+    const childWindow = childDocument.defaultView!;
+    Object.defineProperty(childWindow, 'frameElement', { configurable: true, value: frame });
+    Object.defineProperty(childWindow.HTMLElement.prototype, 'offsetWidth', { configurable: true, get: () => 100 });
+    Object.defineProperty(childWindow.HTMLElement.prototype, 'offsetHeight', { configurable: true, get: () => 30 });
+    Object.defineProperty(childWindow.HTMLElement.prototype, 'scrollIntoView', { configurable: true, value() {} });
+    childDocument.body.innerHTML = '<button>Frame action</button>';
+    const button = childDocument.querySelector('button')!;
+    Object.defineProperty(button, 'getBoundingClientRect', { configurable: true, value: () => ({
+      x: 10, y: 10, left: 10, top: 10, right: 40, bottom: 30, width: 30, height: 20, toJSON: () => ({}),
+    }) });
+    Object.defineProperty(childDocument, 'elementFromPoint', { configurable: true, value: () => button });
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => frame });
+
+    await import('../app/browser-agent/entry.ts');
+    const result = await agent().textCenter('Frame action');
+    expect(result).toMatchObject({ ok: true, x: 45, y: 120 });
+    expect(frameWasScrolled).toBe(true);
+  });
+
+  it('scrolls a nested same-origin frame chain before returning a host viewport point', async () => {
+    document.body.innerHTML = '<iframe></iframe>';
+    const outer = document.querySelector('iframe')!;
+    const outerDocument = outer.contentDocument!;
+    const outerWindow = outerDocument.defaultView!;
+    Object.defineProperty(outerWindow, 'frameElement', { configurable: true, value: outer });
+    let outerTop = 900;
+    let outerWasScrolled = false;
+    Object.defineProperty(outer, 'clientWidth', { configurable: true, get: () => 100 });
+    Object.defineProperty(outer, 'clientHeight', { configurable: true, get: () => 100 });
+    Object.defineProperty(outer, 'offsetHeight', { configurable: true, get: () => 100 });
+    Object.defineProperty(outer, 'getBoundingClientRect', { configurable: true, value: () => ({
+      x: 20, y: outerTop, left: 20, top: outerTop, right: 120, bottom: outerTop + 100, width: 100, height: 100, toJSON: () => ({}),
+    }) });
+    Object.defineProperty(outer, 'scrollIntoView', { configurable: true, value: () => { outerWasScrolled = true; outerTop = 100; } });
+    const inner = outerDocument.createElement('iframe');
+    outerDocument.body.append(inner);
+    let innerWasScrolled = false;
+    Object.defineProperty(inner, 'clientWidth', { configurable: true, get: () => 100 });
+    Object.defineProperty(inner, 'clientHeight', { configurable: true, get: () => 100 });
+    Object.defineProperty(inner, 'offsetWidth', { configurable: true, get: () => 100 });
+    Object.defineProperty(inner, 'offsetHeight', { configurable: true, get: () => 100 });
+    Object.defineProperty(inner, 'getBoundingClientRect', { configurable: true, value: () => ({
+      x: 10, y: 15, left: 10, top: 15, right: 110, bottom: 115, width: 100, height: 100, toJSON: () => ({}),
+    }) });
+    Object.defineProperty(inner, 'scrollIntoView', { configurable: true, value: () => { innerWasScrolled = true; } });
+    const innerDocument = inner.contentDocument!;
+    const innerWindow = innerDocument.defaultView!;
+    Object.defineProperty(innerWindow, 'frameElement', { configurable: true, value: inner });
+    Object.defineProperty(innerWindow.HTMLElement.prototype, 'offsetWidth', { configurable: true, get: () => 100 });
+    Object.defineProperty(innerWindow.HTMLElement.prototype, 'offsetHeight', { configurable: true, get: () => 30 });
+    Object.defineProperty(innerWindow.HTMLElement.prototype, 'scrollIntoView', { configurable: true, value() {} });
+    innerDocument.body.innerHTML = '<button>Nested action</button>';
+    const button = innerDocument.querySelector('button')!;
+    Object.defineProperty(button, 'getBoundingClientRect', { configurable: true, value: () => ({
+      x: 10, y: 10, left: 10, top: 10, right: 40, bottom: 30, width: 30, height: 20, toJSON: () => ({}),
+    }) });
+    Object.defineProperty(innerDocument, 'elementFromPoint', { configurable: true, value: () => button });
+    Object.defineProperty(outerDocument, 'elementFromPoint', { configurable: true, value: () => inner });
+    Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => outer });
+
+    expect(Array.from(composedTextNodes(document)).map((node) => node.textContent)).toContain('Nested action');
+    expect(findTextTarget(document, 'Nested action')).toMatchObject({ ok: true });
+
+    await import('../app/browser-agent/entry.ts');
+    expect(await agent().textCenter('Nested action')).toMatchObject({ ok: true, x: 55, y: 135 });
+    expect(innerWasScrolled).toBe(true);
+    expect(outerWasScrolled).toBe(true);
   });
 });
 
