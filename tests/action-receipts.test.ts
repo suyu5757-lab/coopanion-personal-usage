@@ -1,0 +1,149 @@
+import { afterEach, describe, expect, it } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ActionReceiptLedger, actionReceiptDuplicateKey } from '../core/action-receipts.ts';
+import { hashContent } from '../core/browser/actions.ts';
+import type { BrowserTargetEvidence, DesktopTargetEvidence } from '../core/task-grants.ts';
+
+let dir = '';
+afterEach(() => {
+  if (dir) rmSync(dir, { recursive: true, force: true });
+  dir = '';
+});
+
+describe('shared ActionReceiptLedger', () => {
+  it('persists Browser and desktop receipts with common IDs and distinct evidence states', () => {
+    dir = mkdtempSync(join(tmpdir(), 'coopanion-action-receipts-'));
+    const file = join(dir, 'receipts.json');
+    const ledger = new ActionReceiptLedger(file);
+    const browserTarget: BrowserTargetEvidence = {
+      surface: 'browser',
+      instanceId: 'browser-1',
+      origin: 'https://www.example.test',
+      url: 'https://www.example.test/item/1',
+      accountRef: 'account-1',
+      snapshotId: 'page-1',
+      formId: 'item:1',
+      control: 'comment-submit',
+    };
+    const browser = ledger.begin({
+      taskId: 'browser-call-1',
+      intent: 'platform-write',
+      risk: 'IRREVERSIBLE_OR_PUBLIC',
+      target: browserTarget,
+      payloadDigest: hashContent('approved text'),
+      files: [],
+      duplicateKey: 'browser-duplicate-key',
+    }, 1_000);
+    ledger.awaitingApproval(browser.id, 1_001);
+    ledger.acting(browser.id, 'a'.repeat(64), 1_002, 30_000, 1_003);
+    ledger.complete(browser.id, {
+      phase: 'verified',
+      dispatchState: 'delivered',
+      outcome: 'ui-observed',
+      note: 'the page showed the editor cleared',
+      evidence: { source: 'page-agent', status: 'observed', observedAt: 1_004 },
+    }, 1_004);
+
+    const desktopTarget: DesktopTargetEvidence = {
+      surface: 'desktop',
+      instanceId: 'core-run-1',
+      bundleId: 'com.apple.TextEdit',
+      executablePath: '/System/Applications/TextEdit.app/Contents/MacOS/TextEdit',
+      pid: 42,
+      ownerPid: 42,
+      processStart: '2026-10-31T00:00:00Z',
+      windowId: 7,
+      bounds: { x: 0, y: 0, width: 700, height: 500 },
+      display: null,
+      space: null,
+      snapshotId: 'window-snapshot-1',
+      captureId: 'capture-1',
+      route: 'background-window-pixel',
+      source: 'cua-driver',
+    };
+    const payloadDigest = hashContent('pet_cua_type: type "hello"');
+    const desktopKey = actionReceiptDuplicateKey('computer-input', desktopTarget, payloadDigest, 'type hello');
+    const desktop = ledger.begin({
+      taskId: 'cua-call-1',
+      intent: 'computer-input',
+      risk: 'REVERSIBLE_LOCAL',
+      target: desktopTarget,
+      payloadDigest,
+      files: [],
+      duplicateKey: desktopKey,
+    }, 2_000);
+    ledger.awaitingApproval(desktop.id, 2_001);
+    ledger.acting(desktop.id, 'b'.repeat(64), 2_002, 30_000, 2_003);
+    ledger.complete(desktop.id, {
+      phase: 'unknown',
+      dispatchState: 'delivered',
+      outcome: 'unknown',
+      note: 'the driver returned an unverified effect',
+      evidence: { source: 'cua-driver', status: 'unverifiable', observedAt: 2_004 },
+    }, 2_004);
+
+    const reopened = new ActionReceiptLedger(file);
+    const persisted = JSON.parse(readFileSync(file, 'utf8')) as Array<Record<string, unknown>>;
+    expect(persisted).toHaveLength(2);
+    expect(persisted[0]).toMatchObject({ actionId: browser.id, attemptId: browser.attemptId, action: 'platform-write', risk: 'IRREVERSIBLE_OR_PUBLIC', outcome: 'ui-observed' });
+    expect(persisted[1]).toMatchObject({ actionId: desktop.id, attemptId: desktop.attemptId, action: 'computer-input', target: { surface: 'desktop' }, dispatchState: 'delivered', outcome: 'unknown' });
+    expect(reopened.hasUnresolved(desktopKey)).toBe(true);
+    const restartedTarget: DesktopTargetEvidence = {
+      ...desktopTarget,
+      instanceId: 'core-run-2',
+      pid: 84,
+      ownerPid: 84,
+      processStart: '2026-10-31T02:00:00Z',
+      windowId: 9,
+      snapshotId: 'window-snapshot-2',
+      captureId: 'capture-2',
+    };
+    const restartedKey = actionReceiptDuplicateKey('computer-input', restartedTarget, payloadDigest, 'type hello');
+    expect(restartedKey).toBe(desktopKey);
+    expect(reopened.hasUnresolved(restartedKey)).toBe(true);
+    expect(() => reopened.begin({
+      taskId: 'cua-call-2',
+      intent: 'computer-input',
+      risk: 'REVERSIBLE_LOCAL',
+      target: restartedTarget,
+      payloadDigest,
+      files: [],
+      duplicateKey: restartedKey,
+    }, 2_005)).toThrow(/needs review/);
+
+    const reviewPayload = hashContent('pet_cua_key: press Return');
+    const reviewKey = actionReceiptDuplicateKey('computer-input', desktopTarget, reviewPayload, 'press Return');
+    const review = reopened.begin({
+      taskId: 'cua-call-review',
+      intent: 'computer-input',
+      action: 'pet_cua_key',
+      risk: 'EXTERNAL_MUTATION',
+      target: desktopTarget,
+      payloadDigest: reviewPayload,
+      files: [],
+      duplicateKey: reviewKey,
+    }, 2_006);
+    reopened.awaitingApproval(review.id, 2_007);
+    reopened.acting(review.id, 'c'.repeat(64), 2_008, 30_000, 2_009);
+    reopened.complete(review.id, {
+      phase: 'review-pending',
+      dispatchState: 'delivered',
+      outcome: 'review-pending',
+      note: 'the remote service is reviewing the submitted change',
+    }, 2_010);
+    const reviewAfterRestart = new ActionReceiptLedger(file);
+    expect(reviewAfterRestart.hasUnresolved(reviewKey)).toBe(true);
+    expect(() => reviewAfterRestart.begin({
+      taskId: 'cua-call-review-retry',
+      intent: 'computer-input',
+      action: 'pet_cua_key',
+      risk: 'EXTERNAL_MUTATION',
+      target: desktopTarget,
+      payloadDigest: reviewPayload,
+      files: [],
+      duplicateKey: reviewKey,
+    }, 2_011)).toThrow(/needs review/);
+  });
+});

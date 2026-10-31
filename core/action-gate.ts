@@ -1,4 +1,4 @@
-import { TaskGrantRegistry, type ActionTargetEvidence, type DesktopTargetEvidence, type StepRequest, type StepTicket, type TaskGrant, type TaskGrantRequest } from './task-grants.ts';
+import { TaskGrantRegistry, type ActionRisk, type ActionTargetEvidence, type DesktopTargetEvidence, type StepRequest, type StepTicket, type TaskGrant, type TaskGrantRequest } from './task-grants.ts';
 
 /**
  * The one place that decides whether a tool may change something outside Coo's own state.
@@ -31,6 +31,9 @@ export type Verdict =
   | { allow: false; refusal: Refusal; detail: string };
 
 export interface DesktopStepAuthorization {
+  grantDigest: string;
+  approvedAt: number;
+  expiresAt: number;
   /** Consumes one ticket only when the dispatch evidence still matches the approved snapshot. */
   consume(target: DesktopTargetEvidence | null, expectedChange: string): boolean;
   /** Revokes a grant when the caller cannot dispatch the approved step. */
@@ -41,6 +44,7 @@ export interface DesktopStepGrantRequest {
   taskId: string;
   taskText: string;
   expectedChange: string;
+  risk: ActionRisk;
   target: DesktopTargetEvidence;
   expiresInMs: number;
   maxSteps: 1;
@@ -136,6 +140,7 @@ export class ActionGate {
     const grant = await this.requestTaskGrant({
       taskId: request.taskId,
       taskText: request.taskText,
+      risk: request.risk,
       target: request.target,
       actions: ['computer-input'],
       expiresInMs: request.expiresInMs,
@@ -150,6 +155,9 @@ export class ActionGate {
       this.revokeTask(request.taskId);
     };
     return {
+      grantDigest: grant.digest,
+      approvedAt: grant.approvedAt,
+      expiresAt: grant.expiresAt,
       consume: (target, expectedChange) => {
         if (finished) return false;
         finished = true;

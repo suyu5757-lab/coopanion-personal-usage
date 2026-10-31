@@ -144,6 +144,7 @@ describe('CUA input through the shared action gate', () => {
           taskId: request.taskId,
           taskText: request.taskText,
           expectedChange: request.expectedChange,
+          risk: request.risk ?? 'EXTERNAL_MUTATION',
           target: request.target as CuaDesktopTargetEvidence,
           expiresInMs: request.expiresInMs,
           maxSteps: request.maxSteps,
@@ -158,6 +159,7 @@ describe('CUA input through the shared action gate', () => {
             return consumed;
           },
           revoke: () => authorization.revoke(),
+          complete: (result) => events.push(`receipt:${result.dispatchState}:${result.outcome}:${result.effect}`),
         };
       },
     });
@@ -172,11 +174,11 @@ describe('CUA input through the shared action gate', () => {
     const click = await call('pet_cua_click', { x: 10, y: 10 });
     expect(selected.failed).toBeUndefined();
     expect(click.failed).toBeUndefined();
-    expect(events).toEqual(['ticket-consumed', 'dispatch']);
+    expect(events).toEqual(['ticket-consumed', 'dispatch', 'receipt:delivered:ui-observed:confirmed']);
     alterEvidenceOnConsume = true;
     const stale = await call('pet_cua_click', { x: 10, y: 10 });
     expect(stale.failed).toBe(true);
-    expect(events).toEqual(['ticket-consumed', 'dispatch', 'ticket-refused']);
+    expect(events).toEqual(['ticket-consumed', 'dispatch', 'receipt:delivered:ui-observed:confirmed', 'ticket-refused']);
     await cua.stop();
   });
 
@@ -206,10 +208,15 @@ describe('CUA input through the shared action gate', () => {
       driver: () => driver,
       instanceId: 'run-test',
       askPermission: async () => { questions++; return 'yes'; },
-      authorizeInput: async (request) => { grantRequests++; return gate.requestDesktopStep({
-        taskId: request.taskId, taskText: request.taskText, expectedChange: request.expectedChange,
-        target: request.target as CuaDesktopTargetEvidence, expiresInMs: request.expiresInMs, maxSteps: request.maxSteps,
-      }, request.confirmInCoreUi); },
+      authorizeInput: async (request) => {
+        grantRequests++;
+        const authorization = await gate.requestDesktopStep({
+          taskId: request.taskId, taskText: request.taskText, expectedChange: request.expectedChange,
+          risk: request.risk ?? 'EXTERNAL_MUTATION',
+          target: request.target as CuaDesktopTargetEvidence, expiresInMs: request.expiresInMs, maxSteps: request.maxSteps,
+        }, request.confirmInCoreUi);
+        return authorization ? { ...authorization, complete: () => {} } : null;
+      },
     });
     const inner = cua as unknown as { call: (request: { op: string }) => Promise<unknown> };
     inner.call = async (request) => request.op === 'windows'

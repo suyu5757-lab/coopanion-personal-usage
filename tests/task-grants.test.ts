@@ -30,6 +30,7 @@ const request = (changes: Partial<StepRequest> = {}): StepRequest => ({
 const grantRequest = (changes: Record<string, unknown> = {}) => ({
   taskId: 'session:round-4',
   taskText: 'Insert the approved paragraph in the open editor document.',
+  risk: 'REVERSIBLE_LOCAL' as const,
   target: desktop(),
   actions: ['click', 'type', 'key'],
   expiresInMs: 60_000,

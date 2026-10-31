@@ -98,6 +98,7 @@ describe('action gate', () => {
     const task = {
       taskId: 'session:round-1',
       taskText: 'Type the reviewed paragraph in the editor.',
+      risk: 'REVERSIBLE_LOCAL' as const,
       target,
       actions: ['computer-input'],
       expiresInMs: 30_000,
@@ -108,6 +109,9 @@ describe('action gate', () => {
     expect(await g.requestTaskGrant(task, async () => false, 1_000)).toBeNull();
     const grant = await g.requestTaskGrant(task, async () => true, 2_000);
     expect(grant).not.toBeNull();
+    expect(grant).toMatchObject({ risk: 'REVERSIBLE_LOCAL' });
+    const higherRiskGrant = await g.requestTaskGrant({ ...task, risk: 'EXTERNAL_MUTATION' }, async () => true, 2_001);
+    expect(higherRiskGrant?.digest).not.toBe(grant?.digest);
     const ticket = g.issueStepTicket(grant!.id, step, 2_001);
     expect(ticket).not.toBeNull();
     expect(g.consumeStepTicket(ticket!.id, step, 2_002)).toBe(true);
@@ -148,6 +152,7 @@ describe('action gate', () => {
       taskId: 'desktop:edit-once',
       taskText: 'Type the approved sentence in the editor.',
       expectedChange: 'type the approved sentence',
+      risk: 'REVERSIBLE_LOCAL' as const,
       target,
       expiresInMs: 30_000,
       maxSteps: 1 as const,
@@ -197,6 +202,7 @@ describe('action gate', () => {
       taskId: 'desktop:edit-once',
       taskText: 'Type the approved sentence in the editor.',
       expectedChange: 'type the approved sentence',
+      risk: 'REVERSIBLE_LOCAL',
       target,
       expiresInMs: 30_000,
       maxSteps: 1,
@@ -236,7 +242,7 @@ describe('action gate', () => {
     };
 
     await expect(g.requestTaskGrant({
-      taskId: 'desktop:browser-window', taskText: 'Click this browser window.', target,
+      taskId: 'desktop:browser-window', taskText: 'Click this browser window.', risk: 'EXTERNAL_MUTATION', target,
       actions: ['computer-input'], expiresInMs: 30_000, maxSteps: 1,
     }, async () => { confirmed++; return true; }, 1_000)).resolves.toBeNull();
     expect(confirmed).toBe(0);
@@ -262,7 +268,7 @@ describe('action gate', () => {
       control: 'image prompt',
     };
     await expect(g.requestTaskGrant({
-      taskId: 'browser:round-1', taskText: 'Submit this image prompt.', target,
+      taskId: 'browser:round-1', taskText: 'Submit this image prompt.', risk: 'EXTERNAL_MUTATION', target,
       actions: ['media-upload'], expiresInMs: 30_000, maxSteps: 1,
     }, async () => true, 1_000)).resolves.toBeNull();
   });
@@ -304,7 +310,7 @@ describe('action gate', () => {
       source: 'cua-driver' as const,
     };
     const webGrant = await g.requestTaskGrant({
-      taskId: 'browser:save-image', taskText: 'Save this verified image.', target: browserTarget,
+      taskId: 'browser:save-image', taskText: 'Save this verified image.', risk: 'REVERSIBLE_LOCAL', target: browserTarget,
       actions: ['image-saving'], expiresInMs: 30_000, maxSteps: 1,
     }, async () => true, 1_000);
     expect(webGrant).not.toBeNull();
@@ -313,7 +319,7 @@ describe('action gate', () => {
     }, 1_001)).toBeNull();
 
     const desktopGrant = await g.requestTaskGrant({
-      taskId: 'desktop:edit-text', taskText: 'Edit this local document.', target: desktopTarget,
+      taskId: 'desktop:edit-text', taskText: 'Edit this local document.', risk: 'REVERSIBLE_LOCAL', target: desktopTarget,
       actions: ['computer-input'], expiresInMs: 30_000, maxSteps: 1,
     }, async () => true, 2_000);
     expect(desktopGrant).not.toBeNull();
@@ -345,7 +351,7 @@ describe('action gate', () => {
       control: 'save-image-sha256',
     };
     const grant = await g.requestTaskGrant({
-      taskId: 'browser:save-image', taskText: 'Save the verified image.', target,
+      taskId: 'browser:save-image', taskText: 'Save the verified image.', risk: 'REVERSIBLE_LOCAL', target,
       actions: ['image-saving'], files: [{ path: 'image.png', digest: 'a'.repeat(64), bytes: 100, mime: 'image/png' }],
       expiresInMs: 30_000, maxSteps: 1,
     }, async () => true, 1_000);

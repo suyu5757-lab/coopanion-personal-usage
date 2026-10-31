@@ -60,6 +60,7 @@ import { deploymentRoot, providersRoot, repoRoot } from 'cortico/paths.ts';
 import { providerModules, registerProviderModules } from 'cortico/providers/registry.ts';
 import { withWorlds, type WorldDefinition, type WorldSection } from 'cortico/world.ts';
 import { ActionGate } from './action-gate.ts';
+import { actionReceiptDuplicateKey } from './action-receipts.ts';
 import { InstanceLockedError } from 'cortico/core/instance-lock.ts';
 import { CONSOLE } from 'cortico/worlds/console/definition.ts';
 import { desktopPetDefinition, figurePacks, isSupportedCuaTarget, type DesktopPetWorld } from 'cortico-world-desktop-pet';
@@ -72,6 +73,8 @@ import { askForKey, guideDone, markDone, runGuide, type GuideDeps } from './guid
 import { NOTICE_ID, noticeDefinition, type NoticeWorld } from './notice.ts';
 import { browserDefinition, BROWSER_ID } from './browser/definition.ts';
 import { BrowserBridge } from './browser/bridge.ts';
+import { BrowserTaskActionJournal } from './browser/task-actions.ts';
+import { hashContent } from './browser/actions.ts';
 import { readSelfTime, SELF_TIME_DEFAULTS } from './browser/config.ts';
 import { readResourcePressure } from './resource-pressure.ts';
 import { GROWTH_DEFAULTS, migrateLegacyGrowthConfig, readGrowth } from './growth/config.ts';
@@ -450,6 +453,14 @@ export async function main(): Promise<void> {
     computerInput: () => getByPath((config ?? {}) as unknown as Record<string, unknown>, 'worlds.desktop-pet.cua.control') === true,
     desktopTargetAllowed: isSupportedCuaTarget,
   });
+  const home = deploymentRoot();
+  const deployDir = join(home, DEPLOYMENT);
+  const actionReceiptFile = join(deployDir, 'browser', 'task-actions.json');
+  let actionReceipts: BrowserTaskActionJournal | null = null;
+  try {
+    actionReceipts = new BrowserTaskActionJournal(actionReceiptFile);
+    actionReceipts.recoverInterrupted();
+  } catch { actionReceipts = null; /* Browser and CUA writes fail closed if the ledger is unreadable */ }
   const desktopInputInstanceId = randomUUID();
   const browserBridge = new BrowserBridge();
   /** The introduction is running: the settings it makes are not told as changes. */
@@ -499,22 +510,92 @@ export async function main(): Promise<void> {
       if (answer === 'yes') telemetry?.count('cuaGranted');
     },
     cuaInstanceId: desktopInputInstanceId,
-    authorizeCuaInput: (request) => gate.requestDesktopStep({
-      taskId: request.taskId,
-      taskText: request.taskText,
-      expectedChange: request.expectedChange,
-      target: request.target,
-      expiresInMs: request.expiresInMs,
-      maxSteps: request.maxSteps,
-    }, request.confirmInCoreUi),
+    authorizeCuaInput: async (request) => {
+      const receipts = actionReceipts;
+      if (!receipts) return null;
+      const risk = request.risk ?? 'EXTERNAL_MUTATION';
+      const payloadDigest = hashContent(request.taskText);
+      const duplicateKey = actionReceiptDuplicateKey('computer-input', request.target, payloadDigest, request.expectedChange);
+      let receipt;
+      try {
+        receipt = receipts.begin({
+          taskId: request.taskId,
+          intent: 'computer-input',
+          action: request.tool,
+          risk,
+          target: request.target,
+          payloadDigest,
+          files: [],
+          duplicateKey,
+        });
+        receipts.awaitingApproval(receipt.id);
+      } catch {
+        return null;
+      }
+      let authorization;
+      try {
+        authorization = await gate.requestDesktopStep({
+          taskId: request.taskId,
+          taskText: request.taskText,
+          expectedChange: request.expectedChange,
+          risk,
+          target: request.target,
+          expiresInMs: request.expiresInMs,
+          maxSteps: request.maxSteps,
+        }, request.confirmInCoreUi);
+      } catch {
+        receipts.finish(receipt.id, 'cancelled', 'the Core task grant could not be created');
+        return null;
+      }
+      if (!authorization) {
+        receipts.finish(receipt.id, 'cancelled', 'the Core task grant was not approved');
+        return null;
+      }
+      try {
+        receipts.acting(receipt.id, authorization.grantDigest, authorization.approvedAt, authorization.expiresAt);
+      } catch {
+        authorization.revoke();
+        receipts.finish(receipt.id, 'cancelled', 'the approved grant could not be recorded');
+        return null;
+      }
+      return {
+        consume: (target, expectedChange) => {
+          const consumed = authorization.consume(target, expectedChange);
+          if (!consumed) receipts.finish(receipt.id, 'cancelled', 'the target evidence changed before dispatch');
+          return consumed;
+        },
+        revoke: () => {
+          authorization.revoke();
+          receipts.finish(receipt.id, 'cancelled', 'the CUA step was revoked before dispatch');
+        },
+        complete: (result) => {
+          const now = Date.now();
+          const evidence = {
+            source: 'cua-driver',
+            status: result.effect,
+            summary: result.effect,
+            ...(result.summary ? { digest: hashContent(result.summary) } : {}),
+            observedAt: now,
+          };
+          try {
+            const note = `CUA driver effect: ${result.effect}`;
+            if (result.outcome === 'ui-observed') {
+              receipts.complete(receipt.id, { phase: 'verified', dispatchState: 'delivered', outcome: 'ui-observed', note, evidence }, now);
+            } else if (result.outcome === 'cancelled') {
+              receipts.complete(receipt.id, { phase: 'cancelled', dispatchState: 'not-dispatched', outcome: 'cancelled', note, evidence }, now);
+            } else {
+              receipts.complete(receipt.id, { phase: 'unknown', dispatchState: result.dispatchState, outcome: 'unknown', note, evidence }, now);
+            }
+          } catch { /* an acting receipt remains unresolved and recovers as unknown */ }
+        },
+      };
+    },
     onBotChange: () => (notice as NoticeWorld | null)?.acceptCurrent(),
     onSkin: (skin) => followPetLook(join(deploymentRoot(), DEPLOYMENT), skin, (pet as DesktopPetWorld | null)?.packs() ?? [], language()),
   });
-  const home = deploymentRoot();
   // the system's language, as the Electron main process read it; Chinese when the Core runs without it
   const system = process.env.COOPANION_SYSTEM_LANGUAGE;
   seed(home, isLanguage(system) ? system : 'zh');
-  const deployDir = join(home, DEPLOYMENT);
   const NOTICE = noticeDefinition({
     version: APP_VERSION,
     notesDir: join(APP_ROOT, 'docs', 'releases'),
@@ -629,6 +710,7 @@ export async function main(): Promise<void> {
     journalFile: join(deployDir, 'browser', 'actions.json'),
     replyJournalFile: join(deployDir, 'browser', 'replies.json'),
     taskJournalFile: join(deployDir, 'browser', 'task-actions.json'),
+    ...(actionReceipts ? { taskJournal: actionReceipts } : {}),
     transcribe: (pcm) => pet
       ? pet.transcribePcm(pcm)
       : Promise.resolve({ text: '', error: 'the desktop pet is not running' }),

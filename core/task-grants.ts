@@ -9,6 +9,8 @@ export interface Rect {
 }
 
 export type ActionTargetEvidence = DesktopTargetEvidence | BrowserTargetEvidence;
+export type ActionRisk = 'READ_ONLY' | 'REVERSIBLE_LOCAL' | 'EXTERNAL_MUTATION' | 'IRREVERSIBLE_OR_PUBLIC';
+const ACTION_RISKS = new Set<ActionRisk>(['READ_ONLY', 'REVERSIBLE_LOCAL', 'EXTERNAL_MUTATION', 'IRREVERSIBLE_OR_PUBLIC']);
 
 export interface DesktopTargetEvidence {
   surface: 'desktop';
@@ -43,6 +45,7 @@ export interface BrowserTargetEvidence {
 export interface TaskGrantRequest {
   taskId: string;
   taskText: string;
+  risk: ActionRisk;
   target: ActionTargetEvidence;
   actions: string[];
   files?: Array<{ path: string; digest: string; bytes: number; mime: string }>;
@@ -54,6 +57,7 @@ export interface TaskGrant {
   id: string;
   taskId: string;
   taskText: string;
+  risk: ActionRisk;
   surface: ActionTargetEvidence['surface'];
   targetDigest: string;
   actions: readonly string[];
@@ -141,7 +145,7 @@ export class TaskGrantRegistry {
   ): Promise<TaskGrant | null> {
     const actions = sorted(request.actions);
     const files = normalizeFiles(request.files);
-    if (!request.taskId || !request.taskText.trim() || request.taskText.length > 4000 || !validTarget(request.target)
+    if (!request.taskId || !request.taskText.trim() || request.taskText.length > 4000 || !ACTION_RISKS.has(request.risk) || !validTarget(request.target)
       || actions.length === 0 || actions.length > 16 || files.some((file) => !safeRelativePath(file.path)
         || !/^[a-f0-9]{64}$/.test(file.digest) || !Number.isSafeInteger(file.bytes) || file.bytes <= 0 || !file.mime.trim())
       || !Number.isSafeInteger(request.expiresInMs) || request.expiresInMs < 1_000 || request.expiresInMs > 60 * 60_000
@@ -155,6 +159,7 @@ export class TaskGrantRegistry {
       id: randomUUID(),
       taskId: request.taskId,
       taskText: request.taskText,
+      risk: request.risk,
       surface: request.target.surface,
       targetDigest,
       actions,
@@ -164,7 +169,7 @@ export class TaskGrantRegistry {
       expiresAt: now + request.expiresInMs,
       maxSteps: request.maxSteps,
       stepsUsed: 0,
-      digest: hash([request.taskId, request.taskText, targetDigest, actions, files, this.generation, now, request.expiresInMs, request.maxSteps]),
+      digest: hash([request.taskId, request.taskText, request.risk, targetDigest, actions, files, this.generation, now, request.expiresInMs, request.maxSteps]),
       revoked: false,
     };
     this.grants.set(grant.id, grant);

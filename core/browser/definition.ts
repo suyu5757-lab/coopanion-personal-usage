@@ -6,6 +6,7 @@
 import type { Language } from 'cortico/core/language.ts';
 import { describeTools, type WorldDefinition, type WorldSection } from 'cortico/world.ts';
 import type { ActionGate } from '../action-gate.ts';
+import type { BrowserTaskActionJournal } from './task-actions.ts';
 import type { ModelLanguage } from '../language.ts';
 import type { BrowserTransport } from './bridge.ts';
 import type { SelfTimeConfig } from './config.ts';
@@ -29,6 +30,8 @@ export interface BrowserAssembly {
   replyJournalFile?: string;
   /** Durable transaction log for scoped image and media actions. */
   taskJournalFile?: string;
+  /** Core's shared action receipt ledger. */
+  taskJournal?: BrowserTaskActionJournal;
   /** Transcribes one finished 16 kHz mono utterance from the page's audio; absent when speech recognition is unavailable. */
   transcribe?: (pcm: Int16Array) => Promise<{ text: string; error?: string | null }>;
   /** A browsing session ended; Coo's next heartbeat starts from now. */
@@ -76,6 +79,7 @@ export function browserDefinition(assembly: BrowserAssembly): WorldDefinition<Wo
       ...(assembly.journalFile ? { journalFile: assembly.journalFile } : {}),
       ...(assembly.replyJournalFile ? { replyJournalFile: assembly.replyJournalFile } : {}),
       ...(assembly.taskJournalFile ? { taskJournalFile: assembly.taskJournalFile } : {}),
+      ...(assembly.taskJournal ? { taskJournal: assembly.taskJournal } : {}),
       ...(assembly.transcribe ? { transcribe: assembly.transcribe } : {}),
       ...(assembly.onSessionEnd ? { onSessionEnd: assembly.onSessionEnd } : {}),
     }),

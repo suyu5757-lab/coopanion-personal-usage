@@ -16,9 +16,10 @@ import type { Language } from 'cortico/core/language.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import type { ModelLanguage } from '../language.ts';
 import { ActionGate, type Impact } from '../action-gate.ts';
+import { defaultActionRisk, type ActionRisk } from '../action-receipts.ts';
 import { coreText } from '../i18n/index.ts';
 import { ActionJournal, hashContent, originOf, ReplyJournal, type ActionTarget, type PublicAction } from './actions.ts';
-import { browserDuplicateKey, BrowserTaskActionJournal } from './task-actions.ts';
+import { BrowserTaskActionJournal, browserDuplicateKey } from './task-actions.ts';
 import type { BrowserTargetEvidence, StepRequest } from '../task-grants.ts';
 import type { BrowserTransport } from './bridge.ts';
 import { CONTENT_MAX, SESSION_MAX_CALLS, TEXT_MAX, WATCH_FRAMES_DEFAULT, WATCH_FRAMES_MAX, WATCH_MAX, type SelfTimeConfig } from './config.ts';
@@ -56,6 +57,8 @@ export interface BrowserWorldOptions {
   replyJournalFile?: string;
   /** Durable transaction log for scoped image and media actions. */
   taskJournalFile?: string;
+  /** Core's shared receipt ledger. */
+  taskJournal?: BrowserTaskActionJournal;
   /** Transcribes one finished 16 kHz mono utterance from the page's audio; absent when speech recognition is unavailable. */
   transcribe?: (pcm: Int16Array) => Promise<{ text: string; error?: string | null }>;
   /** A browsing session ended (closed, timed out or out of calls); Coo's next heartbeat starts from now. */
@@ -309,6 +312,10 @@ export class BrowserWorld implements World {
 
   private ensureTaskJournal(): boolean {
     if (this.taskJournal) return true;
+    if (this.opts.taskJournal) {
+      this.taskJournal = this.opts.taskJournal;
+      return true;
+    }
     if (!this.opts.taskJournalFile) return false;
     try {
       this.taskJournal = new BrowserTaskActionJournal(this.opts.taskJournalFile);
@@ -351,6 +358,7 @@ export class BrowserWorld implements World {
       actionLabel?: string;
       payloadDigest?: string;
       commentFingerprint?: string;
+      risk?: ActionRisk;
     } = {},
   ): Promise<BrowserActionApproval> {
     if (!this.ensureTaskJournal() || !this.taskJournal) return { approved: false, reason: 'unavailable' };
@@ -369,6 +377,7 @@ export class BrowserWorld implements World {
     const taskId = ctx.callId ? `${ctx.role}:${ctx.callId}` : `${ctx.role}:${ctx.round ?? 'direct'}:${randomUUID()}`;
     const files = scope.files ?? [];
     const payloadDigest = scope.payloadDigest ?? hashContent(taskText);
+    const risk = scope.risk ?? defaultActionRisk(impact);
     const duplicateKey = browserDuplicateKey(impact, target, payloadDigest, scope.dedupeKey, files);
     if (this.taskJournal.hasUnresolved(duplicateKey)) return { approved: false, reason: 'unknown' };
     let action: ReturnType<BrowserTaskActionJournal['begin']>;
@@ -376,10 +385,12 @@ export class BrowserWorld implements World {
       action = this.taskJournal.begin({
         taskId,
         intent: impact,
+        action: `${impact}:${control}`,
         target,
         payloadDigest,
         files,
         ...(scope.commentFingerprint ? { commentFingerprint: scope.commentFingerprint } : {}),
+        risk,
         duplicateKey,
       });
       this.taskJournal.awaitingApproval(action.id);
@@ -393,6 +404,7 @@ export class BrowserWorld implements World {
       grant = await this.gate.requestTaskGrant({
         taskId,
         taskText,
+        risk,
         target,
         actions: [impact],
         ...(scope.files ? { files: scope.files } : {}),
@@ -1434,6 +1446,7 @@ export class BrowserWorld implements World {
           dedupeKey: replyTarget?.fingerprint,
           commentFingerprint: replyTarget?.fingerprint,
           payloadDigest: contentDigest,
+          risk: 'IRREVERSIBLE_OR_PUBLIC',
         },
       );
       if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
