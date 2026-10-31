@@ -31,6 +31,7 @@ export interface BrowserTaskAction {
 const PHASES = new Set<BrowserTaskPhase>(['planned', 'awaiting-approval', 'acting', 'verified', 'unknown', 'cancelled']);
 const INTENTS = new Set<BrowserTaskIntent>(['platform-write', 'image-generation', 'image-saving', 'media-upload']);
 const UNRESOLVED = new Set<BrowserTaskPhase>(['planned', 'awaiting-approval', 'acting', 'unknown']);
+const MAX_RECENT_ACTIONS = 500;
 
 function usable(value: unknown): value is BrowserTaskAction {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -111,7 +112,15 @@ export class BrowserTaskActionJournal {
   }
 
   private save(): void {
-    if (this.actions.length > 500) this.actions = this.actions.slice(-500);
+    if (this.actions.length > MAX_RECENT_ACTIONS) {
+      const unresolved = this.actions.filter((action) => UNRESOLVED.has(action.phase));
+      const settledLimit = Math.max(0, MAX_RECENT_ACTIONS - unresolved.length);
+      const settled = settledLimit === 0
+        ? []
+        : this.actions.filter((action) => !UNRESOLVED.has(action.phase)).slice(-settledLimit);
+      const retainedIds = new Set([...unresolved, ...settled].map((action) => action.id));
+      this.actions = this.actions.filter((action) => retainedIds.has(action.id));
+    }
     mkdirSync(dirname(this.file), { recursive: true });
     writeState(this.file, `${JSON.stringify(this.actions, null, 2)}\n`);
   }
