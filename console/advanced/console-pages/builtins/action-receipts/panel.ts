@@ -121,7 +121,7 @@ export const panel: WebUiPanel = {
       for (const evidence of receipt.evidence) {
         card.body.append(ui.h('div', 'stloc', `${t.evidence}: ${evidence.status} · ${evidence.source}${evidence.summary ? ` · ${evidence.summary}` : ''} · ${when(evidence.observedAt, ctx.language)}`));
       }
-      if (!['unknown', 'submitted', 'review-pending'].includes(receipt.phase)) return card.el;
+      if (!['draft-ready', 'unknown', 'submitted', 'review-pending'].includes(receipt.phase)) return card.el;
       const note = ui.textarea({ placeholder: t.notePlaceholder, cls: 'grow' });
       const actions = ui.actions();
       const verify = ui.button(t.verified, { size: 'sm', variant: 'primary', onClick: () => void review(receipt, 'verified', verify, note) });

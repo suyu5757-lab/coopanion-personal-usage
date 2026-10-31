@@ -26,7 +26,7 @@ const zh = {
   reconcileUnavailable: '动作回执账本不可用，请稍后刷新。',
   reconcileInvalid: '请填写核对说明并重新选择结果。',
   reconcileStale: '这条回执状态已变化，请刷新后重新核对。',
-  phaseName: (value: string) => ({ planned: '已计划', 'awaiting-approval': '等待批准', acting: '执行中', submitted: '已提交，待核对', 'review-pending': '平台审核中', unknown: '结果未知' }[value] ?? value),
+  phaseName: (value: string) => ({ planned: '已计划', 'awaiting-approval': '等待批准', acting: '执行中', 'draft-ready': '草稿已就绪，等待检查', submitted: '已提交，待核对', 'review-pending': '平台审核中', unknown: '结果未知' }[value] ?? value),
   dispatchName: (value: string) => ({ 'not-dispatched': '尚未派发', delivered: '已派发', unknown: '派发结果未知' }[value] ?? value),
 };
 
@@ -56,7 +56,7 @@ const en = {
   reconcileUnavailable: 'The action receipt ledger is unavailable. Refresh later.',
   reconcileInvalid: 'Enter a review note and choose a result again.',
   reconcileStale: 'This receipt changed. Refresh and review it again.',
-  phaseName: (value: string) => ({ planned: 'Planned', 'awaiting-approval': 'Awaiting approval', acting: 'Acting', submitted: 'Submitted; awaiting review', 'review-pending': 'Platform review', unknown: 'Unknown result' }[value] ?? value),
+  phaseName: (value: string) => ({ planned: 'Planned', 'awaiting-approval': 'Awaiting approval', acting: 'Acting', 'draft-ready': 'Draft ready for review', submitted: 'Submitted; awaiting review', 'review-pending': 'Platform review', unknown: 'Unknown result' }[value] ?? value),
   dispatchName: (value: string) => ({ 'not-dispatched': 'Not dispatched', delivered: 'Dispatched', unknown: 'Dispatch unknown' }[value] ?? value),
 };
 const zhHant: Partial<typeof zh> = {
@@ -67,7 +67,7 @@ const zhHant: Partial<typeof zh> = {
   reconcileUnavailable: '動作回執帳本無法使用，請稍後重新整理。',
   reconcileInvalid: '請填寫核對說明並重新選擇結果。',
   reconcileStale: '這條回執狀態已變更，請重新整理後再核對。',
-  phaseName: (value) => ({ planned: '已計畫', 'awaiting-approval': '等待批准', acting: '執行中', submitted: '已提交，待核對', 'review-pending': '平台審核中', unknown: '結果未知' }[value] ?? value),
+  phaseName: (value) => ({ planned: '已計畫', 'awaiting-approval': '等待批准', acting: '執行中', 'draft-ready': '草稿已就緒，等待檢查', submitted: '已提交，待核對', 'review-pending': '平台審核中', unknown: '結果未知' }[value] ?? value),
   dispatchName: (value) => ({ 'not-dispatched': '尚未派發', delivered: '已派發', unknown: '派發結果未知' }[value] ?? value),
 };
 
@@ -81,7 +81,7 @@ const ja: Partial<typeof zh> = {
   reconcileUnavailable: '操作レシートを利用できません。後で再読み込みしてください。',
   reconcileInvalid: '確認メモを入力し、結果を選び直してください。',
   reconcileStale: 'レシートの状態が変わりました。再読み込みして確認してください。',
-  phaseName: (value) => ({ planned: '予定済み', 'awaiting-approval': '承認待ち', acting: '実行中', submitted: '送信済み・確認待ち', 'review-pending': '審査中', unknown: '結果不明' }[value] ?? value),
+  phaseName: (value) => ({ planned: '予定済み', 'awaiting-approval': '承認待ち', acting: '実行中', 'draft-ready': '下書き確認待ち', submitted: '送信済み・確認待ち', 'review-pending': '審査中', unknown: '結果不明' }[value] ?? value),
   dispatchName: (value) => ({ 'not-dispatched': '未実行', delivered: '実行済み', unknown: '実行状態不明' }[value] ?? value),
 };
 const ko: Partial<typeof zh> = {
@@ -91,7 +91,7 @@ const ko: Partial<typeof zh> = {
   reconcileUnavailable: '작업 영수증을 사용할 수 없습니다. 나중에 새로고침하세요.',
   reconcileInvalid: '검토 메모를 입력하고 결과를 다시 선택하세요.',
   reconcileStale: '영수증 상태가 변경되었습니다. 새로고침한 뒤 다시 검토하세요.',
-  phaseName: (value) => ({ planned: '계획됨', 'awaiting-approval': '승인 대기', acting: '실행 중', submitted: '제출됨 · 확인 대기', 'review-pending': '플랫폼 검토 중', unknown: '결과 불명' }[value] ?? value), dispatchName: (value) => ({ 'not-dispatched': '전달 전', delivered: '전달됨', unknown: '전달 결과 불명' }[value] ?? value),
+  phaseName: (value) => ({ planned: '계획됨', 'awaiting-approval': '승인 대기', acting: '실행 중', 'draft-ready': '검토할 초안이 준비됨', submitted: '제출됨 · 확인 대기', 'review-pending': '플랫폼 검토 중', unknown: '결과 불명' }[value] ?? value), dispatchName: (value) => ({ 'not-dispatched': '전달 전', delivered: '전달됨', unknown: '전달 결과 불명' }[value] ?? value),
 };
 const fr: Partial<typeof zh> = {
   title: 'Reçus d’action', refresh: 'Actualiser', loading: 'Chargement des reçus…', unavailable: 'Le registre des reçus est indisponible.', empty: 'Aucun reçu ne nécessite de vérification.', count: (n) => `${n} reçu${n === 1 ? '' : 's'} à vérifier.`, phase: 'État', target: 'Cible', dispatch: 'Envoi', created: 'Créé', payload: 'Empreinte du contenu', files: 'Fichiers', evidence: 'Éléments disponibles', note: 'Note de vérification', notePlaceholder: 'Décrivez ce que vous avez observé. Ne consignez pas une supposition non vérifiée.', noteRequired: 'Ajoutez une note de vérification.',
@@ -99,7 +99,7 @@ const fr: Partial<typeof zh> = {
   reconcileUnavailable: 'Registre indisponible. Réessayez plus tard.',
   reconcileInvalid: 'Saisissez une note et choisissez à nouveau un résultat.',
   reconcileStale: 'Le reçu a changé. Actualisez-le avant de le vérifier.',
-  phaseName: (value) => ({ planned: 'Planifié', 'awaiting-approval': 'En attente d’approbation', acting: 'En cours', submitted: 'Soumis, à vérifier', 'review-pending': 'En examen par la plateforme', unknown: 'Résultat inconnu' }[value] ?? value), dispatchName: (value) => ({ 'not-dispatched': 'Non envoyé', delivered: 'Envoyé', unknown: 'Envoi incertain' }[value] ?? value),
+  phaseName: (value) => ({ planned: 'Planifié', 'awaiting-approval': 'En attente d’approbation', acting: 'En cours', 'draft-ready': 'Brouillon prêt à vérifier', submitted: 'Soumis, à vérifier', 'review-pending': 'En examen par la plateforme', unknown: 'Résultat inconnu' }[value] ?? value), dispatchName: (value) => ({ 'not-dispatched': 'Non envoyé', delivered: 'Envoyé', unknown: 'Envoi incertain' }[value] ?? value),
 };
 const de: Partial<typeof zh> = {
   title: 'Aktionsbelege', refresh: 'Aktualisieren', loading: 'Aktionsbelege werden geladen…', unavailable: 'Das Aktionsbeleg-Register ist nicht verfügbar.', empty: 'Keine Aktionsbelege zur Prüfung.', count: (n) => `${n} Aktionsbeleg${n === 1 ? '' : 'e'} zur Prüfung.`, phase: 'Status', target: 'Ziel', dispatch: 'Versand', created: 'Erstellt', payload: 'Inhalts-Hash', files: 'Dateien', evidence: 'Bisherige Belege', note: 'Prüfnotiz', notePlaceholder: 'Halte fest, was du beobachtet hast. Ungeprüfte Annahmen gehören nicht hierher.', noteRequired: 'Gib eine Prüfnotiz ein.',
@@ -107,7 +107,7 @@ const de: Partial<typeof zh> = {
   reconcileUnavailable: 'Das Register ist nicht verfügbar. Bitte später aktualisieren.',
   reconcileInvalid: 'Gib eine Prüfnotiz ein und wähle ein Ergebnis.',
   reconcileStale: 'Der Beleg hat sich geändert. Bitte aktualisieren und erneut prüfen.',
-  phaseName: (value) => ({ planned: 'Geplant', 'awaiting-approval': 'Wartet auf Freigabe', acting: 'Wird ausgeführt', submitted: 'Gesendet, Prüfung ausstehend', 'review-pending': 'Plattformprüfung', unknown: 'Ergebnis unbekannt' }[value] ?? value), dispatchName: (value) => ({ 'not-dispatched': 'Nicht versandt', delivered: 'Versandt', unknown: 'Versand unklar' }[value] ?? value),
+  phaseName: (value) => ({ planned: 'Geplant', 'awaiting-approval': 'Wartet auf Freigabe', acting: 'Wird ausgeführt', 'draft-ready': 'Entwurf zur Prüfung bereit', submitted: 'Gesendet, Prüfung ausstehend', 'review-pending': 'Plattformprüfung', unknown: 'Ergebnis unbekannt' }[value] ?? value), dispatchName: (value) => ({ 'not-dispatched': 'Nicht versandt', delivered: 'Versandt', unknown: 'Versand unklar' }[value] ?? value),
 };
 const es419: Partial<typeof zh> = {
   title: 'Comprobantes de acciones', refresh: 'Actualizar', loading: 'Cargando comprobantes…', unavailable: 'El registro de comprobantes no está disponible.', empty: 'No hay comprobantes pendientes de revisión.', count: (n) => `${n} comprobantes requieren revisión.`, phase: 'Estado', target: 'Destino', dispatch: 'Envío', created: 'Creado', payload: 'Huella del contenido', files: 'Archivos', evidence: 'Evidencia disponible', note: 'Nota de revisión', notePlaceholder: 'Escribe lo que observaste. No registres suposiciones sin verificar.', noteRequired: 'Escribe una nota de revisión.',
@@ -115,7 +115,7 @@ const es419: Partial<typeof zh> = {
   reconcileUnavailable: 'El registro no está disponible. Actualiza más tarde.',
   reconcileInvalid: 'Escribe una nota y elige un resultado nuevamente.',
   reconcileStale: 'El comprobante cambió. Actualiza y vuelve a revisarlo.',
-  phaseName: (value) => ({ planned: 'Planeada', 'awaiting-approval': 'En espera de aprobación', acting: 'En curso', submitted: 'Enviada; pendiente de revisión', 'review-pending': 'Revisión de la plataforma', unknown: 'Resultado desconocido' }[value] ?? value), dispatchName: (value) => ({ 'not-dispatched': 'No enviado', delivered: 'Enviado', unknown: 'Envío incierto' }[value] ?? value),
+  phaseName: (value) => ({ planned: 'Planeada', 'awaiting-approval': 'En espera de aprobación', acting: 'En curso', 'draft-ready': 'Borrador listo para revisar', submitted: 'Enviada; pendiente de revisión', 'review-pending': 'Revisión de la plataforma', unknown: 'Resultado desconocido' }[value] ?? value), dispatchName: (value) => ({ 'not-dispatched': 'No enviado', delivered: 'Enviado', unknown: 'Envío incierto' }[value] ?? value),
 };
 const ptBR: Partial<typeof zh> = {
   title: 'Comprovantes de ações', refresh: 'Atualizar', loading: 'Carregando comprovantes…', unavailable: 'O registro de comprovantes está indisponível.', empty: 'Não há comprovantes para revisar.', count: (n) => `${n} comprovantes precisam de revisão.`, phase: 'Estado', target: 'Destino', dispatch: 'Envio', created: 'Criado', payload: 'Resumo do conteúdo', files: 'Arquivos', evidence: 'Evidências atuais', note: 'Nota de revisão', notePlaceholder: 'Descreva o que você observou. Não registre suposições sem verificar.', noteRequired: 'Escreva uma nota de revisão.',
@@ -123,7 +123,7 @@ const ptBR: Partial<typeof zh> = {
   reconcileUnavailable: 'O registro está indisponível. Atualize mais tarde.',
   reconcileInvalid: 'Escreva uma nota e escolha novamente o resultado.',
   reconcileStale: 'O comprovante mudou. Atualize e revise novamente.',
-  phaseName: (value) => ({ planned: 'Planejado', 'awaiting-approval': 'Aguardando aprovação', acting: 'Em execução', submitted: 'Enviado; aguardando revisão', 'review-pending': 'Em análise pela plataforma', unknown: 'Resultado desconhecido' }[value] ?? value), dispatchName: (value) => ({ 'not-dispatched': 'Não enviado', delivered: 'Enviado', unknown: 'Envio incerto' }[value] ?? value),
+  phaseName: (value) => ({ planned: 'Planejado', 'awaiting-approval': 'Aguardando aprovação', acting: 'Em execução', 'draft-ready': 'Rascunho pronto para revisão', submitted: 'Enviado; aguardando revisão', 'review-pending': 'Em análise pela plataforma', unknown: 'Resultado desconhecido' }[value] ?? value), dispatchName: (value) => ({ 'not-dispatched': 'Não enviado', delivered: 'Enviado', unknown: 'Envio incerto' }[value] ?? value),
 };
 const it: Partial<typeof zh> = {
   title: 'Ricevute delle azioni', refresh: 'Aggiorna', loading: 'Caricamento delle ricevute…', unavailable: 'Il registro delle ricevute non è disponibile.', empty: 'Nessuna ricevuta da verificare.', count: (n) => `${n} ricevute da verificare.`, phase: 'Stato', target: 'Destinazione', dispatch: 'Invio', created: 'Creata', payload: 'Impronta del contenuto', files: 'File', evidence: 'Prove disponibili', note: 'Nota di verifica', notePlaceholder: 'Descrivi ciò che hai osservato. Non inserire supposizioni non verificate.', noteRequired: 'Inserisci una nota di verifica.',
@@ -131,7 +131,7 @@ const it: Partial<typeof zh> = {
   reconcileUnavailable: 'Registro non disponibile. Riprova più tardi.',
   reconcileInvalid: 'Inserisci una nota e scegli di nuovo un risultato.',
   reconcileStale: 'La ricevuta è cambiata. Aggiorna e controllala di nuovo.',
-  phaseName: (value) => ({ planned: 'Pianificata', 'awaiting-approval': 'In attesa di approvazione', acting: 'In esecuzione', submitted: 'Inviata, da verificare', 'review-pending': 'Revisione della piattaforma', unknown: 'Risultato sconosciuto' }[value] ?? value), dispatchName: (value) => ({ 'not-dispatched': 'Non inviata', delivered: 'Inviata', unknown: 'Invio incerto' }[value] ?? value),
+  phaseName: (value) => ({ planned: 'Pianificata', 'awaiting-approval': 'In attesa di approvazione', acting: 'In esecuzione', 'draft-ready': 'Bozza pronta da verificare', submitted: 'Inviata, da verificare', 'review-pending': 'Revisione della piattaforma', unknown: 'Risultato sconosciuto' }[value] ?? value), dispatchName: (value) => ({ 'not-dispatched': 'Non inviata', delivered: 'Inviata', unknown: 'Invio incerto' }[value] ?? value),
 };
 const ru: Partial<typeof zh> = {
   title: 'Квитанции действий', refresh: 'Обновить', loading: 'Загрузка квитанций…', unavailable: 'Журнал квитанций недоступен.', empty: 'Нет квитанций, требующих проверки.', count: (n) => `Требуют проверки: ${n}.`, phase: 'Статус', target: 'Цель', dispatch: 'Отправка', created: 'Создано', payload: 'Хэш содержимого', files: 'Файлы', evidence: 'Имеющиеся доказательства', note: 'Заметка проверки', notePlaceholder: 'Запишите, что вы наблюдали. Не указывайте непроверенные предположения.', noteRequired: 'Добавьте заметку проверки.',
@@ -139,7 +139,7 @@ const ru: Partial<typeof zh> = {
   reconcileUnavailable: 'Журнал недоступен. Обновите позже.',
   reconcileInvalid: 'Добавьте заметку и выберите результат снова.',
   reconcileStale: 'Квитанция изменилась. Обновите список и проверьте её снова.',
-  phaseName: (value) => ({ planned: 'Запланировано', 'awaiting-approval': 'Ожидает подтверждения', acting: 'Выполняется', submitted: 'Отправлено, ожидает проверки', 'review-pending': 'Рассмотрение платформой', unknown: 'Результат неизвестен' }[value] ?? value), dispatchName: (value) => ({ 'not-dispatched': 'Не отправлено', delivered: 'Отправлено', unknown: 'Отправка неизвестна' }[value] ?? value),
+  phaseName: (value) => ({ planned: 'Запланировано', 'awaiting-approval': 'Ожидает подтверждения', acting: 'Выполняется', 'draft-ready': 'Черновик готов к проверке', submitted: 'Отправлено, ожидает проверки', 'review-pending': 'Рассмотрение платформой', unknown: 'Результат неизвестен' }[value] ?? value), dispatchName: (value) => ({ 'not-dispatched': 'Не отправлено', delivered: 'Отправлено', unknown: 'Отправка неизвестна' }[value] ?? value),
 };
 
 export const S: LanguageTable<typeof zh> = { zh, en, 'zh-Hant': zhHant, ja, ko, fr, de, 'es-419': es419, 'pt-BR': ptBR, it, ru };
