@@ -7,6 +7,7 @@ import type { Language } from 'cortico/core/language.ts';
 import type { ConfigGroup } from 'cortico/core/config-schema.ts';
 import { describeTools, type WorldDefinition, type WorldSection } from 'cortico/world.ts';
 import type { ModelLanguage } from '../language.ts';
+import type { FileSystemActionAuthorizationRequest, FileSystemActionAuthorization } from '../action-authorization.ts';
 import { VIDEO_TOOL_DECLS } from './tools.ts';
 import { VideoWorld, VIDEO_WORLD_ID } from './world.ts';
 
@@ -48,6 +49,11 @@ export interface VideoAssembly {
   language?: () => Language;
   ffmpegPath?: () => string;
   ffprobePath?: () => string;
+  authorizeAction?: (
+    request: FileSystemActionAuthorizationRequest,
+    confirmInCoreUi: () => Promise<boolean>,
+  ) => Promise<FileSystemActionAuthorization | null>;
+  confirmAction?: (request: Pick<FileSystemActionAuthorizationRequest, 'action' | 'target' | 'taskText' | 'files'>) => Promise<boolean>;
 }
 
 const SUMMARIES = {
@@ -80,6 +86,8 @@ export function videoDefinition(assembly: VideoAssembly): WorldDefinition<WorldS
         modelLanguage: assembly.modelLanguage,
         ffmpegPath: () => assembly.ffmpegPath?.() ?? cfg.ffmpegPath ?? '',
         ffprobePath: () => assembly.ffprobePath?.() ?? cfg.ffprobePath ?? '',
+        authorizeAction: assembly.authorizeAction,
+        confirmAction: assembly.confirmAction,
       });
     },
     describe: {

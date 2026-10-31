@@ -6,6 +6,8 @@ export interface MemoryStorageText {
   hindsightNote: string;
   hindsightStat: (bank: string) => string;
   hindsightCleared: string;
+  actionReceiptsLabel: string;
+  actionReceiptsPanelDesc: string;
 }
 
 const zh: MemoryStorageText = {
@@ -14,6 +16,8 @@ const zh: MemoryStorageText = {
   hindsightNote: '删除本机的 Hindsight bank：事实、观察、画像和关系摘要都会被清掉，不能恢复。',
   hindsightStat: (bank) => `bank：${bank}`,
   hindsightCleared: '长期记忆已清除',
+  actionReceiptsLabel: '动作回执',
+  actionReceiptsPanelDesc: '查看未决动作；核实结果后记录观察，仍不确定时保留未决状态。',
 };
 
 const zhHant: MemoryStorageText = {
@@ -22,6 +26,8 @@ const zhHant: MemoryStorageText = {
   hindsightNote: '刪除本機的 Hindsight bank：事實、觀察、畫像和關係摘要都會被清掉，不能恢復。',
   hindsightStat: (bank) => `bank：${bank}`,
   hindsightCleared: '長期記憶已清除',
+  actionReceiptsLabel: '動作回執',
+  actionReceiptsPanelDesc: '查看未解決的動作；核實結果後記錄觀察，仍不確定時保留未解決狀態。',
 };
 
 const en: MemoryStorageText = {
@@ -30,6 +36,8 @@ const en: MemoryStorageText = {
   hindsightNote: 'Deletes this machine\'s Hindsight bank: facts, observations, portraits and the relationship summary. This cannot be undone.',
   hindsightStat: (bank) => `bank: ${bank}`,
   hindsightCleared: 'Long-term memory cleared',
+  actionReceiptsLabel: 'Action receipts',
+  actionReceiptsPanelDesc: 'Review unresolved actions and record what you observed; leave uncertain results unresolved.',
 };
 
 const ja: MemoryStorageText = {
@@ -38,6 +46,8 @@ const ja: MemoryStorageText = {
   hindsightNote: 'この端末の Hindsight bank を削除します。事実、観察、ポートレート、関係の要約が消え、元に戻せません。',
   hindsightStat: (bank) => `bank: ${bank}`,
   hindsightCleared: '長期記憶を削除しました',
+  actionReceiptsLabel: '操作レシート',
+  actionReceiptsPanelDesc: '未解決の操作を確認し、観察した結果を記録します。不明な場合は未解決のままにします。',
 };
 
 const ko: MemoryStorageText = {
@@ -46,6 +56,8 @@ const ko: MemoryStorageText = {
   hindsightNote: '이 기기의 Hindsight bank를 삭제합니다. 사실, 관찰, 초상, 관계 요약이 사라지며 되돌릴 수 없습니다.',
   hindsightStat: (bank) => `bank: ${bank}`,
   hindsightCleared: '장기 기억을 지웠습니다',
+  actionReceiptsLabel: '작업 영수증',
+  actionReceiptsPanelDesc: '미해결 작업을 검토하고 관찰한 결과를 기록합니다. 확실하지 않으면 미해결 상태로 둡니다.',
 };
 
 const fr: MemoryStorageText = {
@@ -54,6 +66,8 @@ const fr: MemoryStorageText = {
   hindsightNote: 'Supprime la banque Hindsight de cette machine : faits, observations, portrait et résumé de la relation. Action irréversible.',
   hindsightStat: (bank) => `banque : ${bank}`,
   hindsightCleared: 'Mémoire à long terme effacée',
+  actionReceiptsLabel: 'Reçus d’action',
+  actionReceiptsPanelDesc: 'Examinez les actions non résolues et consignez vos observations ; gardez-les ouvertes si le résultat reste incertain.',
 };
 
 const de: MemoryStorageText = {
@@ -62,6 +76,8 @@ const de: MemoryStorageText = {
   hindsightNote: 'Löscht die Hindsight-Bank dieses Rechners: Fakten, Beobachtungen, Porträt und Beziehungszusammenfassung. Nicht rückgängig zu machen.',
   hindsightStat: (bank) => `Bank: ${bank}`,
   hindsightCleared: 'Langzeitgedächtnis gelöscht',
+  actionReceiptsLabel: 'Aktionsbelege',
+  actionReceiptsPanelDesc: 'Prüfe offene Aktionen und halte deine Beobachtung fest. Bei Unsicherheit bleibt der Status offen.',
 };
 
 const es419: MemoryStorageText = {
@@ -70,6 +86,8 @@ const es419: MemoryStorageText = {
   hindsightNote: 'Elimina el banco Hindsight de esta máquina: hechos, observaciones, retrato y resumen de la relación. No se puede deshacer.',
   hindsightStat: (bank) => `banco: ${bank}`,
   hindsightCleared: 'Memoria a largo plazo borrada',
+  actionReceiptsLabel: 'Comprobantes de acciones',
+  actionReceiptsPanelDesc: 'Revisa las acciones sin resolver y registra lo que observaste; si no es claro, déjalas pendientes.',
 };
 
 const ptBR: MemoryStorageText = {
@@ -78,6 +96,8 @@ const ptBR: MemoryStorageText = {
   hindsightNote: 'Apaga o banco Hindsight desta máquina: fatos, observações, retrato e resumo do relacionamento. Não pode ser desfeito.',
   hindsightStat: (bank) => `banco: ${bank}`,
   hindsightCleared: 'Memória de longo prazo apagada',
+  actionReceiptsLabel: 'Comprovantes de ações',
+  actionReceiptsPanelDesc: 'Revise as ações não resolvidas e registre o que observou; mantenha pendente se o resultado não estiver claro.',
 };
 
 const it: MemoryStorageText = {
@@ -86,6 +106,8 @@ const it: MemoryStorageText = {
   hindsightNote: 'Elimina il bank Hindsight di questa macchina: fatti, osservazioni, ritratto e riepilogo della relazione. Non può essere annullato.',
   hindsightStat: (bank) => `bank: ${bank}`,
   hindsightCleared: 'Memoria a lungo termine cancellata',
+  actionReceiptsLabel: 'Ricevute delle azioni',
+  actionReceiptsPanelDesc: 'Esamina le azioni irrisolte e registra ciò che hai osservato; lasciale irrisolte se il risultato non è chiaro.',
 };
 
 const ru: MemoryStorageText = {
@@ -94,6 +116,8 @@ const ru: MemoryStorageText = {
   hindsightNote: 'Удаляет банк Hindsight на этом компьютере: факты, наблюдения, портрет и сводку отношений. Отменить нельзя.',
   hindsightStat: (bank) => `банк: ${bank}`,
   hindsightCleared: 'Долговременная память очищена',
+  actionReceiptsLabel: 'Квитанции действий',
+  actionReceiptsPanelDesc: 'Проверьте нерешённые действия и запишите наблюдения; если результат неясен, оставьте его нерешённым.',
 };
 
 const TEXT: Record<Language, MemoryStorageText> = {

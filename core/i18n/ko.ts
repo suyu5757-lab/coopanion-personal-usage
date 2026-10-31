@@ -67,6 +67,12 @@ const ko: Translation<CoreText> = {
     yes: '한 번 허용', no: '취소',
   },
 
+  workspaceAction: {
+    fileWrite: '작업공간 파일 쓰기', commandExecution: '작업공간 명령 실행',
+    question: (action: string, target: string, details: string) => 'Coo가 작업공간 "' + target + '"에서 ' + action + '하는 것을 한 번 허용할까요?\n\n' + details + '\n\n표시된 경로와 작업에만 적용됩니다.',
+    yes: '한 번 허용', no: '취소',
+  },
+
   status: {
     read: '읽는 중', browse: '둘러보는 중', memory: '기억', find: '찾는 중', search: '검색 중', write: '쓰는 중', edit: '고치는 중', append: '덧붙이는 중',
     delete: '삭제 중', save: '저장 중', screen: '화면 보는 중', web: '웹페이지 보는 중', windows: '열린 창 보는 중', rightClick: '오른쪽 클릭 중', doubleClick: '더블클릭 중', click: '클릭 중',

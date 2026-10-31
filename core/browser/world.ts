@@ -16,7 +16,7 @@ import type { Language } from 'cortico/core/language.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import type { ModelLanguage } from '../language.ts';
 import { ActionGate, type Impact } from '../action-gate.ts';
-import { defaultActionRisk, type ActionRisk } from '../action-receipts.ts';
+import { defaultActionRisk, type ActionReceiptCompletion, type ActionRisk } from '../action-receipts.ts';
 import { coreText } from '../i18n/index.ts';
 import { ActionJournal, hashContent, originOf, ReplyJournal, type ActionTarget, type PublicAction } from './actions.ts';
 import { BrowserTaskActionJournal, browserDuplicateKey } from './task-actions.ts';
@@ -1454,13 +1454,13 @@ export class BrowserWorld implements World {
           : decision.reason === 'not-answered' ? this.t.sendNotAnswered
             : decision.reason === 'not-approved' ? this.t.sendCancelled
               : this.t.sendJournalUnavailable, true);
-      const finish = (phase: 'verified' | 'unknown' | 'cancelled', note: string) => {
-        try { this.taskJournal?.finish(decision.authorization.journalId, phase, note); } catch { /* acting remains unresolved on disk */ }
+      const finish = (result: ActionReceiptCompletion) => {
+        try { this.taskJournal?.complete(decision.authorization.journalId, result); } catch { /* acting remains unresolved on disk */ }
       };
 
       // Re-resolve the page, editor, control and text after the grant reaches the journal.
       if (!await targetStillBound() || await this.draftAt(input.boxIndex, ctx.signal) !== input.content) {
-        finish('cancelled', 'the target or the text changed after approval');
+        finish({ phase: 'cancelled', dispatchState: 'not-dispatched', outcome: 'cancelled', note: 'the target or the text changed after approval' });
         return this.toast(this.t.sendChanged, true);
       }
 
@@ -1468,7 +1468,7 @@ export class BrowserWorld implements World {
       try {
         state = await dispatch();
       } catch {
-        finish('unknown', 'the page did not answer after the input');
+        finish({ phase: 'unknown', dispatchState: 'unknown', outcome: 'unknown', note: 'the page did not answer after the input' });
         return this.toast(this.t.sendUnknown, true);
       }
 
@@ -1477,22 +1477,30 @@ export class BrowserWorld implements World {
         const status = submissionStatus(state.statusMessages ?? []);
         const newReplyNotice = (state.statusMessages ?? []).some((message) => commentReplyConfirmed([message])
           && !previousReplyNotices.has(message.replace(/\s+/g, ' ').trim().toLowerCase()));
-        if (replyTarget && (status !== 'submitted' || !newReplyNotice)) {
-          finish('unknown', 'the reply box cleared without a page confirmation of the comment reply');
+        if (replyTarget && (!newReplyNotice || (status !== 'submitted' && status !== 'pending-review' && status !== 'published'))) {
+          finish({ phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown', note: 'the reply box cleared without a page confirmation of the comment reply' });
           return this.toast(this.t.sendUnknown, true);
         }
         if (replyTarget) {
           try { this.replyJournal!.add(replyTarget.fingerprint); }
           catch {
-            finish('unknown', 'the page confirmed the reply but the duplicate guard could not be saved');
+            finish({ phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown', note: 'the page confirmed the reply but the duplicate guard could not be saved' });
             return this.toast(this.t.sendUnknown, true);
           }
         }
-        finish('verified', 'the page showed the text box cleared after dispatch');
+        if (status === 'pending-review') {
+          finish({ phase: 'review-pending', dispatchState: 'delivered', outcome: 'review-pending', note: 'the page shows the submission under review' });
+        } else if (status === 'published') {
+          finish({ phase: 'verified', dispatchState: 'delivered', outcome: 'verified', note: 'the page shows the submitted item as published' });
+        } else if (status === 'submitted' || newReplyNotice) {
+          finish({ phase: 'submitted', dispatchState: 'delivered', outcome: 'remote-acknowledged', note: 'the page acknowledges the submission without a final review status' });
+        } else {
+          finish({ phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown', note: 'the text box cleared but the page gave no submission status' });
+        }
         this.lastTyped = null;
         return this.toast(this.full(state, this.t.sent(approvalWhere, status)));
       }
-      finish('unknown', 'the box still shows the text, or could not be read');
+      finish({ phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown', note: 'the box still shows the text, or could not be read' });
       return this.toast(this.t.sendUnknown, true);
     } finally {
       this.publishing = false;

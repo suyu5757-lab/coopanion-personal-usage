@@ -67,6 +67,12 @@ const fr: Translation<CoreText> = {
     yes: 'Autoriser une fois', no: 'Annuler',
   },
 
+  workspaceAction: {
+    fileWrite: 'écrire un fichier de l’espace de travail', commandExecution: 'exécuter une commande dans l’espace de travail',
+    question: (action: string, target: string, details: string) => 'Autorisez-vous Coo à ' + action + ' une fois dans l’espace de travail « ' + target + ' » ?\n\n' + details + '\n\nCela concerne uniquement le chemin et l’opération indiqués.',
+    yes: 'Autoriser une fois', no: 'Annuler',
+  },
+
   status: {
     read: 'Lit', browse: 'Parcourt', memory: 'mémoire', find: 'Cherche', search: 'Recherche', write: 'Écrit', edit: 'Modifie', append: 'Complète',
     delete: 'Supprime', save: 'Enregistre', screen: "Regarde l'écran", web: "Sur une page web", windows: 'Regarde les fenêtres ouvertes', rightClick: 'Fait un clic droit', doubleClick: 'Double-clique', click: 'Clique',

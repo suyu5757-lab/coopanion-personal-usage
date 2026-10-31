@@ -7,8 +7,9 @@ import { createRequire } from 'node:module';
 import { afterEach, describe, expect, it } from 'vitest';
 import { readManifest, resolveInside, srt } from '../core/video/manifest.ts';
 import { canDrawText, discoverTools, render } from '../core/video/render.ts';
-import { prepareUpload } from '../core/video/prepared.ts';
+import { planPreparedUpload } from '../core/video/prepared.ts';
 import { VideoWorld } from '../core/video/world.ts';
+import type { FileSystemActionAuthorization, FileSystemActionAuthorizationRequest } from '../core/action-authorization.ts';
 import type { ToolCallContext } from 'cortico/core/types.ts';
 
 const require = createRequire(import.meta.url);
@@ -38,6 +39,19 @@ const dirs = (files: string[] = ['clip1.mp4', 'clip2.mp4']) => {
   for (const file of files) writeFileSync(join(mediaDir, 'assets', file), '');
   return { root, mediaDir, rendersDir, workDir };
 };
+
+const allowVideoFileWrite = (requests: FileSystemActionAuthorizationRequest[] = []) => ({
+  authorizeAction: async (request: FileSystemActionAuthorizationRequest): Promise<FileSystemActionAuthorization> => {
+    requests.push(request);
+    return {
+      receipt: {} as FileSystemActionAuthorization['receipt'],
+      consume: () => true,
+      revoke() {},
+      complete() {},
+    };
+  },
+  confirmAction: async () => true,
+});
 
 const manifest = (overrides: Record<string, unknown> = {}) => ({
   canvas: { width: 1080, height: 1920, fps: 30 },
@@ -106,6 +120,16 @@ describe('edit manifest', () => {
     expect(parsed.ok).toBe(false);
     expect(parsed.ok === false && parsed.problems.join('\n')).toContain('existing files are preserved');
     expect(readFileSync(output, 'utf8')).toBe('keep');
+  });
+
+  it('preserves an existing caption sidecar', () => {
+    const d = dirs();
+    const sidecar = join(d.rendersDir, 'preview.srt');
+    writeFileSync(sidecar, 'keep captions');
+    const parsed = readManifest(manifest({ captions: [{ text: 'new', startSec: 0, durationSec: 1 }] }), d);
+    expect(parsed.ok).toBe(false);
+    expect(parsed.ok === false && parsed.problems.join('\n')).toContain('caption sidecar must be new');
+    expect(readFileSync(sidecar, 'utf8')).toBe('keep captions');
   });
 
   it('rejects a malformed output path instead of replacing it with a default', () => {
@@ -252,7 +276,8 @@ describe.skipIf(!hasFfmpeg)('rendering', () => {
     mkdirSync(join(dataDir, 'video', 'renders'), { recursive: true });
     mkdirSync(join(dataDir, 'video', 'work'), { recursive: true });
     make(join(mediaDir, 'assets', 'clip.mp4'), 'green', 2);
-    const world = new VideoWorld({ dataDir, modelLanguage: () => 'en' });
+    const requests: FileSystemActionAuthorizationRequest[] = [];
+    const world = new VideoWorld({ dataDir, modelLanguage: () => 'en', ...allowVideoFileWrite(requests) });
     const ctx = { signal: new AbortController().signal } as unknown as ToolCallContext;
     const renderTool = world.tools().find((tool) => tool.name === 'video_render')!;
     const preparedTool = world.tools().find((tool) => tool.name === 'video_prepare_upload')!;
@@ -267,6 +292,12 @@ describe.skipIf(!hasFfmpeg)('rendering', () => {
     const renderId = rendered.text.match(/renderId:\s*([0-9a-f-]{36})/)?.[1];
     expect(renderId).toMatch(/^[0-9a-f-]{36}$/);
     expect(rendered.text).toMatch(/SHA-256:\s*[0-9a-f]{64}/);
+    expect(requests[0]).toMatchObject({
+      actionName: 'video_render',
+      action: 'file-write',
+      risk: 'REVERSIBLE_LOCAL',
+      target: { surface: 'filesystem', source: 'video-world', operation: 'file-write' },
+    });
 
     const preparedResult = await preparedTool.handler({ renderId }, ctx);
     const prepared = typeof preparedResult === 'string' ? { text: preparedResult } : preparedResult;
@@ -281,6 +312,14 @@ describe.skipIf(!hasFfmpeg)('rendering', () => {
     const uploadFiles = await resolveUploadFiles(mediaDir, [relativePath]);
     expect(uploadFiles).toHaveLength(1);
     expect(uploadFiles[0]).toMatchObject({ name: relativePath, mime: 'video/mp4', digest: receipt.sha256 });
+    expect(requests[1]).toMatchObject({
+      actionName: 'video_prepare_upload',
+      target: { source: 'video-world', path: `media/prepared/${renderId}` },
+    });
+    expect(requests[1]!.files.map((file) => file.path)).toEqual([
+      `media/prepared/${renderId}/render.mp4`,
+      `media/prepared/${renderId}/receipt.json`,
+    ]);
 
     const changedRender = await renderTool.handler({
       manifest: {
@@ -302,10 +341,72 @@ describe.skipIf(!hasFfmpeg)('rendering', () => {
   }, 120_000);
 });
 
+describe('video file authorization', () => {
+  it('fails closed before writing when the Core authorization path is unavailable', async () => {
+    const d = dirs([]);
+    const dataDir = join(d.root, 'app-data');
+    const videoRoot = join(dataDir, 'video');
+    mkdirSync(join(videoRoot, 'media', 'assets'), { recursive: true });
+    mkdirSync(join(videoRoot, 'renders'), { recursive: true });
+    writeFileSync(join(videoRoot, 'media', 'assets', 'clip.mp4'), 'source');
+    const world = new VideoWorld({ dataDir, modelLanguage: () => 'en' });
+    const renderTool = world.tools().find((tool) => tool.name === 'video_render')!;
+    const result = await renderTool.handler({ manifest: {
+      canvas: { width: 1080, height: 1920, fps: 30 },
+      sources: [{ id: 's1', path: 'assets/clip.mp4', rights: 'self-made' }],
+      clips: [{ source: 's1', startSec: 0, durationSec: 1 }],
+    } }, { signal: new AbortController().signal } as unknown as ToolCallContext);
+    const outcome = typeof result === 'string' ? { text: result } : result;
+    expect(outcome.failed).toBe(true);
+    expect(outcome.text).toContain('authorization was unavailable');
+    expect(readdirSync(join(videoRoot, 'renders'))).toEqual([]);
+    await world.stop();
+  });
+
+  it('revokes a one-step grant when the tool is cancelled before dispatch', async () => {
+    const d = dirs([]);
+    const dataDir = join(d.root, 'app-data');
+    const videoRoot = join(dataDir, 'video');
+    mkdirSync(join(videoRoot, 'media', 'assets'), { recursive: true });
+    mkdirSync(join(videoRoot, 'renders'), { recursive: true });
+    writeFileSync(join(videoRoot, 'media', 'assets', 'clip.mp4'), 'source');
+    const controller = new AbortController();
+    let consumed = false;
+    let revoked = false;
+    const world = new VideoWorld({
+      dataDir,
+      modelLanguage: () => 'en',
+      authorizeAction: async (_request, confirmInCoreUi): Promise<FileSystemActionAuthorization | null> => {
+        if (!await confirmInCoreUi()) return null;
+        return {
+          receipt: {} as FileSystemActionAuthorization['receipt'],
+          consume: () => { consumed = true; return true; },
+          revoke: () => { revoked = true; },
+          complete() {},
+        };
+      },
+      confirmAction: async () => { controller.abort(); return true; },
+    });
+    const renderTool = world.tools().find((tool) => tool.name === 'video_render')!;
+    const result = await renderTool.handler({ manifest: {
+      canvas: { width: 1080, height: 1920, fps: 30 },
+      sources: [{ id: 's1', path: 'assets/clip.mp4', rights: 'self-made' }],
+      clips: [{ source: 's1', startSec: 0, durationSec: 1 }],
+    } }, { signal: controller.signal } as unknown as ToolCallContext);
+    const outcome = typeof result === 'string' ? { text: result } : result;
+    expect(outcome.failed).toBe(true);
+    expect(outcome.text).toContain('Interrupted');
+    expect(consumed).toBe(false);
+    expect(revoked).toBe(true);
+    expect(readdirSync(join(videoRoot, 'renders'))).toEqual([]);
+    await world.stop();
+  });
+});
+
 describe('prepared media path checks', () => {
   it('rejects renderId path traversal before creating a file', async () => {
     const d = dirs([]);
-    await expect(prepareUpload(d.mediaDir, d.rendersDir, {
+    await expect(planPreparedUpload(d.mediaDir, d.rendersDir, {
       renderId: '../escape', output: join(d.rendersDir, 'missing.mp4'), sha256: '0'.repeat(64),
       probe: { width: 1, height: 1, fps: 1, durationSec: 1, sizeBytes: 1, videoCodec: 'h264', pixelFormat: 'yuv420p', audioCodec: null },
       tools: { ffmpeg: 'ffmpeg', ffprobe: 'ffprobe', version: 'test' },
@@ -318,7 +419,7 @@ describe('prepared media path checks', () => {
     const outside = join(d.root, 'outside.mp4');
     writeFileSync(outside, 'not a real render');
     symlinkSync(outside, join(d.rendersDir, 'linked.mp4'));
-    await expect(prepareUpload(d.mediaDir, d.rendersDir, {
+    await expect(planPreparedUpload(d.mediaDir, d.rendersDir, {
       renderId: randomUUID(), output: join(d.rendersDir, 'linked.mp4'), sha256: '0'.repeat(64),
       probe: { width: 1, height: 1, fps: 1, durationSec: 1, sizeBytes: 1, videoCodec: 'h264', pixelFormat: 'yuv420p', audioCodec: null },
       tools: { ffmpeg: 'ffmpeg', ffprobe: 'ffprobe', version: 'test' },
@@ -330,7 +431,7 @@ describe('prepared media path checks', () => {
     const d = dirs([]);
     const output = join(d.rendersDir, 'changed.mp4');
     writeFileSync(output, 'x');
-    await expect(prepareUpload(d.mediaDir, d.rendersDir, {
+    await expect(planPreparedUpload(d.mediaDir, d.rendersDir, {
       renderId: randomUUID(), output, sha256: '0'.repeat(64),
       probe: { width: 1, height: 1, fps: 1, durationSec: 1, sizeBytes: 2, videoCodec: 'h264', pixelFormat: 'yuv420p', audioCodec: null },
       tools: { ffmpeg: 'ffmpeg', ffprobe: 'ffprobe', version: 'test' },
@@ -342,7 +443,7 @@ describe('prepared media path checks', () => {
     const d = dirs([]);
     const output = join(d.rendersDir, 'changed.mp4');
     writeFileSync(output, 'x');
-    await expect(prepareUpload(d.mediaDir, d.rendersDir, {
+    await expect(planPreparedUpload(d.mediaDir, d.rendersDir, {
       renderId: randomUUID(), output, sha256: '0'.repeat(64),
       probe: { width: 1, height: 1, fps: 1, durationSec: 1, sizeBytes: 1, videoCodec: 'h264', pixelFormat: 'yuv420p', audioCodec: null },
       tools: { ffmpeg: 'ffmpeg', ffprobe: 'ffprobe', version: 'test' },

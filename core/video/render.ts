@@ -167,19 +167,19 @@ const probeOf = (json: string): Probe => {
   };
 };
 
-async function probe(tools: Tools, file: string): Promise<Probe> {
-  const { stdout } = await run(tools.ffprobe, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file], { timeout: 30_000, maxBuffer: MAX_BUFFER });
+async function probe(tools: Tools, file: string, signal?: AbortSignal): Promise<Probe> {
+  const { stdout } = await run(tools.ffprobe, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file], { timeout: 30_000, maxBuffer: MAX_BUFFER, signal });
   return probeOf(String(stdout));
 }
 
-export async function inspectVideo(tools: Tools, file: string): Promise<Probe> {
-  return probe(tools, file);
+export async function inspectVideo(tools: Tools, file: string, signal?: AbortSignal): Promise<Probe> {
+  return probe(tools, file, signal);
 }
 
-export async function sha256File(file: string): Promise<string> {
+export async function sha256File(file: string, signal?: AbortSignal): Promise<string> {
   const hash = createHash('sha256');
   await new Promise<void>((resolveHash, reject) => {
-    const stream = createReadStream(file);
+    const stream = createReadStream(file, signal ? { signal } : undefined);
     stream.on('data', (chunk: string | Buffer) => { hash.update(chunk); });
     stream.once('error', reject);
     stream.once('end', resolveHash);
@@ -226,7 +226,7 @@ export async function render(manifest: ResolvedManifest, opts: { ffmpegPath?: st
     } catch (error) {
       throw new RenderFailure(`the render did not finish: ${String((error as Error).message ?? error)}`);
     }
-    const facts = await probe(tools, manifest.output);
+    const facts = await probe(tools, manifest.output, signal);
     if (facts.width !== manifest.canvas.width || facts.height !== manifest.canvas.height) {
       throw new RenderFailure(`the output is ${facts.width}×${facts.height}, not ${manifest.canvas.width}×${manifest.canvas.height}`);
     }
@@ -243,7 +243,7 @@ export async function render(manifest: ResolvedManifest, opts: { ffmpegPath?: st
       throw new RenderFailure(`the output unexpectedly contains ${facts.audioCodec} audio`);
     }
     if (facts.sizeBytes < 1) throw new RenderFailure('the output file is empty');
-    const sha256 = await sha256File(manifest.output);
+    const sha256 = await sha256File(manifest.output, signal);
     const posterFrame = await poster(tools, manifest.output, Math.min(1, manifest.totalSec / 2), scratch);
     if (!posterFrame.length) throw new RenderFailure('the output poster frame is empty');
     const blackSec = await blackSeconds(tools, manifest.output);
@@ -255,7 +255,7 @@ export async function render(manifest: ResolvedManifest, opts: { ffmpegPath?: st
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       }
-      writeFileSync(captionsFile, srt(manifest.captions), 'utf8');
+      writeFileSync(captionsFile, srt(manifest.captions), { encoding: 'utf8', flag: 'wx' });
     }
     return {
       renderId: opts.renderId,

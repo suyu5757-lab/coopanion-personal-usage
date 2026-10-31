@@ -75,6 +75,12 @@ export default {
     yes: '允许一次', no: '取消',
   },
 
+  workspaceAction: {
+    fileWrite: '写入工作区文件', commandExecution: '运行工作区命令',
+    question: (action: string, target: string, details: string) => '允许 Coo 在工作区「' + target + '」执行一次' + action + '吗？\n\n' + details + '\n\n只适用于这一次列出的路径和操作。',
+    yes: '允许一次', no: '取消',
+  },
+
   status: {
     read: '在查看', browse: '在翻阅', memory: '记忆', find: '在查找', search: '在搜索', write: '在写入', edit: '在修改', append: '在追加',
     delete: '在删除', save: '在保存', screen: '在查看屏幕', web: '在看网页', windows: '在查看打开的窗口', rightClick: '在右击', doubleClick: '在双击', click: '在点击',

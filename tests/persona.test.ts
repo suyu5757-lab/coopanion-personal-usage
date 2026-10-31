@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { ToolDef } from 'cortico/core/types.ts';
+import type { CoreApi, ToolDef } from 'cortico/core/types.ts';
 import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import { gitInstalled } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
 import { AUTHOR_COO, PARTNER_DIR, PARTNER_FILE, PARTNER_NOTE, SNAPSHOT_TAG, arrangePartner, coopanionPersona } from '../core/persona.ts';
+import { ActionGate } from '../core/action-gate.ts';
+import { authorizeFileSystemAction } from '../core/action-authorization.ts';
+import { ActionReceiptLedger, actionReceiptDuplicateKey } from '../core/action-receipts.ts';
 
 const CoopanionPersona = coopanionPersona(Cormini);
 const ctx = { role: 'main', log: { emit: () => {}, warn: () => {}, error: () => {}, info: () => {}, debug: () => {} } } as never;
@@ -137,5 +140,164 @@ describe('arranging the partner notes', () => {
     expect(git(dir, 'show', `${SNAPSHOT_TAG('2.0.0')}:${PARTNER_DIR}`)).toBe('old notes');
     expect(git(dir, 'show', `HEAD:${PARTNER_DIR}/${PARTNER_DIR}`)).toBe('old notes');
     expect(git(dir, 'status', '--porcelain')).toBe('');
+  });
+});
+
+describe('Core-gated Persona workspace writes', () => {
+  function gatedPersona(confirm: () => Promise<boolean>) {
+    const dir = mkdtempSync(join(tmpdir(), 'coo-persona-gated-'));
+    const workspace = join(dir, 'workspace');
+    mkdirSync(workspace);
+    const receiptFile = join(dir, 'action-receipts.json');
+    const ledger = new ActionReceiptLedger(receiptFile);
+    const gate = new ActionGate({
+      platformWrites: () => false,
+      imageGeneration: () => false,
+      imageSaving: () => false,
+      mediaUpload: () => false,
+      computerInput: () => false,
+      desktopTargetAllowed: () => false,
+      fileSystemActionAllowed: (target, action) => target.surface === 'filesystem'
+        && target.source === 'persona-workspace'
+        && target.operation === action
+        && target.workspaceRoot === realpathSync(workspace),
+      fileSystemPermissionGeneration: () => workspace,
+    });
+    const GatedPersona = coopanionPersona(Cormini, {
+      authorizeWorkspaceAction: (request) => authorizeFileSystemAction(ledger, gate, request, confirm),
+      actionReceipts: () => ledger,
+    });
+    const p = new GatedPersona({ memoryDir: workspace });
+    const run = (name: string, args: Record<string, unknown>) => {
+      const tool = p.declareSessions()[0]!.tools().find((entry) => entry.name === name)!;
+      return tool.handler(args, ctx);
+    };
+    const receipts = () => JSON.parse(readFileSync(receiptFile, 'utf8')) as Array<Record<string, unknown>>;
+    return { dir, workspace, p, run, receipts, ledger };
+  }
+
+  it('waits for Core approval, binds exact bytes and verifies the written file', async () => {
+    let decide!: (approved: boolean) => void;
+    const { dir, workspace, run, receipts } = gatedPersona(() => new Promise<boolean>((resolve) => { decide = resolve; }));
+    try {
+      const file = join(workspace, 'notes', 'today.md');
+      const pending = run('write_file', { path: 'notes/today.md', content: 'tea and coffee' });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(existsSync(file)).toBe(false);
+      expect(receipts()[0]).toMatchObject({ phase: 'awaiting-approval', intent: 'file-write', target: { surface: 'filesystem', path: 'notes/today.md', source: 'persona-workspace' } });
+
+      decide(true);
+      expect(await pending).toContain('[written] notes/today.md');
+      expect(readFileSync(file, 'utf8')).toBe('tea and coffee');
+      expect(receipts()[0]).toMatchObject({ phase: 'verified', dispatchState: 'delivered', outcome: 'ui-observed', files: [{ digest: expect.any(String), bytes: 14 }] });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not initialize workspace history or dispatch when Core rejects the grant', async () => {
+    const { dir, workspace, run, receipts } = gatedPersona(async () => false);
+    try {
+      const result = await run('write_file', { path: 'blocked.md', content: 'no' });
+      expect(String(result)).toContain('Core did not authorize');
+      expect(existsSync(join(workspace, 'blocked.md'))).toBe(false);
+      expect(existsSync(join(workspace, '.git'))).toBe(false);
+      expect(receipts()[0]).toMatchObject({ phase: 'cancelled', outcome: 'cancelled' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects symlink paths that leave the Persona workspace before asking for approval', async () => {
+    let confirmations = 0;
+    const { dir, workspace, run } = gatedPersona(async () => { confirmations++; return true; });
+    try {
+      const outside = join(dir, 'outside');
+      mkdirSync(outside);
+      symlinkSync(outside, join(workspace, 'outside'));
+      const result = await run('write_file', { path: 'outside/private.md', content: 'blocked' });
+      expect(String(result)).toContain('resolves outside the workspace');
+      expect(confirmations).toBe(0);
+      expect(existsSync(join(outside, 'private.md'))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('checks the approved preimage before editing, appending or deleting', async () => {
+    let alterBeforeApproval = false;
+    const { dir, workspace, run, receipts } = gatedPersona(async () => {
+      if (alterBeforeApproval) writeFileSync(join(workspace, 'note.md'), 'changed elsewhere');
+      return true;
+    });
+    try {
+      writeFileSync(join(workspace, 'note.md'), 'today');
+      expect(await run('append_file', { path: 'note.md', content: 'next' })).toContain('[appended]');
+      expect(readFileSync(join(workspace, 'note.md'), 'utf8')).toBe('today\nnext');
+      expect(await run('edit_file', { path: 'note.md', old_string: 'today', new_string: 'yesterday' })).toContain('[edited]');
+      expect(readFileSync(join(workspace, 'note.md'), 'utf8')).toBe('yesterday\nnext');
+      expect(await run('delete_file', { path: 'note.md' })).toContain('[deleted]');
+      expect(existsSync(join(workspace, 'note.md'))).toBe(false);
+      expect(receipts().slice(-3).map((receipt) => receipt.phase)).toEqual(['verified', 'verified', 'verified']);
+
+      writeFileSync(join(workspace, 'note.md'), 'approved content');
+      alterBeforeApproval = true;
+      expect(String(await run('write_file', { path: 'note.md', content: 'new content' }))).toContain('changed before dispatch');
+      expect(readFileSync(join(workspace, 'note.md'), 'utf8')).toBe('changed elsewhere');
+      expect(receipts().at(-1)).toMatchObject({ phase: 'cancelled', outcome: 'cancelled' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('authorizes save_blob against its effective blobs path and verifies the copied bytes', async () => {
+    const { dir, workspace, p, run, receipts } = gatedPersona(async () => true);
+    try {
+      p.attach({ blob: () => ({ bytes: Buffer.from([1, 2, 3, 4]), mime: 'image/png' }) } as unknown as CoreApi);
+      expect(await run('save_blob', { handle: 'abcdef12', path: 'cat.png' })).toContain('[saved] mem:blobs/cat.png');
+      expect(readFileSync(join(workspace, 'blobs', 'cat.png'))).toEqual(Buffer.from([1, 2, 3, 4]));
+      expect(receipts()[0]).toMatchObject({ phase: 'verified', target: { path: 'blobs/cat.png' }, files: [{ bytes: 4, mime: 'image/png' }] });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('exposes unresolved shared receipts to Persona WebUI and records an operator reconciliation', async () => {
+    const { dir, workspace, p, ledger } = gatedPersona(async () => true);
+    try {
+      const target = {
+        surface: 'filesystem' as const,
+        instanceId: 'persona-review-test',
+        workspaceRoot: realpathSync(workspace),
+        path: 'note.md',
+        operation: 'file-write' as const,
+        snapshotId: 'before-write',
+        source: 'persona-workspace' as const,
+      };
+      const payloadDigest = 'a'.repeat(64);
+      const receipt = ledger.begin({
+        taskId: 'persona-review-test',
+        intent: 'file-write',
+        action: 'Persona write_file',
+        risk: 'REVERSIBLE_LOCAL',
+        target,
+        payloadDigest,
+        files: [{ path: 'note.md', digest: payloadDigest, bytes: 4, mime: 'text/plain' }],
+        duplicateKey: actionReceiptDuplicateKey('file-write', target, payloadDigest),
+      }, 5_000);
+      ledger.awaitingApproval(receipt.id, 5_001);
+      ledger.acting(receipt.id, 'b'.repeat(64), 5_002, 30_000, 5_003);
+      ledger.complete(receipt.id, { phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown', note: 'read-back unavailable' }, 5_004);
+
+      const webUi = p.webUi('en');
+      expect(webUi.memory?.panels).toContainEqual(expect.objectContaining({ id: 'action-receipts' }));
+      const list = await webUi.invoke!('action-receipts', 'list', []) as { available: boolean; receipts: Array<{ id: string; phase: string }> };
+      expect(list).toMatchObject({ available: true, receipts: [{ id: receipt.id, phase: 'unknown' }] });
+      await webUi.invoke!('action-receipts', 'reconcile', [receipt.id, 'verified', 'I checked the workspace and confirmed the approved contents.']);
+      const cleared = await webUi.invoke!('action-receipts', 'list', []) as { receipts: unknown[] };
+      expect(cleared.receipts).toHaveLength(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

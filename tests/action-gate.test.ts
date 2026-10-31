@@ -169,6 +169,53 @@ describe('action gate', () => {
     expect(current!.consume(target, request.expectedChange)).toBe(false);
   });
 
+  it('binds a one-step workspace grant to the allowed root, file snapshot and exact payload', async () => {
+    const target = {
+      surface: 'filesystem' as const,
+      instanceId: 'opencode-task-1',
+      workspaceRoot: '/tmp/coopanion-work',
+      path: 'src/main.ts',
+      operation: 'file-write' as const,
+      snapshotId: 'before-hash',
+      source: 'opencode-acp' as const,
+    };
+    const file = { path: 'src/main.ts', digest: 'a'.repeat(64), bytes: 42, mime: 'text/plain' };
+    const request = {
+      taskId: 'opencode-task-1:file-write-1',
+      taskText: 'Write src/main.ts in the allowed workspace.',
+      expectedChange: 'write src/main.ts sha256:aaaaaaaa',
+      risk: 'REVERSIBLE_LOCAL' as const,
+      target,
+      action: 'file-write' as const,
+      files: [file],
+      expiresInMs: 30_000,
+      maxSteps: 1 as const,
+    };
+    const gate = new ActionGate({
+      platformWrites: () => false,
+      imageGeneration: () => false,
+      imageSaving: () => false,
+      mediaUpload: () => false,
+      computerInput: () => false,
+      desktopTargetAllowed: () => false,
+      fileSystemActionAllowed: (candidate, action) => candidate.workspaceRoot === '/tmp/coopanion-work' && action === 'file-write',
+      fileSystemPermissionGeneration: () => 'roots-v1',
+    });
+
+    const changedPayload = await gate.requestFileSystemStep(request, async () => true);
+    expect(changedPayload).not.toBeNull();
+    expect(changedPayload!.consume(target, request.expectedChange, [{ ...file, digest: 'b'.repeat(64) }])).toBe(false);
+
+    const current = await gate.requestFileSystemStep({ ...request, taskId: 'opencode-task-1:file-write-2' }, async () => true);
+    expect(current).not.toBeNull();
+    expect(current!.consume({ ...target, snapshotId: 'changed-before-dispatch' }, request.expectedChange, [file])).toBe(false);
+
+    const authorized = await gate.requestFileSystemStep({ ...request, taskId: 'opencode-task-1:file-write-3' }, async () => true);
+    expect(authorized).not.toBeNull();
+    expect(authorized!.consume(target, request.expectedChange, [file])).toBe(true);
+    expect(authorized!.consume(target, request.expectedChange, [file])).toBe(false);
+  });
+
   it('does not issue a desktop grant when computer input is turned off during approval', async () => {
     let computerInput = true;
     let answer!: (approved: boolean) => void;

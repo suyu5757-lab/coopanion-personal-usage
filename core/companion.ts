@@ -40,9 +40,9 @@
  * `{ type: 'companion:locked', pid, file }` when another process holds the data directory, and
  * `{ type: 'companion:ports-busy', from, to }` when every console port Cortico tried could not be listened on.
  */
-import { readdirSync } from 'node:fs';
+import { readdirSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { delimiter, join } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { BotDefinition } from 'cortico/bot.ts';
 import { createBot } from 'cortico/bot.ts';
@@ -60,12 +60,13 @@ import { deploymentRoot, providersRoot, repoRoot } from 'cortico/paths.ts';
 import { providerModules, registerProviderModules } from 'cortico/providers/registry.ts';
 import { withWorlds, type WorldDefinition, type WorldSection } from 'cortico/world.ts';
 import { ActionGate } from './action-gate.ts';
+import { authorizeFileSystemAction, type FileSystemActionAuthorizationRequest } from './action-authorization.ts';
 import { actionReceiptDuplicateKey } from './action-receipts.ts';
 import { InstanceLockedError } from 'cortico/core/instance-lock.ts';
 import { CONSOLE } from 'cortico/worlds/console/definition.ts';
 import { desktopPetDefinition, figurePacks, isSupportedCuaTarget, type DesktopPetWorld } from 'cortico-world-desktop-pet';
 import CODEX from 'cortico-world-codex';
-import { opencodeDefinition } from 'cortico-world-opencode';
+import { insideRoot, opencodeDefinition, OPENCODE_DEFAULTS, readConfig as readOpencodeConfig, workRoots as opencodeWorkRoots, type OpencodeConfigSection } from 'cortico-world-opencode';
 import COO, { CHATGPT, CHATGPT_PROVIDER, signedIn, usageLimited, vendorOf } from 'cortico-provider-coo';
 import { appWebUiAsset, bundledWebUiAssets } from './bundled-panels.ts';
 import { followPetLook } from './console-theme.ts';
@@ -445,6 +446,22 @@ export async function main(): Promise<void> {
   let telemetry: Telemetry | null = null;
   let config: CoreConfig | null = null;
   let notice: NoticeWorld | null = null;
+  let personaWorkspaceRoot = '';
+  const opencodeSettings = (): OpencodeConfigSection => {
+    const raw = config
+      ? getByPath(config as unknown as Record<string, unknown>, 'worlds.opencode') as Partial<OpencodeConfigSection> | undefined
+      : undefined;
+    return readOpencodeConfig({ ...OPENCODE_DEFAULTS, ...(raw ?? {}), enabled: raw?.enabled === true });
+  };
+  const allowedOpencodeRoots = () => opencodeWorkRoots(opencodeSettings()).map((root) => {
+    try { return realpathSync(root); } catch { return resolve(root); }
+  });
+  const canonicalRoot = (root: string) => {
+    try { return realpathSync(root); } catch { return resolve(root); }
+  };
+  const home = deploymentRoot();
+  const deployDir = join(home, DEPLOYMENT);
+  const videoWorkspaceRoot = join(deployDir, 'video');
   const gate = new ActionGate({
     platformWrites: () => readSelfTime(config).actions,
     imageGeneration: () => readSelfTime(config).imageGeneration,
@@ -452,9 +469,24 @@ export async function main(): Promise<void> {
     mediaUpload: () => readSelfTime(config).mediaUpload,
     computerInput: () => getByPath((config ?? {}) as unknown as Record<string, unknown>, 'worlds.desktop-pet.cua.control') === true,
     desktopTargetAllowed: isSupportedCuaTarget,
+    fileSystemActionAllowed: (target, action) => {
+      if (target.operation !== action) return false;
+      if (target.source === 'opencode-acp') {
+        return opencodeSettings().enabled && insideRoot(allowedOpencodeRoots(), target.workspaceRoot);
+      }
+      if (target.source === 'persona-workspace') {
+        return action === 'file-write' && !!personaWorkspaceRoot
+          && canonicalRoot(target.workspaceRoot) === canonicalRoot(personaWorkspaceRoot);
+      }
+      return action === 'file-write' && canonicalRoot(target.workspaceRoot) === canonicalRoot(videoWorkspaceRoot)
+        && (target.path.startsWith('renders/') || target.path.startsWith('media/prepared/'));
+    },
+    fileSystemPermissionGeneration: () => JSON.stringify({
+      opencode: opencodeSettings().enabled ? allowedOpencodeRoots() : [],
+      personaWorkspaceRoot: personaWorkspaceRoot ? canonicalRoot(personaWorkspaceRoot) : '',
+      videoWorkspaceRoot: canonicalRoot(videoWorkspaceRoot),
+    }),
   });
-  const home = deploymentRoot();
-  const deployDir = join(home, DEPLOYMENT);
   const actionReceiptFile = join(deployDir, 'browser', 'task-actions.json');
   let actionReceipts: BrowserTaskActionJournal | null = null;
   try {
@@ -616,6 +648,14 @@ export async function main(): Promise<void> {
   const longTerm = new HindsightMemory();
   const journal = new RelationshipJournal();
   const affinitySync = new AffinitySync();
+  const confirmWorkspaceAction = async (request: Pick<FileSystemActionAuthorizationRequest, 'action' | 'target' | 'taskText' | 'files'>): Promise<boolean> => {
+    const text = coreText(language()).workspaceAction;
+    const label = request.action === 'file-write' ? text.fileWrite : text.commandExecution;
+    const target = request.target.path === '.' ? request.target.workspaceRoot : join(request.target.workspaceRoot, request.target.path);
+    const files = request.files.map((file) => `${file.path} — ${file.bytes} bytes — sha256 ${file.digest}`).join('\n');
+    const details = [request.taskText, ...(files ? [`Approved files:\n${files}`] : [])].join('\n');
+    return (await pet?.confirm(text.question(label, target, details), [text.yes, text.no]) ?? 'unavailable') === 'yes';
+  };
   const base = await cormini({
     memory: longTerm,
     selfTime: () => readSelfTime(config),
@@ -624,6 +664,13 @@ export async function main(): Promise<void> {
     growthStateFile: join(deployDir, 'growth.json'),
     paused: () => core?.bus.isPaused() === true || readResourcePressure().paused,
     timezone: () => config?.timezone ?? 'UTC',
+    authorizeWorkspaceAction: (request) => authorizeFileSystemAction(
+      actionReceipts,
+      gate,
+      request,
+      () => confirmWorkspaceAction(request),
+    ),
+    actionReceipts: () => actionReceipts,
   });
   /** Coo's Persona, once the bot is built. */
   let coo: CoopanionPersona | null = null;
@@ -686,6 +733,7 @@ export async function main(): Promise<void> {
           return cfg.tick?.intervalMinutes === null || cfg.tick?.intervalMinutes === undefined ? null : cfg.tick.intervalMinutes * 60_000;
         },
       });
+      personaWorkspaceRoot = loaded.memoryDir;
       persona.snapshot(APP_VERSION);
       coo = persona;
       return {
@@ -720,12 +768,16 @@ export async function main(): Promise<void> {
     modelLanguage: () => modelLanguage(config?.language),
     // the avatar beside the pet; the task itself does not depend on the page being connected
     onState: (state) => pet?.guest(state),
+    authorizeAction: (request, confirmInCoreUi) => authorizeFileSystemAction(actionReceipts, gate, request, confirmInCoreUi),
+    confirmAction: confirmWorkspaceAction,
   });
   const VIDEO = videoDefinition({
     modelLanguage: () => modelLanguage(config?.language),
     language: () => language(),
     ffmpegPath: () => String(getByPath(config as unknown as Record<string, unknown>, 'worlds.video.ffmpegPath') ?? ''),
     ffprobePath: () => String(getByPath(config as unknown as Record<string, unknown>, 'worlds.video.ffprobePath') ?? ''),
+    authorizeAction: (request, confirmInCoreUi) => authorizeFileSystemAction(actionReceipts, gate, request, confirmInCoreUi),
+    confirmAction: confirmWorkspaceAction,
   });
   const bundled = [CONSOLE, DESKTOP_PET, NOTICE, BROWSER, OPENCODE, CODEX, VIDEO] as WorldDefinition<WorldSection>[];
 

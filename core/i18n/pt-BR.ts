@@ -67,6 +67,12 @@ const ptBR: Translation<CoreText> = {
     yes: 'Permitir uma vez', no: 'Cancelar',
   },
 
+  workspaceAction: {
+    fileWrite: 'escrever um arquivo na área de trabalho', commandExecution: 'executar um comando na área de trabalho',
+    question: (action: string, target: string, details: string) => 'Você permite que Coo faça ' + action + ' uma vez na área de trabalho “' + target + '”?\n\n' + details + '\n\nA autorização vale apenas para o caminho e a operação listados.',
+    yes: 'Permitir uma vez', no: 'Cancelar',
+  },
+
   status: {
     read: 'Lendo', browse: 'Consultando', memory: 'memória', find: 'Procurando', search: 'Pesquisando', write: 'Escrevendo', edit: 'Editando', append: 'Acrescentando a',
     delete: 'Excluindo', save: 'Salvando', screen: 'Olhando a tela', web: 'Numa página da web', windows: 'Olhando as janelas abertas', rightClick: 'Clicando com o botão direito', doubleClick: 'Clicando duas vezes', click: 'Clicando',

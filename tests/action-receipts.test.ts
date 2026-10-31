@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ActionReceiptLedger, actionReceiptDuplicateKey } from '../core/action-receipts.ts';
 import { hashContent } from '../core/browser/actions.ts';
-import type { BrowserTargetEvidence, DesktopTargetEvidence } from '../core/task-grants.ts';
+import type { BrowserTargetEvidence, DesktopTargetEvidence, FileSystemTargetEvidence } from '../core/task-grants.ts';
 
 let dir = '';
 afterEach(() => {
@@ -145,5 +145,94 @@ describe('shared ActionReceiptLedger', () => {
       files: [],
       duplicateKey: reviewKey,
     }, 2_011)).toThrow(/needs review/);
+  });
+
+  it('keeps an unresolved workspace write from being retried with a changed payload', () => {
+    dir = mkdtempSync(join(tmpdir(), 'coopanion-action-receipts-'));
+    const file = join(dir, 'receipts.json');
+    const ledger = new ActionReceiptLedger(file);
+    const target: FileSystemTargetEvidence = {
+      surface: 'filesystem',
+      instanceId: 'opencode-task-1',
+      workspaceRoot: '/tmp/coopanion-work',
+      path: 'src/main.ts',
+      operation: 'file-write',
+      snapshotId: 'before-hash',
+      source: 'opencode-acp',
+    };
+    const originalDigest = hashContent('first version');
+    const duplicateKey = actionReceiptDuplicateKey('file-write', target, originalDigest);
+    const original = ledger.begin({
+      taskId: 'opencode-task-1:file-write-1',
+      intent: 'file-write',
+      action: 'opencode edit',
+      risk: 'REVERSIBLE_LOCAL',
+      target,
+      payloadDigest: originalDigest,
+      files: [{ path: 'src/main.ts', digest: originalDigest, bytes: 13, mime: 'text/plain' }],
+      duplicateKey,
+    }, 3_000);
+    ledger.awaitingApproval(original.id, 3_001);
+    ledger.acting(original.id, 'd'.repeat(64), 3_002, 30_000, 3_003);
+    ledger.complete(original.id, {
+      phase: 'unknown',
+      dispatchState: 'delivered',
+      outcome: 'unknown',
+      note: 'the ACP result was lost after the edit dispatch',
+    }, 3_004);
+
+    const reopened = new ActionReceiptLedger(file);
+    const changedDigest = hashContent('different version');
+    const retryKey = actionReceiptDuplicateKey('file-write', {
+      ...target,
+      instanceId: 'persona-task-2',
+      source: 'persona-workspace',
+    }, changedDigest);
+    expect(retryKey).toBe(duplicateKey);
+    expect(() => reopened.begin({
+      taskId: 'opencode-task-2:file-write-1',
+      intent: 'file-write',
+      action: 'opencode edit',
+      risk: 'REVERSIBLE_LOCAL',
+      target: { ...target, instanceId: 'opencode-task-2' },
+      payloadDigest: changedDigest,
+      files: [{ path: 'src/main.ts', digest: changedDigest, bytes: 17, mime: 'text/plain' }],
+      duplicateKey: retryKey,
+    }, 3_005)).toThrow(/needs review/);
+  });
+
+  it('lets an operator reconcile only unresolved receipts with a recorded observation', () => {
+    dir = mkdtempSync(join(tmpdir(), 'coopanion-action-receipts-'));
+    const file = join(dir, 'receipts.json');
+    const ledger = new ActionReceiptLedger(file);
+    const target: BrowserTargetEvidence = {
+      surface: 'browser', instanceId: 'browser-1', origin: 'https://www.example.test',
+      url: 'https://www.example.test/item/1', accountRef: 'account-1', snapshotId: 'page-1',
+      formId: 'item:1', control: 'publish',
+    };
+    const duplicateKey = actionReceiptDuplicateKey('platform-write', target, hashContent('post'));
+    const receipt = ledger.begin({
+      taskId: 'browser-call-review', intent: 'platform-write', action: 'publish', risk: 'IRREVERSIBLE_OR_PUBLIC',
+      target, payloadDigest: hashContent('post'), files: [], duplicateKey,
+    }, 4_000);
+    ledger.awaitingApproval(receipt.id, 4_001);
+    ledger.acting(receipt.id, 'e'.repeat(64), 4_002, 30_000, 4_003);
+    ledger.complete(receipt.id, {
+      phase: 'unknown', dispatchState: 'unknown', outcome: 'unknown', note: 'the page did not answer after submit',
+    }, 4_004);
+
+    expect(ledger.listUnresolved()).toHaveLength(1);
+    expect(ledger.reconcile(receipt.id, 'review-pending', 'Creator Center shows the submission under review.', 4_005)).toBe(true);
+    expect(ledger.listUnresolved()[0]).toMatchObject({ phase: 'review-pending', dispatchState: 'delivered', outcome: 'review-pending' });
+    expect(ledger.reconcile(receipt.id, 'verified', 'The post is visible on the target page.', 4_006)).toBe(true);
+    expect(ledger.listUnresolved()).toHaveLength(0);
+
+    const reopened = new ActionReceiptLedger(file);
+    const persisted = JSON.parse(readFileSync(file, 'utf8')) as Array<Record<string, unknown>>;
+    expect(persisted[0]).toMatchObject({ phase: 'verified', outcome: 'verified', evidence: [
+      expect.objectContaining({ source: 'operator-review', status: 'review-pending' }),
+      expect.objectContaining({ source: 'operator-review', status: 'verified' }),
+    ] });
+    expect(reopened.reconcile(receipt.id, 'failed', 'no longer unresolved', 4_007)).toBe(false);
   });
 });

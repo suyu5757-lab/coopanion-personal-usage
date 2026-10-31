@@ -217,6 +217,11 @@ const problemsOf = (raw: unknown, dirs: ManifestDirs): string[] => {
   else {
     try { lstatSync(output); problems.push('output.path must be new; existing files are preserved'); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') problems.push('output.path could not be checked safely'); }
+    if (Array.isArray(rawCaptions) && rawCaptions.length) {
+      const sidecar = output.replace(/\.mp4$/i, '.srt');
+      try { lstatSync(sidecar); problems.push('caption sidecar must be new; existing files are preserved'); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') problems.push('caption sidecar could not be checked safely'); }
+    }
   }
   if (output && [...sources.values()].some((source) => source.file === output)) problems.push('output.path must not be one of the sources');
 

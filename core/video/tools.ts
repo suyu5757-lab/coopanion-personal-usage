@@ -25,6 +25,7 @@ export const VIDEO_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
     tags: ['act'],
     interruptible: true,
     description: 'Render one vertical preview MP4 from source clips the person has put in the media folder and return its renderId and SHA-256. '
+      + 'Before writing the MP4 or caption sidecar, request one Core approval bound to the output path and frozen input digest. '
       + 'The manifest names the canvas, the authorized sources, the clips cut from them, optional music, voice-over and captions, and the output path under the renders folder. '
       + 'Sources are only read. The result is checked with ffprobe (size, duration, codecs) and for long black stretches; a poster frame comes back with the receipt. '
       + 'Captions are written beside the video as an .srt. Set captionsBurnIn to true to also draw them into the picture; that requires an FFmpeg build with drawtext.',
@@ -107,6 +108,7 @@ export const VIDEO_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
     tags: ['act'],
     interruptible: true,
     description: 'Copy a render created in this Core session to video/media/prepared/<renderId>/render.mp4 for a later, separately approved browser upload. '
+      + 'Before creating the prepared MP4 and receipt.json, request one Core approval bound to both exact file digests. '
       + 'Re-check the source path, MP4 signature, byte length, SHA-256 and ffprobe facts before and after copying. '
       + 'This only prepares a local file; it does not open a browser, select a file, upload or publish anything.',
     parameters: {

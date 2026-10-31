@@ -67,6 +67,12 @@ const it: Translation<CoreText> = {
     yes: 'Consenti una volta', no: 'Annulla',
   },
 
+  workspaceAction: {
+    fileWrite: 'scrivere un file nell’area di lavoro', commandExecution: 'eseguire un comando nell’area di lavoro',
+    question: (action: string, target: string, details: string) => 'Consenti a Coo di ' + action + ' una volta nell’area di lavoro “' + target + '”?\n\n' + details + '\n\nL’autorizzazione vale solo per il percorso e l’operazione elencati.',
+    yes: 'Consenti una volta', no: 'Annulla',
+  },
+
   status: {
     read: 'Legge', browse: 'Sfoglia', memory: 'memoria', find: 'Trova', search: 'Cerca', write: 'Scrive', edit: 'Modifica', append: 'Aggiunge a',
     delete: 'Elimina', save: 'Salva', screen: 'Guarda lo schermo', web: 'Su una pagina web', windows: 'Guarda le finestre aperte', rightClick: 'Fa clic destro', doubleClick: 'Fa doppio clic', click: 'Fa clic',

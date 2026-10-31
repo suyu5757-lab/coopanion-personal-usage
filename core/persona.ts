@@ -4,9 +4,9 @@
  * - `PARTNER.md` in the workspace goes into the system prefix whole (Cormini's partner segment), after a
  *   standing line asking Coo to keep it short and put details under `partner/`, and cannot be deleted with
  *   `delete_file`, as `CONSTITUTION.md` cannot.
- * - Every write Coo makes to its workspace is committed to the workspace's Git repository, one commit
- *   per tool call, so the workspace has a history to look back on and go back to. `blobs/` is left out
- *   of the repository. Without Git (`gitInstalled`) the files are written all the same.
+ * - In Coopanion Core, each workspace write asks for a one-use grant, records an action receipt and
+ *   verifies the file after dispatch. Successful writes are committed one per tool call; `blobs/` is
+ *   left out of Git. A standalone Persona without the Core callback keeps its local write behavior.
  * - The lines the Persona itself puts into the context (a session opening, new events, a World
  *   switched, context pressure, the handoff, the round cap, stalls) and its workspace listing are in
  *   English whatever the app language; Coo is told which language to talk in by the desktop-pet World.
@@ -16,10 +16,12 @@
  * Cortico is staged at build time and the bots are not part of its module paths, so the base class is
  * passed in: the app loads it from the staged Cortico (`companion.ts`), the tests from vendor/cortico.
  */
+import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, statfsSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, statfsSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { freemem, totalmem } from 'node:os';
-import { dirname, join, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { LOG_SCHEME, blobScheme } from 'cortico/core/blobs.ts';
 import type { CoreApi, EventEnvelope, PersonaWebUiDecl, SessionDecl, SessionOpeningReason, StoragePart, ToolCallContext, ToolDef, WorldLifecycleEvent } from 'cortico/core/types.ts';
 import { withText, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
@@ -40,6 +42,10 @@ import { GROWTH_CHECK_MS, GrowthSchedule } from './growth/schedule.ts';
 import { readResourcePressure } from './resource-pressure.ts';
 import { memoryReadNotice } from './memory/model-text.ts';
 import type { ModelLanguage } from './language.ts';
+import type { FileSystemActionAuthorization, FileSystemActionAuthorizationRequest } from './action-authorization.ts';
+import type { ActionReceiptLedger, ActionReceiptReviewDecision } from './action-receipts.ts';
+import { BLOBS_DIR } from '../vendor/cortico/bots/cormini/persona/memory.ts';
+import type { FileSystemTargetEvidence } from './task-grants.ts';
 import { writeState } from './state-file.ts';
 
 /** The workspace file that goes into the prefix as Coo's notes on the person. */
@@ -100,6 +106,27 @@ const WRITES: Record<string, { ok: string; verb: string }> = {
   delete_file: { ok: '[deleted] ', verb: 'deleted' },
   save_blob: { ok: '[saved] ', verb: 'saved' },
 };
+
+const sha256 = (value: string | Uint8Array): string => createHash('sha256').update(value).digest('hex');
+
+function insidePath(root: string, target: string): boolean {
+  const rel = relative(root, target);
+  return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel));
+}
+
+interface WorkspacePathState {
+  absolutePath: string;
+  relativePath: string;
+  bytes: Buffer | null;
+  snapshotId: string;
+}
+
+interface WorkspaceActionPlan {
+  request: FileSystemActionAuthorizationRequest;
+  path: WorkspacePathState;
+  finalBytes: Buffer | null;
+  failurePrefix: string;
+}
 
 /**
  * Takes `path` out of the repository at `dir` and leaves the files: a workspace may have committed `blobs/`
@@ -173,6 +200,10 @@ export interface MemoryDeps {
   /** True while the app is paused; a paused app starts no background review. */
   paused?: () => boolean;
   timezone?: () => string;
+  /** Core authorizes one workspace file change through the shared action receipt ledger. */
+  authorizeWorkspaceAction?: (request: FileSystemActionAuthorizationRequest) => Promise<FileSystemActionAuthorization | null>;
+  /** Core owns the shared Browser, CUA and filesystem action receipts shown in Persona settings. */
+  actionReceipts?: () => ActionReceiptLedger | null;
 }
 
 export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
@@ -186,6 +217,8 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     private readonly growthStateFile = deps.growthStateFile ?? null;
     private readonly pausedNow = deps.paused ?? (() => false);
     private readonly timezoneNow = deps.timezone ?? (() => 'UTC');
+    private readonly authorizeWorkspaceAction = deps.authorizeWorkspaceAction ?? null;
+    private readonly actionReceiptsNow = deps.actionReceipts ?? (() => null);
     private growthSchedule: GrowthSchedule | null = null;
     private growthCheck: ReturnType<typeof setInterval> | null = null;
     private lastUserMemory: { documentId: string; at: number } | null = null;
@@ -481,21 +514,257 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
       })];
     }
 
-    /** The tool, committing the workspace after each call that succeeded. */
+    private workspacePathState(path: string, instanceId: string): { path: WorkspacePathState; target: FileSystemTargetEvidence } {
+      const root = resolve(this.memoryDir);
+      const absolutePath = this.memory.resolveSafe(path);
+      const relativePath = relative(root, absolutePath).split(sep).join('/');
+      if (!relativePath || relativePath === '.' || relativePath.startsWith('../') || isAbsolute(relativePath)) {
+        throw new Error('the workspace path must name one file');
+      }
+
+      const realRoot = realpathSync(root);
+      let bytes: Buffer | null = null;
+      if (existsSync(absolutePath)) {
+        if (statSync(absolutePath).isDirectory()) throw new Error('the workspace target is a directory');
+        if (!insidePath(realRoot, realpathSync(absolutePath))) throw new Error('the workspace target resolves outside the workspace');
+        bytes = readFileSync(absolutePath);
+      } else {
+        try {
+          lstatSync(absolutePath);
+          throw new Error('the workspace target is a broken symbolic link');
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+        let ancestor = dirname(absolutePath);
+        while (!existsSync(ancestor)) {
+          const parent = dirname(ancestor);
+          if (parent === ancestor) throw new Error('the workspace parent directory is unavailable');
+          ancestor = parent;
+        }
+        if (!insidePath(realRoot, realpathSync(ancestor))) throw new Error('the workspace parent resolves outside the workspace');
+      }
+
+      const snapshotId = sha256(JSON.stringify(bytes === null
+        ? ['absent']
+        : ['file', sha256(bytes), bytes.byteLength]));
+      return {
+        path: { absolutePath, relativePath, bytes, snapshotId },
+        target: {
+          surface: 'filesystem',
+          instanceId,
+          workspaceRoot: realRoot,
+          path: relativePath,
+          operation: 'file-write',
+          snapshotId,
+          source: 'persona-workspace',
+        },
+      };
+    }
+
+    private workspaceActionPlan(name: string, args: Record<string, unknown>, role: string): WorkspaceActionPlan | { error: string; failurePrefix: string } {
+      const failurePrefix = name === 'save_blob' ? '[save failed] '
+        : name === 'append_file' ? '[append failed] '
+          : name === 'edit_file' ? '[edit failed] '
+            : name === 'delete_file' ? '[delete failed] ' : '[write failed] ';
+      const rawPath = String(args.path ?? '').trim();
+      if (!rawPath) return { error: 'path 不能为空', failurePrefix };
+
+      const operation = name === 'append_file' ? 'append' : name === 'delete_file' ? 'delete' : 'write';
+      const denied = this.writeGuard(operation, rawPath, role);
+      if (denied) return { error: denied, failurePrefix };
+
+      let effectivePath = rawPath;
+      let mime = 'text/plain';
+      let risk: FileSystemActionAuthorizationRequest['risk'] = 'REVERSIBLE_LOCAL';
+      let finalBytes: Buffer | null = null;
+      if (name === 'save_blob') {
+        const given = String(args.handle ?? '').trim();
+        if (!given) return { error: 'handle 不能为空', failurePrefix };
+        const handle = blobScheme(given) ? given : `${LOG_SCHEME}${given}`;
+        const blob = this.core?.blob(handle) ?? null;
+        if (!blob) return { error: `没有 ${handle} 这份二进制`, failurePrefix };
+        const normalized = this.memory.normalize(rawPath).replace(/^\.\//, '');
+        effectivePath = normalized.includes('/') ? normalized : `${BLOBS_DIR}${normalized}`;
+        finalBytes = Buffer.from(blob.bytes);
+        mime = blob.mime;
+      } else if (name === 'delete_file') {
+        risk = 'EXTERNAL_MUTATION';
+      }
+
+      const nonce = randomUUID();
+      let pathState: WorkspacePathState;
+      let target: FileSystemTargetEvidence;
+      try {
+        ({ path: pathState, target } = this.workspacePathState(effectivePath, nonce));
+      } catch (error) {
+        return { error: error instanceof Error ? error.message : String(error), failurePrefix };
+      }
+
+      if (name === 'delete_file') {
+        if (this.prefixResidentFiles().some((file) => resolve(file) === pathState.absolutePath)) {
+          return { error: `${rawPath} 常驻系统前缀,不能删`, failurePrefix };
+        }
+        if (!pathState.bytes) return { error: `${rawPath} 不存在`, failurePrefix };
+        mime = 'application/octet-stream';
+      }
+
+      if (name === 'write_file') {
+        finalBytes = Buffer.from(String(args.content ?? ''), 'utf8');
+      } else if (name === 'append_file') {
+        const content = String(args.content ?? '');
+        const previous = pathState.bytes?.toString('utf8') ?? '';
+        const payload = previous.length > 0 && !previous.endsWith('\n') ? `\n${content}` : content;
+        finalBytes = Buffer.from(previous + payload, 'utf8');
+      } else if (name === 'edit_file') {
+        const oldText = String(args.old_string ?? '');
+        const newText = String(args.new_string ?? '');
+        if (oldText === '') return { error: 'old_string 不能为空', failurePrefix };
+        if (oldText === newText) return { error: 'new_string 与 old_string 相同,没有可改的', failurePrefix };
+        if (!pathState.bytes) return { error: `${rawPath} 不存在`, failurePrefix };
+        const previous = pathState.bytes.toString('utf8');
+        const count = previous.split(oldText).length - 1;
+        if (count === 0) return { error: `${rawPath} 里没有这段文字`, failurePrefix };
+        if (count > 1 && args.replace_all !== true) return { error: `这段文字在 ${rawPath} 里出现 ${count} 次`, failurePrefix };
+        const next = args.replace_all === true ? previous.split(oldText).join(newText) : previous.replace(oldText, () => newText);
+        finalBytes = Buffer.from(next, 'utf8');
+      } else if (name === 'delete_file' || name === 'save_blob') {
+        // The target or content was established before the tool-specific preflight above.
+      } else {
+        return { error: 'unsupported workspace action', failurePrefix };
+      }
+
+      const expectedBytes = name === 'delete_file' ? pathState.bytes! : finalBytes!;
+      const digest = sha256(expectedBytes);
+      const file = { path: pathState.relativePath, digest, bytes: expectedBytes.byteLength, mime };
+      const verb = name === 'delete_file' ? 'delete'
+        : name === 'append_file' ? 'append'
+          : name === 'edit_file' ? 'edit'
+            : name === 'save_blob' ? 'save attachment to' : 'write';
+      const expectedChange = name === 'delete_file'
+        ? `delete ${pathState.relativePath} sha256:${digest}`
+        : `${verb} ${pathState.relativePath} sha256:${digest} (${expectedBytes.byteLength} bytes)`;
+      const taskText = name === 'delete_file'
+        ? `Delete ${pathState.relativePath} (${expectedBytes.byteLength} bytes; sha256 ${digest}).`
+        : `${verb} ${pathState.relativePath} (${expectedBytes.byteLength} bytes; sha256 ${digest}).`;
+      const request: FileSystemActionAuthorizationRequest = {
+        taskId: `persona:${role}:${nonce}`,
+        taskText,
+        actionName: `Persona ${name}`,
+        expectedChange,
+        payloadDigest: sha256(JSON.stringify([name, pathState.relativePath, pathState.snapshotId, digest, expectedBytes.byteLength, mime])),
+        risk,
+        target,
+        action: 'file-write',
+        files: [file],
+        expiresInMs: 30_000,
+        maxSteps: 1,
+      };
+      return { request, path: pathState, finalBytes: name === 'delete_file' ? null : finalBytes, failurePrefix };
+    }
+
+    /** The tool, authorized before dispatch and committed after a matching read-back. */
     private committed(base: ToolDef, { ok, verb }: { ok: string; verb: string }): ToolDef {
       return {
         ...base,
         handler: async (args, ctx) => {
-          // the repository exists before the first write, so its first commit (checkpoint0) holds the workspace as it was
-          this.git.ensureRepo();
-          const out = await base.handler(args, ctx);
-          if (typeof out === 'string' && out.startsWith(ok)) {
+          if (!this.authorizeWorkspaceAction) {
+            // The standalone Persona retains its existing local behavior when Core has not supplied a gate.
+            this.git.ensureRepo();
+            const out = await base.handler(args, ctx);
+            if (typeof out === 'string' && out.startsWith(ok)) {
+              const message = `Coo ${verb} ${String(args.path ?? '')}`.trim();
+              const run = () => this.git.commitAllAsync(message, AUTHOR_COO);
+              this.commits = this.commits.then(run, run);
+              await this.commits;
+            }
+            return out;
+          }
+
+          const planned = this.workspaceActionPlan(base.name, args, ctx.role);
+          if ('error' in planned) return `${planned.failurePrefix}${planned.error}`;
+          const authorization = await this.authorizeWorkspaceAction(planned.request);
+          if (!authorization) return `${planned.failurePrefix}Core did not authorize this workspace action`;
+
+          let dispatched = false;
+          try {
+            // Establish the pre-write checkpoint only after approval; it is workspace history metadata.
+            this.git.ensureRepo();
+            const current = this.workspacePathState(planned.path.relativePath, planned.request.target.instanceId);
+            if (current.path.snapshotId !== planned.path.snapshotId) {
+              authorization.revoke();
+              return `${planned.failurePrefix}the workspace file changed before dispatch`;
+            }
+            if (!authorization.consume(current.target, planned.request.expectedChange, planned.request.files)) {
+              authorization.revoke();
+              return `${planned.failurePrefix}the workspace grant expired or no longer matches`;
+            }
+
+            dispatched = true;
+            const out = await base.handler(args, ctx);
+            if (typeof out !== 'string' || !out.startsWith(ok)) {
+              authorization.complete({
+                phase: 'unknown', dispatchState: 'unknown', outcome: 'unknown',
+                note: 'the workspace tool did not confirm whether it changed the file',
+                evidence: { source: 'persona-workspace-tool', status: 'unknown', observedAt: Date.now() },
+              });
+              return out;
+            }
+
+            let observed: WorkspacePathState;
+            try {
+              observed = this.workspacePathState(planned.path.relativePath, planned.request.target.instanceId).path;
+            } catch (error) {
+              authorization.complete({
+                phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown',
+                note: `workspace read-back failed: ${error instanceof Error ? error.message : String(error)}`,
+                evidence: { source: 'persona-workspace-readback', status: 'unavailable', observedAt: Date.now() },
+              });
+              return `${planned.failurePrefix}workspace read-back could not verify the result`;
+            }
+            const matches = planned.finalBytes === null
+              ? observed.bytes === null
+              : observed.bytes !== null && observed.bytes.equals(planned.finalBytes);
+            if (!matches) {
+              authorization.complete({
+                phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown',
+                note: 'workspace read-back differed from the approved file state',
+                evidence: {
+                  source: 'persona-workspace-readback', status: 'mismatch',
+                  ...(observed.bytes ? { digest: sha256(observed.bytes) } : {}), observedAt: Date.now(),
+                },
+              });
+              return `${planned.failurePrefix}workspace read-back differed from the approved result`;
+            }
+
+            authorization.complete({
+              phase: 'verified', dispatchState: 'delivered', outcome: 'ui-observed',
+              note: planned.finalBytes === null ? 'the approved workspace file is absent after deletion' : 'the workspace file matches the approved bytes',
+              evidence: {
+                source: 'persona-workspace-readback', status: planned.finalBytes === null ? 'deleted' : 'matched',
+                ...(observed.bytes ? { digest: sha256(observed.bytes) } : {}), observedAt: Date.now(),
+              },
+            });
             const message = `Coo ${verb} ${String(args.path ?? '')}`.trim();
             const run = () => this.git.commitAllAsync(message, AUTHOR_COO);
             this.commits = this.commits.then(run, run);
             await this.commits;
+            return out;
+          } catch (error) {
+            if (dispatched) {
+              try {
+                authorization.complete({
+                  phase: 'unknown', dispatchState: 'unknown', outcome: 'unknown',
+                  note: `workspace action result is uncertain: ${error instanceof Error ? error.message : String(error)}`,
+                  evidence: { source: 'persona-workspace-tool', status: 'unknown', observedAt: Date.now() },
+                });
+              } catch {
+                // The unresolved receipt remains recoverable if the ledger itself cannot be written.
+              }
+            } else {
+              authorization.revoke();
+            }
+            return `${planned.failurePrefix}${error instanceof Error ? error.message : String(error)}`;
           }
-          return out;
         },
       };
     }
@@ -508,6 +777,7 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
       if (this.longTerm || this.growthStateFile) {
         panels.push({ id: 'hindsight', title: t.hindsightLabel, description: t.hindsightPanelDesc });
       }
+      panels.push({ id: 'action-receipts', title: t.actionReceiptsLabel, description: t.actionReceiptsPanelDesc });
       if (this.longTerm?.enabled()) {
         storage.push({
           key: 'hindsight',
@@ -524,6 +794,7 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
       const baseInvoke = decl.invoke;
       const invoke = async (panel: string, method: string, args: unknown[]): Promise<unknown> => {
         if (panel === 'hindsight') return this.hindsightInvoke(method, args);
+        if (panel === 'action-receipts') return this.actionReceiptsInvoke(method, args);
         if (!baseInvoke) throw new Error(`No handler for panel ${panel}`);
         return baseInvoke(panel, method, args);
       };
@@ -532,6 +803,49 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
         invoke,
         ...(decl.memory ? { memory: { ...decl.memory, panels, storage } } : { memory: { panels, storage } }),
       };
+    }
+
+    private actionReceiptsInvoke(method: string, args: unknown[]): unknown {
+      const ledger = this.actionReceiptsNow();
+      if (method === 'list') {
+        if (!ledger) return { available: false, receipts: [] };
+        return {
+          available: true,
+          receipts: ledger.listUnresolved().map((action) => ({
+            id: action.id,
+            actionId: action.actionId,
+            attemptId: action.attemptId,
+            taskId: action.taskId,
+            intent: action.intent,
+            action: action.action,
+            risk: action.risk,
+            phase: action.phase,
+            target: action.target,
+            payloadDigest: action.payloadDigest,
+            files: action.files,
+            dispatchState: action.dispatchState,
+            evidence: action.evidence,
+            createdAt: action.createdAt,
+            updatedAt: action.updatedAt,
+            ...(action.outcome ? { outcome: action.outcome } : {}),
+            ...(action.note ? { note: action.note } : {}),
+          })),
+        };
+      }
+      if (method === 'reconcile') {
+        if (!ledger) return { ok: false, error: 'unavailable' };
+        const id = typeof args[0] === 'string' ? args[0] : '';
+        const decision = args[1];
+        const note = typeof args[2] === 'string' ? args[2] : '';
+        if (!id || (decision !== 'verified' && decision !== 'review-pending' && decision !== 'failed') || !note.trim()) {
+          return { ok: false, error: 'invalid' };
+        }
+        if (!ledger.reconcile(id, decision as ActionReceiptReviewDecision, note)) {
+          return { ok: false, error: 'stale' };
+        }
+        return { ok: true };
+      }
+      throw new Error(`Unknown action receipt method: ${method}`);
     }
 
     private async hindsightInvoke(method: string, args: unknown[]): Promise<unknown> {

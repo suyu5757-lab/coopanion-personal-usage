@@ -76,6 +76,12 @@ const en: CoreText = {
     yes: 'Allow once', no: 'Cancel',
   },
 
+  workspaceAction: {
+    fileWrite: 'write a workspace file', commandExecution: 'run a workspace command',
+    question: (action: string, target: string, details: string) => 'Allow Coo to ' + action + ' in workspace "' + target + '" once?\n\n' + details + '\n\nThis applies only to this listed path and operation.',
+    yes: 'Allow once', no: 'Cancel',
+  },
+
   status: {
     read: 'Reading', browse: 'Browsing', memory: 'memory', find: 'Looking for', search: 'Searching', write: 'Writing', edit: 'Editing', append: 'Adding to',
     delete: 'Deleting', save: 'Saving', screen: 'Looking at the screen', web: 'On a web page', windows: 'Looking at the open windows', rightClick: 'Right-clicking', doubleClick: 'Double-clicking', click: 'Clicking',

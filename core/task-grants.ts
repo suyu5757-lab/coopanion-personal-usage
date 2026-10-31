@@ -1,5 +1,6 @@
 /** Short lived user grants and one-use tickets for actions bound to a verified target. */
 import { createHash, randomUUID } from 'node:crypto';
+import { isAbsolute } from 'node:path';
 
 export interface Rect {
   x: number;
@@ -8,7 +9,7 @@ export interface Rect {
   height: number;
 }
 
-export type ActionTargetEvidence = DesktopTargetEvidence | BrowserTargetEvidence;
+export type ActionTargetEvidence = DesktopTargetEvidence | BrowserTargetEvidence | FileSystemTargetEvidence;
 export type ActionRisk = 'READ_ONLY' | 'REVERSIBLE_LOCAL' | 'EXTERNAL_MUTATION' | 'IRREVERSIBLE_OR_PUBLIC';
 const ACTION_RISKS = new Set<ActionRisk>(['READ_ONLY', 'REVERSIBLE_LOCAL', 'EXTERNAL_MUTATION', 'IRREVERSIBLE_OR_PUBLIC']);
 
@@ -40,6 +41,16 @@ export interface BrowserTargetEvidence {
   snapshotId: string;
   formId: string;
   control: string;
+}
+
+export interface FileSystemTargetEvidence {
+  surface: 'filesystem';
+  instanceId: string;
+  workspaceRoot: string;
+  path: string;
+  operation: 'file-write' | 'command-execution';
+  snapshotId: string;
+  source: 'opencode-acp' | 'persona-workspace' | 'video-world';
 }
 
 export interface TaskGrantRequest {
@@ -102,12 +113,22 @@ const safeRelativePath = (path: string) => !!path.trim() && !path.startsWith('/'
   && !path.includes('\0') && !path.split(/[\\/]/).some((part) => part === '..' || part === '');
 const normalizeFiles = (files: readonly { path: string; digest: string; bytes: number; mime: string }[] | undefined) =>
   [...(files ?? [])].map(({ path, digest, bytes, mime }) => ({ path, digest, bytes, mime }));
-const targetIdentity = (target: ActionTargetEvidence): unknown => target.surface === 'desktop'
-  ? [target.surface, target.instanceId, target.bundleId, target.executablePath, target.pid, target.ownerPid, target.processStart, target.windowId]
-  : [target.surface, target.instanceId, target.origin, target.url, target.accountRef, target.formId, target.control];
-const targetSnapshot = (target: ActionTargetEvidence): unknown => target.surface === 'desktop'
-  ? [target.snapshotId, target.captureId, target.bounds, target.display, target.space, target.element?.role ?? '', target.element?.label ?? '', target.element?.token ?? '', target.route]
-  : [target.snapshotId, target.url, target.accountRef, target.formId, target.control];
+const targetIdentity = (target: ActionTargetEvidence): unknown => {
+  if (target.surface === 'desktop') {
+    return [target.surface, target.instanceId, target.bundleId, target.executablePath, target.pid, target.ownerPid, target.processStart, target.windowId];
+  }
+  if (target.surface === 'browser') {
+    return [target.surface, target.instanceId, target.origin, target.url, target.accountRef, target.formId, target.control];
+  }
+  return [target.surface, target.instanceId, target.workspaceRoot, target.path, target.operation, target.source];
+};
+const targetSnapshot = (target: ActionTargetEvidence): unknown => {
+  if (target.surface === 'desktop') {
+    return [target.snapshotId, target.captureId, target.bounds, target.display, target.space, target.element?.role ?? '', target.element?.label ?? '', target.element?.token ?? '', target.route];
+  }
+  if (target.surface === 'browser') return [target.snapshotId, target.url, target.accountRef, target.formId, target.control];
+  return [target.snapshotId, target.workspaceRoot, target.path, target.operation, target.source];
+};
 
 function validTarget(target: ActionTargetEvidence): boolean {
   if (target.surface === 'desktop') {
@@ -118,8 +139,13 @@ function validTarget(target: ActionTargetEvidence): boolean {
       && (target.element === undefined || (!!target.element.role && !!target.element.label && !!target.element.token
         && target.element.token.startsWith(`${target.snapshotId}:`)));
   }
-  return !!target.instanceId && !!target.origin && !!target.url && !!target.accountRef
-    && !!target.snapshotId && !!target.formId && !!target.control;
+  if (target.surface === 'browser') {
+    return !!target.instanceId && !!target.origin && !!target.url && !!target.accountRef
+      && !!target.snapshotId && !!target.formId && !!target.control;
+  }
+  return !!target.instanceId && isAbsolute(target.workspaceRoot) && !!target.snapshotId
+    && safeRelativePath(target.path) && (target.operation === 'file-write' || target.operation === 'command-execution')
+    && (target.source === 'opencode-acp' || target.source === 'persona-workspace' || target.source === 'video-world');
 }
 
 /** Core owns this registry; callers supply the confirmation callback bound to the app's own UI. */
@@ -147,7 +173,7 @@ export class TaskGrantRegistry {
     const files = normalizeFiles(request.files);
     if (!request.taskId || !request.taskText.trim() || request.taskText.length > 4000 || !ACTION_RISKS.has(request.risk) || !validTarget(request.target)
       || actions.length === 0 || actions.length > 16 || files.some((file) => !safeRelativePath(file.path)
-        || !/^[a-f0-9]{64}$/.test(file.digest) || !Number.isSafeInteger(file.bytes) || file.bytes <= 0 || !file.mime.trim())
+      || !/^[a-f0-9]{64}$/.test(file.digest) || !Number.isSafeInteger(file.bytes) || file.bytes < 0 || !file.mime.trim())
       || !Number.isSafeInteger(request.expiresInMs) || request.expiresInMs < 1_000 || request.expiresInMs > 60 * 60_000
       || !Number.isSafeInteger(request.maxSteps) || request.maxSteps < 1 || request.maxSteps > 200) {
       throw new Error('task grant request is incomplete or outside its limits');

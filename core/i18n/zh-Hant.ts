@@ -67,6 +67,12 @@ const zhHant: Translation<CoreText> = {
     yes: '允許一次', no: '取消',
   },
 
+  workspaceAction: {
+    fileWrite: '寫入工作區檔案', commandExecution: '執行工作區命令',
+    question: (action: string, target: string, details: string) => '允許 Coo 在工作區「' + target + '」執行一次' + action + '嗎？\n\n' + details + '\n\n僅適用於這次列出的路徑和操作。',
+    yes: '允許一次', no: '取消',
+  },
+
   status: {
     read: '在查看', browse: '在翻閱', memory: '記憶', find: '在尋找', search: '在搜尋', write: '在寫入', edit: '在修改', append: '在附加',
     delete: '在刪除', save: '在儲存', screen: '在查看螢幕', web: '在看網頁', windows: '在查看開啟的視窗', rightClick: '在按右鍵', doubleClick: '在點兩下', click: '在點選',

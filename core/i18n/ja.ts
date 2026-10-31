@@ -67,6 +67,12 @@ const ja: Translation<CoreText> = {
     yes: '一度だけ許可', no: 'キャンセル',
   },
 
+  workspaceAction: {
+    fileWrite: 'ワークスペースのファイルを書き込む', commandExecution: 'ワークスペースでコマンドを実行する',
+    question: (action: string, target: string, details: string) => 'Coo がワークスペース「' + target + '」で ' + action + ' することを一度だけ許可しますか？\n\n' + details + '\n\n記載されたパスと操作だけに適用されます。',
+    yes: '一度だけ許可', no: 'キャンセル',
+  },
+
   status: {
     read: '読み取り中', browse: '閲覧中', memory: '記憶', find: '探索中', search: '検索中', write: '書き込み中', edit: '編集中', append: '追記中',
     delete: '削除中', save: '保存中', screen: '画面を確認中', web: 'ページ閲覧中', windows: '開いているウィンドウを確認中', rightClick: '右クリック中', doubleClick: 'ダブルクリック中', click: 'クリック中',

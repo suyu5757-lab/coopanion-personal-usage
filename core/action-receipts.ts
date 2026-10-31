@@ -1,13 +1,13 @@
 /** Durable receipts for side effects that need a scoped user grant. */
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, isAbsolute } from 'node:path';
 import { writeState } from './state-file.ts';
 import type { ActionRisk, ActionTargetEvidence, DesktopTargetEvidence } from './task-grants.ts';
 
 export type ActionIntent = 'platform-write' | 'image-generation' | 'image-saving' | 'media-upload' | 'computer-input' | 'file-write' | 'command-execution' | 'platform-api';
 export type BrowserTaskIntent = Extract<ActionIntent, 'platform-write' | 'image-generation' | 'image-saving' | 'media-upload'>;
-export type ActionReceiptPhase = 'planned' | 'awaiting-approval' | 'acting' | 'review-pending' | 'verified' | 'unknown' | 'cancelled' | 'failed';
+export type ActionReceiptPhase = 'planned' | 'awaiting-approval' | 'acting' | 'submitted' | 'review-pending' | 'verified' | 'unknown' | 'cancelled' | 'failed';
 export type BrowserTaskPhase = ActionReceiptPhase;
 export type BrowserTaskFile = { path: string; digest: string; bytes: number; mime: string };
 export type { ActionRisk } from './task-grants.ts';
@@ -26,10 +26,13 @@ interface ActionReceiptCompletionDetails {
 }
 export type ActionReceiptCompletion =
   | (ActionReceiptCompletionDetails & { phase: 'review-pending'; dispatchState: 'delivered'; outcome: 'review-pending' })
+  | (ActionReceiptCompletionDetails & { phase: 'submitted'; dispatchState: 'delivered'; outcome: 'remote-acknowledged' })
+  | (ActionReceiptCompletionDetails & { phase: 'acting'; dispatchState: 'delivered'; outcome: 'delivered' })
   | (ActionReceiptCompletionDetails & { phase: 'verified'; dispatchState: 'delivered'; outcome: 'ui-observed' | 'remote-acknowledged' | 'verified' })
   | (ActionReceiptCompletionDetails & { phase: 'unknown'; dispatchState: ActionDispatchState; outcome: 'unknown' })
   | (ActionReceiptCompletionDetails & { phase: 'cancelled'; dispatchState: 'not-dispatched'; outcome: 'cancelled' })
   | (ActionReceiptCompletionDetails & { phase: 'failed'; dispatchState: ActionDispatchState; outcome: 'failed' });
+export type ActionReceiptReviewDecision = 'verified' | 'review-pending' | 'failed';
 
 export interface ActionReceipt {
   id: string;
@@ -60,9 +63,10 @@ export interface ActionReceipt {
 export type BrowserTaskAction = ActionReceipt;
 export type NewActionReceipt = Omit<ActionReceipt, 'id' | 'actionId' | 'attemptId' | 'phase' | 'createdAt' | 'updatedAt' | 'risk' | 'dispatchState' | 'evidence' | 'action'>
   & Partial<Pick<ActionReceipt, 'actionId' | 'attemptId' | 'risk' | 'dispatchState' | 'evidence' | 'action'>>;
-const PHASES = new Set<ActionReceiptPhase>(['planned', 'awaiting-approval', 'acting', 'review-pending', 'verified', 'unknown', 'cancelled', 'failed']);
+const PHASES = new Set<ActionReceiptPhase>(['planned', 'awaiting-approval', 'acting', 'submitted', 'review-pending', 'verified', 'unknown', 'cancelled', 'failed']);
 const INTENTS = new Set<ActionIntent>(['platform-write', 'image-generation', 'image-saving', 'media-upload', 'computer-input', 'file-write', 'command-execution', 'platform-api']);
-const UNRESOLVED = new Set<ActionReceiptPhase>(['planned', 'awaiting-approval', 'acting', 'review-pending', 'unknown']);
+const UNRESOLVED = new Set<ActionReceiptPhase>(['planned', 'awaiting-approval', 'acting', 'submitted', 'review-pending', 'unknown']);
+const REVIEWABLE = new Set<ActionReceiptPhase>(['submitted', 'review-pending', 'unknown']);
 const MAX_RECENT_ACTIONS = 500;
 const RISKS = new Set<ActionRisk>(['READ_ONLY', 'REVERSIBLE_LOCAL', 'EXTERNAL_MUTATION', 'IRREVERSIBLE_OR_PUBLIC']);
 const DISPATCH_STATES = new Set<ActionDispatchState>(['not-dispatched', 'delivered', 'unknown']);
@@ -95,6 +99,16 @@ const validDesktopTarget = (target: Record<string, unknown>): boolean => {
       && typeof element.token === 'string' && element.token.startsWith(`${target.snapshotId}:`)));
 };
 
+const validFileSystemTarget = (target: Record<string, unknown>): boolean =>
+  target.surface === 'filesystem' && typeof target.instanceId === 'string' && !!target.instanceId
+  && typeof target.workspaceRoot === 'string' && isAbsolute(target.workspaceRoot)
+  && typeof target.path === 'string' && !!target.path.trim() && !target.path.includes('\0')
+  && !target.path.startsWith('/') && !target.path.startsWith('\\')
+  && !target.path.split(/[\\/]/).some((part) => part === '..' || part === '')
+  && (target.operation === 'file-write' || target.operation === 'command-execution')
+  && typeof target.snapshotId === 'string' && !!target.snapshotId
+  && (target.source === 'opencode-acp' || target.source === 'persona-workspace' || target.source === 'video-world');
+
 const receiptRisk = (value: unknown, intent: ActionIntent): ActionRisk => RISKS.has(value as ActionRisk) ? value as ActionRisk : defaultActionRisk(intent);
 
 export function actionReceiptDuplicateKey(
@@ -103,6 +117,10 @@ export function actionReceiptDuplicateKey(
   payloadDigest: string,
   dedupeKey = '',
 ): string {
+  if (target.surface === 'filesystem') {
+    const identity = [target.surface, target.workspaceRoot, target.path, target.operation];
+    return hash(JSON.stringify([intent, identity]));
+  }
   const identity = target.surface === 'desktop'
     // App and window process identifiers change across restarts; unresolved input must still block a retry.
     ? [target.surface, target.bundleId, target.executablePath]
@@ -121,10 +139,10 @@ function usable(value: unknown): value is BrowserTaskAction {
     && (record.action === undefined || (typeof record.action === 'string' && !!record.action && record.action.length <= 200))
     && INTENTS.has(record.intent as ActionIntent) && PHASES.has(record.phase as ActionReceiptPhase)
     && (record.risk === undefined || RISKS.has(record.risk as ActionRisk))
-    && !!target && (validBrowserTarget(target) || validDesktopTarget(target))
+    && !!target && (validBrowserTarget(target) || validDesktopTarget(target) || validFileSystemTarget(target))
     && typeof record.payloadDigest === 'string' && /^[a-f0-9]{64}$/.test(record.payloadDigest)
     && Array.isArray(record.files) && record.files.every((file) => !!file && typeof file.path === 'string'
-      && /^[a-f0-9]{64}$/.test(file.digest) && Number.isSafeInteger(file.bytes) && file.bytes > 0 && typeof file.mime === 'string')
+      && /^[a-f0-9]{64}$/.test(file.digest) && Number.isSafeInteger(file.bytes) && file.bytes >= 0 && typeof file.mime === 'string')
     && (record.commentFingerprint === undefined || (typeof record.commentFingerprint === 'string' && /^[a-f0-9]{64}$/.test(record.commentFingerprint)))
     && (record.dispatchState === undefined || DISPATCH_STATES.has(record.dispatchState as ActionDispatchState))
     && (evidence === undefined || (Array.isArray(evidence) && evidence.every((item) => !!item && typeof item.source === 'string'
@@ -166,6 +184,32 @@ export class ActionReceiptLedger {
 
   hasUnresolvedMatching(predicate: (action: ActionReceipt) => boolean): boolean {
     return this.actions.some((action) => UNRESOLVED.has(action.phase) && predicate(action));
+  }
+
+  listUnresolved(): ActionReceipt[] {
+    return structuredClone(this.actions.filter((action) => UNRESOLVED.has(action.phase))
+      .sort((a, b) => b.updatedAt - a.updatedAt));
+  }
+
+  reconcile(id: string, decision: ActionReceiptReviewDecision, note: string, now = Date.now()): boolean {
+    const action = this.actions.find((candidate) => candidate.id === id);
+    const detail = note.trim();
+    if (!action || !REVIEWABLE.has(action.phase) || !detail) return false;
+    if (decision === 'review-pending' && (action.target.surface !== 'browser' || action.intent !== 'platform-write')) return false;
+    const evidence = {
+      source: 'operator-review',
+      status: decision,
+      summary: detail.slice(0, 200),
+      observedAt: now,
+    };
+    if (decision === 'verified') {
+      this.complete(id, { phase: 'verified', dispatchState: 'delivered', outcome: 'verified', note: detail, evidence }, now);
+    } else if (decision === 'review-pending') {
+      this.complete(id, { phase: 'review-pending', dispatchState: 'delivered', outcome: 'review-pending', note: detail, evidence }, now);
+    } else {
+      this.complete(id, { phase: 'failed', dispatchState: action.dispatchState, outcome: 'failed', note: detail, evidence }, now);
+    }
+    return true;
   }
 
   importUnresolved(receipt: ActionReceipt): void {

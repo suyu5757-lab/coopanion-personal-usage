@@ -73,6 +73,12 @@ const ru: Translation<CoreText> = {
     yes: 'Разрешить один раз', no: 'Отмена',
   },
 
+  workspaceAction: {
+    fileWrite: 'записать файл в рабочей области', commandExecution: 'выполнить команду в рабочей области',
+    question: (action: string, target: string, details: string) => 'Разрешить Coo один раз ' + action + ' в рабочей области «' + target + '»?\n\n' + details + '\n\nРазрешение действует только для указанного пути и операции.',
+    yes: 'Разрешить один раз', no: 'Отмена',
+  },
+
   status: {
     read: 'Читаю', browse: 'Просматриваю', memory: 'память', find: 'Ищу файлы', search: 'Ищу', write: 'Пишу', edit: 'Правлю', append: 'Дописываю',
     delete: 'Удаляю', save: 'Сохраняю', screen: 'Смотрю на экран', web: 'На веб-странице', windows: 'Смотрю открытые окна', rightClick: 'Щёлкаю правой кнопкой', doubleClick: 'Щёлкаю дважды', click: 'Щёлкаю',

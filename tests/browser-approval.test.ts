@@ -139,7 +139,33 @@ describe('public write approval', () => {
     expect(out.text).toContain('输入框已清空,提交动作已观察到');
     expect(out.text).toContain('没有给出审核或公开状态');
     expect(bridge.calls.filter((call) => call.op === 'press')).toHaveLength(1);
-    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))).toMatchObject([{ phase: 'verified', outcome: 'ui-observed' }]);
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))).toMatchObject([{ phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown' }]);
+  });
+
+  it('keeps a confirmed submission unresolved until its public status is known', async () => {
+    const bridge = new FakeBridge();
+    bridge.state.statusMessages = ['提交成功'];
+    let asked = 0;
+    const { world, taskJournalFile } = await make({ bridge, ask: async () => { asked++; return 'yes'; } });
+    await run(world, 'browser_type', { index: 2, text: '同一条评论' });
+    expect((await run(world, 'browser_press', { index: 2, key: 'Enter' })).failed).toBeUndefined();
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))).toMatchObject([{ phase: 'submitted', dispatchState: 'delivered', outcome: 'remote-acknowledged' }]);
+
+    await run(world, 'browser_type', { index: 2, text: '同一条评论' });
+    const retry = await run(world, 'browser_press', { index: 2, key: 'Enter' });
+    expect(retry.failed).toBe(true);
+    expect(asked).toBe(1);
+    expect(bridge.calls.filter((call) => call.op === 'press')).toHaveLength(1);
+  });
+
+  it('records platform review separately and lets the operator reconcile it later', async () => {
+    const bridge = new FakeBridge();
+    bridge.state.statusMessages = ['审核中'];
+    const { world, taskJournalFile } = await make({ bridge, ask: yes });
+    await run(world, 'browser_type', { index: 2, text: '等待审核的评论' });
+    const out = await run(world, 'browser_press', { index: 2, key: 'Enter' });
+    expect(out.failed).toBeUndefined();
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))).toMatchObject([{ phase: 'review-pending', dispatchState: 'delivered', outcome: 'review-pending' }]);
   });
 
   it('sends nothing when the person says no', async () => {
@@ -306,7 +332,7 @@ describe('public write approval', () => {
     expect(out.failed).toBeUndefined();
     expect(bridge.calls.filter((call) => call.op === 'press')).toHaveLength(1);
     expect(JSON.parse(readFileSync(join(dir, 'replies.json'), 'utf8'))).toEqual([{ fingerprint, sentAt: expect.any(Number) }]);
-    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))).toMatchObject([{ phase: 'verified', outcome: 'ui-observed' }]);
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))).toMatchObject([{ phase: 'submitted', dispatchState: 'delivered', outcome: 'remote-acknowledged' }]);
   });
 
   it('does not send a second reply to a comment already recorded', async () => {

@@ -1,4 +1,4 @@
-<!-- Owner: world.ts, library.ts, manifest.ts, render.ts, prepared.ts, tools.ts, definition.ts, model-text.ts -->
+<!-- Owner: world.ts, library.ts, manifest.ts, render.ts, prepared.ts, tools.ts, definition.ts, model-text.ts; ../action-authorization.ts and ../action-gate.ts -->
 
 # core/video
 
@@ -21,6 +21,10 @@ into a vertical preview MP4 and checks the file that came out. Each render retur
   `<data>/video/media/prepared/<renderId>/render.mp4` and verifies the copy. The `receipt.json` beside
   it records the checked file facts. The copy is eligible for the existing browser media allowlist;
   browser upload still needs its own approval.
+- Before either tool writes, the Core asks for one approval bound to the output path, input digest and
+  known output files. The shared action ledger records the approval, dispatch and file read-back;
+  cancelled or unresolved writes stay visible for review. Render outputs and caption sidecars must
+  be new files; existing files are preserved.
 - Captions are written beside the video as an `.srt` of the same name. Burning text into the picture
   needs an FFmpeg built with libfreetype (`drawtext`); the development build on this machine has no
   such filter, so the renderer does not depend on it.

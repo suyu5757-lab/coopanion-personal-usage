@@ -67,6 +67,12 @@ const de: Translation<CoreText> = {
     yes: 'Einmal erlauben', no: 'Abbrechen',
   },
 
+  workspaceAction: {
+    fileWrite: 'eine Workspace-Datei schreiben', commandExecution: 'einen Workspace-Befehl ausführen',
+    question: (action: string, target: string, details: string) => 'Darf Coo einmal ' + action + ' im Workspace „' + target + '“?\n\n' + details + '\n\nDas gilt nur für den aufgeführten Pfad und Vorgang.',
+    yes: 'Einmal erlauben', no: 'Abbrechen',
+  },
+
   status: {
     read: 'Liest', browse: 'Stöbert', memory: 'Gedächtnis', find: 'Sucht', search: 'Durchsucht', write: 'Schreibt', edit: 'Bearbeitet', append: 'Ergänzt',
     delete: 'Löscht', save: 'Speichert', screen: 'Schaut auf den Bildschirm', web: 'Auf einer Webseite', windows: 'Schaut auf die offenen Fenster', rightClick: 'Rechtsklickt', doubleClick: 'Doppelklickt', click: 'Klickt',

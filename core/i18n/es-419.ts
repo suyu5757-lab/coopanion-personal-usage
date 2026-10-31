@@ -67,6 +67,12 @@ const es419: Translation<CoreText> = {
     yes: 'Permitir una vez', no: 'Cancelar',
   },
 
+  workspaceAction: {
+    fileWrite: 'escribir un archivo del espacio de trabajo', commandExecution: 'ejecutar un comando del espacio de trabajo',
+    question: (action: string, target: string, details: string) => '¿Permites que Coo realice una vez la acción «' + action + '» en el espacio de trabajo «' + target + '»?\n\n' + details + '\n\nEsto solo se aplica a la ruta y operación indicadas.',
+    yes: 'Permitir una vez', no: 'Cancelar',
+  },
+
   status: {
     read: 'Leyendo', browse: 'Revisando', memory: 'memoria', find: 'Localizando', search: 'Buscando', write: 'Escribiendo', edit: 'Editando', append: 'Agregando a',
     delete: 'Borrando', save: 'Guardando', screen: 'Mirando la pantalla', web: 'En una página web', windows: 'Mirando las ventanas abiertas', rightClick: 'Haciendo clic derecho', doubleClick: 'Haciendo doble clic', click: 'Haciendo clic',
