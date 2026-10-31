@@ -89,6 +89,7 @@ const run = async (world: BrowserWorld, name: string, args: Record<string, unkno
 const make = async (opts: {
   ask?: (question: string, choices: [string, string]) => Promise<ApprovalAnswer>;
   journalFile?: string;
+  taskJournalFile?: string;
   replyJournalFile?: string | null;
   bridge?: FakeBridge;
   pushed?: Array<Record<string, unknown>>;
@@ -97,6 +98,7 @@ const make = async (opts: {
   const pushed = opts.pushed ?? [];
   const dir = mkdtempSync(join(tmpdir(), 'coo-approval-'));
   tempDirs.push(dir);
+  const taskJournalFile = opts.taskJournalFile ?? join(dir, 'task-actions.json');
   const world = new BrowserWorld({
     bridge,
     selfTime: () => ({ ...SELF_TIME_DEFAULTS, enabled: true, actions: true }),
@@ -105,11 +107,12 @@ const make = async (opts: {
     timezone: 'Asia/Shanghai',
     ...(opts.ask ? { ask: opts.ask } : {}),
     journalFile: opts.journalFile ?? join(dir, 'actions.json'),
+    taskJournalFile,
     ...(opts.replyJournalFile === null ? {} : { replyJournalFile: opts.replyJournalFile ?? join(dir, 'replies.json') }),
   });
   await world.start(host(pushed));
   await run(world, 'browser_open', { url: 'https://www.douyin.com/video/123' });
-  return { world, bridge, pushed, dir };
+  return { world, bridge, pushed, dir, taskJournalFile };
 };
 
 const yes = async () => 'yes' as const;
@@ -122,7 +125,7 @@ describe('public write approval', () => {
   it('asks with the video and the exact text, sends once, and reports what the page shows', async () => {
     let question = '';
     const bridge = new FakeBridge();
-    const { world, dir } = await make({
+    const { world, taskJournalFile } = await make({
       bridge,
       ask: async (q) => { question = q; return 'yes'; },
     });
@@ -136,8 +139,7 @@ describe('public write approval', () => {
     expect(out.text).toContain('输入框已清空,提交动作已观察到');
     expect(out.text).toContain('没有给出审核或公开状态');
     expect(bridge.calls.filter((call) => call.op === 'press')).toHaveLength(1);
-    // a verified write leaves no unresolved record behind
-    expect(JSON.parse(readFileSync(join(dir, 'actions.json'), 'utf8'))).toEqual([]);
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))).toMatchObject([{ phase: 'verified', outcome: 'ui-observed' }]);
   });
 
   it('sends nothing when the person says no', async () => {
@@ -295,7 +297,7 @@ describe('public write approval', () => {
     bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint, evidenceHash, author: '阿青', context: '阿青 这段配色好舒服', timestamp: '2026-10-28T03:00:00Z', needsExpand: false }], statusMessages: [] });
     bridge.replyStatusAfterPress = ['回复成功'];
     let question = '';
-    const { world, dir } = await make({ bridge, ask: async (value) => { question = value; return 'yes'; } });
+    const { world, dir, taskJournalFile } = await make({ bridge, ask: async (value) => { question = value; return 'yes'; } });
     await run(world, 'browser_type', { index: 2, text: '谢谢你喜欢这段配色' });
     const out = await run(world, 'browser_press', { index: 2, key: 'Enter' });
     expect(question).toContain('回复对象：阿青');
@@ -304,7 +306,7 @@ describe('public write approval', () => {
     expect(out.failed).toBeUndefined();
     expect(bridge.calls.filter((call) => call.op === 'press')).toHaveLength(1);
     expect(JSON.parse(readFileSync(join(dir, 'replies.json'), 'utf8'))).toEqual([{ fingerprint, sentAt: expect.any(Number) }]);
-    expect(JSON.parse(readFileSync(join(dir, 'actions.json'), 'utf8'))).toEqual([]);
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))).toMatchObject([{ phase: 'verified', outcome: 'ui-observed' }]);
   });
 
   it('does not send a second reply to a comment already recorded', async () => {
@@ -365,7 +367,7 @@ describe('public write approval', () => {
     bridge.box = element({ placeholder: '回复评论' });
     bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint, evidenceHash, author: '阿青', context: '阿青 评论', timestamp: '', needsExpand: true }] });
     let asked = 0;
-    const { world, dir } = await make({ bridge, ask: async () => { asked++; return 'yes'; } });
+    const { world, taskJournalFile } = await make({ bridge, ask: async () => { asked++; return 'yes'; } });
     await run(world, 'browser_type', { index: 2, text: '先展开再回复' });
     expect((await run(world, 'browser_press', { index: 2, key: 'Enter' })).text).toContain('回复列表尚未展开');
     expect(asked).toBe(0);
@@ -377,7 +379,7 @@ describe('public write approval', () => {
     const out = await run(world, 'browser_press', { index: 2, key: 'Enter' });
     expect(out.text).toContain('不确定这条内容有没有发出去');
     expect(bridge.calls.filter((call) => call.op === 'press')).toHaveLength(1);
-    expect(JSON.parse(readFileSync(join(dir, 'actions.json'), 'utf8'))).toMatchObject([{ phase: 'unknown', target: { commentFingerprint: fingerprint } }]);
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))).toMatchObject([{ phase: 'unknown', duplicateKey: expect.any(String) }]);
     await run(world, 'browser_type', { index: 2, text: '先展开再回复' });
     expect((await run(world, 'browser_press', { index: 2, key: 'Enter' })).text).toContain('已发送或待核对回复记录');
     expect(bridge.calls.filter((call) => call.op === 'press')).toHaveLength(1);
@@ -388,12 +390,12 @@ describe('public write approval', () => {
     const fingerprint = '6'.repeat(64), evidenceHash = '7'.repeat(64);
     bridge.box = element({ placeholder: '回复评论' });
     bridge.state = page({ replyTargets: [{ boxId: 2, fingerprint, evidenceHash, author: '阿青', context: '阿青 评论', timestamp: '', needsExpand: false }], statusMessages: ['回复成功'] });
-    const { world, dir } = await make({ bridge, ask: yes });
+    const { world, dir, taskJournalFile } = await make({ bridge, ask: yes });
     await run(world, 'browser_type', { index: 2, text: '另一条回复' });
     const out = await run(world, 'browser_press', { index: 2, key: 'Enter' });
     expect(out.text).toContain('不确定这条内容有没有发出去');
     expect(JSON.parse(readFileSync(join(dir, 'replies.json'), 'utf8'))).toEqual([]);
-    expect(JSON.parse(readFileSync(join(dir, 'actions.json'), 'utf8'))).toMatchObject([{ phase: 'unknown', target: { commentFingerprint: fingerprint } }]);
+    expect(JSON.parse(readFileSync(taskJournalFile, 'utf8'))).toMatchObject([{ phase: 'unknown', duplicateKey: expect.any(String) }]);
   });
 
   it('refuses to send when the record cannot be written first', async () => {
@@ -401,11 +403,11 @@ describe('public write approval', () => {
     tempDirs.push(dir);
     writeFileSync(join(dir, 'not-a-directory'), 'occupied');
     const bridge = new FakeBridge();
-    const { world } = await make({ bridge, ask: yes, journalFile: join(dir, 'not-a-directory', 'actions.json') });
+    const { world } = await make({ bridge, ask: yes, taskJournalFile: join(dir, 'not-a-directory', 'task-actions.json') });
     bridge.draft = '写不进磁盘';
     const out = await run(world, 'browser_press', { index: 2, key: 'Enter' });
     expect(out.failed).toBe(true);
-    expect(out.text).toContain('没能把记录写到磁盘');
+    expect(out.text).toContain('发送记录不可用');
     expect(bridge.calls.some((call) => call.op === 'press')).toBe(false);
   });
 
@@ -429,18 +431,19 @@ describe('public write approval', () => {
   it('marks an unacknowledged send unknown and never presses twice', async () => {
     const bridge = new FakeBridge();
     bridge.failOn = 'press';
-    const { world, dir } = await make({ bridge, ask: yes });
+    const { world, taskJournalFile } = await make({ bridge, ask: yes });
     bridge.draft = '发出去了吗';
     const out = await run(world, 'browser_press', { index: 2, key: 'Enter' });
     expect(out.failed).toBe(true);
     expect(out.text).toContain('不确定这条内容有没有发出去');
     expect(bridge.calls.filter((call) => call.op === 'press')).toHaveLength(1);
-    const left = JSON.parse(readFileSync(join(dir, 'actions.json'), 'utf8'));
+    const left = JSON.parse(readFileSync(taskJournalFile, 'utf8'));
     expect(left).toHaveLength(1);
     expect(left[0].phase).toBe('unknown');
-    expect(left[0].contentHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(left[0].payloadDigest).toBe(hashContent('发出去了吗'));
     expect(left[0].content).toBeUndefined();
-    expect(left[0].contentLength).toBe('发出去了吗'.length);
+    await run(world, 'browser_press', { index: 2, key: 'Enter' });
+    expect(bridge.calls.filter((call) => call.op === 'press')).toHaveLength(1);
   });
 
   it('reports unknown when the box still shows the text', async () => {
@@ -491,7 +494,7 @@ describe('public write approval', () => {
 });
 
 describe('restart after an interrupted post', () => {
-  it('turns a left-over acting record into unknown and tells Coo', async () => {
+  it('migrates a left-over acting record and blocks the same text after restart', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'coo-approval-'));
     tempDirs.push(dir);
     const file = join(dir, 'actions.json');
@@ -499,8 +502,8 @@ describe('restart after an interrupted post', () => {
     const target = {
       surface: 'browser' as const,
       origin: 'https://www.douyin.com',
-      url: 'https://www.douyin.com/video/1',
-      videoUrl: 'https://www.douyin.com/video/1',
+      url: 'https://www.douyin.com/video/123',
+      videoUrl: 'https://www.douyin.com/video/123',
       videoTitle: '海边的下午',
       snapshotId: 'snapshot-1',
       control: '发送',
@@ -515,6 +518,7 @@ describe('restart after an interrupted post', () => {
     }]));
     const bridge = new FakeBridge();
     const pushed: Array<Record<string, unknown>> = [];
+    const taskJournalFile = join(dir, 'task-actions.json');
     const world = new BrowserWorld({
       bridge,
       selfTime: () => ({ ...SELF_TIME_DEFAULTS, enabled: true, actions: true }),
@@ -522,13 +526,20 @@ describe('restart after an interrupted post', () => {
       language: () => 'zh',
       timezone: 'Asia/Shanghai',
       journalFile: file,
+      taskJournalFile,
     });
     await world.start(host(pushed));
 
     expect(pushed.map((event) => event.type)).toContain('browser.unresolved');
     expect(String(pushed[0].text)).toContain('不知道有没有发出去');
-    const left = JSON.parse(readFileSync(file, 'utf8'));
+    const left = JSON.parse(readFileSync(taskJournalFile, 'utf8'));
     expect(left[0].phase).toBe('unknown');
-    expect(bridge.calls).toHaveLength(0);
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual([]);
+
+    bridge.draft = content;
+    await run(world, 'browser_open', { url: 'https://www.douyin.com/video/123' });
+    const retry = await run(world, 'browser_press', { index: 2, key: 'Enter' });
+    expect(retry.text).toContain('不确定这条内容有没有发出去');
+    expect(bridge.calls.filter((call) => call.op === 'press')).toHaveLength(0);
   });
 });

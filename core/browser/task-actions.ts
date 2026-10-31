@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { writeState } from '../state-file.ts';
+import { hashContent, type PublicAction } from './actions.ts';
 import type { BrowserTargetEvidence } from '../task-grants.ts';
 
 export type BrowserTaskIntent = 'platform-write' | 'image-generation' | 'image-saving' | 'media-upload';
@@ -17,6 +18,7 @@ export interface BrowserTaskAction {
   target: BrowserTargetEvidence;
   payloadDigest: string;
   files: BrowserTaskFile[];
+  commentFingerprint?: string;
   duplicateKey: string;
   createdAt: number;
   updatedAt: number;
@@ -33,6 +35,18 @@ const INTENTS = new Set<BrowserTaskIntent>(['platform-write', 'image-generation'
 const UNRESOLVED = new Set<BrowserTaskPhase>(['planned', 'awaiting-approval', 'acting', 'unknown']);
 const MAX_RECENT_ACTIONS = 500;
 
+export function browserDuplicateKey(
+  intent: BrowserTaskIntent,
+  target: BrowserTargetEvidence,
+  payloadDigest: string,
+  dedupeKey: string | undefined,
+  files: readonly BrowserTaskFile[],
+): string {
+  return hashContent(JSON.stringify([
+    intent, target.origin, target.accountRef, target.formId, payloadDigest, dedupeKey ?? files,
+  ]));
+}
+
 function usable(value: unknown): value is BrowserTaskAction {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
@@ -45,6 +59,7 @@ function usable(value: unknown): value is BrowserTaskAction {
     && typeof record.payloadDigest === 'string' && /^[a-f0-9]{64}$/.test(record.payloadDigest)
     && Array.isArray(record.files) && record.files.every((file) => !!file && typeof file.path === 'string'
       && /^[a-f0-9]{64}$/.test(file.digest) && Number.isSafeInteger(file.bytes) && file.bytes > 0 && typeof file.mime === 'string')
+    && (record.commentFingerprint === undefined || (typeof record.commentFingerprint === 'string' && /^[a-f0-9]{64}$/.test(record.commentFingerprint)))
     && typeof record.duplicateKey === 'string'
     && Number.isFinite(record.createdAt) && Number.isFinite(record.updatedAt);
 }
@@ -64,6 +79,71 @@ export class BrowserTaskActionJournal {
 
   hasUnresolved(duplicateKey: string): boolean {
     return this.actions.some((action) => UNRESOLVED.has(action.phase) && action.duplicateKey === duplicateKey);
+  }
+
+  hasUnresolvedComment(commentFingerprint: string): boolean {
+    return this.actions.some((action) => UNRESOLVED.has(action.phase) && action.commentFingerprint === commentFingerprint);
+  }
+
+  hasLegacyTextCollision(videoUrl: string, payloadDigest: string, commentFingerprint?: string): boolean {
+    return this.actions.some((action) => action.id.startsWith('legacy:')
+      && UNRESOLVED.has(action.phase)
+      && action.intent === 'platform-write'
+      && action.target.formId === `video:${videoUrl}`
+      && action.payloadDigest === payloadDigest
+      && (!action.commentFingerprint || !commentFingerprint || action.commentFingerprint === commentFingerprint));
+  }
+
+  importLegacy(action: PublicAction, now = Date.now()): void {
+    const target: BrowserTargetEvidence = {
+      surface: 'browser',
+      instanceId: 'legacy-browser-action-journal',
+      origin: action.target.origin,
+      url: action.target.url,
+      accountRef: action.target.accountRef ?? 'legacy-unknown-account',
+      snapshotId: action.target.snapshotId,
+      formId: `video:${action.target.videoUrl}`,
+      control: 'text-submit',
+    };
+    const duplicateKey = browserDuplicateKey('platform-write', target, action.contentHash, action.target.commentFingerprint, []);
+    if (this.actions.some((candidate) => candidate.id === `legacy:${action.taskId}`)
+      || this.hasUnresolved(duplicateKey)) return;
+    this.actions.push({
+      id: `legacy:${action.taskId}`,
+      taskId: action.taskId,
+      intent: 'platform-write',
+      phase: 'unknown',
+      target,
+      payloadDigest: action.contentHash,
+      files: [],
+      ...(action.target.commentFingerprint ? { commentFingerprint: action.target.commentFingerprint } : {}),
+      duplicateKey,
+      createdAt: action.createdAt,
+      updatedAt: now,
+      outcome: 'unknown',
+      note: 'migrated from the legacy public-text action journal; reconcile before retry',
+    });
+    this.save();
+  }
+
+  recoverInterrupted(now = Date.now()): number {
+    let changed = false;
+    for (const action of this.actions) {
+      if (action.phase === 'acting') {
+        action.phase = 'unknown';
+        action.outcome = 'unknown';
+        action.note = 'the app stopped while the action result was unresolved';
+        action.updatedAt = now;
+        changed = true;
+      } else if (action.phase === 'planned' || action.phase === 'awaiting-approval') {
+        action.phase = 'cancelled';
+        action.note = 'the app stopped before dispatch';
+        action.updatedAt = now;
+        changed = true;
+      }
+    }
+    if (changed) this.save();
+    return this.actions.filter((action) => action.phase === 'unknown').length;
   }
 
   begin(input: Omit<BrowserTaskAction, 'id' | 'phase' | 'createdAt' | 'updatedAt'>, now = Date.now()): BrowserTaskAction {

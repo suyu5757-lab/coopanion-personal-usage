@@ -17,8 +17,8 @@ import { nowIso } from 'cortico/core/util.ts';
 import type { ModelLanguage } from '../language.ts';
 import { ActionGate, type Impact } from '../action-gate.ts';
 import { coreText } from '../i18n/index.ts';
-import { actionDigest, ActionJournal, APPROVAL_MINUTES, hashContent, newAction, originOf, ReplyJournal, type ActionTarget, type PublicAction } from './actions.ts';
-import { BrowserTaskActionJournal } from './task-actions.ts';
+import { ActionJournal, hashContent, originOf, ReplyJournal, type ActionTarget, type PublicAction } from './actions.ts';
+import { browserDuplicateKey, BrowserTaskActionJournal } from './task-actions.ts';
 import type { BrowserTargetEvidence, StepRequest } from '../task-grants.ts';
 import type { BrowserTransport } from './bridge.ts';
 import { CONTENT_MAX, SESSION_MAX_CALLS, TEXT_MAX, WATCH_FRAMES_DEFAULT, WATCH_FRAMES_MAX, WATCH_MAX, type SelfTimeConfig } from './config.ts';
@@ -66,7 +66,7 @@ export type ApprovalAnswer = 'yes' | 'always' | 'no' | 'dismissed' | 'timeout' |
 
 interface Shot { base64: string; width: number; height: number; state: PageState }
 interface BrowserActionAuthorization { journalId: string; grantDigest: string; approvedAt: number; expiresAt: number }
-type BrowserActionApproval = { approved: true; authorization: BrowserActionAuthorization } | { approved: false; reason: 'unavailable' | 'not-approved' | 'changed' | 'unknown' };
+type BrowserActionApproval = { approved: true; authorization: BrowserActionAuthorization } | { approved: false; reason: 'unavailable' | 'not-approved' | 'not-answered' | 'changed' | 'unknown' };
 interface ClickAnswer { success?: boolean; message?: string }
 interface PlayAnswer { ok?: boolean; error?: string; video?: VideoState | null }
 
@@ -349,6 +349,8 @@ export class BrowserWorld implements World {
       files?: Array<{ path: string; digest: string; bytes: number; mime: string }>;
       dedupeKey?: string;
       actionLabel?: string;
+      payloadDigest?: string;
+      commentFingerprint?: string;
     } = {},
   ): Promise<BrowserActionApproval> {
     if (!this.ensureTaskJournal() || !this.taskJournal) return { approved: false, reason: 'unavailable' };
@@ -366,11 +368,8 @@ export class BrowserWorld implements World {
     const text = coreText(this.opts.language?.() ?? 'zh').browserAction;
     const taskId = ctx.callId ? `${ctx.role}:${ctx.callId}` : `${ctx.role}:${ctx.round ?? 'direct'}:${randomUUID()}`;
     const files = scope.files ?? [];
-    const payloadDigest = hashContent(taskText);
-    const duplicateKey = hashContent(JSON.stringify([
-      impact, target.origin, target.accountRef, target.formId, payloadDigest,
-      scope.dedupeKey ?? files,
-    ]));
+    const payloadDigest = scope.payloadDigest ?? hashContent(taskText);
+    const duplicateKey = browserDuplicateKey(impact, target, payloadDigest, scope.dedupeKey, files);
     if (this.taskJournal.hasUnresolved(duplicateKey)) return { approved: false, reason: 'unknown' };
     let action: ReturnType<BrowserTaskActionJournal['begin']>;
     try {
@@ -380,6 +379,7 @@ export class BrowserWorld implements World {
         target,
         payloadDigest,
         files,
+        ...(scope.commentFingerprint ? { commentFingerprint: scope.commentFingerprint } : {}),
         duplicateKey,
       });
       this.taskJournal.awaitingApproval(action.id);
@@ -388,6 +388,7 @@ export class BrowserWorld implements World {
     }
     const finishCancelled = () => this.taskJournal?.finish(action.id, 'cancelled');
     let grant;
+    let answer: ApprovalAnswer | null = null;
     try {
       grant = await this.gate.requestTaskGrant({
         taskId,
@@ -398,9 +399,12 @@ export class BrowserWorld implements World {
         expiresInMs: 30_000,
         maxSteps: 1,
       }, async () => {
-        if (!this.opts.ask) return false;
-        const answer = await askUnlessAborted(
-        this.opts.ask(text.question(scope.actionLabel ?? text[impact === 'platform-write' ? 'platformWrite' : impact === 'image-generation' ? 'imageGeneration' : impact === 'image-saving' ? 'imageSaving' : 'mediaUpload'], `${page.title} (${target.origin})`, details), [text.yes, text.no]),
+        if (!this.opts.ask) {
+          answer = 'unavailable';
+          return false;
+        }
+        answer = await askUnlessAborted(
+          this.opts.ask(text.question(scope.actionLabel ?? text[impact === 'platform-write' ? 'platformWrite' : impact === 'image-generation' ? 'imageGeneration' : impact === 'image-saving' ? 'imageSaving' : 'mediaUpload'], `${page.title} (${target.origin})`, details), [text.yes, text.no]),
           ctx.signal,
         );
         return answer === 'yes';
@@ -411,7 +415,8 @@ export class BrowserWorld implements World {
     }
     if (!grant || !target.origin || !target.snapshotId) {
       finishCancelled();
-      return { approved: false, reason: 'not-approved' };
+      const reason = answer && answer !== 'yes' && answer !== 'no' ? 'not-answered' : 'not-approved';
+      return { approved: false, reason };
     }
 
     const current = asState(await this.call('read', {}, ctx.signal));
@@ -453,7 +458,35 @@ export class BrowserWorld implements World {
     this.unsubscribe = this.opts.bridge.onEvent((event) => {
       if (event === 'closed') void this.windowClosed();
     });
+    this.ensureTaskJournal();
+    const interruptedTaskActions = this.taskJournal?.recoverInterrupted() ?? 0;
     await this.recover();
+    if (interruptedTaskActions) {
+      const now = Date.now();
+      await this.host?.pushEvent({
+        type: 'browser.unresolved',
+        source: this.id,
+        senderKey: 'browser.unresolved',
+        ts: nowIso(this.opts.timezone),
+        text: this.t.unresolved(interruptedTaskActions),
+      }, { trigger: 'debounce' }).catch(() => undefined);
+    }
+    this.migrateLegacyActions();
+  }
+
+  private migrateLegacyActions(): void {
+    if (!this.actions.length) return;
+    if (!this.journal || !this.taskJournal) {
+      this.journalUnavailable = true;
+      return;
+    }
+    try {
+      for (const action of this.actions) this.taskJournal.importLegacy(action);
+      this.journal.save([]);
+      this.actions = [];
+    } catch {
+      this.journalUnavailable = true;
+    }
   }
 
   /**
@@ -1310,9 +1343,8 @@ export class BrowserWorld implements World {
     dispatch: () => Promise<PageState | null>,
   ): Promise<ToolOutcome> {
     if (this.publishing) return this.toast(this.t.sendBusy, true);
-    if (this.journalUnavailable || !this.journal) return this.toast(this.t.sendJournalUnavailable, true);
+    if (this.journalUnavailable || !this.journal || !this.ensureTaskJournal()) return this.toast(this.t.sendJournalUnavailable, true);
     this.publishing = true;
-    let task: PublicAction | null = null;
     try {
       const targetRefusal = clickRefusal(input.boxLabel) ?? clickRefusal(input.label);
       if (targetRefusal) return this.toast(this.t.refusedClick(input.boxLabel || input.label, targetRefusal), true);
@@ -1330,7 +1362,8 @@ export class BrowserWorld implements World {
         if (!this.replyJournal || this.replyJournalUnavailable) return this.toast(this.t.sendReplyJournalUnavailable, true);
         try {
           if (this.replyJournal.has(replyTarget.fingerprint)
-            || this.actions.some((action) => action.target.commentFingerprint === replyTarget.fingerprint)) {
+            || this.actions.some((action) => action.target.commentFingerprint === replyTarget.fingerprint)
+            || this.taskJournal?.hasUnresolvedComment(replyTarget.fingerprint)) {
             return this.toast(this.t.sendReplyDuplicate, true);
           }
         } catch {
@@ -1352,6 +1385,10 @@ export class BrowserWorld implements World {
       };
       if (!target.videoUrl || !target.snapshotId) return this.toast(this.t.sendTargetUnverified, true);
       if (!target.accountRef || !target.accountLabel) return this.toast(this.t.sendAccountUnverified, true);
+      const contentDigest = hashContent(input.content);
+      if (this.taskJournal?.hasLegacyTextCollision(target.videoUrl, contentDigest, replyTarget?.fingerprint)) {
+        return this.toast(this.t.sendUnknown, true);
+      }
       const where = [target.videoTitle, target.videoUrl].filter(Boolean).join(' — ');
       const approvalWhere = replyTarget
         ? `${where}\n回复对象：${replyTarget.author}\n原评论：${replyTarget.context}`
@@ -1382,40 +1419,35 @@ export class BrowserWorld implements World {
           return true;
         } catch { return false; }
       };
-      task = newAction(target, input.content, `the text appears on ${target.origin}`);
-      task.phase = 'awaiting-approval';
-      try { await this.record(task); } catch { return this.toast(this.t.sendUnsaved, true); }
-
-      const person = coreText(this.opts.language?.() ?? 'zh').browserSend;
       const accountDisplay = `${target.accountLabel} (${target.accountRef})`;
-      const answer = this.opts.ask
-        ? await askUnlessAborted(this.opts.ask(person.question(accountDisplay, approvalWhere, input.content), [person.yes, person.no]), ctx.signal)
-        : 'unavailable';
-      if (answer !== 'yes' && answer !== 'always') {
-        task.phase = 'cancelled';
-        task.note = 'the person did not approve this action';
-        await this.record(task).catch(() => undefined);
-        return this.toast(answer === 'no' ? this.t.sendCancelled : this.t.sendNotAnswered, true);
-      }
+      const taskText = `Send this exact text once on ${target.videoUrl}: ${input.content}`;
+      const decision = await this.approveBrowserAction(
+        'platform-write',
+        taskText,
+        page!,
+        `video:${target.videoUrl}`,
+        'text-submit',
+        `Account: ${accountDisplay}\nTarget: ${approvalWhere}\nControl: ${input.label || input.boxLabel}\nText: ${input.content}`,
+        ctx,
+        {
+          accountRef: target.accountRef,
+          dedupeKey: replyTarget?.fingerprint,
+          commentFingerprint: replyTarget?.fingerprint,
+          payloadDigest: contentDigest,
+        },
+      );
+      if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
+        : decision.reason === 'changed' ? this.t.sendChanged
+          : decision.reason === 'not-answered' ? this.t.sendNotAnswered
+            : decision.reason === 'not-approved' ? this.t.sendCancelled
+              : this.t.sendJournalUnavailable, true);
+      const finish = (phase: 'verified' | 'unknown' | 'cancelled', note: string) => {
+        try { this.taskJournal?.finish(decision.authorization.journalId, phase, note); } catch { /* acting remains unresolved on disk */ }
+      };
+
+      // Re-resolve the page, editor, control and text after the grant reaches the journal.
       if (!await targetStillBound() || await this.draftAt(input.boxIndex, ctx.signal) !== input.content) {
-        task.phase = 'cancelled';
-        task.note = 'the target or the text changed after the confirmation';
-        await this.record(task).catch(() => undefined);
-        return this.toast(this.t.sendChanged, true);
-      }
-
-      const now = Date.now();
-      task.approval = { digest: actionDigest(target, input.content), issuedAt: now, expiresAt: now + APPROVAL_MINUTES * 60_000, used: true };
-      task.phase = 'acting';
-      task.updatedAt = now;
-      try { await this.record(task); } catch { return this.toast(this.t.sendUnsaved, true); }
-
-      // Re-resolve the page, editor, control and text after the record reaches disk.
-      const nowDraft = await this.draftAt(input.boxIndex, ctx.signal);
-      if (!await targetStillBound() || nowDraft !== input.content || Date.now() > task.approval.expiresAt) {
-        task.phase = 'cancelled';
-        task.note = 'the target or the text changed after the confirmation';
-        await this.record(task).catch(() => undefined);
+        finish('cancelled', 'the target or the text changed after approval');
         return this.toast(this.t.sendChanged, true);
       }
 
@@ -1423,10 +1455,7 @@ export class BrowserWorld implements World {
       try {
         state = await dispatch();
       } catch {
-        task.phase = 'unknown';
-        task.outcome = 'unknown';
-        task.note = 'the page did not answer after the input';
-        await this.record(task).catch(() => undefined);
+        finish('unknown', 'the page did not answer after the input');
         return this.toast(this.t.sendUnknown, true);
       }
 
@@ -1436,46 +1465,24 @@ export class BrowserWorld implements World {
         const newReplyNotice = (state.statusMessages ?? []).some((message) => commentReplyConfirmed([message])
           && !previousReplyNotices.has(message.replace(/\s+/g, ' ').trim().toLowerCase()));
         if (replyTarget && (status !== 'submitted' || !newReplyNotice)) {
-          task.phase = 'unknown';
-          task.outcome = 'unknown';
-          task.note = 'the reply box cleared without a page confirmation of the comment reply';
-          await this.record(task).catch(() => undefined);
+          finish('unknown', 'the reply box cleared without a page confirmation of the comment reply');
           return this.toast(this.t.sendUnknown, true);
         }
         if (replyTarget) {
           try { this.replyJournal!.add(replyTarget.fingerprint); }
           catch {
-            task.phase = 'unknown';
-            task.outcome = 'unknown';
-            task.note = 'the page confirmed the reply but the duplicate guard could not be saved';
-            await this.record(task).catch(() => undefined);
+            finish('unknown', 'the page confirmed the reply but the duplicate guard could not be saved');
             return this.toast(this.t.sendUnknown, true);
           }
         }
-        task.phase = 'verified';
-        task.outcome = 'ui-observed';
-        await this.record(task).catch(() => undefined);
+        finish('verified', 'the page showed the text box cleared after dispatch');
         this.lastTyped = null;
         return this.toast(this.full(state, this.t.sent(approvalWhere, status)));
       }
-      task.phase = 'unknown';
-      task.outcome = 'unknown';
-      task.note = 'the box still shows the text, or could not be read';
-      await this.record(task).catch(() => undefined);
+      finish('unknown', 'the box still shows the text, or could not be read');
       return this.toast(this.t.sendUnknown, true);
     } finally {
       this.publishing = false;
-    }
-  }
-
-  /** Replaces this task's record and writes the unresolved ones out; throws when the disk refuses. */
-  private async record(task: PublicAction): Promise<void> {
-    if (!this.journal) throw new Error('the browser action journal is unavailable');
-    task.updatedAt = Date.now();
-    this.actions = [...this.actions.filter((action) => action.taskId !== task.taskId), task];
-    this.journal.save(this.actions);
-    if (task.phase === 'verified' || task.phase === 'cancelled' || task.phase === 'failed') {
-      this.actions = this.actions.filter((action) => action.taskId !== task.taskId);
     }
   }
 

@@ -94,6 +94,26 @@ describe('BrowserTaskActionJournal', () => {
     expect(() => reopened.begin(record('older-acting'), 2_002)).toThrow(/needs review/);
   });
 
+  it('reconciles actions interrupted before and during dispatch on restart', () => {
+    const store = journal();
+    const planned = store.begin(record('planned'), 1_000);
+    const awaiting = store.begin(record('awaiting'), 1_001);
+    store.awaitingApproval(awaiting.id, 1_002);
+    const acting = store.begin(record('acting'), 1_003);
+    store.awaitingApproval(acting.id, 1_004);
+    store.acting(acting.id, 'c'.repeat(64), 1_005, 30_000, 1_006);
+
+    const reopened = new BrowserTaskActionJournal(join(dir, 'task-actions.json'));
+    expect(reopened.recoverInterrupted(2_000)).toBe(1);
+    const persisted = JSON.parse(readFileSync(join(dir, 'task-actions.json'), 'utf8')) as Array<{ duplicateKey: string; phase: string }>;
+    expect(persisted.find((action) => action.duplicateKey === 'planned')?.phase).toBe('cancelled');
+    expect(persisted.find((action) => action.duplicateKey === 'awaiting')?.phase).toBe('cancelled');
+    expect(persisted.find((action) => action.duplicateKey === 'acting')?.phase).toBe('unknown');
+    expect(reopened.hasUnresolved('acting')).toBe(true);
+    expect(() => reopened.begin(record('acting'), 2_001)).toThrow(/needs review/);
+    expect(planned.phase).toBe('planned');
+  });
+
   it('refuses an unreadable journal', () => {
     dir = mkdtempSync(join(tmpdir(), 'coopanion-browser-task-journal-'));
     const path = join(dir, 'task-actions.json');
