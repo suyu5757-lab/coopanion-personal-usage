@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-const { httpUrl, isPublicHttp, isPublicResolvedHost, isWebSocketRequest, sameAddress } = require('../app/browser-network-policy.cjs') as {
+type ResolvedHost = { endpoints?: Array<{ address: string }> };
+type DestinationCheck = { allowed: boolean; reason: string | null };
+type TimeoutRunner = <T>(work: () => Promise<T>) => Promise<T>;
+
+const { checkPublicDestination, httpUrl, isPublicHttp, isPublicResolvedHost, isWebSocketRequest, sameAddress } = require('../app/browser-network-policy.cjs') as {
+  checkPublicDestination(
+    value: string,
+    resolveHost: (hostname: string) => Promise<ResolvedHost>,
+    withTimeout?: TimeoutRunner,
+  ): Promise<DestinationCheck>;
   httpUrl(value: string): URL | null;
   isPublicHttp(value: string): boolean;
   isPublicResolvedHost(result: { endpoints?: Array<{ address: string }> }): boolean;
@@ -50,5 +59,44 @@ describe('Browser resolved-address policy', () => {
     expect(sameAddress('2001:4860:4860::8888', '2001:4860:4860:0:0:0:0:8888')).toBe(true);
     expect(sameAddress('::ffff:8.8.8.8', '8.8.8.8')).toBe(true);
     expect(sameAddress('93.184.216.34', '127.0.0.1')).toBe(false);
+  });
+});
+
+describe('Browser public destination preflight', () => {
+  const noTimeout: TimeoutRunner = (work) => work();
+
+  it('allows a public HTTPS URL only after a public resolver result', async () => {
+    const check = await checkPublicDestination(
+      'https://example.com/',
+      async () => ({ endpoints: [{ address: '93.184.216.34' }] }),
+      noTimeout,
+    );
+    expect(check).toEqual({ allowed: true, reason: null });
+  });
+
+  it('reports an empty resolver result without making a Browser page claim', async () => {
+    const check = await checkPublicDestination('https://example.com/', async () => ({ endpoints: [] }), noTimeout);
+    expect(check).toEqual({ allowed: false, reason: 'no-addresses' });
+  });
+
+  it('reports a blocked address when any resolver endpoint is non-public', async () => {
+    const check = await checkPublicDestination(
+      'https://example.com/',
+      async () => ({ endpoints: [{ address: '93.184.216.34' }, { address: '127.0.0.1' }] }),
+      noTimeout,
+    );
+    expect(check).toEqual({ allowed: false, reason: 'non-public-address' });
+  });
+
+  it('distinguishes resolver timeouts and failures without returning resolver details', async () => {
+    const timeout = await checkPublicDestination(
+      'https://example.com/', async () => ({ endpoints: [] }),
+      async () => { throw new Error('public destination check timed out'); },
+    );
+    const failure = await checkPublicDestination(
+      'https://example.com/', async () => { throw new Error('private resolver detail'); }, noTimeout,
+    );
+    expect(timeout).toEqual({ allowed: false, reason: 'resolution-timeout' });
+    expect(failure).toEqual({ allowed: false, reason: 'resolution-failed' });
   });
 });

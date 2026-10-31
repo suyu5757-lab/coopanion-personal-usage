@@ -103,6 +103,25 @@ function isPublicResolvedHost(result) {
   });
 }
 
+async function checkPublicDestination(value, resolveHost, withTimeout = (work) => work()) {
+  const url = httpUrl(value);
+  if (!url) return { allowed: false, reason: 'invalid-url' };
+  if (!isPublicHttp(url.href)) return { allowed: false, reason: 'url-policy' };
+
+  let resolved;
+  try {
+    resolved = await withTimeout(() => resolveHost(url.hostname));
+  } catch (error) {
+    const message = String(error?.message ?? error).toLowerCase();
+    return { allowed: false, reason: message.includes('timed out') ? 'resolution-timeout' : 'resolution-failed' };
+  }
+
+  const endpoints = Array.isArray(resolved?.endpoints) ? resolved.endpoints : [];
+  if (!endpoints.length) return { allowed: false, reason: 'no-addresses' };
+  if (!isPublicResolvedHost(resolved)) return { allowed: false, reason: 'non-public-address' };
+  return { allowed: true, reason: null };
+}
+
 function isWebSocketRequest(details) {
   if (details?.resourceType === 'webSocket') return true;
   try {
@@ -129,4 +148,4 @@ function mappedIpv4(value) {
   return Number(value & 0xffffffffn);
 }
 
-module.exports = { httpUrl, isPublicHttp, isPublicResolvedHost, isWebSocketRequest, sameAddress };
+module.exports = { checkPublicDestination, httpUrl, isPublicHttp, isPublicResolvedHost, isWebSocketRequest, sameAddress };
