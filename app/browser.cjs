@@ -67,6 +67,28 @@ const mediaDownloadError = (status, message, dispatchState = 'not-dispatched') =
 /** A tab recording decodes its audio in the page after the stop; give that call more room than a page read. */
 const AUDIO_TIMEOUT_MS = 30_000;
 const IMAGE_DOWNLOAD_TIMEOUT_MS = 120_000;
+const CHATGPT_IMAGE_TASK_TTL_MS = 2 * 60 * 60_000;
+const CHATGPT_IMAGE_TASK_MAX = 32;
+
+function validChatGPTImageTaskId(value) {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function chatGPTTurnDigest(taskId, marker, index) {
+  return createHash('sha256').update(`${taskId}\0${marker}\0${index}`).digest('hex');
+}
+
+function publicChatGPTImageTask(task) {
+  return {
+    taskId: task.taskId,
+    promptDigest: task.promptDigest,
+    status: task.status,
+    expectedOutputCount: task.expectedOutputCount,
+    userTurnDigest: task.userTurnDigest,
+    evidenceDigest: task.evidenceDigest,
+    imageCount: task.imageCount,
+  };
+}
 
 /** Runs `work` with a deadline; the page could be busy and never answer. */
 function within(work, ms, what) {
@@ -103,6 +125,10 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
   let agent = null;
   /** One verified ChatGPT image download requested by Coo's image-save tool. */
   let pendingImageDownload = null;
+  /** Current Browser-session image tasks; prompts and page content are never stored here. */
+  const chatGPTImageTasks = new Map();
+  let documentGeneration = 0;
+  let navigationGeneration = 0;
   /** One user-approved C02 transfer; a Browser Session accepts no other download. */
   let pendingMediaDownload = null;
   let egressProxy = null;
@@ -310,6 +336,21 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     } catch { throw mediaDownloadError('not-dispatched', 'the selected media source could not be rechecked'); }
     if (!fresh || fresh.url !== record.sourceUrl || fresh.mediaType !== record.mediaType || !isMediaDownloadUrl(fresh.url)) {
       throw mediaDownloadError('not-dispatched', 'the selected media source changed; read the page again');
+    }
+    if (message.imageTaskId !== undefined) {
+      const imageTaskId = message.imageTaskId;
+      const imageTask = chatGPTImageTasks.get(imageTaskId);
+      if (!validChatGPTImageTaskId(imageTaskId) || record.frame || record.mediaType !== 'image' || !imageTask
+        || imageTask.status !== 'image_available' || imageTask.webContentsId !== win.webContents.id
+        || imageTask.documentGeneration !== documentGeneration || imageTask.navigationGeneration !== navigationGeneration
+        || imageTask.pageUrl !== record.pageUrl) {
+        throw mediaDownloadError('not-dispatched', 'the selected image does not belong to the verified ChatGPT task on this Browser page');
+      }
+      let taskTarget = false;
+      try {
+        taskTarget = await rootAgentCall('chatGPTImageTaskMediaTarget', [imageTaskId, record.targetId, record.agentSnapshotId]);
+      } catch { /* the assistant image target changed before the task binding check */ }
+      if (taskTarget !== true) throw mediaDownloadError('not-dispatched', 'the media target is not a loaded assistant image from the verified ChatGPT task');
     }
     let directory, filename, name;
     try {
@@ -1083,6 +1124,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
         if (!isPublicHttp(event.url)) event.preventDefault();
       });
       wc.on('did-navigate-in-page', () => {
+        navigationGeneration++;
         activeVisualCapture = null;
         if (pendingMediaDownload) cancelMediaDownload(pendingMediaDownload.id, new Error('the Browser page changed during download'));
       });
@@ -1093,6 +1135,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       // only a new main document replaces the page script; iframes and in-page routes keep it
       wc.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
         if (!isMainFrame || isInPlace) return;
+        documentGeneration++;
+        navigationGeneration++;
         if (pendingMediaDownload) cancelMediaDownload(pendingMediaDownload.id, new Error('the Browser page changed during download'));
         injected = false;
         navigating = true;
@@ -1149,7 +1193,17 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     if (!win || !isChatGPTPageUrl(win.webContents.getURL())) throw new Error('open chatgpt.com in this browser first');
     const prompt = typeof message.prompt === 'string' ? message.prompt.trim() : '';
     if (!prompt || prompt.length > 2000) throw new Error('prompt must be 1 to 2000 characters');
+    const taskId = message.taskId;
+    const promptDigest = message.promptDigest;
+    if (!validChatGPTImageTaskId(taskId) || typeof promptDigest !== 'string' || !/^[a-f0-9]{64}$/.test(promptDigest)) {
+      throw new Error('the approved image task identity is invalid');
+    }
+    if (createHash('sha256').update(prompt).digest('hex') !== promptDigest) throw new Error('the image prompt changed after approval');
+    if (chatGPTImageTasks.has(taskId)) throw new Error('this image task was already dispatched');
     await ensureAgent();
+    const initialUrl = win.webContents.getURL();
+    const initialOrigin = new URL(initialUrl).origin;
+    const initialDocumentGeneration = documentGeneration;
     const target = await agentCall('chatGPTComposer');
     if (!target?.ok) throw new Error(target?.reason || 'the ChatGPT message box could not be identified');
     if ((message.composerId && target.id !== message.composerId)
@@ -1157,6 +1211,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     const before = await agentCall('draft', [target.id, target.snapshotId]);
     if (typeof before !== 'string' || before.trim()) throw new Error('the ChatGPT message box already contains text; read it before continuing');
     if (!await agentCall('prepareInput', [target.id, target.snapshotId])) throw new Error('the ChatGPT message box changed before typing');
+    const taskStart = await agentCall('chatGPTImageTaskStart', [taskId]);
+    if (!taskStart?.ok) throw new Error(taskStart?.reason || 'the ChatGPT conversation could not be bound to this image task');
 
     const fullPrompt = `Create an image based on this prompt:\n\n${prompt}`;
     await agentCall('setAgentAction', [true]);
@@ -1172,14 +1228,84 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       await agentCall('setAgentAction', [false]).catch(() => undefined);
     }
 
-    const outcome = await agentCall('chatGPTSubmission', [fullPrompt]);
+    const outcome = await agentCall('chatGPTSubmission', [taskId, fullPrompt]);
     const page = await state().catch(() => null);
-    const screenshot = await capture().catch(() => null);
+    const confirmed = outcome?.submitted === true && documentGeneration === initialDocumentGeneration
+      && page && new URL(page.url).origin === initialOrigin && page.url === win.webContents.getURL()
+      && Number.isSafeInteger(outcome.userTurnIndex) && outcome.userTurnIndex >= 0;
+    let task = { taskId, promptDigest, status: 'unknown', expectedOutputCount: 1 };
+    if (confirmed) {
+      const userTurnDigest = chatGPTTurnDigest(taskId, outcome.userTurnMarker || '', outcome.userTurnIndex);
+      const evidenceDigest = createHash('sha256').update(JSON.stringify([taskId, userTurnDigest, page.url])).digest('hex');
+      task = { taskId, promptDigest, status: 'prompt_submitted', expectedOutputCount: 1, userTurnDigest, evidenceDigest };
+      chatGPTImageTasks.set(taskId, {
+        taskId,
+        promptDigest,
+        status: 'prompt_submitted',
+        expectedOutputCount: 1,
+        userTurnDigest,
+        webContentsId: win.webContents.id,
+        documentGeneration,
+        navigationGeneration,
+        pageUrl: page.url,
+        evidenceDigest,
+        imageCount: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      const cutoff = Date.now() - CHATGPT_IMAGE_TASK_TTL_MS;
+      for (const [id, record] of chatGPTImageTasks) if (record.updatedAt < cutoff) chatGPTImageTasks.delete(id);
+      while (chatGPTImageTasks.size > CHATGPT_IMAGE_TASK_MAX) chatGPTImageTasks.delete(chatGPTImageTasks.keys().next().value);
+    }
+    const screenshot = confirmed ? await capture().catch(() => null) : null;
     return {
-      submitted: outcome?.submitted === true,
+      submitted: confirmed,
+      task,
       state: page,
       ...(screenshot ?? {}),
     };
+  };
+
+  const chatGPTImageTaskStatus = async (message) => {
+    const taskId = message.taskId;
+    const promptDigest = message.promptDigest;
+    const task = chatGPTImageTasks.get(taskId);
+    if (!task || typeof promptDigest !== 'string' || promptDigest !== task.promptDigest) {
+      return { taskId: validChatGPTImageTaskId(taskId) ? taskId : '', status: 'unknown', expectedOutputCount: 1 };
+    }
+    if (['image_available', 'failed', 'unknown'].includes(task.status)) return publicChatGPTImageTask(task);
+    if (Date.now() - task.updatedAt > CHATGPT_IMAGE_TASK_TTL_MS) {
+      task.status = 'unknown';
+      task.updatedAt = Date.now();
+      return publicChatGPTImageTask(task);
+    }
+    if (!win || win.isDestroyed() || win.webContents.id !== task.webContentsId
+      || documentGeneration !== task.documentGeneration || navigationGeneration !== task.navigationGeneration
+      || win.webContents.getURL() !== task.pageUrl) {
+      task.status = 'unknown';
+      task.updatedAt = Date.now();
+      return publicChatGPTImageTask(task);
+    }
+    try {
+      await ensureAgent();
+      const observed = await agentCall('chatGPTImageTaskStatus', [taskId]);
+      const states = new Set(['prompt_submitted', 'generating', 'image_available', 'unknown', 'failed']);
+      if (!states.has(observed?.status)) throw new Error('the page did not return a valid image task state');
+      task.status = observed.status;
+      task.imageCount = Number.isSafeInteger(observed.imageCount) && observed.imageCount >= 0 ? observed.imageCount : 0;
+      task.evidenceDigest = createHash('sha256').update(JSON.stringify([
+        taskId,
+        task.userTurnDigest,
+        task.status,
+        observed.imageSizes ?? [],
+      ])).digest('hex');
+      task.updatedAt = Date.now();
+      return publicChatGPTImageTask(task);
+    } catch {
+      task.status = 'unknown';
+      task.updatedAt = Date.now();
+      return publicChatGPTImageTask(task);
+    }
   };
 
   const stageChatGPTImage = async (message) => {
@@ -1377,6 +1503,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       return { id: target.id, snapshotId: target.snapshotId };
     }
     if (op === 'chatgpt-generate-image') return generateChatGPTImage(message);
+    if (op === 'chatgpt-image-status') return chatGPTImageTaskStatus(message);
     if (op === 'stage-chatgpt-image') return stageChatGPTImage(message);
     if (op === 'commit-staged-chatgpt-image') return commitStagedChatGPTImage(message);
     if (op === 'discard-staged-chatgpt-image') return discardStagedChatGPTImage(message);

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { chatGPTComposer, isChatGPTImageSaveTarget, isChatGPTPage } from '../app/browser-agent/chatgpt.ts';
+import { chatGPTComposer, chatGPTImageMediaMatchesTurn, chatGPTImageTaskEvidence, chatGPTSubmittedUserTurn, chatGPTUserTurnBaseline, isChatGPTImageSaveTarget, isChatGPTPage } from '../app/browser-agent/chatgpt.ts';
 import { composedTextNodes } from '../app/browser-agent/accessible-name.ts';
 import { findTextTarget } from '../app/browser-agent/targets.ts';
 
@@ -392,6 +392,80 @@ describe('ChatGPT image controls', () => {
     expect(isChatGPTImageSaveTarget(document, 'https://example.org/', button)).toBe(false);
     image.remove();
     expect(isChatGPTImageSaveTarget(document, 'https://chatgpt.com/c/abc', button)).toBe(false);
+  });
+
+  it('binds a submitted prompt to a newly-added exact user turn, including duplicate prompt text', () => {
+    const url = 'https://chatgpt.com/c/abc';
+    const prompt = 'Create an image based on this prompt: A blue whale';
+    document.body.innerHTML = `<article data-message-author-role="user">${prompt}</article>`;
+    const baseline = chatGPTUserTurnBaseline(document, url)!;
+    const priorTurn = baseline.last;
+    expect(chatGPTSubmittedUserTurn(document, url, prompt, baseline)).toEqual({ submitted: false });
+
+    const current = document.createElement('article');
+    current.setAttribute('data-message-author-role', 'user');
+    current.setAttribute('data-message-id', 'new-turn-1');
+    current.textContent = prompt;
+    document.body.append(current);
+    const result = chatGPTSubmittedUserTurn(document, url, prompt, baseline);
+    expect(result).toMatchObject({ submitted: true, turn: current, index: 1, marker: 'new-turn-1' });
+    expect(result.submitted && result.turn === priorTurn).toBe(false);
+    expect(chatGPTSubmittedUserTurn(document, 'https://example.org/', prompt, baseline)).toEqual({ submitted: false });
+  });
+
+  it('counts only loaded assistant images after the submitted user turn', () => {
+    const url = 'https://chatgpt.com/c/abc';
+    document.body.innerHTML = '<article data-message-author-role="assistant"><img id="old"></article><article data-message-author-role="user">prompt</article><article data-message-author-role="assistant" aria-busy="true"></article>';
+    const user = document.querySelector<HTMLElement>('[data-message-author-role="user"]')!;
+    const oldImage = document.getElementById('old') as HTMLImageElement;
+    Object.defineProperties(oldImage, { naturalWidth: { value: 1024 }, naturalHeight: { value: 1024 } });
+    expect(chatGPTImageTaskEvidence(document, url, user)).toMatchObject({ status: 'generating', imageCount: 0 });
+
+    const assistant = document.querySelectorAll<HTMLElement>('[data-message-author-role="assistant"]')[1]!;
+    assistant.removeAttribute('aria-busy');
+    const image = document.createElement('img');
+    Object.defineProperties(image, { naturalWidth: { value: 1024 }, naturalHeight: { value: 768 } });
+    assistant.append(image);
+    expect(chatGPTImageTaskEvidence(document, url, user)).toEqual({
+      status: 'image_available', imageCount: 1, imageSizes: [{ width: 1024, height: 768 }],
+    });
+  });
+
+  it('keeps non-image assistant completions unknown and recognizes a clear generation failure', () => {
+    const url = 'https://chatgpt.com/c/abc';
+    document.body.innerHTML = '<article data-message-author-role="user">prompt</article><article data-message-author-role="assistant">I could not complete that.</article>';
+    const user = document.querySelector<HTMLElement>('[data-message-author-role="user"]')!;
+    expect(chatGPTImageTaskEvidence(document, url, user).status).toBe('unknown');
+    const alert = document.createElement('div');
+    alert.setAttribute('role', 'alert');
+    alert.textContent = 'There was an error generating your image';
+    document.body.append(alert);
+    expect(chatGPTImageTaskEvidence(document, url, user).status).toBe('failed');
+  });
+
+  it('binds a C02 direct image source to a loaded image after the task user turn', () => {
+    const url = 'https://chatgpt.com/c/abc';
+    document.body.innerHTML = '<article data-message-author-role="assistant"><img id="old" src="https://cdn.example.test/old.png"></article><article data-message-author-role="user">prompt</article><article data-message-author-role="assistant"><img id="new" src="https://cdn.example.test/new.png"></article>';
+    const user = document.querySelector<HTMLElement>('[data-message-author-role="user"]')!;
+    const oldImage = document.getElementById('old') as HTMLImageElement;
+    const newImage = document.getElementById('new') as HTMLImageElement;
+    Object.defineProperties(oldImage, { naturalWidth: { value: 1024 }, naturalHeight: { value: 1024 } });
+    Object.defineProperties(newImage, { naturalWidth: { value: 1024 }, naturalHeight: { value: 1024 } });
+
+    expect(chatGPTImageMediaMatchesTurn(document, url, user, 'https://cdn.example.test/new.png')).toBe(true);
+    expect(chatGPTImageMediaMatchesTurn(document, url, user, 'https://cdn.example.test/old.png')).toBe(false);
+    expect(chatGPTImageMediaMatchesTurn(document, 'https://example.org/', user, 'https://cdn.example.test/new.png')).toBe(false);
+  });
+
+  it('does not attribute an image after a later user turn to the earlier image task', () => {
+    const url = 'https://chatgpt.com/c/abc';
+    document.body.innerHTML = '<article data-message-author-role="user">task prompt</article><article data-message-author-role="user">later manual prompt</article><article data-message-author-role="assistant"><img id="later" src="https://cdn.example.test/later.png"></article>';
+    const taskTurn = document.querySelector<HTMLElement>('[data-message-author-role="user"]')!;
+    const image = document.getElementById('later') as HTMLImageElement;
+    Object.defineProperties(image, { naturalWidth: { value: 1024 }, naturalHeight: { value: 1024 } });
+
+    expect(chatGPTImageTaskEvidence(document, url, taskTurn).status).toBe('unknown');
+    expect(chatGPTImageMediaMatchesTurn(document, url, taskTurn, 'https://cdn.example.test/later.png')).toBe(false);
   });
 });
 

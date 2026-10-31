@@ -8,7 +8,16 @@
  */
 import { PageController } from '@page-agent/page-controller';
 import { accountEvidence, sharePanelOpen, shareTarget, videoEvidence } from './card.ts';
-import { chatGPTComposer, isChatGPTImageSaveTarget, isChatGPTPage } from './chatgpt.ts';
+import {
+  chatGPTComposer,
+  chatGPTImageMediaMatchesTurn,
+  chatGPTImageTaskEvidence,
+  chatGPTSubmittedUserTurn,
+  chatGPTUserTurnBaseline,
+  isChatGPTImageSaveTarget,
+  isChatGPTPage,
+  type ChatGPTUserTurnBaseline,
+} from './chatgpt.ts';
 import { replyTargetForBox } from './comments.ts';
 import { installFileChooserGuard } from './safety.ts';
 import { accessibleRole, composedElements, composedParentElement } from './accessible-name.ts';
@@ -55,6 +64,15 @@ interface AgentState {
   snapshotId: string;
 }
 
+interface ChatGPTImageTaskRuntime {
+  initialUrl: string;
+  baseline: ChatGPTUserTurnBaseline;
+  pageUrl: string | null;
+  turn: HTMLElement | null;
+  turnMarker: string;
+  turnIndex: number;
+}
+
 interface VideoState {
   current: number;
   duration: number;
@@ -97,6 +115,7 @@ if (!host[KEY]) {
   const elementIds = new WeakMap<HTMLElement, number>();
   let nextElementId = 1;
   const shareMarked = new WeakSet<HTMLElement>();
+  const chatGPTImageTasks = new Map<string, ChatGPTImageTaskRuntime>();
   const elementId = (element: HTMLElement): number => {
     let id = elementIds.get(element);
     if (id === undefined) { id = nextElementId++; elementIds.set(element, id); }
@@ -441,18 +460,75 @@ if (!host[KEY]) {
     return id === undefined ? { ok: false, reason: 'the ChatGPT message box is not in the current page map' } : { ok: true, id, snapshotId: snapshotId() };
   };
 
-  const chatGPTSubmission = async (prompt: string): Promise<{ submitted: boolean; state: AgentState }> => {
+  const chatGPTImageTaskStart = (taskId: string): { ok: boolean; reason?: string } => {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(taskId) || chatGPTImageTasks.has(taskId)) {
+      return { ok: false, reason: 'invalid or duplicate image task id' };
+    }
+    const baseline = chatGPTUserTurnBaseline(document, location.href);
+    if (!baseline) return { ok: false, reason: 'the current page is not ChatGPT' };
+    chatGPTImageTasks.set(taskId, {
+      initialUrl: location.href,
+      baseline,
+      pageUrl: null,
+      turn: null,
+      turnMarker: '',
+      turnIndex: -1,
+    });
+    while (chatGPTImageTasks.size > 16) chatGPTImageTasks.delete(chatGPTImageTasks.keys().next().value!);
+    return { ok: true };
+  };
+
+  const chatGPTSubmission = async (taskId: string, prompt: string): Promise<{ submitted: boolean; userTurnMarker?: string; userTurnIndex?: number; state: AgentState }> => {
     const page = await readPage();
+    const task = chatGPTImageTasks.get(taskId);
     const composer = chatGPTComposer(document, location.href);
     const draft = composer instanceof HTMLInputElement || composer instanceof HTMLTextAreaElement
       ? composer.value
       : composer?.innerText ?? '';
-    const turns = Array.from(document.querySelectorAll<HTMLElement>('[data-message-author-role="user"]'));
-    const lastTurn = turns.at(-1)?.innerText ?? turns.at(-1)?.textContent ?? '';
-    const norm = (value: string) => value.replace(/\s+/g, ' ').trim();
-    const visiblePrompt = norm(lastTurn) === norm(prompt) || (!turns.length && (document.body?.innerText ?? '').includes(prompt));
-    return { submitted: isChatGPTPage(location.href) && !draft.trim() && visiblePrompt, state: { ...page, elements: elements(), current: videoEvidence(document), account: accountEvidence(document), timestamps: timestamps(), fileInputs: fileInputs(), replyTargets: await replyTargets(), statusMessages: statusMessages(), snapshotId: snapshotId(), video: video(), mediaTargets: mediaTargets() } };
+    const submittedTurn = task && new URL(task.initialUrl).origin === new URL(location.href).origin
+      ? chatGPTSubmittedUserTurn(document, location.href, prompt, task.baseline)
+      : { submitted: false as const };
+    const submitted = !!task && isChatGPTPage(location.href) && !draft.trim() && submittedTurn.submitted;
+    if (submitted && submittedTurn.submitted) {
+      task.pageUrl = location.href;
+      task.turn = submittedTurn.turn;
+      task.turnMarker = submittedTurn.marker;
+      task.turnIndex = submittedTurn.index;
+    }
+    return {
+      submitted,
+      ...(submitted && submittedTurn.submitted ? { userTurnMarker: submittedTurn.marker, userTurnIndex: submittedTurn.index } : {}),
+      state: { ...page, elements: elements(), current: videoEvidence(document), account: accountEvidence(document), timestamps: timestamps(), fileInputs: fileInputs(), replyTargets: await replyTargets(), statusMessages: statusMessages(), snapshotId: snapshotId(), video: video(), mediaTargets: mediaTargets() },
+    };
   };
+
+  const chatGPTImageTaskTurn = (task: ChatGPTImageTaskRuntime): HTMLElement | null => {
+    let turn = task.turn?.isConnected ? task.turn : null;
+    if (!turn && task.turnMarker) {
+      const matches = Array.from(document.querySelectorAll<HTMLElement>('[data-message-author-role="user"]'))
+        .filter((candidate) => (candidate.getAttribute('data-message-id') || candidate.id) === task.turnMarker);
+      if (matches.length === 1) turn = matches[0]!;
+    }
+    return turn;
+  };
+
+  const chatGPTImageTaskStatus = (taskId: string): ReturnType<typeof chatGPTImageTaskEvidence> => {
+    const task = chatGPTImageTasks.get(taskId);
+    if (!task?.pageUrl || location.href !== task.pageUrl) return { status: 'unknown', imageCount: 0, imageSizes: [] };
+    const turn = chatGPTImageTaskTurn(task);
+    return chatGPTImageTaskEvidence(document, location.href, turn);
+  };
+
+  const chatGPTImageTaskMediaTarget = (taskId: string, targetId: number, expectedSnapshotId: string): boolean => {
+    const task = chatGPTImageTasks.get(taskId);
+    if (!task?.pageUrl || location.href !== task.pageUrl || snapshotId() !== expectedSnapshotId) return false;
+    const turn = chatGPTImageTaskTurn(task);
+    if (chatGPTImageTaskEvidence(document, location.href, turn).status !== 'image_available') return false;
+    const selected = mediaTargets().filter((target) => target.id === targetId && target.mediaType === 'image');
+    return selected.length === 1 && chatGPTImageMediaMatchesTurn(document, location.href, turn, selected[0]!.url);
+  };
+
+  const chatGPTImageTaskRelease = (taskId: string): void => { chatGPTImageTasks.delete(taskId); };
 
   const active = (): AgentElement | null => {
     const element = document.activeElement;
@@ -820,7 +896,11 @@ if (!host[KEY]) {
       return { ok: true, id, snapshotId: expectedSnapshotId };
     },
     chatGPTComposer: chatGPTComposerTarget,
+    chatGPTImageTaskStart,
     chatGPTSubmission,
+    chatGPTImageTaskStatus,
+    chatGPTImageTaskMediaTarget,
+    chatGPTImageTaskRelease,
     fileInputTarget,
     releaseFileInput,
     fileInputSelection,
