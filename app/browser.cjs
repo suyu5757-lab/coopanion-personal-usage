@@ -489,9 +489,9 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
   );
 
   const isPublicDestination = async (value) => (await publicDestinationCheck(value)).allowed;
-  const publicDestinationError = (reason) => reason === 'invalid-url' || reason === 'url-policy'
+  const publicDestinationError = (reason, blockedFamilies = []) => reason === 'invalid-url' || reason === 'url-policy'
     ? new Error('only public http and https pages are opened')
-    : new Error(`browser public destination check failed: ${reason}`);
+    : new Error(`browser public destination check failed: ${reason}${blockedFamilies.length ? ` (${blockedFamilies.join(',')})` : ''}`);
 
   const frameAgentCall = async (frame, method, args = [], timeout = SCRIPT_TIMEOUT_MS) => {
     if (!win || win.isDestroyed()) throw new Error('browser window is closed');
@@ -892,7 +892,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     if (!target) throw publicDestinationError('invalid-url');
     if (!destinationChecked) {
       const check = await publicDestinationCheck(target.href);
-      if (!check.allowed) throw publicDestinationError(check.reason);
+      if (!check.allowed) throw publicDestinationError(check.reason, check.blockedFamilies);
     }
     injected = false;
     resetFrameState();
@@ -1192,7 +1192,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     if (!target || !isPublicHttp(target.href)) throw publicDestinationError(target ? 'url-policy' : 'invalid-url');
     await ensureNetworkRoute(session.fromPartition(partition));
     const check = await publicDestinationCheck(target.href);
-    if (!check.allowed) throw publicDestinationError(check.reason);
+    if (!check.allowed) throw publicDestinationError(check.reason, check.blockedFamilies);
     await ensureWindow();
     if (win.isMinimized()) win.restore();
     if (!win.isVisible()) win.showInactive();

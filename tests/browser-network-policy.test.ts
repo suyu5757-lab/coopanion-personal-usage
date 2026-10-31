@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 type ResolvedHost = { endpoints?: Array<{ address: string }> };
-type DestinationCheck = { allowed: boolean; reason: string | null };
+type DestinationCheck = { allowed: boolean; reason: string | null; blockedFamilies?: string[] };
 type TimeoutRunner = <T>(work: () => Promise<T>) => Promise<T>;
 
 const { checkPublicDestination, httpUrl, isPublicHttp, isPublicResolvedHost, isWebSocketRequest, sameAddress } = require('../app/browser-network-policy.cjs') as {
@@ -85,7 +85,14 @@ describe('Browser public destination preflight', () => {
       async () => ({ endpoints: [{ address: '93.184.216.34' }, { address: '127.0.0.1' }] }),
       noTimeout,
     );
-    expect(check).toEqual({ allowed: false, reason: 'non-public-address' });
+    expect(check).toEqual({ allowed: false, reason: 'non-public-address', blockedFamilies: ['ipv4'] });
+  });
+
+  it('reports an invalid endpoint class without returning address values', async () => {
+    const check = await checkPublicDestination(
+      'https://example.com/', async () => ({ endpoints: [{ address: 'not-an-ip' }] }), noTimeout,
+    );
+    expect(check).toEqual({ allowed: false, reason: 'non-public-address', blockedFamilies: ['invalid'] });
   });
 
   it('distinguishes resolver timeouts and failures without returning resolver details', async () => {

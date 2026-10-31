@@ -103,6 +103,19 @@ function isPublicResolvedHost(result) {
   });
 }
 
+function nonPublicAddressFamilies(result) {
+  const endpoints = Array.isArray(result?.endpoints) ? result.endpoints : [];
+  const families = new Set();
+  for (const endpoint of endpoints) {
+    if (!endpoint || typeof endpoint.address !== 'string') { families.add('invalid'); continue; }
+    const family = isIP(endpoint.address);
+    if (family === 4 && blockedIpv4(endpoint.address)) families.add('ipv4');
+    else if (family === 6 && blockedIpv6(endpoint.address)) families.add('ipv6');
+    else if (!family) families.add('invalid');
+  }
+  return [...families].sort();
+}
+
 async function checkPublicDestination(value, resolveHost, withTimeout = (work) => work()) {
   const url = httpUrl(value);
   if (!url) return { allowed: false, reason: 'invalid-url' };
@@ -118,7 +131,9 @@ async function checkPublicDestination(value, resolveHost, withTimeout = (work) =
 
   const endpoints = Array.isArray(resolved?.endpoints) ? resolved.endpoints : [];
   if (!endpoints.length) return { allowed: false, reason: 'no-addresses' };
-  if (!isPublicResolvedHost(resolved)) return { allowed: false, reason: 'non-public-address' };
+  if (!isPublicResolvedHost(resolved)) {
+    return { allowed: false, reason: 'non-public-address', blockedFamilies: nonPublicAddressFamilies(resolved) };
+  }
   return { allowed: true, reason: null };
 }
 
