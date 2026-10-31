@@ -106,16 +106,25 @@ export interface CuaInputGrantRequest {
   taskId: string;
   taskText: string;
   expectedChange: string;
+  risk?: 'REVERSIBLE_LOCAL' | 'EXTERNAL_MUTATION';
   target: CuaDesktopTargetEvidence;
   expiresInMs: number;
   maxSteps: 1;
   confirmInCoreUi: () => Promise<boolean>;
 }
 
+export interface CuaInputCompletion {
+  dispatchState: 'not-dispatched' | 'delivered' | 'unknown';
+  outcome: 'ui-observed' | 'unknown' | 'cancelled';
+  effect: string;
+  summary: string;
+}
+
 /** Core holds this capability until CUA reaches the input dispatch boundary. */
 export interface CuaInputAuthorization {
   consume(target: CuaDesktopTargetEvidence | null, expectedChange: string): boolean;
   revoke(): void;
+  complete?(result: CuaInputCompletion): void;
 }
 
 /** The person did not allow this turn's computer use. */
@@ -449,6 +458,7 @@ export class Cua {
         taskId: randomUUID(),
         taskText: `${tool}: ${detail}`,
         expectedChange: detail,
+        risk: operation === 'move' || operation === 'scroll' ? 'REVERSIBLE_LOCAL' : 'EXTERNAL_MUTATION',
         target: evidence,
         expiresInMs: 30_000,
         maxSteps: 1,
@@ -491,6 +501,27 @@ export class Cua {
     }
     approval.used = true;
     return true;
+  }
+
+  private completeInput(approval: ApprovedInput | null, result: CuaInputCompletion): void {
+    try { approval?.authorization?.complete?.(result); } catch { /* the unresolved receipt remains fail-closed */ }
+  }
+
+  private completeDriverAction(approval: ApprovedInput | null, action: DriverAction): void {
+    this.completeInput(approval, {
+      dispatchState: 'delivered',
+      outcome: action.effect === 'confirmed' ? 'ui-observed' : 'unknown',
+      effect: action.effect,
+      summary: action.summary,
+    });
+  }
+
+  private completeUncertainInput(approval: ApprovedInput | null, summary: string, dispatchState: CuaInputCompletion['dispatchState'] = 'unknown'): void {
+    this.completeInput(approval, { dispatchState, outcome: 'unknown', effect: 'unverifiable', summary });
+  }
+
+  private cancelInput(approval: ApprovedInput | null, summary: string): void {
+    this.completeInput(approval, { dispatchState: 'not-dispatched', outcome: 'cancelled', effect: 'refused', summary });
   }
 
   /* ---------- coordinates ---------- */
@@ -772,7 +803,7 @@ export class Cua {
     const button = (args.button === 'right' || args.button === 'middle' ? args.button : 'left') as Button;
     const count = args.clicks === 2 || args.clicks === 3 ? args.clicks : 1;
     const detail = element
-      ? `elementToken ${token}, ${element.role} "${element.label}"`
+      ? `press ${element.role} "${element.label}"`
       : `${button} click at (${args.x}, ${args.y}), ${count} time${count === 1 ? '' : 's'}`;
     const approval = await this.approveInput('pet_cua_click', 'click', detail, signal, undefined, element);
     if (!this.consumeApproval(approval, 'pet_cua_click', 'click', detail, undefined, element)) return { text: this.t.notRun('pet_cua_click', this.inputApprovalRefusal()), failed: true };
@@ -785,7 +816,10 @@ export class Cua {
           if (!backgroundUnavailable(err)) throw err;
           const retry = await this.foregroundRetry('pet_cua_click', detail, signal,
             () => this.driver.clickElement(target.pid, target.windowId, token, { signal, deliveryMode: 'foreground' }));
-          if (!retry.ok) return { text: this.t.notRun('pet_cua_click', retry.reason), failed: true };
+          if (!retry.ok) {
+            this.cancelInput(approval, retry.reason);
+            return { text: this.t.notRun('pet_cua_click', retry.reason), failed: true };
+          }
           action = retry.value;
         }
       } else {
@@ -799,18 +833,27 @@ export class Cua {
           if (!backgroundUnavailable(err)) throw err;
           const retry = await this.foregroundRetry('pet_cua_click', detail, signal,
             () => this.driver.click(target.pid, target.windowId, point.x, point.y, target.captureId, { button, count, signal, deliveryMode: 'foreground' }));
-          if (!retry.ok) return { text: this.t.notRun('pet_cua_click', retry.reason), failed: true };
+          if (!retry.ok) {
+            this.cancelInput(approval, retry.reason);
+            return { text: this.t.notRun('pet_cua_click', retry.reason), failed: true };
+          }
           action = retry.value;
         }
       }
-      if (!action) return { text: this.t.notRun('pet_cua_click', this.t.clickUnknown), failed: true };
+      if (!action) {
+        this.completeUncertainInput(approval, 'the driver returned no click result');
+        return { text: this.t.notRun('pet_cua_click', this.t.clickUnknown), failed: true };
+      }
+      this.completeDriverAction(approval, action);
       const done = element ? this.t.clickedElement(element.role, element.label) : this.t.clicked(args.x, args.y, button, count);
       return this.afterWindow('pet_cua_click', done, args, signal, action);
     } catch (err) {
       if (err instanceof DriverFailure && err.code === 'stale_element_token') {
+        this.cancelInput(approval, 'the accessibility element became stale before dispatch');
         await this.refreshWindow(false, signal).catch(() => undefined);
         return { text: this.t.notRun('pet_cua_click', this.t.elementStale), failed: true };
       }
+      this.completeUncertainInput(approval, err instanceof Error ? err.message : String(err));
       return this.driverOutcome('pet_cua_click', err);
     }
   }
@@ -823,8 +866,10 @@ export class Cua {
     if (!this.consumeApproval(approval, 'pet_cua_move', 'move', detail)) return { text: this.t.notRun('pet_cua_move', this.inputApprovalRefusal()), failed: true };
     try {
       const action = await this.driver.move(this.target!.pid, this.target!.windowId, p.x, p.y, { signal });
+      this.completeDriverAction(approval, action);
       return this.afterWindow('pet_cua_move', this.t.movedWindow(args.x, args.y), args, signal, action);
     } catch (err) {
+      this.completeUncertainInput(approval, err instanceof Error ? err.message : String(err));
       return this.driverOutcome('pet_cua_move', err);
     }
   }
@@ -849,11 +894,16 @@ export class Cua {
         if (!backgroundUnavailable(err)) throw err;
         const retry = await this.foregroundRetry('pet_cua_drag', detail, signal,
           () => this.driver.drag(target.pid, target.windowId, [a.x, a.y], [b.x, b.y], { signal, deliveryMode: 'foreground' }));
-        if (!retry.ok) return { text: this.t.notRun('pet_cua_drag', retry.reason), failed: true };
+        if (!retry.ok) {
+          this.cancelInput(approval, retry.reason);
+          return { text: this.t.notRun('pet_cua_drag', retry.reason), failed: true };
+        }
         action = retry.value;
       }
+      this.completeDriverAction(approval, action);
       return this.afterWindow('pet_cua_drag', this.t.dragged(from, to), args, signal, action);
     } catch (err) {
+      this.completeUncertainInput(approval, err instanceof Error ? err.message : String(err));
       return this.driverOutcome('pet_cua_drag', err);
     }
   }
@@ -869,8 +919,10 @@ export class Cua {
     if (!this.consumeApproval(approval, 'pet_cua_scroll', 'scroll', detail)) return { text: this.t.notRun('pet_cua_scroll', this.inputApprovalRefusal()), failed: true };
     try {
       const action = await this.driver.scroll(this.target!.pid, this.target!.windowId, p.x, p.y, down, right, { signal });
+      this.completeDriverAction(approval, action);
       return this.afterWindow('pet_cua_scroll', this.t.scrolled(args.x, args.y, down, right), args, signal, action);
     } catch (err) {
+      this.completeUncertainInput(approval, err instanceof Error ? err.message : String(err));
       return this.driverOutcome('pet_cua_scroll', err);
     }
   }
@@ -907,18 +959,30 @@ export class Cua {
       } catch (err) {
         if (!backgroundUnavailable(err) || typed !== 0) throw err;
         const retry = await this.foregroundRetry('pet_cua_type', detail, signal, () => send('foreground'));
-        if (!retry.ok) return { text: t.notRun('pet_cua_type', retry.reason), failed: true };
+        if (!retry.ok) {
+          this.cancelInput(approval, retry.reason);
+          return { text: t.notRun('pet_cua_type', retry.reason), failed: true };
+        }
         action = retry.value;
       }
+      if (action) this.completeDriverAction(approval, action);
+      else this.completeUncertainInput(approval, 'the driver returned no typing result');
       return this.afterWindow('pet_cua_type', t.typed(total), args, signal, action);
     } catch (err) {
       if (err instanceof DriverFailure) {
+        this.completeInput(approval, {
+          dispatchState: typed > 0 ? 'delivered' : 'unknown',
+          outcome: 'unknown',
+          effect: typed > 0 ? 'partial' : 'unverifiable',
+          summary: `${typed} of ${total} characters sent; ${err.message}`,
+        });
         if (windowGone(err)) {
           this.target = null;
           return { text: t.failed('pet_cua_type', t.windowGone(err.message)), failed: true };
         }
         return { text: t.failed('pet_cua_type', t.typedDriver(typed, total, err.message)), failed: true };
       }
+      this.completeUncertainInput(approval, err instanceof Error ? err.message : String(err), typed > 0 ? 'delivered' : 'unknown');
       return this.driverOutcome('pet_cua_type', err);
     }
   }
@@ -941,11 +1005,16 @@ export class Cua {
         if (!backgroundUnavailable(err) || chords.length !== 1) throw err;
         const retry = await this.foregroundRetry('pet_cua_key', detail, signal,
           () => this.driver.key(target.pid, target.windowId, chords, { signal, deliveryMode: 'foreground' }));
-        if (!retry.ok) return { text: this.t.notRun('pet_cua_key', retry.reason), failed: true };
+        if (!retry.ok) {
+          this.cancelInput(approval, retry.reason);
+          return { text: this.t.notRun('pet_cua_key', retry.reason), failed: true };
+        }
         action = retry.value;
       }
+      this.completeDriverAction(approval, action);
       return this.afterWindow('pet_cua_key', this.t.pressed(spec.trim()), args, signal, action);
     } catch (err) {
+      this.completeUncertainInput(approval, err instanceof Error ? err.message : String(err));
       return this.driverOutcome('pet_cua_key', err);
     }
   }
