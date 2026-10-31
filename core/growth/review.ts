@@ -245,7 +245,7 @@ function proposeGrowthTool(
 
 const PROPOSE_EXPERIENCE_DECL: Omit<ToolDef, 'handler'> = {
   name: PROPOSE_EXPERIENCE_TOOL,
-  description: 'Leave one source-linked experience card for the person to review. Use only a repeated, useful pattern supported by user-source records from different times; the card stays inactive until the person approves it.',
+  description: 'Leave one source-linked experience card for the person to review. Use only a repeated, useful pattern supported by user-source records from different times. Set kind=skill only for a repeatable action strategy; a skill candidate stays inactive until a later real task has an actual Action Receipt, the person confirms it was not candidate evidence, and the person approves the candidate. Skills never grant action permission.',
   tags: ['write'],
   parameters: {
     type: 'object',
@@ -254,6 +254,7 @@ const PROPOSE_EXPERIENCE_DECL: Omit<ToolDef, 'handler'> = {
       situation: { type: 'string', description: 'The recurring situation in which the experience applies.' },
       lesson: { type: 'string', description: 'A short, concrete conversational lesson.' },
       scope: { type: 'string', enum: ['conversation', 'proactive_speech', 'browser_exploration'] },
+      kind: { type: 'string', enum: ['policy', 'skill'], description: 'Use skill for a repeatable action strategy that will need a later receipt-backed trial; otherwise use policy.' },
       sourceIds: { type: 'array', items: { type: 'string' }, description: 'One to eight exact source_id values returned by memory_search.' },
     },
     required: ['title', 'situation', 'lesson', 'scope', 'sourceIds'],

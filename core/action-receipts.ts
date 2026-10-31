@@ -35,6 +35,18 @@ export type ActionReceiptCompletion =
   | (ActionReceiptCompletionDetails & { phase: 'failed'; dispatchState: ActionDispatchState; outcome: 'failed' });
 export type ActionReceiptReviewDecision = 'verified' | 'review-pending' | 'failed';
 
+export type ExperienceTrialOutcome = 'verified' | 'unknown' | 'failed';
+
+/** A content-free receipt projection used when a person records a Growth skill trial. */
+export interface ExperienceTrialReceipt {
+  receiptId: string;
+  taskFingerprint: string;
+  intent: ActionIntent;
+  outcome: ExperienceTrialOutcome;
+  dispatchState: ActionDispatchState;
+  createdAt: number;
+}
+
 export interface ActionReceipt {
   id: string;
   actionId: string;
@@ -199,6 +211,21 @@ export class ActionReceiptLedger {
   findByTaskId(taskId: string): ActionReceipt | null {
     const action = [...this.actions].reverse().find((candidate) => candidate.taskId === taskId);
     return action ? structuredClone(action) : null;
+  }
+
+  listExperienceTrialReceipts(afterCreatedAt: number): ExperienceTrialReceipt[] {
+    if (!Number.isFinite(afterCreatedAt)) return [];
+    return this.actions
+      .filter((action) => action.createdAt > afterCreatedAt)
+      .map(experienceTrialReceipt)
+      .filter((receipt): receipt is ExperienceTrialReceipt => !!receipt)
+      .sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  findExperienceTrialReceipt(id: string, afterCreatedAt: number): ExperienceTrialReceipt | null {
+    if (!Number.isFinite(afterCreatedAt)) return null;
+    const action = this.actions.find((candidate) => candidate.id === id && candidate.createdAt > afterCreatedAt);
+    return action ? experienceTrialReceipt(action) : null;
   }
 
   reconcile(id: string, decision: ActionReceiptReviewDecision, note: string, now = Date.now()): boolean {
@@ -376,4 +403,40 @@ export class ActionReceiptLedger {
     mkdirSync(dirname(this.file), { recursive: true });
     writeState(this.file, `${JSON.stringify(this.actions, null, 2)}\n`);
   }
+}
+
+function experienceTrialReceipt(action: ActionReceipt): ExperienceTrialReceipt | null {
+  const outcome = action.outcome;
+  if (action.phase === 'verified' && action.dispatchState === 'delivered'
+    && (outcome === 'verified' || outcome === 'ui-observed' || outcome === 'remote-acknowledged')) {
+    return {
+      receiptId: action.id,
+      taskFingerprint: hash(action.taskId),
+      intent: action.intent,
+      outcome: 'verified',
+      dispatchState: action.dispatchState,
+      createdAt: action.createdAt,
+    };
+  }
+  if (action.phase === 'failed' && action.dispatchState === 'delivered' && outcome === 'failed') {
+    return {
+      receiptId: action.id,
+      taskFingerprint: hash(action.taskId),
+      intent: action.intent,
+      outcome: 'failed',
+      dispatchState: action.dispatchState,
+      createdAt: action.createdAt,
+    };
+  }
+  if (action.phase === 'unknown' || action.dispatchState === 'unknown' || outcome === 'unknown') {
+    return {
+      receiptId: action.id,
+      taskFingerprint: hash(action.taskId),
+      intent: action.intent,
+      outcome: 'unknown',
+      dispatchState: action.dispatchState,
+      createdAt: action.createdAt,
+    };
+  }
+  return null;
 }

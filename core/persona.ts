@@ -241,7 +241,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         clearDerived: () => {
           this.growthProposals()?.clear();
           this.experienceCards()?.clear();
-          this.injectMemoryContext('[memory] Long-term memory was cleared. Disregard all Hindsight-derived experience policies injected earlier in this session; none remain active.');
+          this.injectMemoryContext('[memory] Long-term memory was cleared. Disregard all Hindsight-derived experience strategies injected earlier in this session; none remain active.');
         },
       });
       if (!this.growthStateFile) return;
@@ -875,6 +875,42 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
         return proposal;
       }
       if (method === 'growth-proposal-apply') throw new Error('Growth proposal application is not enabled.');
+      if (method === 'experience-trial-receipts') {
+        const id = String(args[0] ?? '');
+        const cards = this.experienceCards();
+        const card = cards?.get(id);
+        if (!card || card.state !== 'candidate' || card.kind !== 'skill') throw new Error('A skill candidate is required.');
+        const memory = this.longTerm;
+        const sourcesValid = card.userExplicit
+          ? await this.verifiedMemorySources(card.sourceIds)
+          : await this.verifiedRepeatedUserEventSources(card.sourceIds);
+        if (!memory?.enabled() || !sourcesValid) throw new Error('The experience sources cannot be verified.');
+        const ledger = this.actionReceiptsNow();
+        if (!ledger) throw new Error('Action receipts are unavailable.');
+        return ledger.listExperienceTrialReceipts(Date.parse(card.createdAt));
+      }
+      if (method === 'experience-trial-record') {
+        const id = String(args[0] ?? '');
+        const receiptId = String(args[1] ?? '');
+        const confirmedUnseen = args[2] === true;
+        if (!confirmedUnseen) throw new Error('Confirm that the task was not used as candidate evidence.');
+        const cards = this.experienceCards();
+        const card = cards?.get(id);
+        if (!card || card.state !== 'candidate' || card.kind !== 'skill') throw new Error('A skill candidate is required.');
+        const memory = this.longTerm;
+        const sourcesValid = card.userExplicit
+          ? await this.verifiedMemorySources(card.sourceIds)
+          : await this.verifiedRepeatedUserEventSources(card.sourceIds);
+        if (!memory?.enabled() || !sourcesValid) throw new Error('The experience sources cannot be verified.');
+        const ledger = this.actionReceiptsNow();
+        if (!ledger) throw new Error('Action receipts are unavailable.');
+        const receipt = ledger.findExperienceTrialReceipt(receiptId, Date.parse(card.createdAt));
+        if (!receipt) throw new Error('The selected action receipt is unavailable, unresolved or predates the candidate.');
+        if (!card.sourceIds.every((sourceId) => memory.sourceVisible(sourceId))) throw new Error('The experience sources are fenced.');
+        const result = cards?.recordTrial(id, receipt, confirmedUnseen);
+        if (!result?.ok) throw new Error(result?.errors.join('; ') ?? 'The skill trial could not be saved.');
+        return result.card;
+      }
       if (method === 'experience-create') {
         const input = (args[0] && typeof args[0] === 'object' ? args[0] : {}) as Record<string, unknown>;
         const parsed = readExperienceCardInput(input);
@@ -894,6 +930,14 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
         const before = cards?.get(id);
         if (action === 'approved') {
           const memory = this.longTerm;
+          if (before?.kind === 'skill') {
+            const ledger = this.actionReceiptsNow();
+            const hasLiveVerifiedTrial = !!ledger && before.trials.some((trial) => {
+              const receipt = ledger.findExperienceTrialReceipt(trial.receiptId, Date.parse(before.createdAt));
+              return receipt?.outcome === 'verified' && receipt.taskFingerprint === trial.taskFingerprint;
+            });
+            if (!hasLiveVerifiedTrial) throw new Error('A current verified receipt-backed trial is required before skill approval.');
+          }
           const sourcesValid = before && (before.userExplicit
             ? await this.verifiedMemorySources(before.sourceIds)
             : await this.verifiedRepeatedUserEventSources(before.sourceIds));
@@ -908,7 +952,7 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
           if (context) this.injectMemoryContext(context);
         } else if (action === 'deprecated') {
           const context = await this.experienceContext();
-          this.injectMemoryContext(`[memory] The user revoked the experience policy “${before?.title ?? id}”. Do not follow it anymore. ${context || 'No approved experience policies remain active.'}`);
+          this.injectMemoryContext(`[memory] The user revoked the experience strategy “${before?.title ?? id}”. Do not follow it anymore. ${context || 'No approved experience strategies remain active.'}`);
         }
         return card;
       }

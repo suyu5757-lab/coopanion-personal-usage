@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -380,5 +381,48 @@ describe('shared ActionReceiptLedger', () => {
       expect.objectContaining({ source: 'operator-review', status: 'verified' }),
     ] });
     expect(reopened.reconcile(receipt.id, 'failed', 'no longer unresolved', 4_007)).toBe(false);
+  });
+
+  it('projects only settled Growth trial outcomes without action content', () => {
+    dir = mkdtempSync(join(tmpdir(), 'coopanion-action-receipts-'));
+    const ledger = new ActionReceiptLedger(join(dir, 'receipts.json'));
+    const target: BrowserTargetEvidence = {
+      surface: 'browser', instanceId: 'browser-1', origin: 'https://private.example.test',
+      url: 'https://private.example.test/account', accountRef: 'account-secret', snapshotId: 'snapshot-1',
+      formId: 'form-1', control: 'submit',
+    };
+    const makeReceipt = (taskId: string, outcome: 'verified' | 'unknown' | 'failed' | 'not-dispatched-failure' | 'draft-ready', at: number) => {
+      const receipt = ledger.begin({
+        taskId, intent: 'platform-write', action: 'private task details', risk: 'EXTERNAL_MUTATION', target,
+        payloadDigest: hashContent('private prompt'), files: [], duplicateKey: taskId,
+      }, at);
+      ledger.awaitingApproval(receipt.id, at + 1);
+      ledger.acting(receipt.id, 'a'.repeat(64), at + 2, at + 30_000, at + 3);
+      ledger.complete(receipt.id, outcome === 'verified'
+        ? { phase: 'verified', dispatchState: 'delivered', outcome: 'verified', note: 'private outcome details' }
+        : outcome === 'unknown'
+          ? { phase: 'unknown', dispatchState: 'unknown', outcome: 'unknown', note: 'private uncertainty details' }
+          : outcome === 'failed'
+            ? { phase: 'failed', dispatchState: 'delivered', outcome: 'failed', note: 'private failure details' }
+            : outcome === 'not-dispatched-failure'
+              ? { phase: 'failed', dispatchState: 'not-dispatched', outcome: 'failed', note: 'not dispatched' }
+              : { phase: 'draft-ready', dispatchState: 'delivered', outcome: 'draft-ready', note: 'draft details' }, at + 4);
+      return receipt;
+    };
+    const verified = makeReceipt('task-verified', 'verified', 2_000);
+    const unknown = makeReceipt('task-unknown', 'unknown', 3_000);
+    const failed = makeReceipt('task-failed', 'failed', 4_000);
+    makeReceipt('task-draft', 'draft-ready', 5_000);
+    makeReceipt('task-not-dispatched', 'not-dispatched-failure', 6_000);
+
+    const trials = ledger.listExperienceTrialReceipts(1_000);
+    expect(trials.map((trial) => trial.outcome)).toEqual(['failed', 'unknown', 'verified']);
+    expect(ledger.findExperienceTrialReceipt(unknown.id, 2_500)).toMatchObject({ outcome: 'unknown', dispatchState: 'unknown' });
+    expect(ledger.findExperienceTrialReceipt(verified.id, 2_000)).toBeNull();
+    expect(ledger.findExperienceTrialReceipt(failed.id, 1_000)).toMatchObject({ outcome: 'failed' });
+    expect(JSON.stringify(trials)).not.toMatch(/private\.example|account-secret|private prompt|private outcome|private uncertainty|private failure|draft details/);
+    expect(Object.keys(trials[0]).sort()).toEqual(['createdAt', 'dispatchState', 'intent', 'outcome', 'receiptId', 'taskFingerprint']);
+    expect(trials.find((trial) => trial.receiptId === verified.id)?.taskFingerprint)
+      .toBe(createHash('sha256').update('task-verified').digest('hex'));
   });
 });

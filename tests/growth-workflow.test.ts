@@ -7,6 +7,7 @@ import { functionCall, functionResult, message } from 'cortico/protocol/open-res
 import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import { WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
 import { coopanionPersona } from '../core/persona.ts';
+import { ActionReceiptLedger } from '../core/action-receipts.ts';
 import type { HindsightMemory } from '../core/memory/hindsight.ts';
 import { ExperienceCards } from '../core/growth/experience-cards.ts';
 import { GrowthProposals } from '../core/growth/proposals.ts';
@@ -264,7 +265,114 @@ describe('experience policy cards', () => {
       sourceIds: ['user:focus'], state: 'candidate',
     }));
 
-    expect(new ExperienceCards(dir).get(id)?.userExplicit).toBe(true);
+    const cards = new ExperienceCards(dir);
+    expect(cards.get(id)).toMatchObject({ userExplicit: true, kind: 'policy', trials: [] });
+    expect(cards.transition(id, 'approved')?.state).toBe('approved');
+    const saved = JSON.parse(readFileSync(join(dir, `${id}.json`), 'utf8')) as Record<string, unknown>;
+    expect(saved).not.toHaveProperty('kind');
+    expect(saved).not.toHaveProperty('trials');
+  });
+
+  it('requires a post-candidate Action Receipt and unseen-task confirmation before skill approval', () => {
+    const root = temp();
+    let now = new Date('2026-10-01T00:00:00.000Z');
+    const cards = new ExperienceCards(join(root, 'experience-cards'), () => new Date(now));
+    const candidate = cards.propose({
+      title: 'Use the verified browser result', situation: 'A browser task has a verified result.',
+      lesson: 'Check the receipt before reporting completion.', scope: 'browser_exploration', kind: 'skill',
+      sourceIds: ['user:task-1', 'user:task-2'],
+    });
+    if (!candidate.ok) throw new Error(candidate.errors.join('; '));
+    expect(cards.transition(candidate.card.id, 'approved')).toBeNull();
+
+    const receiptBase = {
+      receiptId: 'receipt-unknown', taskFingerprint: 'a'.repeat(64), intent: 'platform-write' as const,
+      dispatchState: 'unknown' as const, createdAt: Date.parse(candidate.card.createdAt) + 1,
+    };
+    expect(cards.recordTrial(candidate.card.id, { ...receiptBase, outcome: 'unknown' }, false).ok).toBe(false);
+    now = new Date('2026-10-01T00:01:00.000Z');
+    const unknown = cards.recordTrial(candidate.card.id, { ...receiptBase, outcome: 'unknown' }, true);
+    expect(unknown).toMatchObject({ ok: true, trial: { outcome: 'unknown', unseenConfirmedAt: '2026-10-01T00:01:00.000Z' } });
+    expect(cards.transition(candidate.card.id, 'approved')).toBeNull();
+
+    now = new Date('2026-10-01T00:02:00.000Z');
+    const verified = cards.recordTrial(candidate.card.id, {
+      ...receiptBase, dispatchState: 'delivered', outcome: 'verified',
+    }, true);
+    expect(verified).toMatchObject({ ok: true, trial: { outcome: 'verified', receiptId: 'receipt-unknown' } });
+    expect(cards.recordTrial(candidate.card.id, {
+      ...receiptBase, receiptId: 'receipt-duplicate-task', outcome: 'verified', dispatchState: 'delivered',
+    }, true).ok).toBe(false);
+    expect(cards.transition(candidate.card.id, 'approved')?.state).toBe('approved');
+    expect(cards.approvedContext()).toContain('Check the receipt before reporting completion.');
+  });
+
+  it('reads settled receipt projections only after the person opens a skill trial picker', async () => {
+    const root = temp();
+    const workspace = join(root, 'workspace');
+    const deploy = join(root, 'deploy');
+    mkdirSync(workspace);
+    mkdirSync(deploy);
+    const ledger = new ActionReceiptLedger(join(deploy, 'actions.json'));
+    let listCalls = 0;
+    const listTrialReceipts = ledger.listExperienceTrialReceipts.bind(ledger);
+    ledger.listExperienceTrialReceipts = (after) => { listCalls += 1; return listTrialReceipts(after); };
+    const memory = {
+      enabled: () => true,
+      settled: () => true,
+      sourceVisible: () => true,
+      sourceEvidence: async () => ({ present: true, visible: true, actor: 'user', status: 'completed' }),
+    } as unknown as HindsightMemory;
+    const Persona = coopanionPersona(Cormini, {
+      growthStateFile: join(deploy, 'growth.json'),
+      memory,
+      actionReceipts: () => ledger,
+    });
+    const persona = new Persona({ memoryDir: workspace });
+    const invoke = persona.webUi('en').invoke!;
+    const card = await invoke('hindsight', 'experience-create', [{
+      title: 'Verify the result', situation: 'An action task has finished.', lesson: 'Check its receipt before reporting completion.',
+      scope: 'browser_exploration', kind: 'skill', sourceIds: ['user:skill-1'],
+    }]) as { id: string; createdAt: string };
+
+    const createdAt = Date.parse(card.createdAt);
+    const makeUnknownReceipt = (taskId: string, at: number) => {
+      const receipt = ledger.begin({
+        taskId, intent: 'file-write', action: 'private task label', risk: 'REVERSIBLE_LOCAL',
+        target: {
+          surface: 'filesystem', instanceId: 'persona', workspaceRoot: workspace, path: 'result.txt',
+          operation: 'file-write', snapshotId: 'snapshot-1', source: 'persona-workspace',
+        },
+        payloadDigest: 'a'.repeat(64), files: [], duplicateKey: taskId,
+      }, at);
+      ledger.awaitingApproval(receipt.id, at + 1);
+      ledger.acting(receipt.id, 'b'.repeat(64), at + 2, at + 30_000, at + 3);
+      ledger.complete(receipt.id, {
+        phase: 'unknown', dispatchState: 'unknown', outcome: 'unknown', note: 'private unknown note',
+      }, at + 4);
+      return receipt;
+    };
+    const unknown = makeUnknownReceipt('task-unknown', createdAt + 1_000);
+
+    const status = await invoke('hindsight', 'growth-status', []) as { experiences: Array<{ id: string; trials: unknown[] }> };
+    expect(status.experiences.find((entry) => entry.id === card.id)?.trials).toEqual([]);
+    expect(listCalls).toBe(0);
+    const eligible = await invoke('hindsight', 'experience-trial-receipts', [card.id]) as Array<Record<string, unknown>>;
+    expect(listCalls).toBe(1);
+    expect(eligible.map((entry) => entry.outcome)).toEqual(['unknown']);
+    expect(JSON.stringify(eligible)).not.toMatch(/private task label|private receipt note|private unknown note|result\.txt/);
+    await expect(invoke('hindsight', 'experience-trial-record', [card.id, unknown.id, false]))
+      .rejects.toThrow(/Confirm that the task was not used/);
+    await invoke('hindsight', 'experience-trial-record', [card.id, unknown.id, true]);
+    await expect(invoke('hindsight', 'experience-review', [card.id, 'approved']))
+      .rejects.toThrow(/verified receipt-backed trial/);
+    expect(ledger.reconcile(unknown.id, 'verified', 'A later review verified the completed task.', createdAt + 6_000)).toBe(true);
+    const refreshed = await invoke('hindsight', 'experience-trial-receipts', [card.id]) as Array<Record<string, unknown>>;
+    expect(refreshed).toMatchObject([{ receiptId: unknown.id, outcome: 'verified', dispatchState: 'delivered' }]);
+    await invoke('hindsight', 'experience-trial-record', [card.id, unknown.id, true]);
+    await invoke('hindsight', 'experience-review', [card.id, 'approved']);
+    expect(new ExperienceCards(join(deploy, 'experience-cards')).get(card.id)?.trials.map((trial) => trial.outcome))
+      .toEqual(['verified']);
   });
 
   it('tells the current session which approved policy was revoked', async () => {
@@ -290,7 +398,7 @@ describe('experience policy cards', () => {
     await invoke('hindsight', 'experience-review', [card.id, 'deprecated']);
     expect(injected.at(-1)).toContain('Quiet coding time');
     expect(injected.at(-1)).toContain('Do not follow it anymore');
-    expect(injected.at(-1)).toContain('No approved experience policies remain active.');
+    expect(injected.at(-1)).toContain('No approved experience strategies remain active.');
   });
 
   it('rejects experience cards and proposal approval when a source is gone', async () => {
