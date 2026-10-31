@@ -58,9 +58,31 @@ interface ExperienceCard {
   situation: string;
   lesson: string;
   scope: 'conversation' | 'proactive_speech' | 'browser_exploration';
+  kind: 'policy' | 'skill';
+  trials: ExperienceTrial[];
   sourceIds: string[];
   state: 'candidate' | 'approved' | 'rejected' | 'deprecated';
   updatedAt: string;
+}
+
+interface ExperienceTrial {
+  receiptId: string;
+  taskFingerprint: string;
+  intent: string;
+  outcome: 'verified' | 'unknown' | 'failed';
+  dispatchState: 'not-dispatched' | 'delivered' | 'unknown';
+  createdAt: number;
+  recordedAt: string;
+  unseenConfirmedAt: string;
+}
+
+interface GrowthTrialReceipt {
+  receiptId: string;
+  taskFingerprint: string;
+  intent: string;
+  outcome: 'verified' | 'unknown' | 'failed';
+  dispatchState: 'not-dispatched' | 'delivered' | 'unknown';
+  createdAt: number;
 }
 
 interface GrowthStatus {
@@ -214,6 +236,12 @@ const panel: WebUiPanel = {
     const cardSituation = ui.textarea({ placeholder: t.cardSituation, cls: 'grow' });
     const cardLesson = ui.textarea({ placeholder: t.cardLesson, cls: 'grow' });
     const cardSources = ui.textarea({ placeholder: t.cardSources, cls: 'grow' });
+    const cardKind = ui.h('select', 'grow') as HTMLSelectElement;
+    for (const [value, label] of [['policy', t.kindPolicy], ['skill', t.kindSkill]]) {
+      const option = ui.h('option', null, label) as HTMLOptionElement;
+      option.value = value;
+      cardKind.append(option);
+    }
     const cardScope = ui.h('select', 'grow') as HTMLSelectElement;
     for (const [value, label] of [
       ['conversation', t.scopeConversation], ['proactive_speech', t.scopeSpeech], ['browser_exploration', t.scopeBrowser],
@@ -230,6 +258,7 @@ const panel: WebUiPanel = {
             situation: cardSituation.value,
             lesson: cardLesson.value,
             scope: cardScope.value,
+            kind: cardKind.value,
             sourceIds: cardSources.value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
           }]);
           if (ctx.signal.aborted) return;
@@ -237,6 +266,7 @@ const panel: WebUiPanel = {
           cardSituation.value = '';
           cardLesson.value = '';
           cardSources.value = '';
+          cardKind.value = 'policy';
           ui.toast(t.cardAdded, 'ok');
           await loadGrowth();
         } catch (error) {
@@ -244,7 +274,7 @@ const panel: WebUiPanel = {
         }
       },
     });
-    cardForm.append(cardTitle, cardSituation, cardLesson, cardScope, cardSources, addCard);
+    cardForm.append(cardTitle, cardSituation, cardLesson, cardKind, cardScope, cardSources, addCard);
     const addCardSheet = ui.sheet({ title: t.createCard });
     addCardSheet.body.append(cardForm);
 
@@ -313,21 +343,83 @@ const panel: WebUiPanel = {
       const row = ui.h('div', 'strow');
       const info = ui.h('div', 'stinfo');
       const scope = card.scope === 'conversation' ? t.scopeConversation : card.scope === 'proactive_speech' ? t.scopeSpeech : t.scopeBrowser;
+      const kind = card.kind === 'skill' ? t.kindSkill : t.kindPolicy;
       info.append(
         ui.h('div', 'stlabel', card.title),
-        ui.h('div', 'stloc', `${stateLabel(card.state)} · ${scope} · ${when(card.updatedAt)}`),
+        ui.h('div', 'stloc', `${stateLabel(card.state)} · ${kind} · ${scope} · ${when(card.updatedAt)}`),
         ui.h('p', 'home-note', `${card.situation} — ${card.lesson}`),
         ui.h('div', 'stloc', `${t.proposalSources}: ${card.sourceIds.join(', ')}`),
       );
+      for (const trial of card.trials) {
+        const outcome = trial.outcome === 'verified' ? t.trialVerified : trial.outcome === 'unknown' ? t.trialUnknown : t.trialFailed;
+        info.append(ui.h('div', 'stloc', `${outcome} · ${trial.intent} · ${when(new Date(trial.createdAt).toISOString())} · ${trial.receiptId.slice(0, 8)}`));
+        info.append(ui.h('div', 'stloc', `${t.trialUserConfirmed} · ${when(trial.unseenConfirmedAt)}`));
+      }
       const actions = ui.actions();
       if (card.state === 'candidate') {
-        actions.append(ui.button(t.approve, { size: 'sm', onClick: () => void reviewCard(card, 'approved') }));
+        if (card.kind === 'skill' && !card.trials.some((trial) => trial.outcome === 'verified')) {
+          info.append(ui.h('div', 'stloc', t.skillNeedsTrial));
+        } else {
+          actions.append(ui.button(t.approve, { size: 'sm', onClick: () => void reviewCard(card, 'approved') }));
+        }
         actions.append(ui.button(t.reject, { size: 'sm', variant: 'danger', onClick: () => void reviewCard(card, 'rejected') }));
+        if (card.kind === 'skill') actions.append(ui.button(t.recordTrial, { size: 'sm', onClick: () => void selectTrial(card, row) }));
       } else if (card.state === 'approved') {
         actions.append(ui.button(t.deprecate, { size: 'sm', variant: 'danger', onClick: () => void reviewCard(card, 'deprecated') }));
       }
       row.append(info, actions);
       return row;
+    }
+
+    async function selectTrial(card: ExperienceCard, row: HTMLElement): Promise<void> {
+      try {
+        const receipts = await ctx.invoke<GrowthTrialReceipt[]>('experience-trial-receipts', [card.id]);
+        if (ctx.signal.aborted) return;
+        if (receipts.length === 0) {
+          ui.toast(t.trialNoReceipts, 'bad');
+          return;
+        }
+        const selector = ui.h('select', 'grow') as HTMLSelectElement;
+        const placeholder = ui.h('option', null, t.trialSelectReceipt) as HTMLOptionElement;
+        placeholder.value = '';
+        selector.append(placeholder);
+        const byId = new Map<string, GrowthTrialReceipt>();
+        for (const receipt of receipts) {
+          byId.set(receipt.receiptId, receipt);
+          const outcome = receipt.outcome === 'verified' ? t.trialVerified : receipt.outcome === 'unknown' ? t.trialUnknown : t.trialFailed;
+          const option = ui.h('option', null, `${when(new Date(receipt.createdAt).toISOString())} · ${receipt.intent} · ${outcome} · ${receipt.receiptId.slice(0, 8)}`) as HTMLOptionElement;
+          option.value = receipt.receiptId;
+          selector.append(option);
+        }
+        const record = ui.button(t.recordTrial, {
+          size: 'sm',
+          onClick: async () => {
+            const receipt = byId.get(selector.value);
+            if (!receipt) {
+              ui.toast(t.trialSelectReceipt, 'bad');
+              return;
+            }
+            const outcome = receipt.outcome === 'verified' ? t.trialVerified : receipt.outcome === 'unknown' ? t.trialUnknown : t.trialFailed;
+            const confirmed = await ui.confirm({
+              title: t.trialConfirmTitle,
+              body: `${when(new Date(receipt.createdAt).toISOString())} · ${receipt.intent} · ${outcome}\n\n${t.trialConfirmBody}`,
+            });
+            if (!confirmed || ctx.signal.aborted) return;
+            await ctx.invoke('experience-trial-record', [card.id, receipt.receiptId, true]);
+            if (ctx.signal.aborted) return;
+            ui.toast(t.trialRecorded, 'ok');
+            await loadGrowth();
+          },
+        });
+        const trialControls = ui.h('div', 'hindsight-list');
+        trialControls.append(selector, record);
+        const existing = row.querySelector('[data-growth-trial-picker]');
+        existing?.remove();
+        trialControls.setAttribute('data-growth-trial-picker', card.id);
+        row.append(trialControls);
+      } catch (error) {
+        if (!ctx.signal.aborted) ui.toast(error instanceof Error ? error.message : String(error), 'bad');
+      }
     }
 
     async function reviewCard(card: ExperienceCard, action: 'approved' | 'rejected' | 'deprecated'): Promise<void> {

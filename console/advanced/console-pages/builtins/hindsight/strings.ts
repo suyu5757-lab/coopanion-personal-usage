@@ -1,6 +1,87 @@
 import type { LanguageTable } from 'cortico/core/language.ts';
 
+const n5 = {
+  zh: {
+    cardKind: '候选类型', kindPolicy: '经验策略', kindSkill: '技能候选', recordTrial: '记录任务试验',
+    trialSelectReceipt: '选择候选建立后的任务回执', trialNoReceipts: '候选建立后没有可用于试验的已结束回执。',
+    trialConfirmTitle: '确认这是一项未见任务', trialConfirmBody: '确认任务发生在候选建立后，且不属于候选来源证据。结果将按回执记录；未知不算成功。',
+    trialRecorded: '试验回执已记录。', trialVerified: '已核验完成', trialUnknown: '结果未知', trialFailed: '已失败',
+    skillNeedsTrial: '技能候选至少需要一条已核验完成的任务试验才能批准。', trialUserConfirmed: '用户确认任务未用于候选来源',
+  },
+  en: {
+    cardKind: 'Candidate kind', kindPolicy: 'Experience policy', kindSkill: 'Skill candidate', recordTrial: 'Record task trial',
+    trialSelectReceipt: 'Select a settled task receipt created after this candidate', trialNoReceipts: 'No settled task receipts were created after this candidate.',
+    trialConfirmTitle: 'Confirm this is an unseen task', trialConfirmBody: 'Confirm the task happened after the candidate was created and was not among its source evidence. The result is recorded from its receipt; unknown is not success.',
+    trialRecorded: 'Task trial receipt recorded.', trialVerified: 'Verified complete', trialUnknown: 'Unknown result', trialFailed: 'Failed',
+    skillNeedsTrial: 'A skill candidate needs at least one verified task trial before approval.', trialUserConfirmed: 'Person confirmed task was not candidate evidence',
+  },
+  'zh-Hant': {
+    cardKind: '候選類型', kindPolicy: '經驗策略', kindSkill: '技能候選', recordTrial: '記錄任務試驗',
+    trialSelectReceipt: '選擇候選建立後的任務回執', trialNoReceipts: '候選建立後沒有可用於試驗的已結束回執。',
+    trialConfirmTitle: '確認這是一項未見任務', trialConfirmBody: '確認任務發生在候選建立後，且不屬於候選來源證據。結果將依回執記錄；未知不算成功。',
+    trialRecorded: '試驗回執已記錄。', trialVerified: '已核驗完成', trialUnknown: '結果未知', trialFailed: '已失敗',
+    skillNeedsTrial: '技能候選至少需要一項已核驗完成的任務試驗才能核准。', trialUserConfirmed: '使用者確認任務未用於候選來源',
+  },
+  ja: {
+    cardKind: '候補の種類', kindPolicy: '経験ポリシー', kindSkill: 'スキル候補', recordTrial: 'タスク試験を記録',
+    trialSelectReceipt: '候補作成後に完了したタスクのレシートを選択', trialNoReceipts: '候補作成後に試験に使える完了済みレシートはありません。',
+    trialConfirmTitle: '未見のタスクであることを確認', trialConfirmBody: 'このタスクが候補作成後に発生し、候補の根拠資料に含まれていないことを確認します。結果はレシートから記録され、不明は成功として扱われません。',
+    trialRecorded: 'タスク試験のレシートを記録しました。', trialVerified: '完了を確認', trialUnknown: '結果不明', trialFailed: '失敗',
+    skillNeedsTrial: 'スキル候補の承認には、完了が確認されたタスク試験が1件以上必要です。', trialUserConfirmed: '候補の根拠に含まれないことを確認済み',
+  },
+  ko: {
+    cardKind: '후보 유형', kindPolicy: '경험 정책', kindSkill: '기술 후보', recordTrial: '작업 시험 기록',
+    trialSelectReceipt: '후보 생성 후 완료된 작업 영수증 선택', trialNoReceipts: '후보 생성 후 시험에 사용할 완료 영수증이 없습니다.',
+    trialConfirmTitle: '처음 보는 작업인지 확인', trialConfirmBody: '이 작업이 후보 생성 후 발생했으며 후보 근거 자료에 포함되지 않았음을 확인합니다. 결과는 영수증으로 기록하며 알 수 없는 결과는 성공으로 보지 않습니다.',
+    trialRecorded: '작업 시험 영수증을 기록했습니다.', trialVerified: '완료 확인', trialUnknown: '결과 알 수 없음', trialFailed: '실패',
+    skillNeedsTrial: '기술 후보를 승인하려면 완료가 확인된 작업 시험이 하나 이상 필요합니다.', trialUserConfirmed: '후보 근거에 포함되지 않았음을 확인함',
+  },
+  fr: {
+    cardKind: 'Type de proposition', kindPolicy: 'Conseil d’expérience', kindSkill: 'Compétence candidate', recordTrial: 'Enregistrer un essai',
+    trialSelectReceipt: 'Choisir un reçu de tâche terminé après la création', trialNoReceipts: 'Aucun reçu terminé après la création de cette proposition.',
+    trialConfirmTitle: 'Confirmer une tâche inédite', trialConfirmBody: 'Confirmez que la tâche a eu lieu après la création de la proposition et ne figurait pas parmi ses sources. Le résultat vient du reçu ; un résultat inconnu ne compte pas comme une réussite.',
+    trialRecorded: 'Reçu d’essai enregistré.', trialVerified: 'Fin vérifiée', trialUnknown: 'Résultat inconnu', trialFailed: 'Échec',
+    skillNeedsTrial: 'Une compétence candidate doit avoir au moins un essai terminé et vérifié avant approbation.', trialUserConfirmed: 'Tâche confirmée comme absente des sources',
+  },
+  de: {
+    cardKind: 'Kandidatentyp', kindPolicy: 'Erfahrungsregel', kindSkill: 'Fähigkeitskandidat', recordTrial: 'Aufgabenversuch erfassen',
+    trialSelectReceipt: 'Abgeschlossenen Beleg nach Erstellung des Kandidaten auswählen', trialNoReceipts: 'Nach Erstellung dieses Kandidaten gibt es keine abgeschlossenen Belege für einen Versuch.',
+    trialConfirmTitle: 'Unbekannte Aufgabe bestätigen', trialConfirmBody: 'Bestätige, dass die Aufgabe nach Erstellung des Kandidaten stattfand und nicht zu seinen Quellen gehörte. Das Ergebnis stammt aus dem Beleg; ein unbekanntes Ergebnis gilt nicht als Erfolg.',
+    trialRecorded: 'Aufgabenbeleg erfasst.', trialVerified: 'Abschluss bestätigt', trialUnknown: 'Ergebnis unbekannt', trialFailed: 'Fehlgeschlagen',
+    skillNeedsTrial: 'Ein Fähigkeitskandidat braucht vor der Freigabe mindestens einen bestätigten Aufgabenversuch.', trialUserConfirmed: 'Nicht als Kandidatenquelle bestätigte Aufgabe',
+  },
+  'es-419': {
+    cardKind: 'Tipo de propuesta', kindPolicy: 'Regla de experiencia', kindSkill: 'Candidata de habilidad', recordTrial: 'Registrar prueba de tarea',
+    trialSelectReceipt: 'Elige un comprobante completado después de crear la propuesta', trialNoReceipts: 'No hay comprobantes completados posteriores a esta propuesta.',
+    trialConfirmTitle: 'Confirma que la tarea es nueva', trialConfirmBody: 'Confirma que la tarea ocurrió después de crear la propuesta y no formó parte de sus fuentes. El resultado se registra desde el comprobante; un resultado desconocido no cuenta como éxito.',
+    trialRecorded: 'Comprobante de prueba registrado.', trialVerified: 'Finalización verificada', trialUnknown: 'Resultado desconocido', trialFailed: 'Falló',
+    skillNeedsTrial: 'Una candidata de habilidad necesita al menos una prueba de tarea completada y verificada antes de aprobarse.', trialUserConfirmed: 'Tarea confirmada como ajena a las fuentes',
+  },
+  'pt-BR': {
+    cardKind: 'Tipo de candidata', kindPolicy: 'Política de experiência', kindSkill: 'Candidata de habilidade', recordTrial: 'Registrar teste da tarefa',
+    trialSelectReceipt: 'Selecione um recibo concluído após a criação da candidata', trialNoReceipts: 'Não há recibos concluídos após a criação desta candidata.',
+    trialConfirmTitle: 'Confirme que a tarefa é inédita', trialConfirmBody: 'Confirme que a tarefa ocorreu após a criação da candidata e não fez parte das evidências de origem. O resultado vem do recibo; resultado desconhecido não conta como sucesso.',
+    trialRecorded: 'Recibo de teste registrado.', trialVerified: 'Conclusão verificada', trialUnknown: 'Resultado desconhecido', trialFailed: 'Falhou',
+    skillNeedsTrial: 'Uma candidata de habilidade precisa de pelo menos um teste de tarefa concluído e verificado antes da aprovação.', trialUserConfirmed: 'Tarefa confirmada como fora das fontes',
+  },
+  it: {
+    cardKind: 'Tipo di proposta', kindPolicy: 'Regola di esperienza', kindSkill: 'Abilità candidata', recordTrial: 'Registra una prova',
+    trialSelectReceipt: 'Seleziona una ricevuta completata dopo la creazione', trialNoReceipts: 'Non ci sono ricevute completate dopo la creazione di questa proposta.',
+    trialConfirmTitle: 'Conferma che la prova è inedita', trialConfirmBody: 'Conferma che l’attività è avvenuta dopo la creazione della proposta e non faceva parte delle sue fonti. Il risultato viene dalla ricevuta; un esito sconosciuto non conta come successo.',
+    trialRecorded: 'Ricevuta della prova registrata.', trialVerified: 'Completamento verificato', trialUnknown: 'Esito sconosciuto', trialFailed: 'Non riuscita',
+    skillNeedsTrial: 'Un’abilità candidata deve avere almeno una prova di attività completata e verificata prima dell’approvazione.', trialUserConfirmed: 'Attività confermata come non presente nelle fonti',
+  },
+  ru: {
+    cardKind: 'Тип кандидата', kindPolicy: 'Правило опыта', kindSkill: 'Кандидат на навык', recordTrial: 'Записать испытание задачи',
+    trialSelectReceipt: 'Выберите завершённую квитанцию после создания кандидата', trialNoReceipts: 'После создания кандидата нет завершённых квитанций для испытания.',
+    trialConfirmTitle: 'Подтвердите, что задача новая', trialConfirmBody: 'Подтвердите, что задача возникла после создания кандидата и не входила в его исходные данные. Результат берётся из квитанции; неизвестный результат не считается успехом.',
+    trialRecorded: 'Квитанция испытания записана.', trialVerified: 'Завершение подтверждено', trialUnknown: 'Результат неизвестен', trialFailed: 'Неудача',
+    skillNeedsTrial: 'Перед одобрением кандидата на навык требуется хотя бы одно подтверждённое испытание задачи.', trialUserConfirmed: 'Подтверждено, что задачи не было среди источников',
+  },
+};
+
 const zh = {
+  ...n5.zh,
   title: '长期记忆',
   refresh: '刷新',
   searchPlaceholder: '搜索长期记忆…',
@@ -105,6 +186,7 @@ const zh = {
 };
 
 const en: typeof zh = {
+  ...n5.en,
   title: 'Long-term memory',
   refresh: 'Refresh',
   searchPlaceholder: 'Search long-term memory…',
@@ -209,6 +291,7 @@ const en: typeof zh = {
 };
 
 const zhHant: Partial<typeof zh> = {
+  ...n5['zh-Hant'],
   forgetDone: (local, deleted, pending, failed) => `本機取消 ${local}，遠端刪除確認 ${deleted}，待處理 ${pending}，失敗 ${failed}。目前對話仍可能包含該來源。`,
   candidate: '候選', deprecated: '已撤銷', reviewOk: '完成', reviewFailed: '失敗', reviewInterrupted: '中斷', reviewBlocked: '等待取消與預算驗收', proposalCount: (n) => `提案 ${n} 項`, backgroundUnpaused: '未因記憶體暫停',
   growth: '成長與探索', growthLoading: '正在讀取成長狀態…', growthSchedule: '定期自省', enabled: '啟用', off: '關閉', paused: '已暫停', running: '執行中', notRun: '尚未執行', nextReview: '下次複核', lastReview: '最近複核',
@@ -227,6 +310,7 @@ const zhHant: Partial<typeof zh> = {
   lastDelivery: (submitted, completed, verified, failed) => `最近投遞：提交 ${submitted}，操作完成 ${completed}，來源核驗 ${verified}，失敗 ${failed}`, refreshGrowth: '重新整理成長狀態',
 };
 const ja: Partial<typeof zh> = {
+  ...n5.ja,
   forgetDone: (local, deleted, pending, failed) => `ローカル取消 ${local}、リモート削除確認 ${deleted}、保留 ${pending}、失敗 ${failed}。現在の会話にはまだ情報が含まれる場合があります。`,
   candidate: '候補', deprecated: '取り消し済み', reviewOk: '完了', reviewFailed: '失敗', reviewInterrupted: '中断', reviewBlocked: 'キャンセルと予算の確認待ち', proposalCount: (n) => `提案 ${n} 件`, backgroundUnpaused: 'メモリ不足による停止なし',
   growth: '成長と探索', growthLoading: '成長状態を読み込み中…', growthSchedule: '定期レビュー', enabled: '有効', off: 'オフ', paused: '一時停止中', running: '実行中', notRun: '未実行', nextReview: '次回レビュー', lastReview: '前回レビュー', backgroundWork: 'バックグラウンド処理',
@@ -244,6 +328,7 @@ const ja: Partial<typeof zh> = {
   lastDelivery: (submitted, completed, verified, failed) => `直近の送信：送信 ${submitted}、操作完了 ${completed}、ソース確認 ${verified}、失敗 ${failed}`, refreshGrowth: '成長状態を更新',
 };
 const ko: Partial<typeof zh> = {
+  ...n5.ko,
   forgetDone: (local, deleted, pending, failed) => `로컬 취소 ${local}, 원격 삭제 확인 ${deleted}, 대기 ${pending}, 실패 ${failed}. 현재 대화에는 해당 내용이 남아 있을 수 있습니다.`,
   candidate: '후보', deprecated: '철회됨', reviewOk: '완료', reviewFailed: '실패', reviewInterrupted: '중단됨', reviewBlocked: '취소 및 예산 검증 대기', proposalCount: (n) => `제안 ${n}개`, backgroundUnpaused: '메모리로 인한 일시 중지 없음',
   growth: '성장 및 탐색', growthLoading: '성장 상태 불러오는 중…', growthSchedule: '정기 검토', enabled: '켜짐', off: '꺼짐', paused: '일시 중지됨', running: '실행 중', notRun: '실행 기록 없음', nextReview: '다음 검토', lastReview: '최근 검토', lastReviewError: '최근 오류', backgroundWork: '백그라운드 작업',
@@ -260,6 +345,7 @@ const ko: Partial<typeof zh> = {
   lastDelivery: (submitted, completed, verified, failed) => `최근 전달: 제출 ${submitted}, 작업 완료 ${completed}, 출처 확인 ${verified}, 실패 ${failed}`, refreshGrowth: '성장 상태 새로고침',
 };
 const fr: Partial<typeof zh> = {
+  ...n5.fr,
   forgetDone: (local, deleted, pending, failed) => `Annulations locales : ${local} ; suppressions distantes confirmées : ${deleted} ; en attente : ${pending} ; échecs : ${failed}. La conversation active peut encore contenir cette source.`,
   candidate: 'Candidate', deprecated: 'Révoquée', reviewOk: 'Terminée', reviewFailed: 'Échec', reviewInterrupted: 'Interrompue', reviewBlocked: 'En attente des contrôles d’annulation et de budget', proposalCount: (n) => `${n} propositions`, backgroundUnpaused: 'Pas de pause mémoire',
   growth: 'Évolution et exploration', growthLoading: 'Chargement de l’état…', growthSchedule: 'Revue périodique', enabled: 'Activée', off: 'Désactivée', paused: 'En pause', running: 'En cours', notRun: 'Pas encore exécutée', nextReview: 'Prochaine revue', lastReview: 'Dernière revue', lastReviewError: 'Dernière erreur', backgroundWork: 'Activité en arrière-plan',
@@ -276,6 +362,7 @@ const fr: Partial<typeof zh> = {
   lastDelivery: (submitted, completed, verified, failed) => `Dernier envoi : ${submitted} soumis, ${completed} opérations terminées, ${verified} sources vérifiées, ${failed} échecs`, refreshGrowth: 'Actualiser l’état',
 };
 const de: Partial<typeof zh> = {
+  ...n5.de,
   forgetDone: (local, deleted, pending, failed) => `Lokal abgebrochen: ${local}; Remote-Löschungen bestätigt: ${deleted}; offen: ${pending}; Fehler: ${failed}. Diese Unterhaltung kann die Quelle noch enthalten.`,
   candidate: 'Kandidat', deprecated: 'Widerrufen', reviewOk: 'Abgeschlossen', reviewFailed: 'Fehlgeschlagen', reviewInterrupted: 'Unterbrochen', reviewBlocked: 'Wartet auf Abbruch- und Budgetprüfung', proposalCount: (n) => `${n} Vorschläge`, backgroundUnpaused: 'Nicht wegen Speicher pausiert',
   growth: 'Wachstum und Erkundung', growthLoading: 'Wachstumsstatus wird geladen…', growthSchedule: 'Regelmäßige Prüfung', enabled: 'An', off: 'Aus', paused: 'Pausiert', running: 'Läuft', notRun: 'Noch nicht ausgeführt', nextReview: 'Nächste Prüfung', lastReview: 'Letzte Prüfung', lastReviewError: 'Letzter Fehler', backgroundWork: 'Hintergrundaktivität',
@@ -292,6 +379,7 @@ const de: Partial<typeof zh> = {
   lastDelivery: (submitted, completed, verified, failed) => `Letzte Übertragung: ${submitted} gesendet, ${completed} Vorgänge abgeschlossen, ${verified} Quellen geprüft, ${failed} fehlgeschlagen`, refreshGrowth: 'Wachstumsstatus aktualisieren',
 };
 const es419: Partial<typeof zh> = {
+  ...n5['es-419'],
   forgetDone: (local, deleted, pending, failed) => `Cancelaciones locales: ${local}; eliminaciones remotas confirmadas: ${deleted}; pendientes: ${pending}; fallidas: ${failed}. La conversación activa aún puede contener esta fuente.`,
   candidate: 'Candidata', deprecated: 'Revocada', reviewOk: 'Completada', reviewFailed: 'Fallida', reviewInterrupted: 'Interrumpida', reviewBlocked: 'A la espera de controles de cancelación y presupuesto', proposalCount: (n) => `${n} propuestas`, backgroundUnpaused: 'Sin pausa por memoria',
   growth: 'Crecimiento y exploración', growthLoading: 'Cargando estado de crecimiento…', growthSchedule: 'Revisión periódica', enabled: 'Activada', off: 'Desactivada', paused: 'En pausa', running: 'En curso', notRun: 'Aún no se ejecutó', nextReview: 'Próxima revisión', lastReview: 'Última revisión', lastReviewError: 'Último error', backgroundWork: 'Actividad en segundo plano',
@@ -308,6 +396,7 @@ const es419: Partial<typeof zh> = {
   lastDelivery: (submitted, completed, verified, failed) => `Último envío: ${submitted} enviados, ${completed} operaciones completadas, ${verified} fuentes verificadas, ${failed} fallidos`, refreshGrowth: 'Actualizar estado',
 };
 const ptBR: Partial<typeof zh> = {
+  ...n5['pt-BR'],
   forgetDone: (local, deleted, pending, failed) => `Cancelamentos locais: ${local}; exclusões remotas confirmadas: ${deleted}; pendentes: ${pending}; falhas: ${failed}. Esta conversa ainda pode conter a fonte.`,
   candidate: 'Candidata', deprecated: 'Revogada', reviewOk: 'Concluída', reviewFailed: 'Falhou', reviewInterrupted: 'Interrompida', reviewBlocked: 'Aguardando os controles de cancelamento e orçamento', proposalCount: (n) => `${n} propostas`, backgroundUnpaused: 'Sem pausa por memória',
   growth: 'Crescimento e exploração', growthLoading: 'Carregando estado do crescimento…', growthSchedule: 'Revisão periódica', enabled: 'Ativada', off: 'Desativada', paused: 'Pausada', running: 'Em andamento', notRun: 'Ainda não executada', nextReview: 'Próxima revisão', lastReview: 'Última revisão', lastReviewError: 'Último erro', backgroundWork: 'Atividade em segundo plano',
@@ -324,6 +413,7 @@ const ptBR: Partial<typeof zh> = {
   lastDelivery: (submitted, completed, verified, failed) => `Último envio: ${submitted} enviados, ${completed} operações concluídas, ${verified} fontes verificadas, ${failed} falhas`, refreshGrowth: 'Atualizar estado',
 };
 const it: Partial<typeof zh> = {
+  ...n5.it,
   forgetDone: (local, deleted, pending, failed) => `Annullamenti locali: ${local}; eliminazioni remote confermate: ${deleted}; in attesa: ${pending}; errori: ${failed}. La conversazione attiva può contenere ancora questa fonte.`,
   candidate: 'Candidata', deprecated: 'Revocata', reviewOk: 'Completata', reviewFailed: 'Non riuscita', reviewInterrupted: 'Interrotta', reviewBlocked: 'In attesa delle verifiche su annullamento e budget', proposalCount: (n) => `${n} proposte`, backgroundUnpaused: 'Nessuna pausa per memoria',
   growth: 'Crescita ed esplorazione', growthLoading: 'Caricamento dello stato…', growthSchedule: 'Revisione periodica', enabled: 'Attiva', off: 'Disattiva', paused: 'In pausa', running: 'In corso', notRun: 'Non ancora eseguita', nextReview: 'Prossima revisione', lastReview: 'Ultima revisione', lastReviewError: 'Ultimo errore', backgroundWork: 'Attività in background',
@@ -340,6 +430,7 @@ const it: Partial<typeof zh> = {
   lastDelivery: (submitted, completed, verified, failed) => `Ultimo invio: ${submitted} inviati, ${completed} operazioni completate, ${verified} fonti verificate, ${failed} non riusciti`, refreshGrowth: 'Aggiorna lo stato',
 };
 const ru: Partial<typeof zh> = {
+  ...n5.ru,
   forgetDone: (local, deleted, pending, failed) => `Отменено локально: ${local}; удаление подтверждено: ${deleted}; ожидает: ${pending}; ошибок: ${failed}. В текущем разговоре источник может остаться.`,
   candidate: 'Кандидат', deprecated: 'Отозвана', reviewOk: 'Завершено', reviewFailed: 'Ошибка', reviewInterrupted: 'Прервано', reviewBlocked: 'Ожидает проверки отмены и бюджета', proposalCount: (n) => `Предложений: ${n}`, backgroundUnpaused: 'Нет паузы из-за памяти',
   growth: 'Рост и исследование', growthLoading: 'Загрузка состояния…', growthSchedule: 'Периодический обзор', enabled: 'Включено', off: 'Выключено', paused: 'Приостановлено', running: 'Выполняется', notRun: 'Ещё не запускалось', nextReview: 'Следующий обзор', lastReview: 'Последний обзор', lastReviewError: 'Последняя ошибка', backgroundWork: 'Фоновые задачи',
