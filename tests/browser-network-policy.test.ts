@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-const { isPublicResolvedHost } = require('../app/browser-network-policy.cjs') as {
+const { isPublicResolvedHost, isWebSocketRequest } = require('../app/browser-network-policy.cjs') as {
   isPublicResolvedHost(result: { endpoints?: Array<{ address: string }> }): boolean;
+  isWebSocketRequest(details: { url?: string; resourceType?: string }): boolean;
 };
 
 describe('Browser resolved-address policy', () => {
@@ -21,5 +22,12 @@ describe('Browser resolved-address policy', () => {
     }
     expect(isPublicResolvedHost({ endpoints: [{ address: '8.8.8.8' }, { address: '10.0.0.1' }] })).toBe(false);
     expect(isPublicResolvedHost({ endpoints: [] })).toBe(false);
+  });
+
+  it('refuses WebSocket requests by resource type or URL scheme', () => {
+    expect(isWebSocketRequest({ url: 'ws://127.0.0.1/socket', resourceType: 'other' })).toBe(true);
+    expect(isWebSocketRequest({ url: 'wss://example.com/socket', resourceType: 'other' })).toBe(true);
+    expect(isWebSocketRequest({ url: 'https://example.com/socket', resourceType: 'webSocket' })).toBe(true);
+    expect(isWebSocketRequest({ url: 'https://example.com/api', resourceType: 'xhr' })).toBe(false);
   });
 });

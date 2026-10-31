@@ -78,4 +78,14 @@ function isPublicResolvedHost(result) {
   });
 }
 
-module.exports = { isPublicResolvedHost };
+function isWebSocketRequest(details) {
+  if (details?.resourceType === 'webSocket') return true;
+  try {
+    const protocol = new URL(String(details?.url ?? '')).protocol;
+    return protocol === 'ws:' || protocol === 'wss:';
+  } catch {
+    return false;
+  }
+}
+
+module.exports = { isPublicResolvedHost, isWebSocketRequest };

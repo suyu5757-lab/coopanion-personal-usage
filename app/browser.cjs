@@ -13,7 +13,7 @@
  * The app uses Electron's internal debugger only to set a validated media selection on a page file input; it
  * does not open a remote debugging port.
  * Requests to this machine and the local network are cancelled, so a page cannot reach the Core's console
- * or the pet's server.
+ * or the pet's server. WebSocket requests are refused until their network peer can be checked.
  */
 const { BrowserWindow, screen, session } = require('electron');
 const { randomUUID } = require('node:crypto');
@@ -23,7 +23,7 @@ const { MAX_IMAGE_BYTES, generatedImagePath, isChatGPTImageDownloadUrl, isChatGP
 const { acceptsUpload, isDouyinPageUrl, resolveUploadFiles } = require('./browser-upload.cjs');
 const { imagePointToViewport } = require('./browser-visual-point.cjs');
 const { compositeSnapshotId, inspectFrameHost, mapFramePointToMain: mapFramePoint } = require('./browser-frame-bridge.cjs');
-const { isPublicResolvedHost } = require('./browser-network-policy.cjs');
+const { isPublicResolvedHost, isWebSocketRequest } = require('./browser-network-policy.cjs');
 const { setFileInputFiles } = require('./browser-cdp-upload.cjs');
 
 const PARTITION = 'persist:coo-browser';
@@ -683,7 +683,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     ses.setDevicePermissionHandler(() => false);
     ses.on('will-download', handleImageDownload);
     // Check the session's resolved endpoints before every HTTP request, including frame subresources.
-    ses.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*'] }, (details, callback) => {
+    ses.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*', 'ws://*/*', 'wss://*/*'] }, (details, callback) => {
+      if (isWebSocketRequest(details)) { callback({ cancel: true }); return; }
       void isPublicDestination(details.url)
         .then((allowed) => callback({ cancel: !allowed }))
         .catch(() => callback({ cancel: true }));
