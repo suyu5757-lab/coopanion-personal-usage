@@ -52,6 +52,7 @@ const agent = () => (window as unknown as { __cooBrowserAgent: {
   snapshot(): Promise<string>;
   mediaTarget(id: number, snapshotId: string): Promise<{ id: number; mediaType: 'image' | 'video'; label: string; filenameHint: string; url: string } | null>;
   textCenter(query: string): Promise<{ ok: true; x: number; y: number; snapshotId: string } | { ok: false; reason: string }>;
+  prepareInput(index: number, expectedSnapshotId?: string): Promise<boolean>;
   pointTarget(x: number, y: number, snapshotId?: string): Promise<{ ok: true; target: { token: string; label: string; tag: string; role: string; snapshotId: string } } | { ok: false; reason: string }>;
 } }).__cooBrowserAgent;
 
@@ -68,6 +69,33 @@ beforeEach(() => {
 });
 
 describe('browser page target snapshots', () => {
+  it('focuses and selects the current text input before insertion', async () => {
+    document.body.innerHTML = '<input aria-label="Search" value="previous text">';
+    await import('../app/browser-agent/entry.ts');
+    const page = await agent().state();
+    const input = document.querySelector('input')!;
+    const target = page.elements.find((element) => element.label === 'Search');
+
+    expect(target).toBeDefined();
+    expect(document.activeElement).not.toBe(input);
+    expect(await agent().prepareInput(target!.id, page.snapshotId)).toBe(true);
+    expect(document.activeElement).toBe(input);
+    expect([input.selectionStart, input.selectionEnd]).toEqual([0, input.value.length]);
+  });
+
+  it('does not focus a text input from a stale page snapshot', async () => {
+    document.body.innerHTML = '<input aria-label="Search" value="previous text">';
+    await import('../app/browser-agent/entry.ts');
+    const page = await agent().state();
+    const input = document.querySelector('input')!;
+    const target = page.elements.find((element) => element.label === 'Search');
+    expect(target).toBeDefined();
+
+    input.setAttribute('placeholder', 'Changed after read');
+    expect(await agent().prepareInput(target!.id, page.snapshotId)).toBe(false);
+    expect(document.activeElement).not.toBe(input);
+  });
+
   it('discovers visible direct media and file links, and binds their sources to the page snapshot', async () => {
     document.body.innerHTML = '<img src="https://cdn.example.test/images/whale.png?token=secret" alt="Blue whale"><video src="https://cdn.example.test/video/clip.mp4"></video><a href="https://cdn.example.test/downloads/another.mov">Download clip</a><img src="blob:https://cdn.example.test/asset">';
     await import('../app/browser-agent/entry.ts');

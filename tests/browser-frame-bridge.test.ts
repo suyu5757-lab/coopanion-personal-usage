@@ -65,7 +65,10 @@ describe('composite frame snapshots', () => {
     expect(compositeSnapshotId('root-snapshot', [frame])).toBe(baseline);
     expect(compositeSnapshotId('changed-root', [frame])).not.toBe(baseline);
     expect(compositeSnapshotId('root-snapshot', [{ ...frame, frameToken: 'frame-b' }])).not.toBe(baseline);
+    expect(compositeSnapshotId('root-snapshot', [{ ...frame, parentFrameToken: 'parent-b' }])).not.toBe(baseline);
+    expect(compositeSnapshotId('root-snapshot', [{ ...frame, url: 'https://child.example/next' }])).not.toBe(baseline);
     expect(compositeSnapshotId('root-snapshot', [{ ...frame, childSnapshotId: 'snapshot-b' }])).not.toBe(baseline);
     expect(compositeSnapshotId('root-snapshot', [{ ...frame, hops: [hop({ left: 11 })] }])).not.toBe(baseline);
+    expect(compositeSnapshotId('root-snapshot', [])).not.toBe(baseline);
   });
 });
