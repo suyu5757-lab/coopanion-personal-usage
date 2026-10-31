@@ -10,6 +10,7 @@ import {
   mentionIntensityForText,
 } from './activation.ts';
 import { formatPortrait, formatRecall, formatRecallDetailed, type RecallFormatTrace } from './format.ts';
+import { captureRetrievalScores, type RetrievalScoreEvidence } from './retrieval-scores.ts';
 import { sanitizeForMemory } from './policy.ts';
 import { loadHindsightConfig, type HindsightConfig, type HindsightFileConfig } from './config.ts';
 import { DeliveryError, OutboxDelivery, type DeliveryOps, type OperationState } from './delivery.ts';
@@ -56,6 +57,7 @@ export interface MemorySearchResult {
   sourceFactsIncomplete?: boolean;
   matchScore?: number;
   activationWeight?: number;
+  retrievalScores?: RetrievalScoreEvidence;
 }
 
 export interface MemorySearchRead {
@@ -75,6 +77,7 @@ export interface MemorySearchTraceItem {
   reason?: 'forgotten-support' | 'unverified-source-fact' | 'unlinked-observation' | 'fence-unresolved' | 'ledger-unreadable';
   sourceFactsIncomplete: boolean;
   activationWeight?: number;
+  retrievalScores?: RetrievalScoreEvidence;
 }
 
 export interface MemorySearchTrace {
@@ -844,6 +847,7 @@ export class HindsightMemory {
       const verifiedSupport = new WeakSet<MemorySearchResult>();
       const traceByMapped = opts.captureTrace ? new Map<MemorySearchResult, MemorySearchTraceItem>() : undefined;
       const results = response.results.flatMap((result, resultIndex): MemorySearchResult[] => {
+        const retrievalScores = captureRetrievalScores(result.scores, resultIndex);
         const documentId = result.document_id ?? null;
         const metadata = result.metadata ? { ...result.metadata } : {};
         if (documentId && currentRevisions.has(documentId)) metadata.status = 'current';
@@ -858,6 +862,7 @@ export class HindsightMemory {
           verifiedSources: [],
           disposition: 'candidate',
           sourceFactsIncomplete: false,
+          retrievalScores,
         } : undefined;
         if (traceItem) traceItems.push(traceItem);
         let missingSourceFact = false;
@@ -906,6 +911,7 @@ export class HindsightMemory {
           type: String(result.type ?? 'memory'),
           date: String(result.occurred_start ?? result.mentioned_at ?? ''),
           documentId,
+          retrievalScores,
           ...(typeof result.scores?.reranker === 'number' && Number.isFinite(result.scores.reranker)
             ? { matchScore: result.scores.reranker }
             : typeof result.scores?.semantic === 'number' && Number.isFinite(result.scores.semantic)
@@ -986,6 +992,7 @@ export class HindsightMemory {
       ...(result.sourceFacts ? { sourceFacts: result.sourceFacts } : {}),
       ...(result.sourceFactsIncomplete ? { sourceFactsIncomplete: true } : {}),
       ...(result.activationWeight === undefined ? {} : { activationWeight: result.activationWeight }),
+      ...(result.retrievalScores ? { retrievalScores: result.retrievalScores } : {}),
     }));
     const formatOptions = {
       maxChars,

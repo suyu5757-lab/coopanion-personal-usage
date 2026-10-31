@@ -1,4 +1,5 @@
 import type { RecallResult } from '@vectorize-io/hindsight-client';
+import type { RetrievalScoreEvidence } from './retrieval-scores.ts';
 
 const MARKER = /【[^】]*】|<[^<>]*>/g;
 export const DEFAULT_ACTIVATION_RANK_INFLUENCE = 0.25;
@@ -38,6 +39,7 @@ export type FormattedRecallResult = RecallResult & {
   sourceFacts?: readonly RecallSourceFact[];
   sourceFactsIncomplete?: boolean;
   activationWeight?: number;
+  retrievalScores?: RetrievalScoreEvidence;
 };
 
 export interface RecallFormatTrace {
@@ -61,6 +63,7 @@ export interface RecallFormatTrace {
   coverageWeight: number;
   activationInfluence: number;
   activationWeights: Array<{ resultId: string; weight: number }>;
+  retrievalScores: Array<RetrievalScoreEvidence & { resultId: string }>;
   maxChars: number;
   usedChars: number;
 }
@@ -190,7 +193,7 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
       deduplicatedResultIndexes: [], deduplicatedResultIds: [],
       includedSourceDocumentIds: [], omittedSourceDocumentIds: [], incompleteResultIds: [], clippedResultIds: [],
       clippedContextResultIds: [], clippedSourceFactIds: [], sourceFactsTruncated: false, coverageWeight: 0, maxChars,
-      activationInfluence: 0, activationWeights: [],
+      activationInfluence: 0, activationWeights: [], retrievalScores: [],
       usedChars: text ? usedChars : 0,
     };
     const included = new Set(includedResultIndexes);
@@ -221,6 +224,9 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
           ? [{ resultId: candidate.result.id, weight: Math.min(1, Math.max(0, value)) }]
           : [];
       }),
+      retrievalScores: results.flatMap((result) => result.retrievalScores
+        ? [{ resultId: result.id, ...result.retrievalScores }]
+        : []),
       maxChars,
       usedChars: text ? usedChars : 0,
     };

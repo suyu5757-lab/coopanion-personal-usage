@@ -208,6 +208,14 @@ describe('Hindsight source-fact recall', () => {
       ],
       disposition: 'visible',
       sourceFactsIncomplete: false,
+      retrievalScores: {
+        source: 'hindsight-recall',
+        inputRank: 0,
+        final: { status: 'missing' },
+        reranker: { status: 'missing' },
+        semantic: { status: 'missing' },
+        keyword: { status: 'missing' },
+      },
     }]);
     expect(read.trace?.search.candidateResultIndexes).toEqual([0]);
     expect(read.trace?.search.candidateResultIds).toEqual(['observation-plan']);
@@ -587,6 +595,47 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
     expect(read.trace?.sourceFactsTokenBudget).toBe(4096);
     expect(include?.source_facts?.max_tokens).toBe(4096);
     expect(api.requests[0]?.max_tokens).toBe(300);
+  });
+
+  it('passes Hindsight scores through the memory reader while preserving service order and matchScore', async () => {
+    const api = await hindsightServer({
+      results: [
+        { id: 'first', text: 'The first synthetic result.', type: 'observation', document_id: 'doc-first', scores: { final: 0.1, reranker: 0.2, semantic: null, keyword: 3 } },
+        { id: 'second', text: 'The second synthetic result.', type: 'observation', document_id: 'doc-second', scores: { final: 0.99, reranker: 0.98, semantic: 0.97, keyword: null } },
+      ],
+      source_facts: {},
+      source_facts_truncated: false,
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-recall-score-evidence-'));
+    roots.push(root);
+    const { memory } = await configuredMemory(api.baseUrl, root);
+    const runtime = memory as unknown as HindsightMemory;
+    const search = await runtime.searchResultsDetailed('Find the synthetic results.', { captureTrace: true, activationEnabled: false });
+    const read = await runtime.recallBlockDetailed('Find the synthetic results.', { captureTrace: true, activationEnabled: false, maxItems: 1 });
+    const noTrace = await runtime.recallBlockDetailed('Find the synthetic results.', { activationEnabled: false, maxItems: 1 });
+
+    expect(search.results[0]).toMatchObject({
+      id: 'first',
+      matchScore: 0.2,
+      retrievalScores: {
+        source: 'hindsight-recall', inputRank: 0,
+        final: { status: 'present', value: 0.1 },
+        reranker: { status: 'present', value: 0.2 },
+        semantic: { status: 'missing' },
+        keyword: { status: 'present', value: 3 },
+      },
+    });
+    expect(search.trace?.items[0]?.retrievalScores).toEqual(search.results[0]?.retrievalScores);
+    expect(read.trace?.format.candidateResultIndexes).toEqual([0, 1]);
+    expect(read.trace?.format.includedResultIndexes).toEqual([0]);
+    expect(read.trace?.format.retrievalScores[0]).toMatchObject({ resultId: 'first', inputRank: 0, final: { value: 0.1 } });
+    expect(read.trace?.format.retrievalScores[1]).toMatchObject({ resultId: 'second', inputRank: 1, final: { value: 0.99 } });
+    expect(read.trace?.format.retrievalScores[0]).not.toHaveProperty('route');
+    expect(noTrace.status).toBe('found');
+    expect(noTrace.trace).toBeUndefined();
+    expect(noTrace.text).toContain('The first synthetic result.');
+    expect(noTrace.text).not.toContain('The second synthetic result.');
+    expect(read.text).toBe(noTrace.text);
   });
 
   it('keeps source facts isolated when two banks recall the same question', async () => {

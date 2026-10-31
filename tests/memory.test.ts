@@ -6,6 +6,7 @@ import type { RecallResult } from '@vectorize-io/hindsight-client';
 import { loadHindsightConfig } from '../core/memory/config.ts';
 import { hindsightConfigGroup } from '../core/memory/config-group.ts';
 import { cleanSpeech, DEFAULT_ACTIVATION_RANK_INFLUENCE, formatPortrait, formatRecall, formatRecallDetailed, type FormattedRecallResult } from '../core/memory/format.ts';
+import { captureRetrievalScores } from '../core/memory/retrieval-scores.ts';
 import { sanitizeForMemory } from '../core/memory/policy.ts';
 
 const workspace = () => mkdtempSync(join(tmpdir(), 'coo-memory-'));
@@ -204,6 +205,52 @@ describe('memory formatting', () => {
     ]);
     expect(directMatch.trace.includedResultIds).toEqual(['direct-old-event']);
     expect(directMatch.trace.includedSourceDocumentIds).toEqual(['doc-old']);
+  });
+
+  it('captures only finite retrieval score values and records missing fields without filling them', () => {
+    expect(captureRetrievalScores({ final: 0.82, reranker: null, semantic: Number.NaN, keyword: Number.POSITIVE_INFINITY, route: 'unverified' }, 3)).toEqual({
+      source: 'hindsight-recall',
+      inputRank: 3,
+      final: { status: 'present', value: 0.82 },
+      reranker: { status: 'missing' },
+      semantic: { status: 'missing' },
+      keyword: { status: 'missing' },
+    });
+    expect(captureRetrievalScores(undefined, 0)).toEqual({
+      source: 'hindsight-recall',
+      inputRank: 0,
+      final: { status: 'missing' },
+      reranker: { status: 'missing' },
+      semantic: { status: 'missing' },
+      keyword: { status: 'missing' },
+    });
+  });
+
+  it('passes score evidence to a read-only trace without changing recall text or order', () => {
+    const results = [
+      recallResult({
+        id: 'first', text: 'First result remains first.', document_id: 'doc-a',
+        retrievalScores: captureRetrievalScores({ final: 0.1, reranker: 0.2 }, 0),
+      }),
+      recallResult({
+        id: 'second', text: 'Second result has a higher synthetic score.', document_id: 'doc-b',
+        retrievalScores: captureRetrievalScores({ final: 0.99, reranker: 0.98 }, 1),
+      }),
+    ];
+    const withoutScores = results.map((result) => ({ ...result, retrievalScores: undefined }));
+    const withScores = formatRecallDetailed(results, { maxItems: 1 });
+    const baseline = formatRecallDetailed(withoutScores, { maxItems: 1 });
+    const noTrace = formatRecallDetailed(results, { maxItems: 1, captureTrace: false });
+
+    expect(withScores.text).toBe(baseline.text);
+    expect(withScores.trace.candidateResultIndexes).toEqual(baseline.trace.candidateResultIndexes);
+    expect(withScores.trace.includedResultIndexes).toEqual([0]);
+    expect(withScores.trace.retrievalScores).toMatchObject([
+      { resultId: 'first', source: 'hindsight-recall', inputRank: 0, final: { status: 'present', value: 0.1 } },
+      { resultId: 'second', source: 'hindsight-recall', inputRank: 1, final: { status: 'present', value: 0.99 } },
+    ]);
+    expect(noTrace.text).toBe(withScores.text);
+    expect(noTrace.trace.retrievalScores).toEqual([]);
   });
 
   it('preserves distinct supporting facts for duplicate observations with the same source document', () => {

@@ -156,7 +156,7 @@ describe('memory evaluation contract', () => {
       includedResultIndexes: [0, 1], includedResultIds: ['observation', 'direct'], omittedResultIndexes: [], omittedResultIds: [],
       deduplicatedResultIndexes: [], deduplicatedResultIds: [], includedSourceDocumentIds: ['doc-a', 'doc-b'], omittedSourceDocumentIds: [],
       incompleteResultIds: [], clippedResultIds: [], clippedContextResultIds: [], clippedSourceFactIds: [],
-      sourceFactsTruncated: false, coverageWeight: 0.5, activationInfluence: DEFAULT_ACTIVATION_RANK_INFLUENCE, activationWeights: [], maxChars: 2000, usedChars: 400,
+      sourceFactsTruncated: false, coverageWeight: 0.5, activationInfluence: DEFAULT_ACTIVATION_RANK_INFLUENCE, activationWeights: [], retrievalScores: [], maxChars: 2000, usedChars: 400,
     }, { finalAnswer: 'doc-a and doc-b support the answer.', citationSourceIds: ['doc-a', 'doc-b'], citationCorrect: true, hallucinationDetected: false, sqliteDeltaBytes: 24, activationComputations: 3, activationStateRestored: true });
 
     expect(observation.sourceIdsAt5).toEqual([['doc-a'], ['doc-b']]);
