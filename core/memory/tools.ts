@@ -5,6 +5,7 @@ import { MEMORY_SEARCH_DESCRIPTION, memoryReadNotice } from './model-text.ts';
 export interface MemoryToolDeps {
   memory: () => HindsightMemory | null;
   currentUserSource?: (session: string) => string | null;
+  currentReadSource?: (session: string) => string | null;
 }
 
 const text = (args: Record<string, unknown>, key: string): string =>
@@ -22,12 +23,18 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         properties: {
           query: { type: 'string', description: 'What to look for, in natural language.' },
           max_tokens: { type: 'integer', description: 'How much memory text to bring back; 400–2000, default 900.' },
+          sources: { type: 'boolean', description: 'Use a short literal phrase to search original retained text when semantic recall lacks a needed detail. Returns bounded source excerpts.' },
         },
         required: ['query'],
       },
-      handler: async (args) => {
+      handler: async (args, ctx) => {
         const memory = deps.memory();
         if (!memory?.enabled()) return '[memory] Long-term memory is not available.';
+        if (args.sources === true) {
+          const excludeDocumentId = deps.currentReadSource?.(ctx.role) ?? deps.currentUserSource?.(ctx.role) ?? undefined;
+          const read = await memory.searchSourceDocuments(text(args, 'query'), { excludeDocumentId });
+          return read.text || memoryReadNotice(read.status);
+        }
         const maxTokens = typeof args.max_tokens === 'number' && Number.isFinite(args.max_tokens)
           ? Math.min(2000, Math.max(400, Math.round(args.max_tokens)))
           : undefined;

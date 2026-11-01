@@ -21,9 +21,11 @@ import { planRecall, type RecallRoute } from './router.ts';
 import { partnerSourceScopeDigest } from './partner-provenance.ts';
 import { sourceFactsTokenBudget as resolveSourceFactsTokenBudget, recallContextCharBudget } from './recall-limits.ts';
 import { summarizeSourceFacts, type SourceFactCounts } from './recall-evidence.ts';
+import { SOURCE_LOOKUP_HEADER } from './model-text.ts';
 
 export type MemoryReadStatus = 'found' | 'absent' | 'unavailable' | 'fenced';
 export type TurnRecallStatus = MemoryReadStatus | 'skipped';
+export const SOURCE_LOOKUP_LIMITS = { pageSize: 250, maxDocuments: 2048, maxSourceReads: 1024, concurrency: 4, maxSources: 6, maxChars: 8000 } as const;
 
 export interface MemoryTextRead {
   text: string;
@@ -165,6 +167,20 @@ export interface TurnRecallReceipt {
   clippedResults: number;
   includedSourceFactHashes: string[];
   includedSourceDocumentHashes: string[];
+}
+
+export interface SourceLookupReceipt {
+  at: string;
+  queryHash: string;
+  contextHash: string;
+  contextChars: number;
+  elapsedMs: number;
+  status: MemoryReadStatus;
+  sourceDocumentHashes: string[];
+  clippedSourceDocumentHashes: string[];
+  scannedDocuments: number;
+  sourceReads: number;
+  scanIncomplete: boolean;
 }
 
 export interface ForgetResult {
@@ -311,6 +327,7 @@ export class HindsightMemory {
   private drainTimer: ReturnType<typeof setInterval> | null = null;
   private recallCache = new Map<string, { at: number; value: string; trace?: MemoryRecallTrace }>();
   private lastRecall: TurnRecallReceipt | null = null;
+  private lastSourceLookup: SourceLookupReceipt | null = null;
   private recallStats = { fast: 0, standard: 0, deep: 0, measured: 0, totalMs: 0 };
   /** Incremented by every invalidation; an in-flight read from an older epoch is discarded. */
   private cacheEpoch = 0;
@@ -353,6 +370,7 @@ export class HindsightMemory {
     this.failedRefreshEpochs.clear();
     this.recallStats = { fast: 0, standard: 0, deep: 0, measured: 0, totalMs: 0 };
     this.lastRecall = null;
+    this.lastSourceLookup = null;
     this.cacheEpoch += 1;
     this.latestDelivery = null;
     this.briefing = null;
@@ -1055,6 +1073,97 @@ export class HindsightMemory {
 
   async recallBlock(query: string, opts: RecallOptions = {}): Promise<string> {
     return (await this.recallBlockDetailed(query, opts)).text;
+  }
+
+  /** Bounded literal lookup of original sources when semantic recall omits a needed detail. */
+  async searchSourceDocuments(query: string, opts: { excludeDocumentId?: string } = {}): Promise<MemoryTextRead> {
+    const started = Date.now();
+    const asked = sanitizeForMemory(query).text.trim().slice(0, 120);
+    const sourceIds: string[] = [], clippedIds: string[] = [];
+    let scannedDocuments = 0, sourceReads = 0, scanIncomplete = false;
+    const digest = (text: string) => createHash('sha256').update(text).digest('hex');
+    const finish = (text: string, status: MemoryReadStatus): MemoryTextRead => {
+      this.lastSourceLookup = {
+        at: new Date().toISOString(), queryHash: digest(asked), contextHash: digest(text), contextChars: text.length,
+        elapsedMs: Date.now() - started, status,
+        sourceDocumentHashes: text ? sourceIds.map(digest) : [], clippedSourceDocumentHashes: text ? clippedIds.map(digest) : [],
+        scannedDocuments, sourceReads, scanIncomplete,
+      };
+      return { text, status };
+    };
+    if (!asked) return finish('', 'absent');
+    if (this.forgetScanDepth > 0) return finish('', 'fenced');
+    if (!this.stateStore || !this.outbox?.readable() || !this.ledger || this.ledger.damaged()) return finish('', 'fenced');
+    if (!this.canTry() || !await this.ensureStarted()) return finish('', 'unavailable');
+    const config = this.config!, epoch = this.cacheEpoch, fence = this.visibilityEpoch();
+    const deadline = AbortSignal.timeout(config.recall.timeoutMs);
+    const lines = [SOURCE_LOOKUP_HEADER];
+    const { maxChars, maxDocuments, maxSourceReads, maxSources, pageSize, concurrency } = SOURCE_LOOKUP_LIMITS;
+    let used = SOURCE_LOOKUP_HEADER.length;
+    let blocked = false;
+    try {
+      const superseded = this.stateStore.supersededSources(config.bankId, config.apiUrl);
+      const currentRevisions = this.stateStore.currentRevisionSources(config.bankId, config.apiUrl);
+      const seen = new Set<string>();
+      let offset = 0, total = Infinity;
+      while (offset < total && offset < maxDocuments && sourceReads < maxSourceReads && sourceIds.length < maxSources) {
+        // The installed 0.10 server's q filters IDs only; inspect bounded original user sources.
+        const page = await this.client!.listDocuments(config.bankId, { limit: Math.min(pageSize, maxDocuments - offset), offset, signal: deadline });
+        total = page.total; offset += page.items.length;
+        if (page.items.length === 0) break;
+        let processed = 0;
+        for (let index = 0; index < page.items.length; index += concurrency) {
+          if (scannedDocuments >= maxDocuments || sourceReads >= maxSourceReads || sourceIds.length >= maxSources || maxChars - used < 250) break;
+          const pending = page.items.slice(index, index + concurrency).flatMap(candidate => {
+            if (scannedDocuments >= maxDocuments || sourceReads >= maxSourceReads) return [];
+            processed += 1;
+            if (seen.has(candidate.id)) return [];
+            seen.add(candidate.id); scannedDocuments += 1;
+            if (candidate.id === opts.excludeDocumentId) return [];
+            if (this.forgottenSource(candidate.id)) { blocked = true; return []; }
+            if (candidate.bank_id && candidate.bank_id !== config.bankId) return [];
+            const preview = candidate.document_metadata;
+            if (preview && (preview.source_actor !== 'user' || preview.kind !== 'event')) return [];
+            sourceReads += 1;
+            return [this.client!.getDocument(config.bankId, candidate.id, { signal: deadline }).then(doc => ({ candidate, doc }))];
+          });
+          const documents = await Promise.all(pending);
+          if (epoch !== this.cacheEpoch || fence !== this.visibilityEpoch()) return finish('', 'fenced');
+          for (const { candidate, doc } of documents) {
+            if (sourceIds.length >= maxSources) break;
+            if (!doc || doc.id !== candidate.id || doc.bank_id !== config.bankId || this.forgottenSource(doc.id)) continue;
+            const metadata = doc.document_metadata ?? {};
+            if (metadata.source_actor !== 'user' || metadata.kind !== 'event') continue;
+            const safe = sanitizeForMemory(doc.original_text ?? '');
+            if (!safe.text || !safe.text.toLowerCase().includes(asked.toLowerCase())) continue;
+            const state = currentRevisions.has(doc.id) ? 'current' : superseded.has(doc.id) ? 'superseded'
+              : typeof metadata.status === 'string' ? metadata.status : 'unknown';
+            const at = typeof metadata.said_at === 'string' ? metadata.said_at : doc.created_at;
+            const prefix = `\n- (source_id:${doc.id}, recorded_at:${at}, actor:user, record_status:${state}) `;
+            const notice = '\n  [Source excerpt truncated.]';
+            const remaining = maxChars - used - prefix.length;
+            if (remaining <= notice.length) break;
+            const clipped = safe.text.length > remaining;
+            const text = clipped ? safe.text.slice(0, remaining - notice.length) + notice : safe.text;
+            const line = prefix + text;
+            lines.push(line); used += line.length; sourceIds.push(doc.id);
+            if (clipped) clippedIds.push(doc.id);
+          }
+        }
+        scanIncomplete = offset < total || processed < page.items.length;
+        if (processed < page.items.length) break;
+      }
+      if (epoch !== this.cacheEpoch || fence !== this.visibilityEpoch()) return finish('', 'fenced');
+      if (sourceIds.length) return finish(lines.join(''), 'found');
+      if (blocked) return finish('', 'fenced');
+      return scanIncomplete
+        ? finish('[memory] No matching original user source appeared in this bounded scan. The bank was not searched completely; this does not establish that the event is absent.', 'absent')
+        : finish('', 'absent');
+    } catch (err) {
+      scanIncomplete = true;
+      if (!deadline.aborted) this.noteFailure('source-search', err);
+      return finish('', 'unavailable');
+    }
   }
 
   /**
@@ -1888,7 +1997,7 @@ export class HindsightMemory {
     deletions: ReturnType<ForgetLedger['status']> | null;
     forget: { tombstones: number; unresolved: number; stale: boolean; damaged: boolean } | null;
     lastDelivery: { at: number; submitted: number; completed: number; verified: number; failed: number } | null;
-    recall: { fast: number; standard: number; deep: number; measured: number; avgMs: number; last: TurnRecallReceipt | null; limits: { timeoutMs?: number; maxSourceFactsTokens: number } };
+    recall: { fast: number; standard: number; deep: number; measured: number; avgMs: number; last: TurnRecallReceipt | null; sourceLookup: SourceLookupReceipt | null; limits: { timeoutMs?: number; maxSourceFactsTokens: number } };
     recent: Array<{ id: string; text: string; date: string; type: string; documentId: string | null; status?: string }>;
   }> {
     const health = await this.health();
@@ -1916,6 +2025,7 @@ export class HindsightMemory {
         measured: this.recallStats.measured,
         avgMs: this.recallStats.measured > 0 ? Math.round(this.recallStats.totalMs / this.recallStats.measured) : 0,
         last: this.lastRecall,
+        sourceLookup: this.lastSourceLookup,
         limits: { timeoutMs: this.config?.recall.timeoutMs, maxSourceFactsTokens: resolveSourceFactsTokenBudget(this.config?.recall.maxSourceFactsTokens) },
       },
       recent: health.ok ? await this.recent(limit) : [],

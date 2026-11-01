@@ -592,6 +592,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       });
       return [...base, ...memoryTools({
         memory: () => this.longTerm,
+        currentReadSource: (session) => session === 'main' ? this.lastUserMemory?.documentId ?? null : null,
         currentUserSource: (session) => session === 'main' && Date.now() - (this.lastUserMemory?.at ?? 0) < FORGET_WINDOW_MS
           ? this.lastUserMemory?.documentId ?? null
           : null,
