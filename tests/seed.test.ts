@@ -21,6 +21,8 @@ describe('first-run seed', () => {
       const home = mkdtempSync(join(tmpdir(), 'cc-seed-'));
       const vendor = firstVendor(language), endpoint = endpointName(vendor, defaultRegion(language));
       seed(home, language);
+      const orientation = readFileSync(join(home, DEPLOYMENT, 'prompts', 'ORIENTATION.md'), 'utf8');
+      expect(orientation).toContain(language === 'zh' ? '## 社交情境与安全' : '## Social situations and safety');
       expect(read(join(home, DEPLOYMENT, 'deployment.json'))).toEqual({ bot: 'cormini' });
       expect(read(join(home, DEPLOYMENT, 'config.json'))).toMatchObject({
         activeProvider: endpoint,
