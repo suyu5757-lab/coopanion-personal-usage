@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { HindsightMemory } from '../core/memory/hindsight.ts';
+import { partnerSourceScopeDigest } from '../core/memory/partner-provenance.ts';
 
 const result = (documentId: string) => ({
   id: `fact-${documentId}`,
@@ -43,6 +44,20 @@ describe('memory recall outcomes', () => {
 
     expect(await absent.searchResultsDetailed('a past fact')).toMatchObject({ results: [], status: 'absent' });
     expect(await unavailable.searchResultsDetailed('a past fact')).toMatchObject({ results: [], status: 'unavailable' });
+  });
+
+  it('keeps derived paragraph sources within the active, visible source scope', () => {
+    const visible = memoryFor(async () => ({ results: [] }));
+    const forgotten = memoryFor(async () => ({ results: [] }), { forgotten: (id) => id === 'source-forgotten' });
+    const superseded = memoryFor(async () => ({ results: [] }));
+    const internal = superseded as unknown as { stateStore: { supersededSources: () => Set<string> } };
+    internal.stateStore.supersededSources = () => new Set(['source-old']);
+
+    expect(visible.sourceScopeDigest()).toBe(partnerSourceScopeDigest('test-bank', 'http://hindsight.test'));
+    expect(visible.sourceCurrentForContext('source-current')).toBe(true);
+    expect(forgotten.sourceCurrentForContext('source-forgotten')).toBe(false);
+    expect(superseded.sourceCurrentForContext('source-old')).toBe(false);
+    expect(visible.sourceCurrentForContext('')).toBe(false);
   });
 
   it('reports source-fenced results as restricted and preserves visible evidence', async () => {

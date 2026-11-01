@@ -18,6 +18,7 @@ import { MemoryOutbox, readLegacyOutbox, type OutboxItem, type RetainItem } from
 import { ForgetLedger, readLegacyForget, type DeletionInput } from './forget-ledger.ts';
 import { openMemoryStateStore, type MemoryStateStore } from './state-store.ts';
 import { planRecall, type RecallRoute } from './router.ts';
+import { partnerSourceScopeDigest } from './partner-provenance.ts';
 
 export type MemoryReadStatus = 'found' | 'absent' | 'unavailable' | 'fenced';
 export type TurnRecallStatus = MemoryReadStatus | 'skipped';
@@ -1711,6 +1712,21 @@ export class HindsightMemory {
     const ledger = this.ledger;
     if (!documentId || !this.enabled() || !config || !ledger || ledger.damaged()) return false;
     return !ledger.forgotten(config.bankId, config.apiUrl, documentId);
+  }
+
+  /** A source used in a derived persona paragraph must not be fenced or superseded in local state. */
+  sourceCurrentForContext(documentId: string): boolean {
+    const config = this.config;
+    const store = this.stateStore;
+    if (!this.sourceVisible(documentId) || !config || !store || this.storageError) return false;
+    try { return !store.supersededSources(config.bankId, config.apiUrl).has(documentId); }
+    catch { return false; }
+  }
+
+  /** A content-free identity for the configured source namespace used by the partner sidecar. */
+  sourceScopeDigest(): string | null {
+    const config = this.config;
+    return config ? partnerSourceScopeDigest(config.bankId, config.apiUrl) : null;
   }
 
   /** Whether a persisted forget fence covers this source, independent of whether Memory is enabled. */

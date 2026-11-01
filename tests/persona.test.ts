@@ -10,14 +10,16 @@ import { AUTHOR_COO, PARTNER_DIR, PARTNER_FILE, PARTNER_NOTE, SNAPSHOT_TAG, arra
 import { ActionGate } from '../core/action-gate.ts';
 import { authorizeFileSystemAction } from '../core/action-authorization.ts';
 import { ActionReceiptLedger, actionReceiptDuplicateKey } from '../core/action-receipts.ts';
+import { partnerProvenancePath, partnerSegmentDigest, partnerWorkspaceDigest, writePartnerProvenance } from '../core/memory/partner-provenance.ts';
 
 const CoopanionPersona = coopanionPersona(Cormini);
 const ctx = { role: 'main', log: { emit: () => {}, warn: () => {}, error: () => {}, info: () => {}, debug: () => {} } } as never;
 const git = (dir: string, ...args: string[]) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' }).trim();
 
-function persona() {
+function persona(growthStateFile?: string) {
   const dir = mkdtempSync(join(tmpdir(), 'coo-persona-'));
-  const p = new CoopanionPersona({ memoryDir: dir });
+  const Persona = growthStateFile ? coopanionPersona(Cormini, { growthStateFile }) : CoopanionPersona;
+  const p = new Persona({ memoryDir: dir });
   const tool = (name: string): ToolDef => p.declareSessions()[0]!.tools().find((t) => t.name === name)!;
   return { dir, p, run: (name: string, args: Record<string, unknown>) => tool(name).handler(args, ctx) };
 }
@@ -80,14 +82,54 @@ describe.skipIf(!gitInstalled())('Coo’s workspace history', () => {
 });
 
 describe('PARTNER.md', () => {
-  it('goes into the prefix whole and cannot be deleted', async () => {
-    const { p, run } = persona();
-    await run('write_file', { path: PARTNER_FILE, content: 'Likes cats. Works late.' });
-    const prefix = (await p.systemSegments({ now: new Date(), timezone: 'UTC', worlds: [] })).map((s) => s.text).join('\n');
-    expect(prefix).toContain(`${PARTNER_NOTE}
+  it('includes a user-authored paragraph only when its private sidecar matches', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'coo-persona-app-state-'));
+    const stateFile = join(stateDir, 'app-state', 'growth.json');
+    const { dir: workspace, p, run } = persona(stateFile);
+    try {
+      await run('write_file', { path: PARTNER_FILE, content: 'Likes cats. Works late.' });
+      const privateRoot = join(stateDir, 'app-state');
+      writePartnerProvenance(partnerProvenancePath(privateRoot, workspace), {
+        v: 1,
+        workspaceDigest: partnerWorkspaceDigest(workspace),
+        entries: [{
+          id: '11111111111111111111111111111111',
+          segmentDigest: partnerSegmentDigest('Likes cats. Works late.'),
+          origin: 'user-authored',
+          sourceIds: [],
+          sourceScopeDigest: null,
+          state: 'current',
+        }],
+      });
+      const prefix = (await p.systemSegments({ now: new Date(), timezone: 'UTC', worlds: [] })).map((s) => s.text).join('\n');
+      expect(prefix).toContain(`${PARTNER_NOTE}
 
 Likes cats. Works late.`);
-    expect(String(await run('delete_file', { path: PARTNER_FILE }))).toContain('[delete failed]');
+      expect(String(await run('read_file', { path: PARTNER_FILE }))).toContain('Likes cats. Works late.');
+      const grep = String(await run('grep_files', { pattern: 'cats', path: '.' }));
+      expect(grep).toContain('[search failed]');
+      expect(grep).not.toContain('Likes cats.');
+      expect(String(await run('delete_file', { path: PARTNER_FILE }))).toContain('[delete failed]');
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('withholds legacy paragraphs when their sidecar is missing', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'coo-persona-state-'));
+    const { dir, p, run } = persona(join(stateDir, 'growth.json'));
+    try {
+      await run('write_file', { path: PARTNER_FILE, content: 'Legacy private note.' });
+      const prefix = (await p.systemSegments({ now: new Date(), timezone: 'UTC', worlds: [] })).map((s) => s.text).join('\n');
+      expect(prefix).not.toContain('Legacy private note.');
+      expect(prefix).toContain('provenance sidecar is missing');
+      expect(prefix).toContain('unknown, not false');
+      expect(String(await run('read_file', { path: PARTNER_FILE }))).not.toContain('Legacy private note.');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 });
 

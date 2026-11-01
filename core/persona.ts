@@ -32,6 +32,14 @@ import { memoryTools } from './memory/tools.ts';
 import type { HindsightMemory } from './memory/hindsight.ts';
 import { isMemoryForgetRequest } from './memory/router.ts';
 import { memoryStorageText } from './memory/strings.ts';
+import {
+  filterPartnerMarkdown,
+  markPartnerDerivedStale,
+  markPartnerSourcesStale,
+  partnerProvenancePath,
+  partnerWorkspaceDigest,
+  readPartnerProvenance,
+} from './memory/partner-provenance.ts';
 import { SESSION_MAX_CALLS, type SelfTimeConfig } from './browser/config.ts';
 import { selfTimeLine } from './browser/model-text.ts';
 import { GROWTH_DEFAULTS, type GrowthConfig } from './growth/config.ts';
@@ -51,10 +59,9 @@ import { writeState } from './state-file.ts';
 export const PARTNER_FILE = 'PARTNER.md';
 /** The workspace directory for details about the person that PARTNER.md leaves out; Coo reads them when needed. */
 export const PARTNER_DIR = 'partner';
-/** Heads the partner segment: the segment is the whole file on every request, so its length is paid each time. */
-export const PARTNER_NOTE = `${PARTNER_FILE} in your workspace, below, is read in full on every request. Keep it a short, distilled portrait `
-  + `of the person: merge or drop what is outdated. Put stories, logs and longer notes in files under ${PARTNER_DIR}/ and read them `
-  + 'when needed.';
+/** Heads the partner segment: only paragraphs with current provenance are included in the prefix. */
+export const PARTNER_NOTE = `${PARTNER_FILE} in your workspace is paired with a private provenance sidecar. Only unchanged paragraphs with current provenance are included below. `
+  + 'Untracked, stale, edited or ambiguous paragraphs are withheld; treat omitted details as unknown, not false.';
 /** Commits of Coo's own writes. */
 export const AUTHOR_COO: GitAuthor = { name: 'coo', email: 'coo@persona.local' };
 /** Commits the app makes on its own: the snapshot at start. */
@@ -227,6 +234,13 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       super.attach(core);
       this.longTerm?.setLifecycleHooks({
         forgetSources: (ids) => {
+          let sidecarError: unknown;
+          const sidecar = this.partnerProvenanceFile();
+          const scope = this.longTerm?.sourceScopeDigest();
+          if (sidecar && scope) {
+            try { markPartnerSourcesStale(sidecar, partnerWorkspaceDigest(this.memoryDir), scope, ids); }
+            catch (error) { sidecarError = error; }
+          }
           const forgotten = new Set(ids);
           const policies = this.experienceCards()?.list().filter((card) => card.sourceIds.some((id) => forgotten.has(id))) ?? [];
           const removed = this.growthProposals()?.removeBySource(ids) ?? 0;
@@ -236,11 +250,19 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             const detail = titles.length ? ` Withdraw these policies: ${titles.join('; ')}.` : '';
             this.injectMemoryContext(`[memory] A source was forgotten. Do not rely on any proposal or experience policy derived from it; the linked records were removed.${detail}`);
           }
+          if (sidecarError) throw sidecarError;
         },
         clearDerived: () => {
+          let sidecarError: unknown;
+          const sidecar = this.partnerProvenanceFile();
+          if (sidecar) {
+            try { markPartnerDerivedStale(sidecar, partnerWorkspaceDigest(this.memoryDir), this.longTerm?.sourceScopeDigest() ?? null); }
+            catch (error) { sidecarError = error; }
+          }
           this.growthProposals()?.clear();
           this.experienceCards()?.clear();
           this.injectMemoryContext('[memory] Long-term memory was cleared. Disregard all Hindsight-derived experience strategies injected earlier in this session; none remain active.');
+          if (sidecarError) throw sidecarError;
         },
       });
       if (!this.growthStateFile) return;
@@ -442,15 +464,68 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return join(this.memoryDir, PARTNER_FILE);
     }
 
+    private partnerProvenanceFile(): string | null {
+      const root = this.growthDirectory();
+      return root ? partnerProvenancePath(root, this.memoryDir) : null;
+    }
+
+    private workspaceRelativePath(candidate: unknown): string | null {
+      if (typeof candidate !== 'string' || !candidate.trim()) return null;
+      const root = resolve(this.memoryDir);
+      const absolute = resolve(root, candidate.replace(/\\/g, '/'));
+      const path = relative(root, absolute).split(sep).join('/');
+      return !path || path === '.' || path.startsWith('../') || isAbsolute(path) ? null : path;
+    }
+
+    private searchMayIncludeProvenance(path: string | null): boolean {
+      if (path === null || path === '.') return true;
+      const protectedPaths = [PARTNER_FILE, PARTNER_DIR, 'handoffs'];
+      return protectedPaths.some((protectedPath) => path === protectedPath || path.startsWith(`${protectedPath}/`) || protectedPath.startsWith(`${path}/`));
+    }
+
+    private partnerProvenanceResult(source?: string) {
+      const file = this.partnerDocFile();
+      if (!existsSync(file) || !statSync(file).isFile() || !insidePath(realpathSync(this.memoryDir), realpathSync(file))) {
+        return filterPartnerMarkdown('', { status: 'missing' }, this.longTerm?.sourceScopeDigest() ?? null, () => false);
+      }
+      source ??= readFileSync(file, 'utf8');
+      const sidecar = this.partnerProvenanceFile();
+      const provenance = sidecar ? readPartnerProvenance(sidecar, partnerWorkspaceDigest(this.memoryDir)) : { status: 'missing' as const };
+      return filterPartnerMarkdown(source, provenance, this.longTerm?.sourceScopeDigest() ?? null,
+        (sourceId) => this.longTerm?.sourceCurrentForContext(sourceId) === true);
+    }
+
+    private partnerDocumentForRead(): string {
+      const result = this.partnerProvenanceResult();
+      return result.text || '[read failed] PARTNER.md paragraphs are withheld because their provenance is not current.';
+    }
+
     protected override writeGuard(op: 'write' | 'append' | 'rename' | 'delete', path: string, role: string): string | null {
       if (isWorkspaceGitMetadataPath(this.memoryDir, path)) return 'Git metadata is not available through workspace tools.';
       return super.writeGuard(op, path, role);
     }
 
     protected override partnerDoc(): string {
-      return `${PARTNER_NOTE}
-
-${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
+      const file = this.partnerDocFile();
+      let source = '';
+      try {
+        if (!existsSync(file)) return `${PARTNER_NOTE}\n\n(${PARTNER_FILE} is empty.)`;
+        if (!statSync(file).isFile() || !insidePath(realpathSync(this.memoryDir), realpathSync(file))) {
+          return `${PARTNER_NOTE}\n\n[system] PARTNER.md is withheld because its workspace path is invalid.`;
+        }
+        source = readFileSync(file, 'utf8');
+      } catch {
+        return `${PARTNER_NOTE}\n\n[system] PARTNER.md is withheld because it could not be safely read.`;
+      }
+      if (!source.trim()) return `${PARTNER_NOTE}\n\n(${PARTNER_FILE} is empty.)`;
+      const filtered = this.partnerProvenanceResult(source);
+      const notice = filtered.status !== 'ok'
+        ? `[system] PARTNER.md content is withheld because its provenance sidecar is ${filtered.status}. The omitted statements are unknown, not false.`
+        : filtered.withheldSegments > 0
+          ? '[system] Some PARTNER.md paragraphs are withheld because their provenance is missing, stale, edited or ambiguous. The omitted statements are unknown, not false.'
+          : '';
+      const body = filtered.text || '(No partner paragraphs have current provenance.)';
+      return `${PARTNER_NOTE}\n\n${body}${notice ? `\n\n${notice}` : ''}`;
     }
 
     /**
@@ -500,6 +575,15 @@ ${super.partnerDoc() || `(${PARTNER_FILE} is empty.)`}`;
           handler: async (args: Record<string, unknown>, ctx: ToolCallContext) => {
             if (isWorkspaceGitMetadataPath(this.memoryDir, args[pathArgument])) {
               return `[workspace read failed] Git metadata is not available through workspace tools.`;
+            }
+            const path = this.workspaceRelativePath(args[pathArgument]);
+            if (tool.name === 'read_file' && path === PARTNER_FILE) return this.partnerDocumentForRead();
+            if (tool.name === 'read_file' && path
+              && (path.startsWith(`${PARTNER_DIR}/`) || path.startsWith('handoffs/'))) {
+              return '[read failed] This workspace area is withheld until its content has provenance sidecar entries.';
+            }
+            if (tool.name === 'grep_files' && this.searchMayIncludeProvenance(path)) {
+              return '[search failed] The requested scope may include partner or handoff notes; read only eligible files directly.';
             }
             return tool.handler(args, ctx);
           },

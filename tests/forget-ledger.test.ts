@@ -11,6 +11,7 @@ import { OutboxDelivery } from '../core/memory/delivery.ts';
 import { HindsightMemory, type MemorySearchRead, type MemoryTextRead } from '../core/memory/hindsight.ts';
 import { ExperienceCards } from '../core/growth/experience-cards.ts';
 import { GrowthProposals } from '../core/growth/proposals.ts';
+import { partnerProvenancePath, partnerSegmentDigest, partnerSourceScopeDigest, partnerWorkspaceDigest, readPartnerProvenance, writePartnerProvenance } from '../core/memory/partner-provenance.ts';
 import { coopanionPersona } from '../core/persona.ts';
 
 const roots: string[] = [];
@@ -370,6 +371,40 @@ describe('remote deletion tasks', () => {
   it('removes source-linked Growth state on forget and clears it with the whole bank', async () => {
     const root = dir();
     const sourceId = 'user:focus';
+    const otherSourceId = 'user:other';
+    const workspace = join(root, 'workspace');
+    const partnerSidecar = partnerProvenancePath(root, workspace);
+    const sourceScopeDigest = partnerSourceScopeDigest('bank-a', 'http://hindsight.test');
+    writePartnerProvenance(partnerSidecar, {
+      v: 1,
+      workspaceDigest: partnerWorkspaceDigest(workspace),
+      entries: [
+        {
+          id: 'a'.repeat(32),
+          segmentDigest: partnerSegmentDigest('Paragraph derived from the forgotten source.'),
+          origin: 'derived',
+          sourceIds: [sourceId],
+          sourceScopeDigest,
+          state: 'current',
+        },
+        {
+          id: 'b'.repeat(32),
+          segmentDigest: partnerSegmentDigest('Paragraph derived from another source.'),
+          origin: 'derived',
+          sourceIds: [otherSourceId],
+          sourceScopeDigest,
+          state: 'current',
+        },
+        {
+          id: 'c'.repeat(32),
+          segmentDigest: partnerSegmentDigest('A direct user-authored paragraph.'),
+          origin: 'user-authored',
+          sourceIds: [],
+          sourceScopeDigest: null,
+          state: 'current',
+        },
+      ],
+    });
     const cards = new ExperienceCards(join(root, 'experience-cards'));
     const created = cards.create({ title: 'Quiet coding time', situation: 'The person is programming.', lesson: 'Wait before routine interruptions.', scope: 'proactive_speech', sourceIds: [sourceId] });
     if (!created.ok) throw new Error(created.errors.join('; '));
@@ -397,7 +432,7 @@ describe('remote deletion tasks', () => {
       growthStateFile: join(root, 'growth.json'),
       memory: memory as unknown as HindsightMemory,
     });
-    const persona = new Persona({ memoryDir: join(root, 'workspace') });
+    const persona = new Persona({ memoryDir: workspace });
     persona.attach(core);
 
     const result = await memory.forgetDocument(sourceId);
@@ -406,6 +441,10 @@ describe('remote deletion tasks', () => {
     expect(cards.list()).toEqual([]);
     expect(proposals.list()).toEqual([]);
     expect(memory.sourceFenced(sourceId)).toBe(true);
+    const afterForget = readPartnerProvenance(partnerSidecar, partnerWorkspaceDigest(workspace));
+    expect(afterForget.status).toBe('ok');
+    if (afterForget.status !== 'ok') throw new Error('sidecar should remain readable after source forget');
+    expect(afterForget.file.entries.map((entry) => entry.state)).toEqual(['stale', 'current', 'current']);
 
     const secondCard = cards.create({ title: 'Second card', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation', sourceIds: ['user:other'] });
     const secondProposal = proposals.write({
@@ -416,6 +455,10 @@ describe('remote deletion tasks', () => {
     await memory.clear();
     expect(cards.list()).toEqual([]);
     expect(proposals.list()).toEqual([]);
+    const afterClear = readPartnerProvenance(partnerSidecar, partnerWorkspaceDigest(workspace));
+    expect(afterClear.status).toBe('ok');
+    if (afterClear.status !== 'ok') throw new Error('sidecar should remain readable after bank clear');
+    expect(afterClear.file.entries.map((entry) => entry.state)).toEqual(['stale', 'stale', 'current']);
     persona.stopGrowth();
   });
 });
