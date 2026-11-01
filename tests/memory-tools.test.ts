@@ -44,6 +44,19 @@ describe('memory correction tool', () => {
 });
 
 describe('memory read status', () => {
+  it('tells the bot to check original sources when supporting facts were truncated', async () => {
+    const memory = {
+      enabled: () => true,
+      recallBlockDetailed: async () => ({ text: 'A related memory, with incomplete supporting facts.', status: 'found', sourceFactsTruncated: true }),
+    } as unknown as HindsightMemory;
+    const tool = memoryTools({ memory: () => memory }).find((entry) => entry.name === 'memory_search')!;
+    const result = await tool.handler({ query: 'What happened before?' }, {} as never);
+
+    expect(result).toContain('Supporting source facts were truncated');
+    expect(result).toContain('sources=true');
+    expect(result).toContain('original retained text');
+  });
+
   it.each([
     ['absent', 'No verified source record matched'],
     ['unavailable', 'This does not mean the record is absent'],

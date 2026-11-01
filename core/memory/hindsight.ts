@@ -30,6 +30,7 @@ export const SOURCE_LOOKUP_LIMITS = { pageSize: 250, maxDocuments: 2048, maxSour
 export interface MemoryTextRead {
   text: string;
   status: MemoryReadStatus;
+  sourceFactsTruncated?: boolean;
   trace?: MemoryRecallTrace;
 }
 
@@ -1068,10 +1069,12 @@ export class HindsightMemory {
     };
     if (opts.captureTrace) {
       const formatted = formatRecallDetailed(formattedResults, formatOptions);
-      if (!read.trace) return { text: formatted.text, status: formatted.text ? 'found' : read.status };
+      const incomplete = read.sourceFactsTruncated ? { sourceFactsTruncated: true } : {};
+      if (!read.trace) return { text: formatted.text, status: formatted.text ? 'found' : read.status, ...incomplete };
       return {
         text: formatted.text,
         status: formatted.text ? 'found' : read.results.length > 0 ? 'absent' : read.status,
+        ...incomplete,
         trace: {
           search: read.trace,
           format: formatted.trace,
@@ -1082,7 +1085,9 @@ export class HindsightMemory {
       };
     }
     const text = formatRecall(formattedResults, formatOptions);
-    return text ? { text, status: 'found' } : { text: '', status: read.status === 'found' ? 'absent' : read.status };
+    return text
+      ? { text, status: 'found', ...(read.sourceFactsTruncated ? { sourceFactsTruncated: true } : {}) }
+      : { text: '', status: read.status === 'found' ? 'absent' : read.status, ...(read.sourceFactsTruncated ? { sourceFactsTruncated: true } : {}) };
   }
 
   async recallBlock(query: string, opts: RecallOptions = {}): Promise<string> {
