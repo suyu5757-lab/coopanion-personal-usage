@@ -11,13 +11,66 @@ const MAX_SOURCE_PHRASES = 4;
 const MAX_SOURCE_PHRASE_CHARS = 48;
 const MAX_SUPPLEMENTAL_QUERIES = 2;
 const MAX_SUPPLEMENTAL_QUERY_CHARS = 180;
-const GENERIC_PHRASES = new Set(['什么', '哪个', '哪里', '方式', '方案', '功能', '决定', '约定', '结果', '说法', '一起', '我们', '你我', '之前', '以前', '关于', '最终', '最后', '去年', '前年', '当时', '具体', '采用', '选择', '计划', '一下', '同学', '同事', '项目', '什么是', '人工智能']);
+const MAX_PLANNED_QUERY_CHARS = 1800;
+const QUERY_EDGE_CHARS = MAX_PLANNED_QUERY_CHARS / 2;
+const QUERY_CANDIDATE_SCORE = {
+  explicitQuote: 2_000,
+  explicitRestatement: 1_900,
+  markedTopic: 1_500,
+  backgroundTopic: 820,
+  focusedTopic: 1_400,
+  focusedQuestionTarget: 1_460,
+  focusedTokens: 1_100,
+  markedTopicTokens: 1_120,
+  timeWhenAsked: 1_180,
+  focusStem: 850,
+  nearbyClause: 760,
+  wholeTopic: 700,
+  wholeStem: 660,
+  timeContext: 620,
+  wholeQuestionTokens: 520,
+  englishNgrams: 450,
+} as const;
+const TOKEN_POSITION_WEIGHT = 90;
+const TOPIC_POSITION_WEIGHT = 80;
+const CONTEXT_POSITION_WEIGHT = 55;
+const REDUNDANCY_PENALTY = 100;
+const GENERIC_PHRASES = new Set(['什么', '哪个', '哪里', '谁', '怎么', '如何', '为什么', '是否', '吗', '呢', '方式', '方案', '功能', '决定', '约定', '结果', '说法', '一起', '我们', '你我', '之前', '以前', '关于', '最终', '最后', '去年', '前年', '当时', '具体', '采用', '选择', '计划', '一下', '同学', '同事', '项目', '什么是', '人工智能']);
 const QUERY_FILLER = /(?:我们|咱们|你我|之前|以前|上次|上回|去年|前年|关于|最终|最后|当时|这个|那个|那项|这项|决定|约定|选择|采用|采取|功能|具体|请问|告诉我|记得|还记得|什么|哪种|哪一个|哪个|方式|方案|做法|结果|是什么|如何|怎么|的|吗|呢|吧)/gu;
-const LATIN_STOP = new Set(['about', 'at', 'back', 'did', 'do', 'for', 'from', 'had', 'have', 'how', 'i', 'in', 'is', 'it', 'me', 'of', 'on', 'our', 'the', 'to', 'we', 'what', 'when', 'where', 'which', 'who', 'why', 'with', 'you', 'your']);
+const LATIN_STOP = new Set(['a', 'about', 'and', 'an', 'as', 'at', 'back', 'be', 'but', 'by', 'can', 'could', 'did', 'do', 'for', 'from', 'had', 'have', 'how', 'i', 'in', 'is', 'it', 'me', 'of', 'on', 'or', 'our', 'the', 'that', 'then', 'there', 'these', 'this', 'those', 'to', 'we', 'what', 'when', 'where', 'which', 'who', 'why', 'with', 'you', 'your']);
+const CLAUSE_BOUNDARY = /[,，;；。！？?!\n]+/u;
+const SENTENCE_BOUNDARY = /(?<=[。！？?!\n])/u;
+const TOPIC_MARKER = /(?:关于|针对|围绕|有关|对于|about|regarding|concerning)\s*([^,，;；。！？?!\n]{2,100})/giu;
+const ENGLISH_FOCUS_RELATION = /\b(?:about|for|on|regarding|concerning)\s+(?:(?:the|a|an|our|their|my|your)\s+)?([^,，;；。！？?!\n]{2,100})/giu;
+const ENGLISH_QUESTION_TARGET = /^(?:what|which)\s+([A-Za-z][A-Za-z0-9'-]{1,})\s+(?:(?:did|do|have|had|will|would|should|can)\s+)?(?:we|i|you|they)\b/iu;
+const TIME_QUESTION = /(?:什么时候|哪年|哪月|哪天|何时|多久|几月|周几|when|what time|which day|what date|how long)/iu;
+const TIME_HINT = /(?:\b(?:19|20)\d{2}(?:年)?\b|去年|前年|今年|明年|上周|上个月|昨天|前天|刚才|刚刚|那天|那年|周[一二三四五六日天]|星期[一二三四五六日天])/gu;
+const ANAPHORIC_TAIL = /(?:这个|那个|上述|前述|该决定|该方案|该选择|同一个决定)|\b(?:that decision|this decision|the decision|what was it|what about it)\b/iu;
+const ZH_WORD_SEGMENTER = new Intl.Segmenter('zh-CN', { granularity: 'word' });
+
+interface WordToken {
+  text: string;
+  position: number;
+}
+
+interface PhraseCandidate {
+  text: string;
+  score: number;
+  order: number;
+  tokens: Set<string>;
+}
 
 function safePhrase(value: string): string {
   const safe = sanitizeForMemory(value);
   return safe.skip ? '' : safe.text.replace(/\s+/gu, ' ').trim();
+}
+
+// Keep both an early quoted source cue and the final question focus within the analysis bound.
+function boundedQueryText(value: string): string {
+  if (value.length <= MAX_PLANNED_QUERY_CHARS) return value;
+  const head = value.slice(0, QUERY_EDGE_CHARS).replace(/[\uD800-\uDBFF]$/u, '');
+  const tail = value.slice(-QUERY_EDGE_CHARS).replace(/^[\uDC00-\uDFFF]/u, '');
+  return `${head}\n${tail}`;
 }
 
 function questionStem(text: string): string {
@@ -32,20 +85,34 @@ function questionStem(text: string): string {
 function compactTopic(text: string): string {
   return text
     .replace(/^(?:(?:我们|咱们|你我|一起|共同)\s*)?(?:(?:之前|以前|上次|上回|去年|前年|当时)\s*)?(?:关于\s*)?/u, '')
+    .replace(/^(?:(?:about|for|on|regarding|concerning)\s+)+/iu, '')
+    .replace(/^(?:(?:the|a|an|our|their|my|your)\s+)/iu, '')
     .replace(QUERY_FILLER, '')
     .replace(/[^\p{Script=Han}A-Za-z0-9]+/gu, ' ')
     .replace(/\s+/gu, ' ')
     .trim();
 }
 
-function salientWords(text: string): string[] {
-  const segmenter = new Intl.Segmenter('zh-CN', { granularity: 'word' });
-  return [...segmenter.segment(text)]
+function wordTokens(text: string): WordToken[] {
+  if (!text) return [];
+  return [...ZH_WORD_SEGMENTER.segment(text)]
     .filter((part) => part.isWordLike)
-    .map((part) => part.segment)
-    .filter((word) => [...word].length >= 2
-      && !GENERIC_PHRASES.has(word.toLocaleLowerCase())
-      && !LATIN_STOP.has(word.toLocaleLowerCase()));
+    .flatMap((part) => {
+      const word = part.segment;
+      const normalized = word.toLocaleLowerCase();
+      if ([...word].length < 2 || GENERIC_PHRASES.has(normalized) || LATIN_STOP.has(normalized)) return [];
+      return [{ text: word, position: text.length ? (part.index + word.length / 2) / text.length : 0 }];
+    });
+}
+
+function termBonus(term: string): number {
+  const lengthBonus = Math.min([...term].length, 12) * 2;
+  const scriptBonus = /\p{Script=Han}/u.test(term) ? 18 : 0;
+  return lengthBonus + scriptBonus;
+}
+
+function salientWords(text: string): string[] {
+  return wordTokens(text).map((token) => token.text);
 }
 
 function englishPhrases(text: string): string[] {
@@ -62,43 +129,158 @@ function englishPhrases(text: string): string[] {
 export function planRecallQueries(input: string): RecallQueryPlan {
   const safe = sanitizeForMemory(input);
   if (safe.skip || !safe.text) return { sourcePhrases: [], supplementalQueries: [] };
-  const text = safe.text.trim();
-  const phrases: string[] = [];
-  const addPhrase = (candidate: string): void => {
+  const text = boundedQueryText(safe.text.trim());
+  const clauses = text.split(CLAUSE_BOUNDARY).map((part) => part.trim()).filter(Boolean);
+  const focusText = clauses.at(-1) ?? text;
+  const nearbyClauses = clauses.slice(Math.max(0, clauses.length - 3), -1);
+  const sentences = text.split(SENTENCE_BOUNDARY).map((part) => part.trim()).filter(Boolean);
+  const precedingSentence = sentences.length > 1 ? sentences.at(-2) ?? '' : '';
+  const focusStem = questionStem(focusText) || focusText;
+  const focusTopic = compactTopic(focusStem) || compactTopic(focusText);
+  const stem = questionStem(text);
+  const topic = compactTopic(stem);
+  const asksTime = TIME_QUESTION.test(text);
+  const phraseCandidates = new Map<string, PhraseCandidate>();
+  let candidateOrder = 0;
+  const addPhrase = (candidate: string, score: number, allowGeneric = false): void => {
     const value = safePhrase(candidate);
-    if (!value || GENERIC_PHRASES.has(value.toLocaleLowerCase())
+    if (!value || (!allowGeneric && (GENERIC_PHRASES.has(value.toLocaleLowerCase()) || LATIN_STOP.has(value.toLocaleLowerCase())))
       || [...value].length < 2 || [...value].length > MAX_SOURCE_PHRASE_CHARS) return;
-    if (!phrases.some((item) => item.toLocaleLowerCase() === value.toLocaleLowerCase())) phrases.push(value);
+    const key = value.toLocaleLowerCase();
+    const existing = phraseCandidates.get(key);
+    if (existing) {
+      if (score > existing.score) existing.score = score;
+      return;
+    }
+    phraseCandidates.set(key, {
+      text: value,
+      score,
+      order: candidateOrder++,
+      tokens: new Set(wordTokens(value).map((token) => token.text.toLocaleLowerCase())),
+    });
   };
 
   const quoted = /[“「"']([^”」"']{2,80})[”」"']/gu;
-  for (const match of text.matchAll(quoted)) addPhrase(match[1] ?? '');
+  for (const match of text.matchAll(quoted)) addPhrase(match[1] ?? '', QUERY_CANDIDATE_SCORE.explicitQuote);
   const stated = text.match(/(?:原话|原文|具体表述|约定(?:是|为)|决定(?:是|为)|采用的是|选择的是)(?:是)?[：:]\s*([^。；;？！?]{2,80})/u)?.[1];
-  if (stated) addPhrase(stated);
+  if (stated) addPhrase(stated, QUERY_CANDIDATE_SCORE.explicitRestatement);
+  if (precedingSentence && ANAPHORIC_TAIL.test(focusText)) addPhrase(precedingSentence, QUERY_CANDIDATE_SCORE.explicitRestatement - 50);
 
-  const stem = questionStem(text);
-  const topic = compactTopic(stem);
-  addPhrase(stem);
-  addPhrase(topic);
-  for (const phrase of salientWords(stem)) addPhrase(phrase);
-  for (const phrase of englishPhrases(stem)) addPhrase(phrase);
+  const focusOffset = Math.max(0, text.lastIndexOf(focusText));
+  const topicMatches = [...text.matchAll(TOPIC_MARKER)].flatMap((match) => {
+    const value = (match[1] ?? '').trim();
+    if (!value) return [];
+    const start = match.index ?? 0;
+    return [{ text: value, position: start / Math.max(1, text.length), focused: start >= focusOffset }];
+  }).concat([...focusText.matchAll(ENGLISH_FOCUS_RELATION)].flatMap((match) => {
+    const value = (match[1] ?? '').trim();
+    if (!value) return [];
+    const start = focusOffset + (match.index ?? 0);
+    return [{ text: value, position: start / Math.max(1, text.length), focused: true }];
+  }));
+  for (const match of topicMatches) {
+    const baseScore = match.focused ? QUERY_CANDIDATE_SCORE.markedTopic : QUERY_CANDIDATE_SCORE.backgroundTopic;
+    const tokenScore = match.focused ? QUERY_CANDIDATE_SCORE.markedTopicTokens : QUERY_CANDIDATE_SCORE.backgroundTopic;
+    const score = baseScore + Math.round(match.position * TOPIC_POSITION_WEIGHT);
+    const compactMatch = compactTopic(match.text) || match.text;
+    addPhrase(compactMatch, score);
+    for (const token of wordTokens(compactMatch)) {
+      addPhrase(token.text, tokenScore + Math.round(token.position * 70) + termBonus(token.text));
+    }
+    for (const [index, phrase] of englishPhrases(compactMatch).entries()) {
+      addPhrase(phrase, tokenScore - 60 + index);
+    }
+  }
+
+  addPhrase(focusTopic, QUERY_CANDIDATE_SCORE.focusedTopic);
+  addPhrase(focusStem, QUERY_CANDIDATE_SCORE.focusStem);
+  const englishQuestionTarget = focusText.match(ENGLISH_QUESTION_TARGET)?.[1];
+  if (englishQuestionTarget) addPhrase(englishQuestionTarget, QUERY_CANDIDATE_SCORE.focusedQuestionTarget);
+  const focusTokens = wordTokens(focusText);
+  for (const [index, token] of focusTokens.entries()) {
+    addPhrase(token.text, QUERY_CANDIDATE_SCORE.focusedTokens + Math.round(token.position * TOKEN_POSITION_WEIGHT)
+      + termBonus(token.text) + index / Math.max(1, focusTokens.length));
+  }
+  for (const [clauseIndex, clause] of nearbyClauses.entries()) {
+    const proximity = clauseIndex / Math.max(1, nearbyClauses.length);
+    const clauseTopic = compactTopic(questionStem(clause));
+    addPhrase(clauseTopic, QUERY_CANDIDATE_SCORE.nearbyClause + Math.round(proximity * 140));
+    for (const token of wordTokens(clause)) {
+      addPhrase(token.text, QUERY_CANDIDATE_SCORE.nearbyClause + Math.round(proximity * 140)
+        + Math.round(token.position * CONTEXT_POSITION_WEIGHT) + termBonus(token.text));
+    }
+  }
+
+  for (const [index, hint] of [...text.matchAll(TIME_HINT)].entries()) {
+    const temporalScore = asksTime ? QUERY_CANDIDATE_SCORE.timeWhenAsked : QUERY_CANDIDATE_SCORE.timeContext;
+    addPhrase(hint[0], temporalScore + index, true);
+  }
+
+  addPhrase(topic, QUERY_CANDIDATE_SCORE.wholeTopic);
+  addPhrase(stem, QUERY_CANDIDATE_SCORE.wholeStem);
+  const allWords = wordTokens(text);
+  for (const token of allWords) {
+    addPhrase(token.text, QUERY_CANDIDATE_SCORE.wholeQuestionTokens + Math.round(token.position * 130) + termBonus(token.text));
+  }
+  for (const [index, phrase] of englishPhrases(text).entries()) {
+    addPhrase(phrase, QUERY_CANDIDATE_SCORE.englishNgrams + index / Math.max(1, text.length));
+  }
+
+  const rankedCandidates = [...phraseCandidates.values()];
+  const selected: PhraseCandidate[] = [];
+  // Topic and focus candidates outrank background terms; short overlapping phrases remain useful as literal fallbacks.
+  while (selected.length < MAX_SOURCE_PHRASES && selected.length < rankedCandidates.length) {
+    let best: PhraseCandidate | undefined;
+    let bestScore = Number.NEGATIVE_INFINITY;
+    for (const candidate of rankedCandidates) {
+      if (selected.includes(candidate)) continue;
+      let overlap = 0;
+      for (const prior of selected) {
+        const priorTokens = prior.tokens;
+        const candidateTokens = candidate.tokens;
+        if (candidateTokens.size === 0 || priorTokens.size === 0) continue;
+        const shared = [...candidateTokens].filter((token) => priorTokens.has(token)).length;
+        const tokenOverlap = shared / Math.min(candidateTokens.size, priorTokens.size);
+        const lengthOverlap = Math.min([...candidate.text].length, [...prior.text].length)
+          / Math.max([...candidate.text].length, [...prior.text].length);
+        overlap = Math.max(overlap, tokenOverlap * lengthOverlap);
+      }
+      const score = candidate.score - overlap * REDUNDANCY_PENALTY;
+      if (score > bestScore || (score === bestScore && candidate.order < (best?.order ?? Number.POSITIVE_INFINITY))) {
+        best = candidate;
+        bestScore = score;
+      }
+    }
+    if (!best) break;
+    selected.push(best);
+  }
 
   const supplementalQueries: string[] = [];
   const addQuery = (candidate: string): void => {
     const safeQuery = safePhrase(candidate);
-    if ([...safeQuery].length < 2 || [...safeQuery].length > MAX_SUPPLEMENTAL_QUERY_CHARS) return;
+    if ([...safeQuery].length < 2 || [...safeQuery].length > MAX_SUPPLEMENTAL_QUERY_CHARS
+      || GENERIC_PHRASES.has(safeQuery.toLocaleLowerCase()) || LATIN_STOP.has(safeQuery.toLocaleLowerCase())) return;
     const normalized = safeQuery.toLocaleLowerCase();
     if (normalized === text.slice(0, 120).toLocaleLowerCase()) return;
     if (supplementalQueries.some((query) => query.toLocaleLowerCase() === normalized)) return;
     supplementalQueries.push(safeQuery);
   };
-  const queryTerms = [...new Set(salientWords(stem))];
-  addQuery(topic);
-  addQuery(queryTerms.slice(0, 6).join(' '));
-  addQuery(stem);
+  const bestTopic = topicMatches
+    .filter((match) => match.focused)
+    .map((match) => ({ text: compactTopic(match.text) || match.text, position: match.position }))
+    .sort((left, right) => right.position - left.position)[0]?.text;
+  addQuery(bestTopic || focusTopic || focusStem);
+  const complementaryTokens = [...new Set([
+    ...(englishQuestionTarget ? [englishQuestionTarget] : []),
+    ...topicMatches.filter((match) => match.focused).flatMap((match) => salientWords(match.text)),
+    ...salientWords(focusText),
+    ...(asksTime ? [...text.matchAll(TIME_HINT)].map((match) => match[0]) : []),
+    ...nearbyClauses.slice(-2).flatMap((clause) => salientWords(clause)),
+  ])];
+  addQuery(complementaryTokens.slice(0, 8).join(' '));
 
   return {
-    sourcePhrases: phrases.slice(0, MAX_SOURCE_PHRASES),
+    sourcePhrases: selected.map((candidate) => candidate.text),
     supplementalQueries: supplementalQueries.slice(0, MAX_SUPPLEMENTAL_QUERIES),
   };
 }

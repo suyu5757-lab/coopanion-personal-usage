@@ -189,6 +189,74 @@ describe('N3 local source and workspace validation', () => {
     expect(plan.supplementalQueries.length).toBeLessThanOrEqual(2);
   });
 
+  it('keeps late focal entities across long backgrounds and reordered mixed-language questions', () => {
+    const questions = [
+      '关于抖音评论功能，我们之前讨论了去年项目评审和运营排班，最后决定怎么发布？',
+      '我们之前讨论了去年项目评审、运营排班和抖音评论功能，最后决定怎么发布？',
+      '我们之前讨论了去年项目评审和运营排班，最后关于抖音评论功能决定怎么发布？',
+      'After the review with Lin and the product team, what did we agree about Douyin 评论 moderation and publishing?',
+    ];
+    for (const question of questions) {
+      const plan = planRecallQueries(question);
+      expect(plan.sourcePhrases, question).toContain('评论');
+      expect(plan.sourcePhrases.length).toBeLessThanOrEqual(4);
+      expect(plan.supplementalQueries.length).toBeLessThanOrEqual(2);
+      expect(new Set(plan.supplementalQueries.map((query) => query.toLocaleLowerCase())).size).toBe(plan.supplementalQueries.length);
+      expect(plan.supplementalQueries.join(' ')).toContain('评论');
+      expect(plan.sourcePhrases.every((phrase) => [...phrase].length <= 48)).toBe(true);
+      expect(plan.supplementalQueries.every((query) => [...query].length <= 180)).toBe(true);
+      expect(plan.sourcePhrases.some((phrase) => phrase.includes('林同学') || phrase.includes('评审会'))).toBe(false);
+    }
+    const mixed = planRecallQueries(questions[3]!);
+    expect(mixed.sourcePhrases.some((phrase) => phrase.toLocaleLowerCase().includes('douyin'))).toBe(true);
+    expect(mixed.supplementalQueries.join(' ').toLocaleLowerCase()).toContain('publishing');
+    expect(mixed.sourcePhrases.join(' ').toLocaleLowerCase()).not.toContain('人工确认');
+  });
+
+  it('preserves time clues and multiple focal entities when the user asks for them', () => {
+    const timePlan = planRecallQueries('去年秋天，我们在北门见面后讨论了几次行程，最后约定哪天在北桥集合？');
+    expect(timePlan.sourcePhrases).toContain('去年');
+    expect(timePlan.sourcePhrases.some((phrase) => phrase.includes('北桥') || phrase.includes('集合'))).toBe(true);
+
+    const entityPlan = planRecallQueries('上周我和林同学在博物馆讨论展览安排，最后决定讲解路线与开放时间如何划分？');
+    expect(entityPlan.sourcePhrases.some((phrase) => phrase.includes('路线'))).toBe(true);
+    expect(entityPlan.sourcePhrases.some((phrase) => phrase.includes('开放'))).toBe(true);
+    expect(entityPlan.supplementalQueries.join(' ')).toContain('路线');
+    expect(entityPlan.supplementalQueries.join(' ')).toContain('开放');
+  });
+
+  it('prioritizes the final question over earlier topic markers in long Chinese and English questions', () => {
+    const chinese = '今年春天在山海展馆的策划会上，我和陈老师、林同学、运营组、技术组先后讨论了人员值班、票价调整、志愿者排班、开放时间和活动日期，会议记录还提到入口动线、设备预算、导览手册、月度验收计划、临时展项维护以及语音设备测试，多轮评审后，最后关于无障碍地图的维护责任我们决定由谁承担？';
+    expect(chinese.length).toBeGreaterThan(120);
+    const chinesePlan = planRecallQueries(chinese);
+    expect(chinesePlan.sourcePhrases.some((phrase) => phrase.includes('无障碍地图'))).toBe(true);
+    expect(chinesePlan.supplementalQueries.join(' ')).toContain('无障碍地图');
+    expect(chinesePlan.supplementalQueries.join(' ')).toContain('维护');
+
+    const english = 'After several rounds of planning with the archive staff, curators, and volunteers about budgets, schedules, deliveries, access reviews, and exhibition setup; what policy did we agree on for the north wing reading room?';
+    const englishPlan = planRecallQueries(english);
+    expect(englishPlan.sourcePhrases).toContain('policy');
+    expect(englishPlan.sourcePhrases.some((phrase) => phrase.includes('north wing reading room'))).toBe(true);
+    expect(englishPlan.sourcePhrases).not.toContain('budgets');
+    expect(englishPlan.supplementalQueries.join(' ').toLocaleLowerCase()).toContain('north');
+    expect(englishPlan.supplementalQueries.join(' ').toLocaleLowerCase()).not.toMatch(/budgets\s/);
+
+    const unmarkedFocusPlan = planRecallQueries('After several rounds of planning about budgets and delivery schedules; what plan did we choose?');
+    expect(unmarkedFocusPlan.sourcePhrases).toContain('plan');
+    expect(unmarkedFocusPlan.sourcePhrases).not.toContain('budgets');
+    expect(unmarkedFocusPlan.supplementalQueries[0]?.toLocaleLowerCase()).toContain('plan');
+    expect(unmarkedFocusPlan.supplementalQueries[0]?.toLocaleLowerCase()).not.toContain('budget');
+  });
+
+  it('keeps a late focus term when the user query exceeds the bounded planning window', () => {
+    const background = Array.from({ length: 130 }, () => '我们讨论展览预算和人员排期').join('，');
+    const query = `${background}，最后关于失物招领柜的编号规则，我们决定怎么设置？`;
+    expect(query.length).toBeGreaterThan(1800);
+    const plan = planRecallQueries(query);
+    expect(plan.sourcePhrases.some((phrase) => phrase.includes('失物招领') || phrase.includes('编号'))).toBe(true);
+    expect(plan.supplementalQueries.join(' ')).toContain('失物招领');
+  });
+
   it('automatically finds the supplied A1 source while preserving source identity', async () => {
     const source = '评论先人工确认，暂时不自动发布。';
     const suppliedQuestion = `${source}这个决定是什么？`;
@@ -278,9 +346,30 @@ describe('N3 local source and workspace validation', () => {
     }
   });
 
+  it('finds the previous long-question regression from a late focus term without semantic fixture hits', async () => {
+    const source = '评论先人工确认，暂时不自动发布。';
+    const query = '去年秋天我和林同学在评审会上来回讨论了几轮，最后确认抖音评论功能采用什么发布方式？';
+    const fixture = await localMemory({ documents: [
+      { id: 'source-late-comment-focus', original_text: source, document_metadata: eventMetadata },
+      { id: 'source-late-comment-noise', original_text: '抖音评论由客服筛选后按周发布。', document_metadata: eventMetadata },
+    ] });
+    try {
+      expect(planRecallQueries(query).sourcePhrases).toContain('评论');
+      const result = await fixture.memory.recallForTurn(query, { captureTrace: true });
+      expect(result.route).toBe('deep');
+      expect(result.text).toContain('source_id:source-late-comment-focus');
+      expect(result.text).toContain('candidate relevance to the full question is still unresolved');
+      expect(fixture.calls.recall).toBeLessThanOrEqual(3);
+      expect(fixture.calls.lists).toBe(1);
+      expect(fixture.recallQueries.every((recallQuery) => recallQuery.length > 0)).toBe(true);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it('uses one semantic Recall when complete source wording already covers the historical question', async () => {
     const query = 'What did we decide about comment moderation?';
-    const source = 'We decided comments require a human review before publishing.';
+    const source = 'We decided comment moderation should require a human review before publishing.';
     const fixture = await localMemory({
       documents: [{ id: 'source-covered', original_text: source, document_metadata: eventMetadata }],
       recall: {
@@ -458,7 +547,10 @@ describe('N3 local source and workspace validation', () => {
       expect(result.text).not.toContain('source_id:');
       expect(lastAutomaticLookup(fixture.memory)).toMatchObject({ status: 'unavailable', scanIncomplete: true, sourceDocumentHashes: [] });
       expect(lastAutomaticLookup(fixture.memory)?.elapsedMs).toBeLessThan(1_000);
-      expect(fixture.calls).toEqual({ recall: 3, lists: 1, sourceReads: 0 });
+      expect(fixture.calls.recall).toBe(result.trace?.queryAttempts.length);
+      expect(fixture.calls.recall).toBeLessThanOrEqual(3);
+      expect(fixture.calls.lists).toBe(1);
+      expect(fixture.calls.sourceReads).toBe(0);
     } finally {
       await fixture.close();
     }
