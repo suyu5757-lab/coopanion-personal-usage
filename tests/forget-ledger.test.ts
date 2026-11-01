@@ -50,6 +50,10 @@ interface FakeRecallResult {
 }
 
 interface FakeClient {
+  listDocuments?: (bankId: string, options?: { limit?: number; offset?: number; signal?: AbortSignal }) => Promise<{
+    items: Array<{ id: string; bank_id?: string; document_metadata?: Record<string, unknown> | null }>;
+    total: number;
+  }>;
   getDocument?: (bankId: string, documentId: string) => Promise<unknown | null>;
   deleteDocument?: (bankId: string, documentId: string) => Promise<void>;
   recall?: (bankId: string, query: string, options?: { includeSourceFacts?: boolean; maxSourceFactsTokens?: number }) => Promise<{
@@ -100,6 +104,7 @@ function memoryWith(outbox: MemoryOutbox, ledger: ForgetLedger, client: FakeClie
     retain: { async: true },
   };
   memory.client = {
+    listDocuments: async () => ({ items: [], total: 0 }),
     clearMentalModel: async () => ({}),
     refreshMentalModel: async (_bankId: string, id: string) => ({ operation_id: `refresh-${id}` }),
     getMentalModel: async () => ({ content: '' }),

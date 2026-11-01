@@ -183,6 +183,18 @@ export interface SourceLookupReceipt {
   scanIncomplete: boolean;
 }
 
+export interface ForgetSourceScanReceipt {
+  at: string;
+  queryHash: string;
+  elapsedMs: number;
+  scannedDocuments: number;
+  sourceReads: number;
+  matchedSources: number;
+  matchedSourceDocumentHashes: string[];
+  complete: boolean;
+  stopReason: 'complete' | 'short-query' | 'unavailable' | 'too-many-matches' | 'scan-limit' | 'read-limit' | 'empty-page' | 'timeout' | 'service-error';
+}
+
 export interface ForgetResult {
   /** Writes removed from the local queue before sending. */
   local: number;
@@ -328,6 +340,7 @@ export class HindsightMemory {
   private recallCache = new Map<string, { at: number; value: string; trace?: MemoryRecallTrace }>();
   private lastRecall: TurnRecallReceipt | null = null;
   private lastSourceLookup: SourceLookupReceipt | null = null;
+  private lastForgetSourceScan: ForgetSourceScanReceipt | null = null;
   private recallStats = { fast: 0, standard: 0, deep: 0, measured: 0, totalMs: 0 };
   /** Incremented by every invalidation; an in-flight read from an older epoch is discarded. */
   private cacheEpoch = 0;
@@ -371,6 +384,7 @@ export class HindsightMemory {
     this.recallStats = { fast: 0, standard: 0, deep: 0, measured: 0, totalMs: 0 };
     this.lastRecall = null;
     this.lastSourceLookup = null;
+    this.lastForgetSourceScan = null;
     this.cacheEpoch += 1;
     this.latestDelivery = null;
     this.briefing = null;
@@ -1636,6 +1650,79 @@ export class HindsightMemory {
     }
   }
 
+  private async literalSourceDocumentIds(query: string): Promise<{ documentIds: string[]; complete: boolean }> {
+    const config = this.config;
+    const asked = sanitizeForMemory(query).text.trim();
+    const started = Date.now();
+    let scanned = 0, reads = 0;
+    const documentIds = new Set<string>();
+    const finish = (complete: boolean, stopReason: ForgetSourceScanReceipt['stopReason']) => {
+      this.lastForgetSourceScan = {
+        at: new Date().toISOString(), queryHash: createHash('sha256').update(asked).digest('hex'),
+        elapsedMs: Date.now() - started, scannedDocuments: scanned, sourceReads: reads,
+        matchedSources: documentIds.size, matchedSourceDocumentHashes: [...documentIds].slice(0, SOURCE_LOOKUP_LIMITS.maxSources)
+          .map((id) => createHash('sha256').update(id).digest('hex')),
+        complete, stopReason,
+      };
+      return { documentIds: complete ? [...documentIds] : [], complete };
+    };
+    if (!config || !this.client) return finish(false, 'unavailable');
+    if (asked.length < 3) return finish(true, 'short-query');
+    const { pageSize, maxDocuments, concurrency, maxSources } = SOURCE_LOOKUP_LIMITS;
+    const maxSourceReads = maxDocuments;
+    const deadline = AbortSignal.timeout(config.recall.timeoutMs);
+    const seen = new Set<string>();
+    let offset = 0, total = Infinity;
+    try {
+      while (offset < total && offset < maxDocuments && reads < maxSourceReads) {
+        const page = await this.client!.listDocuments(config.bankId, {
+          limit: Math.min(pageSize, maxDocuments - offset), offset, signal: deadline,
+        });
+        total = page.total;
+        offset += page.items.length;
+        if (page.items.length === 0) return finish(offset >= total, offset >= total ? 'complete' : 'empty-page');
+        let processed = 0;
+        for (let index = 0; index < page.items.length; index += concurrency) {
+          if (scanned >= maxDocuments || reads >= maxSourceReads) break;
+          const pending = page.items.slice(index, index + concurrency).flatMap((candidate) => {
+            if (scanned >= maxDocuments || reads >= maxSourceReads) return [];
+            processed += 1;
+            if (!candidate.id || seen.has(candidate.id)) return [];
+            seen.add(candidate.id);
+            scanned += 1;
+            if (candidate.bank_id && candidate.bank_id !== config.bankId) return [];
+            const metadata = candidate.document_metadata;
+            if (metadata && (
+              (typeof metadata.source_actor === 'string' && metadata.source_actor !== 'user' && metadata.source_actor !== 'coo')
+              || (typeof metadata.kind === 'string' && metadata.kind !== 'event')
+            )) return [];
+            if (this.forgottenSource(candidate.id)) return [];
+            reads += 1;
+            return [this.client!.getDocument(config.bankId, candidate.id, { signal: deadline }).then((document) => ({ candidate, document }))];
+          });
+          const documents = await Promise.all(pending);
+          for (const { candidate, document } of documents) {
+            if (!document || document.id !== candidate.id || document.bank_id !== config.bankId || this.forgottenSource(document.id)) continue;
+            const metadata = document.document_metadata ?? {};
+            const actor = metadata.source_actor;
+            if ((actor !== 'user' && actor !== 'coo') || metadata.kind !== 'event') continue;
+            const safe = sanitizeForMemory(document.original_text ?? '');
+            if (safe.text.toLowerCase().includes(asked.toLowerCase())) documentIds.add(document.id);
+            if (documentIds.size > maxSources) return finish(false, 'too-many-matches');
+          }
+          if (processed < page.items.length) return finish(false, 'read-limit');
+        }
+        if (offset >= total) return finish(true, 'complete');
+        if (scanned >= maxDocuments) return finish(false, 'scan-limit');
+        if (reads >= maxSourceReads) return finish(false, 'read-limit');
+      }
+      return finish(offset >= total, offset >= total ? 'complete' : reads >= maxSourceReads ? 'read-limit' : 'scan-limit');
+    } catch (error) {
+      if (!deadline.aborted) this.log?.warn('[memory] literal source scan failed during forget', { message: error instanceof Error ? error.message : String(error) });
+      return finish(false, deadline.aborted ? 'timeout' : 'service-error');
+    }
+  }
+
   private async forgetMatching(asked: string): Promise<ForgetResult> {
     if (!this.config || !this.ledger) return { local: 0, deleted: 0, pending: 0, failed: 0, activeContextInvalidated: false };
     const outbox = this.outbox;
@@ -1709,14 +1796,15 @@ export class HindsightMemory {
           includeEntities: false,
           signal: AbortSignal.timeout(3000),
         });
-        const discovered: DeletionInput[] = response.results
+        const discovered = response.results
           .map((result) => result.document_id)
-          .filter((documentId): documentId is string => typeof documentId === 'string' && documentId.length > 0)
-          .map((documentId) => ({ bankId: config.bankId, endpoint: config.apiUrl, documentId, reason: 'the person asked to forget this' }));
-        for (const source of discovered) {
-          if (sourceIds.has(source.documentId)) continue;
-          sourceIds.add(source.documentId);
-          const result = await this.forgetDocument(source.documentId);
+          .filter((documentId): documentId is string => typeof documentId === 'string' && documentId.length > 0);
+        for (const documentId of discovered) {
+          if (sourceIds.has(documentId)) continue;
+          const document = await this.client!.getDocument(config.bankId, documentId, { signal: AbortSignal.timeout(3_000) });
+          if (!document || document.id !== documentId || document.bank_id !== config.bankId) continue;
+          sourceIds.add(documentId);
+          const result = await this.forgetDocument(documentId);
           additional.local += result.local;
           additional.deleted += result.deleted;
           additional.pending += result.pending;
@@ -1725,6 +1813,21 @@ export class HindsightMemory {
       } catch (err) {
         this.noteFailure('forget', err);
       }
+    }
+    const literal = await this.literalSourceDocumentIds(asked);
+    if (!literal.complete) additional.failed += 1;
+    else {
+      for (const documentId of literal.documentIds) {
+        if (sourceIds.has(documentId) || this.forgottenSource(documentId)) continue;
+        sourceIds.add(documentId);
+        const result = await this.forgetDocument(documentId);
+        additional.local += result.local;
+        additional.deleted += result.deleted;
+        additional.pending += result.pending;
+        additional.failed += result.failed;
+      }
+    }
+    if (this.canTry() && await this.ensureStarted()) {
       await this.drainDeletions();
       await this.clearDerived();
     }
@@ -1995,7 +2098,7 @@ export class HindsightMemory {
     error?: string;
     outbox: ReturnType<MemoryOutbox['status']> | null;
     deletions: ReturnType<ForgetLedger['status']> | null;
-    forget: { tombstones: number; unresolved: number; stale: boolean; damaged: boolean } | null;
+    forget: { tombstones: number; unresolved: number; stale: boolean; damaged: boolean; sourceScan: ForgetSourceScanReceipt | null } | null;
     lastDelivery: { at: number; submitted: number; completed: number; verified: number; failed: number } | null;
     recall: { fast: number; standard: number; deep: number; measured: number; avgMs: number; last: TurnRecallReceipt | null; sourceLookup: SourceLookupReceipt | null; limits: { timeoutMs?: number; maxSourceFactsTokens: number } };
     recent: Array<{ id: string; text: string; date: string; type: string; documentId: string | null; status?: string }>;
@@ -2015,6 +2118,7 @@ export class HindsightMemory {
             unresolved: this.ledger.unresolved(this.config.bankId, this.config.apiUrl),
             stale: this.ledger.stale(this.config.bankId, this.config.apiUrl),
             damaged: this.ledger.damaged(),
+            sourceScan: this.lastForgetSourceScan,
           }
         : null,
       lastDelivery: this.latestDelivery,

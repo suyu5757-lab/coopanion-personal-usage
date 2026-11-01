@@ -85,3 +85,72 @@ describe('original source lookup', () => {
     });
   }
 });
+
+describe('forget with verified sources', () => {
+  it('finds original user and Coo events when verified outbox payloads were cleared and recall returns a missing document', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'coo-source-forget-'));
+    const marker = 'synthetic-forget-marker-4821-'.repeat(5) + 'unique-tail-92';
+    const documents = [
+      { id: 'old-user-event', original_text: `The person asked Coo to remember ${marker}.`, document_metadata: { source_actor: 'user', kind: 'event', status: 'completed', said_at: '2024-05-01T10:00:00Z' } },
+      { id: 'coo-echo-event', original_text: `Coo repeated the ${marker} test phrase.`, document_metadata: { source_actor: 'coo', kind: 'event', status: 'completed', said_at: '2024-05-01T10:01:00Z' } },
+      { id: 'prefix-only-event', original_text: `A different event contains only this prefix: ${marker.slice(0, 120)}.`, document_metadata: { source_actor: 'user', kind: 'event', status: 'completed', said_at: '2024-05-01T10:01:30Z' } },
+      { id: 'unrelated-event', original_text: 'A separate event without the test phrase.', document_metadata: { source_actor: 'user', kind: 'event', status: 'completed', said_at: '2024-05-01T10:02:00Z' } },
+    ];
+    const deleted = new Set<string>();
+    const server = createServer((req, res) => {
+      req.resume(); req.once('end', () => {
+        const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+        const send = (value: unknown) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
+        if (url.pathname.endsWith('/memories/recall')) {
+          send({ results: [{ id: 'ghost-result', document_id: 'missing-recall-document', text: 'stale fixture result' }] });
+          return;
+        }
+        if (url.pathname.endsWith('/documents') && req.method === 'GET') {
+          const offset = Number(url.searchParams.get('offset') ?? 0);
+          const items = documents.map(d => ({
+            id: d.id,
+            bank_id: 'fixture-bank',
+            document_metadata: d.id === 'old-user-event' ? {} : d.id === 'coo-echo-event' ? { source_actor: 'coo' } : d.id === 'prefix-only-event' ? { kind: 'event' } : undefined,
+          }));
+          send({ items, total: documents.length, limit: SOURCE_LOOKUP_LIMITS.pageSize, offset });
+          return;
+        }
+        const id = decodeURIComponent(url.pathname.split('/').at(-1) ?? '');
+        const doc = documents.find(d => d.id === id);
+        if (req.method === 'DELETE' && doc) {
+          deleted.add(id);
+          res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ deleted: true }));
+          return;
+        }
+        if (!doc || deleted.has(id)) { res.writeHead(404, { 'content-type': 'application/json' }); res.end(JSON.stringify({ detail: 'Document not found' })); return; }
+        send({ ...doc, bank_id: 'fixture-bank', created_at: doc.document_metadata.said_at, updated_at: doc.document_metadata.said_at, content_hash: null, memory_unit_count: 1 });
+      });
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const store = openMemoryStateStore(join(root, 'state.sqlite'));
+    const outbox = new MemoryOutbox(store), ledger = new ForgetLedger(store), memory = new HindsightMemory();
+    Object.assign(memory, { config: loadHindsightConfig(root, { enabled: true, autostart: false, apiUrl: baseUrl, bankId: 'fixture-bank' }), client: new HindsightClient({ baseUrl, maxAttempts: 1 }), stateStore: store, outbox, ledger, ready: true, unavailableUntil: 0 });
+    for (const documentId of ['old-user-event', 'coo-echo-event']) {
+      expect(outbox.add({ bankId: 'fixture-bank', endpoint: baseUrl, documentId, content: `source ${documentId}`, context: '', tags: [], priority: 'normal' })).toBe('queued');
+      const item = outbox.matching(candidate => candidate.documentId === documentId)[0]!;
+      expect(outbox.markDone(item.id)).toBe(true);
+      expect(outbox.markVerified(item.id)).toBe(true);
+    }
+    try {
+      const result = await memory.forget(marker);
+      expect(result).toMatchObject({ local: 0, deleted: 2, pending: 0, failed: 0 });
+      expect([...deleted].sort()).toEqual(['coo-echo-event', 'old-user-event']);
+      expect(ledger.forgotten('fixture-bank', baseUrl, 'old-user-event')).toBe(true);
+      expect(ledger.forgotten('fixture-bank', baseUrl, 'coo-echo-event')).toBe(true);
+      expect(ledger.forgotten('fixture-bank', baseUrl, 'prefix-only-event')).toBe(false);
+      expect(ledger.forgotten('fixture-bank', baseUrl, 'unrelated-event')).toBe(false);
+      expect(ledger.status()).toMatchObject({ pending: 0, failed: 0, staleTargets: 0 });
+      expect(await (memory as unknown as { client: HindsightClient }).client.getDocument('fixture-bank', 'prefix-only-event')).not.toBeNull();
+      expect(await (memory as unknown as { client: HindsightClient }).client.getDocument('fixture-bank', 'unrelated-event')).not.toBeNull();
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      closeMemoryStateStores(); rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
