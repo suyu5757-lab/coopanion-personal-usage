@@ -15,6 +15,7 @@ const en: CoreText = {
     contextRing: { title: 'Context ring', description: "Shows a ring in the Chat page's input box with how far the conversation is from being tidied up." },
     roundsSoft: { title: 'Wrap-up reminder', suffix: 'requests', description: 'After this many model requests in one wake-up, Coo is reminded to finish the current task and end the turn.' },
     roundsHard: { title: 'Requests per wake-up', suffix: 'requests', description: 'The most model requests in one wake-up; the turn ends when it is reached.' },
+    workspaceAppendPath: { title: 'Append paths without prompts', description: "One or more exact relative paths in Coo's Persona workspace, separated by semicolons. Only appending to listed files skips per-action approval; edits, overwrites, deletes, commands and other paths still need approval. Leave blank to disable." },
     selfTime: {
       title: 'Time of her own',
       description: 'After a while without a chat, she may open her own browser and look around. The window and its logins are separate.',

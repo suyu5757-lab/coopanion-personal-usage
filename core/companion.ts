@@ -62,6 +62,7 @@ import { withWorlds, type WorldDefinition, type WorldSection } from 'cortico/wor
 import { ActionGate } from './action-gate.ts';
 import { authorizeFileSystemAction, type FileSystemActionAuthorizationRequest } from './action-authorization.ts';
 import { actionReceiptDuplicateKey } from './action-receipts.ts';
+import { isWorkspaceAppendPreapproved, parseWorkspaceAppendPaths } from './workspace-append-approval.ts';
 import { InstanceLockedError } from 'cortico/core/instance-lock.ts';
 import { CONSOLE } from 'cortico/worlds/console/definition.ts';
 import { desktopPetDefinition, figurePacks, isSupportedCuaTarget, type DesktopPetWorld } from 'cortico-world-desktop-pet';
@@ -162,6 +163,7 @@ function companionGroup(language: Language): ConfigGroup {
         // Cormini copies `rounds` when the bot is built, so a change applies from the next start
         'rounds.soft': { type: 'integer', title: s.roundsSoft.title, minimum: 1, 'x-suffix': s.roundsSoft.suffix, 'x-hot': false, description: s.roundsSoft.description },
         'rounds.hard': { type: 'integer', title: s.roundsHard.title, minimum: 1, 'x-suffix': s.roundsHard.suffix, 'x-hot': false, description: s.roundsHard.description },
+        'companion.workspaceAppendPath': { type: 'string', title: s.workspaceAppendPath.title, description: s.workspaceAppendPath.description, 'x-hot': true },
         'companion.selfTime.enabled': { type: 'boolean', title: s.selfTime.title, description: s.selfTime.description, 'x-hot': true },
         'companion.selfTime.afterMinutes': { type: 'integer', title: s.selfTime.after, minimum: 1, maximum: 240, 'x-suffix': s.selfTime.minutes, 'x-hot': true, description: s.selfTime.afterDescription },
         'companion.selfTime.sessionMinutes': { type: 'integer', title: s.selfTime.session, minimum: 5, maximum: 60, 'x-suffix': s.selfTime.minutes, 'x-hot': true, description: s.selfTime.sessionDescription },
@@ -650,7 +652,20 @@ export async function main(): Promise<void> {
   const longTerm = new HindsightMemory();
   const journal = new RelationshipJournal();
   const affinitySync = new AffinitySync();
-  const confirmWorkspaceAction = async (request: Pick<FileSystemActionAuthorizationRequest, 'action' | 'target' | 'taskText' | 'files'>): Promise<boolean> => {
+  type WorkspaceActionConfirmationRequest = Pick<FileSystemActionAuthorizationRequest, 'action' | 'target' | 'taskText' | 'files'>
+    & Partial<Pick<FileSystemActionAuthorizationRequest, 'actionName' | 'expectedChange'>>;
+  const confirmWorkspaceAction = async (request: WorkspaceActionConfirmationRequest): Promise<boolean> => {
+    const appendPaths = parseWorkspaceAppendPaths(getByPath(
+      (config ?? {}) as unknown as Record<string, unknown>,
+      'companion.workspaceAppendPath',
+    ));
+    if (request.actionName && request.expectedChange && isWorkspaceAppendPreapproved({
+      action: request.action,
+      actionName: request.actionName,
+      expectedChange: request.expectedChange,
+      target: request.target,
+      files: request.files,
+    }, personaWorkspaceRoot, appendPaths, canonicalRoot)) return true;
     const text = coreText(language()).workspaceAction;
     const label = request.action === 'file-write' ? text.fileWrite : text.commandExecution;
     const target = request.target.path === '.' ? request.target.workspaceRoot : join(request.target.workspaceRoot, request.target.path);
@@ -701,6 +716,7 @@ export async function main(): Promise<void> {
         telemetry: !TEST_CHANNEL,
         contextRing: false,
         selfTime: { ...SELF_TIME_DEFAULTS, enabled: false, actions: false },
+        workspaceAppendPath: '',
         growth: { ...GROWTH_DEFAULTS, enabled: false },
       },
     }),

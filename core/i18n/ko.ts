@@ -10,6 +10,7 @@ const ko: Translation<CoreText> = {
     contextRing: { title: '컨텍스트 링', description: '대화 페이지 입력란에 이전 대화를 정리하기까지 얼마나 남았는지 원으로 표시합니다.' },
     roundsSoft: { title: '마무리 알림', suffix: '회', description: '한 번 깨어난 동안 모델 요청이 이만큼 쌓이면 Coo에게 하던 일을 마치고 턴을 끝내라고 알립니다.' },
     roundsHard: { title: '한 번 깨어날 때 요청 한도', suffix: '회', description: '한 번 깨어난 동안 보낼 수 있는 최대 모델 요청 수이며, 도달하면 턴이 끝납니다.' },
+    workspaceAppendPath: { title: '확인 없이 추가할 경로', description: 'Coo Persona 작업 공간 안의 정확한 상대 경로를 하나 이상 세미콜론으로 구분해 입력합니다. 목록에 있는 파일에 추가하는 작업만 매번 확인하지 않습니다. 편집, 덮어쓰기, 삭제, 명령 실행과 다른 경로는 계속 승인이 필요합니다. 비우면 꺼집니다.' },
     selfTime: {
       title: '자기만의 시간',
       description: '한동안 대화가 없으면 스스로 브라우저를 열어 둘러보고 영상을 볼 수 있습니다. 창과 로그인은 따로입니다.',

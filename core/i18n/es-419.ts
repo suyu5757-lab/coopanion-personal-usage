@@ -10,6 +10,7 @@ const es419: Translation<CoreText> = {
     contextRing: { title: 'Anillo de contexto', description: 'Muestra en el cuadro de texto de la página Chat un anillo con cuánto falta para ordenar la conversación anterior.' },
     roundsSoft: { title: 'Recordatorio para cerrar', suffix: 'solicitudes', description: 'Tras esta cantidad de solicitudes al modelo en un mismo despertar, se recuerda a Coo que termine lo que está haciendo y cierre el turno.' },
     roundsHard: { title: 'Solicitudes por despertar', suffix: 'solicitudes', description: 'El máximo de solicitudes al modelo en un despertar; al llegar a él, el turno termina.' },
+    workspaceAppendPath: { title: 'Rutas para agregar sin pedir aprobación cada vez', description: 'Una o más rutas relativas exactas en el espacio de trabajo Persona de Coo, separadas por punto y coma. Solo se omite la aprobación por acción al agregar a los archivos listados; editar, sobrescribir, borrar, ejecutar comandos y otras rutas siguen requiriendo aprobación. Déjalo vacío para desactivar.' },
     selfTime: {
       title: 'Tiempo propio',
       description: 'Tras un rato sin conversación, puede abrir su propio navegador y mirar. La ventana y sus sesiones son aparte.',

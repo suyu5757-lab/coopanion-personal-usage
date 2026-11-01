@@ -10,6 +10,7 @@ const it: Translation<CoreText> = {
     contextRing: { title: 'Anello del contesto', description: 'Mostra nella casella di testo della pagina Chat un anello con quanto manca al riordino della conversazione precedente.' },
     roundsSoft: { title: 'Promemoria di chiusura', suffix: 'richieste', description: 'Dopo questo numero di richieste al modello in un risveglio, Coo riceve un invito a finire ciò che sta facendo e chiudere il turno.' },
     roundsHard: { title: 'Richieste per risveglio', suffix: 'richieste', description: 'Il massimo di richieste al modello in un risveglio; raggiunto il limite, il turno finisce.' },
+    workspaceAppendPath: { title: 'Percorsi append senza richieste ripetute', description: 'Uno o più percorsi relativi esatti nell’area Persona di Coo, separati da punto e virgola. Solo l’aggiunta ai file elencati salta la conferma per azione; modifiche, sovrascritture, eliminazioni, comandi e altri percorsi richiedono ancora conferma. Lascia vuoto per disattivare.' },
     selfTime: {
       title: 'Tempo per sé',
       description: "Dopo un po' senza conversazione può aprire il proprio browser e guardarsi intorno. Finestra e accessi sono separati.",

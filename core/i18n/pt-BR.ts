@@ -10,6 +10,7 @@ const ptBR: Translation<CoreText> = {
     contextRing: { title: 'Anel de contexto', description: 'Mostra na caixa de texto da página Chat um anel com quanto falta para organizar a conversa anterior.' },
     roundsSoft: { title: 'Lembrete para encerrar', suffix: 'solicitações', description: 'Depois dessa quantidade de solicitações ao modelo em um mesmo despertar, Coo recebe um lembrete para terminar o que está fazendo e encerrar o turno.' },
     roundsHard: { title: 'Solicitações por despertar', suffix: 'solicitações', description: 'O máximo de solicitações ao modelo em um despertar; ao chegar nele, o turno termina.' },
+    workspaceAppendPath: { title: 'Caminhos para acrescentar sem pedir sempre', description: 'Um ou mais caminhos relativos exatos no espaço de trabalho Persona da Coo, separados por ponto e vírgula. Somente acrescentar aos arquivos listados dispensa a aprovação por ação; editar, substituir, excluir, executar comandos e usar outros caminhos ainda exige aprovação. Deixe vazio para desativar.' },
     selfTime: {
       title: 'Tempo dela',
       description: 'Depois de um tempo sem conversa, ela pode abrir o próprio navegador e olhar. A janela e os logins são separados.',

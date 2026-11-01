@@ -10,6 +10,7 @@ const zhHant: Translation<CoreText> = {
     contextRing: { title: '上下文圓環', description: '在對話頁輸入框顯示一個圓環，表示離整理之前的對話還有多遠。' },
     roundsSoft: { title: '收尾提醒', suffix: '次', description: '單次喚醒請求模型達到此次數時，提醒 Coo 完成目前任務後結束本輪。' },
     roundsHard: { title: '單次喚醒上限', suffix: '次', description: '單次喚醒最多請求模型的次數，達到後結束本輪。' },
+    workspaceAppendPath: { title: '免逐次審批的追加路徑', description: '填寫 Coo Persona 工作區內一個或多個精確相對路徑，以分號分隔。僅追加到列出的檔案時免逐次審批；編輯、覆蓋、刪除、命令和其他路徑仍需審批。留空關閉。' },
     selfTime: {
       title: '自己的時間',
       description: '沒聊天一段時間後，她可以自己打開瀏覽器逛逛、看看影片。瀏覽器視窗和登入狀態都是她自己的。',

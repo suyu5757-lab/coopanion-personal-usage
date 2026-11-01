@@ -12,6 +12,7 @@ export default {
     contextRing: { title: '上下文圆环', description: '在对话页输入框显示一个圆环，表示离整理之前的对话还有多远。' },
     roundsSoft: { title: '收尾提醒', suffix: '次', description: '单次唤醒请求模型达到此次数时，提醒 Coo 完成当前任务后结束本轮。' },
     roundsHard: { title: '单次唤醒上限', suffix: '次', description: '单次唤醒最多请求模型的次数，达到后结束本轮。' },
+    workspaceAppendPath: { title: '免逐次审批的追加路径', description: '填写 Coo Persona 工作区内的一个或多个精确相对路径，用分号分隔。仅追加到列出的文件时免逐次审批；编辑、覆盖、删除、命令和其他路径仍需审批。留空关闭。' },
     selfTime: {
       title: '自己的时间',
       description: '没聊天一段时间后,她可以自己打开浏览器逛逛、看看视频。浏览器窗口和登录状态都是她自己的。',

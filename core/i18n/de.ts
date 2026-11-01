@@ -10,6 +10,7 @@ const de: Translation<CoreText> = {
     contextRing: { title: 'Kontextring', description: 'Zeigt im Eingabefeld der Chat-Seite einen Ring, wie weit es noch ist, bis das frühere Gespräch aufgeräumt wird.' },
     roundsSoft: { title: 'Abschluss-Erinnerung', suffix: 'Anfragen', description: 'Nach so vielen Modellanfragen in einem Aufwachen wird Coo erinnert, das Laufende abzuschließen und die Runde zu beenden.' },
     roundsHard: { title: 'Anfragen pro Aufwachen', suffix: 'Anfragen', description: 'Höchstzahl der Modellanfragen in einem Aufwachen; ist sie erreicht, endet die Runde.' },
+    workspaceAppendPath: { title: 'Pfade ohne wiederholte Rückfrage erweitern', description: 'Ein oder mehrere exakte relative Pfade in Coos Persona-Arbeitsbereich, durch Semikolons getrennt. Nur Anhängen an aufgeführte Dateien überspringt die Einzelbestätigung; Bearbeiten, Überschreiben, Löschen, Befehle und andere Pfade benötigen weiterhin eine Bestätigung. Leer lassen, um es zu deaktivieren.' },
     selfTime: {
       title: 'Zeit für sich',
       description: 'Nach einer Weile ohne Gespräch darf sie ihren eigenen Browser öffnen und sich umsehen. Fenster und Anmeldungen sind getrennt.',

@@ -10,6 +10,7 @@ const fr: Translation<CoreText> = {
     contextRing: { title: 'Anneau de contexte', description: 'Affiche dans la zone de saisie de la page Discussion un anneau indiquant combien il reste avant la mise en ordre de la conversation précédente.' },
     roundsSoft: { title: 'Rappel de conclusion', suffix: 'requêtes', description: "Après ce nombre de requêtes au modèle dans un même réveil, un rappel demande à Coo de conclure ce qui est en cours et de terminer le tour." },
     roundsHard: { title: 'Requêtes par réveil', suffix: 'requêtes', description: 'Le maximum de requêtes au modèle dans un même réveil ; le tour se termine quand il est atteint.' },
+    workspaceAppendPath: { title: "Chemins d'ajout sans demande répétée", description: "Un ou plusieurs chemins relatifs exacts dans l'espace de travail Persona de Coo, séparés par des points-virgules. Seul l'ajout aux fichiers listés évite la confirmation par action ; modifier, remplacer, supprimer, exécuter des commandes et utiliser d'autres chemins nécessite toujours une approbation. Laisser vide pour désactiver." },
     selfTime: {
       title: "Un temps à elle",
       description: "Après un moment sans conversation, elle peut ouvrir son propre navigateur et regarder. La fenêtre et ses connexions sont séparées.",

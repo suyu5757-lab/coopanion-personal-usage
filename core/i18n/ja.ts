@@ -10,6 +10,7 @@ const ja: Translation<CoreText> = {
     contextRing: { title: 'コンテキストリング', description: 'チャットページの入力欄に、以前の会話を整理するまでの残りを円で表示します。' },
     roundsSoft: { title: 'まとめのリマインド', suffix: '回', description: '1 回のウェイクでモデルへのリクエストがこの回数に達すると、今の作業を片付けてターンを終えるよう Coo に促します。' },
     roundsHard: { title: '1 回のウェイクのリクエスト上限', suffix: '回', description: '1 回のウェイクでモデルにリクエストできる最大回数です。達するとターンが終わります。' },
+    workspaceAppendPath: { title: '確認なしで追記するパス', description: 'Coo の Persona ワークスペース内の正確な相対パスを 1 つ以上、セミコロンで区切って指定します。記載したファイルへの追記だけが毎回の確認なしで実行されます。編集、上書き、削除、コマンド実行、その他のパスには引き続き確認が必要です。空欄で無効になります。' },
     selfTime: {
       title: '自分の時間',
       description: 'しばらく会話がないと、自分でブラウザを開いて動画などを見に行けます。ウィンドウとログインは彼女専用です。',
