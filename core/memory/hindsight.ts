@@ -456,7 +456,7 @@ export class HindsightMemory {
         this.latestDelivery = { at: Date.now(), ...result };
       }
       if (result.verified > 0) {
-        this.invalidateCache();
+        this.clearReadCache();
         this.scheduleModelRefresh();
       }
       await this.drainDeletions();
@@ -1133,6 +1133,11 @@ export class HindsightMemory {
   /** Drop recalled text and the session portrait after an explicit write, forget or bank change. */
   invalidateCache(): void {
     this.cacheEpoch += 1;
+    this.clearReadCache();
+  }
+
+  /** New verified sources and model refreshes expire caches without revoking visible facts. */
+  private clearReadCache(): void {
     this.recallCache.clear();
     this.briefing = null;
   }
@@ -1505,7 +1510,7 @@ export class HindsightMemory {
         if (!isMissing(err)) this.log?.warn(`[memory] could not refresh mental model ${id}`, { message: err instanceof Error ? err.message : String(err) });
       }
     }
-    this.invalidateCache();
+    this.clearReadCache();
   }
 
   async forget(query: string): Promise<ForgetResult> {
@@ -1750,7 +1755,7 @@ export class HindsightMemory {
     if (!this.canTry() || !await this.ensureStarted()) return;
     try {
       await this.client!.refreshMentalModel(this.config!.bankId, id);
-      this.invalidateCache();
+      this.clearReadCache();
     } catch (err) {
       this.log?.warn(`[memory] could not refresh mental model ${id}`, { message: err instanceof Error ? err.message : String(err) });
     }
