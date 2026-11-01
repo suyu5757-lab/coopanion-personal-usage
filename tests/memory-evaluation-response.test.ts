@@ -25,6 +25,15 @@ describe('model response receipts', () => {
     expect(JSON.stringify(invalid.receipt)).not.toContain('private answer');
   });
 
+  it('keeps a scalar allowance debit when the wire cost is zero', async () => {
+    const body = {
+      choices: [{ message: { content: JSON.stringify({ answer: 'A supported answer.', citations: [], abstained: false }) } }],
+      usage: { prompt_tokens: 400, completion_tokens: 40, cost: 0, opencode: { allowance: 0.002 } },
+    };
+    const result = await readModelResponse(new Response(JSON.stringify(body), { status: 200 }));
+    expect(result.receipt).toMatchObject({ status: 'complete', reportedCostUsd: 0, allowance: { amount: 0.002 } });
+  });
+
   it('records the actual HTTP failure without interpreting an error body as an answer', async () => {
     const result = await readModelResponse(new Response('{"error":"private diagnostic"}', { status: 429 }));
     expect(result.receipt).toMatchObject({ httpStatus: 429, httpOk: false, status: 'http-error' });

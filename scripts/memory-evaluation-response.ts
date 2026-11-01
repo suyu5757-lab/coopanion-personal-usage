@@ -28,6 +28,7 @@ export interface ModelResponseReceipt {
 }
 
 function numericFields(value: unknown, prefix = ''): Record<string, number> {
+  if (typeof value === 'number' && Number.isFinite(value)) return { [prefix || 'amount']: value };
   if (!value || typeof value !== 'object') return {};
   return Object.assign({}, ...Object.entries(value).map(([key, item]) => {
     const path = prefix ? `${prefix}.${key}` : key;
