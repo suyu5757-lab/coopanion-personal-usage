@@ -78,7 +78,7 @@ import { BrowserBridge } from './browser/bridge.ts';
 import { BrowserTaskActionJournal } from './browser/task-actions.ts';
 import { hashContent } from './browser/actions.ts';
 import { readSelfTime, SELF_TIME_DEFAULTS } from './browser/config.ts';
-import { readResourcePressure } from './resource-pressure.ts';
+import { readResourcePressure, selfTimeScheduleNeedsRearm, selfTimeTickDelayMs } from './resource-pressure.ts';
 import { GROWTH_DEFAULTS, migrateLegacyGrowthConfig, readGrowth } from './growth/config.ts';
 import { videoConfigGroup, videoDefinition, VIDEO_ID } from './video/definition.ts';
 import { coreText } from './i18n/index.ts';
@@ -745,11 +745,7 @@ export async function main(): Promise<void> {
         worlds,
         orientationOverrideFile: join(loaded.rootDir, 'prompts', 'ORIENTATION.md'),
         firstTurnDir: join(loaded.rootDir, 'prompts'),
-        tickDelayMs: () => {
-          const self = readSelfTime(cfg);
-          if (self.enabled) return self.afterMinutes * 60_000;
-          return cfg.tick?.intervalMinutes === null || cfg.tick?.intervalMinutes === undefined ? null : cfg.tick.intervalMinutes * 60_000;
-        },
+        tickDelayMs: () => selfTimeTickDelayMs(readSelfTime(cfg), cfg.tick?.intervalMinutes, readResourcePressure().paused),
       });
       personaWorkspaceRoot = loaded.memoryDir;
       persona.snapshot(APP_VERSION);
@@ -837,12 +833,15 @@ export async function main(): Promise<void> {
   const bot = createBot(loaded, definition, { extensions });
   bus = bot.core.bus;
   core = bot.core;
-  // turning time of her own on, or changing its quiet interval, re-arms the heartbeat now instead of at its policy recheck
+  // Setting changes and pressure transitions re-arm the heartbeat before its 30-minute policy recheck.
   let rhythm = readSelfTime(loaded.config);
+  let memoryPaused = readResourcePressure().paused;
   const rhythmTimer = setInterval(() => {
     const next = readSelfTime(loaded.config);
-    if (next.enabled === rhythm.enabled && next.afterMinutes === rhythm.afterMinutes) return;
+    const nextMemoryPaused = readResourcePressure().paused;
+    if (!selfTimeScheduleNeedsRearm(rhythm, next, memoryPaused, nextMemoryPaused)) return;
     rhythm = next;
+    memoryPaused = nextMemoryPaused;
     coo?.restartRhythm();
   }, 1000);
   rhythmTimer.unref();
