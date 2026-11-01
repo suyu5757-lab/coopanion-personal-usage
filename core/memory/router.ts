@@ -1,3 +1,5 @@
+import { DEFAULT_RECALL_TIMEOUT_MS, MAX_DEEP_RECALL_TIMEOUT_MS, DEFAULT_SOURCE_FACTS_TOKEN_BUDGET, sourceFactsTokenBudget, recallContextCharBudget } from './recall-limits.ts';
+
 /**
  * How much long-term memory a turn needs. Fast does no Hindsight I/O; deep is for questions
  * whose answer depends on a dated or corrected past fact. The decision is about the question,
@@ -11,12 +13,13 @@ export interface RecallPlan {
   maxTokens: number;
   timeoutMs: number;
   maxChars: number;
+  maxSourceFactsTokens: number;
 }
 
 const PLANS: Record<RecallRoute, Omit<RecallPlan, 'route'>> = {
-  fast: { budget: 'low', maxTokens: 300, timeoutMs: 0, maxChars: 0 },
-  standard: { budget: 'low', maxTokens: 600, timeoutMs: 800, maxChars: 2600 },
-  deep: { budget: 'mid', maxTokens: 1200, timeoutMs: 1600, maxChars: 5600 },
+  fast: { budget: 'low', maxTokens: 300, timeoutMs: 0, maxChars: 0, maxSourceFactsTokens: 0 },
+  standard: { budget: 'low', maxTokens: 600, timeoutMs: DEFAULT_RECALL_TIMEOUT_MS, maxChars: 2600, maxSourceFactsTokens: DEFAULT_SOURCE_FACTS_TOKEN_BUDGET },
+  deep: { budget: 'mid', maxTokens: 1200, timeoutMs: 1600, maxChars: 5600, maxSourceFactsTokens: DEFAULT_SOURCE_FACTS_TOKEN_BUDGET },
 };
 
 const GREETING = /^(?:(?:hi|hello|hey|yo|good morning|good night|thanks|thank you|ok|okay|haha|lol|good)|(?:你好|嗨|哈喽|早|早安|午安|晚安|谢谢|谢啦|在吗|在不在|辛苦了|哈哈|嗯|哦|好呀|可爱|摸摸|抱抱))[!！。.~～\s]*$/iu;
@@ -51,6 +54,7 @@ export interface RecallLimits {
   timeoutMs?: number;
   /** The person's `hindsight.recall.maxTokens`, used as the standard-turn budget. */
   maxTokens?: number;
+  maxSourceFactsTokens?: number;
   budget?: 'low' | 'mid' | 'high';
 }
 
@@ -74,13 +78,15 @@ export function planRecall(text: string, limits: RecallLimits = {}): RecallPlan 
   const baseTimeout = limits.timeoutMs ?? PLANS.standard.timeoutMs;
   const baseTokens = limits.maxTokens ?? PLANS.standard.maxTokens;
   const baseBudget = limits.budget ?? PLANS.standard.budget;
+  const sourceTokens = sourceFactsTokenBudget(limits.maxSourceFactsTokens);
   if (route === 'standard') {
     return {
       route,
       budget: baseBudget,
       maxTokens: baseTokens,
       timeoutMs: baseTimeout,
-      maxChars: Math.max(800, baseTokens * 4),
+      maxChars: recallContextCharBudget(baseTokens, sourceTokens),
+      maxSourceFactsTokens: sourceTokens,
     };
   }
   const budget = BUDGET_ORDER[baseBudget] > BUDGET_ORDER[plan.budget] ? baseBudget : plan.budget;
@@ -89,7 +95,8 @@ export function planRecall(text: string, limits: RecallLimits = {}): RecallPlan 
     route,
     budget,
     maxTokens,
-    timeoutMs: Math.min(5000, Math.max(plan.timeoutMs, baseTimeout * 2)),
-    maxChars: Math.max(1600, maxTokens * 4),
+    timeoutMs: Math.min(MAX_DEEP_RECALL_TIMEOUT_MS, Math.max(plan.timeoutMs, baseTimeout * 2)),
+    maxChars: recallContextCharBudget(maxTokens, sourceTokens),
+    maxSourceFactsTokens: sourceTokens,
   };
 }

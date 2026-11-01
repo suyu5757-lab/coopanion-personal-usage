@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { DEFAULT_RECALL_TIMEOUT_MS, MAX_CONFIGURED_RECALL_TIMEOUT_MS, sourceFactsTokenBudget } from './recall-limits.ts';
 
 export type RecallBudget = 'low' | 'mid' | 'high';
 
@@ -15,6 +16,7 @@ export interface HindsightConfig {
     maxTokens: number;
     budget: RecallBudget;
     timeoutMs: number;
+    maxSourceFactsTokens?: number;
     types: string[];
   };
   retain: {
@@ -41,6 +43,7 @@ export interface HindsightFileConfig {
     maxTokens?: number;
     budget?: RecallBudget;
     timeoutMs?: number;
+    maxSourceFactsTokens?: number;
     types?: string[];
   };
   retain?: {
@@ -59,7 +62,7 @@ export interface HindsightFileConfig {
 const DEFAULTS = {
   apiUrl: 'http://127.0.0.1:8888',
   autostart: false,
-  recall: { maxTokens: 900, budget: 'low' as RecallBudget, timeoutMs: 800, types: ['observation', 'world', 'experience'] },
+  recall: { maxTokens: 900, budget: 'low' as RecallBudget, timeoutMs: DEFAULT_RECALL_TIMEOUT_MS, types: ['observation', 'world', 'experience'] },
   retain: { async: true },
   portrait: { maxTokens: 500 },
   affection: { dailyPositive: 10, dailyNegative: 5 },
@@ -130,7 +133,8 @@ export function loadHindsightConfig(rootDir: string, overrides?: HindsightFileCo
     recall: {
       maxTokens: optionalInt(recall.maxTokens, DEFAULTS.recall.maxTokens, 200, 4000),
       budget,
-      timeoutMs: optionalInt(recall.timeoutMs, DEFAULTS.recall.timeoutMs, 100, 5000),
+      timeoutMs: optionalInt(recall.timeoutMs, DEFAULTS.recall.timeoutMs, 100, MAX_CONFIGURED_RECALL_TIMEOUT_MS),
+      maxSourceFactsTokens: sourceFactsTokenBudget(recall.maxSourceFactsTokens),
       types: types.length ? types : DEFAULTS.recall.types,
     },
     retain: {

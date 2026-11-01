@@ -341,6 +341,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       if (!text) return;
       this.memoryContextBlocks.add(text);
       this.core?.injectInternal(text, 'memory');
+      if (this.core) this.longTerm?.markRecallInjected(text);
     }
 
     private async verifiedMemorySources(sourceIds: readonly string[]): Promise<boolean> {

@@ -11,6 +11,7 @@ import { growthMemorySearchTool } from '../core/growth/review.ts';
 import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import { MemoryOutbox } from '../core/memory/outbox.ts';
 import { closeMemoryStateStores, type MemoryStateStore } from '../core/memory/state-store.ts';
+import { DEFAULT_SOURCE_FACTS_TOKEN_BUDGET } from '../core/memory/recall-limits.ts';
 
 const roots: string[] = [];
 const servers: Server[] = [];
@@ -224,7 +225,7 @@ describe('Hindsight source-fact recall', () => {
     expect(api.requests).toHaveLength(1);
     const include = api.requests[0]?.include as { source_facts?: { max_tokens?: number } } | undefined;
     expect(include?.source_facts?.max_tokens).toBeGreaterThan(0);
-    expect(include?.source_facts?.max_tokens).toBeLessThanOrEqual(1024);
+    expect(include?.source_facts?.max_tokens).toBe(DEFAULT_SOURCE_FACTS_TOKEN_BUDGET);
   });
 
   it('keeps a low-activation user event retrievable by an explicit past-event question', async () => {
@@ -592,8 +593,8 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
 
     expect(read.status).toBe('absent');
     expect(read.trace?.recallTokenBudget).toBe(300);
-    expect(read.trace?.sourceFactsTokenBudget).toBe(4096);
-    expect(include?.source_facts?.max_tokens).toBe(4096);
+    expect(read.trace?.sourceFactsTokenBudget).toBe(5000);
+    expect(include?.source_facts?.max_tokens).toBe(5000);
     expect(api.requests[0]?.max_tokens).toBe(300);
   });
 

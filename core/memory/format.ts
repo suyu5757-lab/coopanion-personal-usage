@@ -54,6 +54,7 @@ export interface RecallFormatTrace {
   deduplicatedResultIndexes: number[];
   deduplicatedResultIds: string[];
   includedSourceDocumentIds: string[];
+  includedSourceFactIds: string[];
   omittedSourceDocumentIds: string[];
   incompleteResultIds: string[];
   clippedResultIds: string[];
@@ -171,6 +172,7 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
   }
   const rankedCandidates = rankRecallCandidates(candidates, coverageWeight, activationInfluence);
   const includedSourceDocumentIds = new Set<string>();
+  const includedSourceFactIds = new Set<string>();
   const incompleteResultIds: string[] = [];
   const clippedResultIds: string[] = [];
   const clippedContextResultIds: string[] = [];
@@ -191,7 +193,7 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
       inputResultIndexes: [], inputResultIds: [], candidateResultIndexes: [], candidateResultIds: [],
       includedResultIndexes: [], includedResultIds: [], omittedResultIndexes: [], omittedResultIds: [],
       deduplicatedResultIndexes: [], deduplicatedResultIds: [],
-      includedSourceDocumentIds: [], omittedSourceDocumentIds: [], incompleteResultIds: [], clippedResultIds: [],
+      includedSourceDocumentIds: [], includedSourceFactIds: [], omittedSourceDocumentIds: [], incompleteResultIds: [], clippedResultIds: [],
       clippedContextResultIds: [], clippedSourceFactIds: [], sourceFactsTruncated: false, coverageWeight: 0, maxChars,
       activationInfluence: 0, activationWeights: [], retrievalScores: [],
       usedChars: text ? usedChars : 0,
@@ -210,6 +212,7 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
       deduplicatedResultIndexes: [...deduplicatedResultIndexes],
       deduplicatedResultIds: deduplicatedResultIndexes.map((index) => results[index]!.id),
       includedSourceDocumentIds: [...includedSourceDocumentIds],
+      includedSourceFactIds: [...includedSourceFactIds],
       omittedSourceDocumentIds: [...allSourceDocumentIds].filter((id) => !includedSourceDocumentIds.has(id)),
       incompleteResultIds: [...new Set(incompleteResultIds)],
       clippedResultIds: [...new Set(clippedResultIds)],
@@ -250,7 +253,7 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
     const linePrefix = `- (${type}, ${when(result)}${provenance(result.metadata)}${source}) `;
     const factLines = (result.sourceFacts ?? []).map((fact) => {
       const normalized = fact.text.replace(/\s+/g, ' ').trim();
-      const factText = clip(normalized, 500);
+      const factText = normalized;
       if (!factText) return null;
       const factSource = `, source_id:${fact.documentId}`;
       return {
@@ -265,15 +268,15 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
     const notice = '  Supporting source facts are incomplete for this result.';
     const noticeLength = notice.length + 1;
     const fullFactsLength = factLines.reduce((total, fact) => total + fact.line.length + 1, 0);
-    const fullTextBudget = Math.min(700, remaining - linePrefix.length - fullFactsLength);
+    const fullTextBudget = remaining - linePrefix.length - fullFactsLength;
     const reserveNotice = result.sourceFactsIncomplete || (factLines.length > 0 && fullTextBudget < 1) ? noticeLength : 0;
     const firstFactLength = factLines[0] ? factLines[0].line.length + 1 : 0;
-    let textBudget = Math.min(700, remaining - linePrefix.length - fullFactsLength - reserveNotice);
+    let textBudget = remaining - linePrefix.length - fullFactsLength - reserveNotice;
     if (textBudget < 1 && firstFactLength > 0) {
-      textBudget = Math.min(700, remaining - linePrefix.length - firstFactLength - reserveNotice);
+      textBudget = remaining - linePrefix.length - firstFactLength - reserveNotice;
     }
     if (textBudget < 1) {
-      textBudget = Math.min(700, remaining - linePrefix.length - reserveNotice);
+      textBudget = remaining - linePrefix.length - reserveNotice;
     }
     if (textBudget < 1) continue;
 
@@ -297,7 +300,7 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
       const contextPrefix = '  context: ';
       const contextBudget = maxChars - used - separator - contentLength - (reserveNotice ? noticeLength : 0) - contextPrefix.length - 1;
       if (contextBudget > 0) {
-        const budget = Math.min(500, contextBudget);
+        const budget = contextBudget;
         contextLine = `${contextPrefix}${clip(context, budget)}`;
         contextTruncated = context.length > budget;
         contentLength += contextLine.length + 1;
@@ -317,6 +320,7 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
       if (rawText.length > textBudget) clippedResultIds.push(result.id);
       if (contextTruncated) clippedContextResultIds.push(result.id);
       for (const fact of includedFacts) {
+        includedSourceFactIds.add(fact.id);
         includedSourceDocumentIds.add(fact.documentId);
         if (fact.clipped) clippedSourceFactIds.push(fact.id);
       }

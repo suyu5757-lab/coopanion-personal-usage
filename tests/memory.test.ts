@@ -65,6 +65,7 @@ describe('Hindsight config', () => {
       'hindsight.apiUrl',
       'hindsight.bankId',
       'hindsight.recall.maxTokens',
+      'hindsight.recall.maxSourceFactsTokens',
       'hindsight.recall.timeoutMs',
       'hindsight.affection.enabled',
     ]);

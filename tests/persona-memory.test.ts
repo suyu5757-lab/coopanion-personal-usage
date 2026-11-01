@@ -31,6 +31,7 @@ function personaWith() {
   const clearMemory = vi.fn(async () => 'long-term memory cleared');
   const memory = {
     enabled: () => true,
+    markRecallInjected: () => {},
     bankId: () => 'coopanion:test',
     retainUser,
     retainTouch,

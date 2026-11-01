@@ -22,6 +22,7 @@ const temp = () => {
 /** The apply path checks that a proposal's evidence still exists. */
 const liveSources = {
   enabled: () => true,
+  markRecallInjected: () => {},
   sourceVisible: () => true,
   hasSource: async () => true,
   sourceEvidence: async () => ({ present: true, visible: true, actor: 'user', status: 'current' }),
@@ -230,6 +231,7 @@ describe('experience policy cards', () => {
     if (!sameDay.ok) throw new Error(sameDay.errors.join('; '));
     const memory = {
       enabled: () => true,
+      markRecallInjected: () => {},
       settled: () => true,
       sourceVisible: () => true,
       sourceEvidence: async (id: string) => ({
@@ -382,7 +384,7 @@ describe('experience policy cards', () => {
     mkdirSync(workspace);
     mkdirSync(deploy);
     const memory = {
-      enabled: () => true, settled: () => true, sourceVisible: () => true, hasSource: async () => true,
+      enabled: () => true, settled: () => true, sourceVisible: () => true, hasSource: async () => true, markRecallInjected: () => {},
       sourceEvidence: async () => ({ present: true, visible: true, actor: 'user', status: 'current' }),
     } as unknown as HindsightMemory;
     const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory });
@@ -475,6 +477,7 @@ describe('forget fences at handoff', () => {
     const memory = {
       enabled: () => true,
       sourceFenced: (sourceId: string) => fenced.has(sourceId),
+      markRecallInjected: () => {},
       setLifecycleHooks: () => {},
       retainUser: () => 'user:main:44',
       recallForTurn: async () => ({ text: memoryText, route: 'standard', found: true, status: 'found' }),

@@ -19,6 +19,8 @@ import { ForgetLedger, readLegacyForget, type DeletionInput } from './forget-led
 import { openMemoryStateStore, type MemoryStateStore } from './state-store.ts';
 import { planRecall, type RecallRoute } from './router.ts';
 import { partnerSourceScopeDigest } from './partner-provenance.ts';
+import { sourceFactsTokenBudget as resolveSourceFactsTokenBudget, recallContextCharBudget } from './recall-limits.ts';
+import { summarizeSourceFacts, type SourceFactCounts } from './recall-evidence.ts';
 
 export type MemoryReadStatus = 'found' | 'absent' | 'unavailable' | 'fenced';
 export type TurnRecallStatus = MemoryReadStatus | 'skipped';
@@ -89,6 +91,7 @@ export interface MemorySearchTrace {
   sourceFactsTruncated: boolean;
   recallTokenBudget?: number;
   sourceFactsTokenBudget?: number;
+  sourceFactCounts?: SourceFactCounts;
 }
 
 export interface MemoryLog {
@@ -139,6 +142,29 @@ export interface TurnRecall {
   found: boolean;
   status: TurnRecallStatus;
   trace?: MemoryRecallTrace;
+}
+
+export interface TurnRecallReceipt {
+  at: string;
+  queryHash: string;
+  contextHash: string;
+  contextChars: number;
+  injectedAt?: string;
+  route: RecallRoute;
+  status: TurnRecallStatus;
+  elapsedMs: number;
+  cacheHit: boolean;
+  maxTokens: number;
+  maxSourceFactsTokens: number;
+  timeoutMs: number;
+  maxChars: number;
+  sourceFactCounts?: SourceFactCounts;
+  serverTruncated?: boolean;
+  includedResults: number;
+  omittedResults: number;
+  clippedResults: number;
+  includedSourceFactHashes: string[];
+  includedSourceDocumentHashes: string[];
 }
 
 export interface ForgetResult {
@@ -283,7 +309,8 @@ export class HindsightMemory {
   private opsClient: ReturnType<typeof createClient> | null = null;
   private draining = false;
   private drainTimer: ReturnType<typeof setInterval> | null = null;
-  private recallCache = new Map<string, { at: number; value: string }>();
+  private recallCache = new Map<string, { at: number; value: string; trace?: MemoryRecallTrace }>();
+  private lastRecall: TurnRecallReceipt | null = null;
   private recallStats = { fast: 0, standard: 0, deep: 0, measured: 0, totalMs: 0 };
   /** Incremented by every invalidation; an in-flight read from an older epoch is discarded. */
   private cacheEpoch = 0;
@@ -325,6 +352,7 @@ export class HindsightMemory {
     this.clearedEpochs.clear();
     this.failedRefreshEpochs.clear();
     this.recallStats = { fast: 0, standard: 0, deep: 0, measured: 0, totalMs: 0 };
+    this.lastRecall = null;
     this.cacheEpoch += 1;
     this.latestDelivery = null;
     this.briefing = null;
@@ -798,6 +826,7 @@ export class HindsightMemory {
     const traceItems: MemorySearchTraceItem[] = [];
     let recallTokenBudget: number | undefined;
     let sourceFactsTokenBudget: number | undefined;
+    let sourceFactCounts: SourceFactCounts | undefined;
     const finishRead = (results: MemorySearchResult[], status: MemoryReadStatus, sourceFactsTruncated = false): MemorySearchRead => ({
       results,
       status,
@@ -811,6 +840,7 @@ export class HindsightMemory {
           sourceFactsTruncated,
           ...(recallTokenBudget === undefined ? {} : { recallTokenBudget }),
           ...(sourceFactsTokenBudget === undefined ? {} : { sourceFactsTokenBudget }),
+          ...(sourceFactCounts ? { sourceFactCounts: { ...sourceFactCounts, parsed: new Set(traceItems.flatMap((item) => item.verifiedSources.map((source) => source.sourceFactId))).size } } : {}),
         },
       } : {}),
     });
@@ -821,9 +851,7 @@ export class HindsightMemory {
     const config = this.config!;
     const timeoutMs = opts.timeoutMs ?? config.recall.timeoutMs;
     recallTokenBudget = opts.maxTokens ?? config.recall.maxTokens;
-    sourceFactsTokenBudget = typeof opts.maxSourceFactsTokens === 'number' && Number.isFinite(opts.maxSourceFactsTokens)
-      ? Math.min(4096, Math.max(1, Math.round(opts.maxSourceFactsTokens)))
-      : Math.min(1024, recallTokenBudget);
+    sourceFactsTokenBudget = resolveSourceFactsTokenBudget(opts.maxSourceFactsTokens ?? config.recall.maxSourceFactsTokens);
     try {
       const response = await this.client!.recall(config.bankId, query.slice(0, 1800), {
         types: opts.types ?? config.recall.types,
@@ -841,6 +869,7 @@ export class HindsightMemory {
       const superseded = this.stateStore!.supersededSources(config.bankId, config.apiUrl);
       const currentRevisions = this.stateStore!.currentRevisionSources(config.bankId, config.apiUrl);
       const sourceFactsById = response.source_facts ?? {};
+      sourceFactCounts = summarizeSourceFacts(response);
       const sourceFactsTruncated = response.source_facts_truncated === true;
       const unresolved = this.ledger?.unresolved(config.bankId, config.apiUrl) ?? 0;
       const hasFencedSources = this.ledger?.hasFencedSources(config.bankId, config.apiUrl) ?? false;
@@ -981,7 +1010,7 @@ export class HindsightMemory {
     }
     const config = this.config;
     const maxTokens = opts.maxTokens ?? config?.recall.maxTokens ?? 900;
-    const maxChars = opts.maxChars ?? Math.max(800, maxTokens * 5);
+    const maxChars = opts.maxChars ?? recallContextCharBudget(maxTokens, resolveSourceFactsTokenBudget(opts.maxSourceFactsTokens ?? config?.recall.maxSourceFactsTokens));
     const formattedResults = read.results.map((result) => ({
       id: result.id,
       text: result.text,
@@ -1038,14 +1067,28 @@ export class HindsightMemory {
     const plan = planRecall(query, config ? {
       timeoutMs: config.recall.timeoutMs,
       maxTokens: config.recall.maxTokens,
+      maxSourceFactsTokens: config.recall.maxSourceFactsTokens,
       budget: config.recall.budget,
     } : {});
-    const finish = (text: string, status: TurnRecallStatus, trace?: MemoryRecallTrace): TurnRecall => {
+    const finish = (text: string, status: TurnRecallStatus, trace?: MemoryRecallTrace, cacheHit = false): TurnRecall => {
       this.recallStats[plan.route] += 1;
       if (plan.route !== 'fast') {
         this.recallStats.measured += 1;
         this.recallStats.totalMs += Date.now() - started;
       }
+      const hash = (value: string) => createHash('sha256').update(value).digest('hex');
+      this.lastRecall = {
+        at: new Date().toISOString(), queryHash: hash(query), contextHash: hash(text), contextChars: text.length,
+        route: plan.route, status, elapsedMs: Date.now() - started, cacheHit,
+        maxTokens: plan.maxTokens, maxSourceFactsTokens: plan.maxSourceFactsTokens, timeoutMs: plan.timeoutMs, maxChars: plan.maxChars,
+        ...(trace?.search.sourceFactCounts ? { sourceFactCounts: trace.search.sourceFactCounts } : {}),
+        ...(trace ? { serverTruncated: trace.search.sourceFactsTruncated } : {}),
+        includedResults: trace?.format.includedResultIds.length ?? 0,
+        omittedResults: trace?.format.omittedResultIds.length ?? 0,
+        clippedResults: trace?.format.clippedResultIds.length ?? 0,
+        includedSourceFactHashes: (trace?.format.includedSourceFactIds ?? []).map(hash),
+        includedSourceDocumentHashes: (trace?.format.includedSourceDocumentIds ?? []).map(hash),
+      };
       return {
         text,
         route: plan.route,
@@ -1057,27 +1100,34 @@ export class HindsightMemory {
     if (plan.route === 'fast') return finish('', 'skipped');
     const key = `${config?.bankId ?? ''}|${config?.apiUrl ?? ''}|${this.visibilityEpoch()}|${plan.route}|${context.userEventDocumentId ?? ''}|${context.activationEnabled === false ? 'disabled' : 'enabled'}|${context.activationInfluence ?? 'default'}|${query.trim().toLowerCase().slice(0, 300)}`;
     const cached = !context.captureTrace && plan.route === 'standard' ? this.recallCache.get(key) : undefined;
-    if (cached && Date.now() - cached.at < 5 * 60_000) return finish(cached.value, 'found');
+    if (cached && Date.now() - cached.at < 5 * 60_000) return finish(cached.value, 'found', cached.trace, true);
     const read = await this.recallBlockDetailed(query, {
       budget: plan.budget,
       maxTokens: plan.maxTokens,
+      maxSourceFactsTokens: plan.maxSourceFactsTokens,
       timeoutMs: plan.timeoutMs,
       maxChars: plan.maxChars,
       ...(context.activationEnabled === undefined ? {} : { activationEnabled: context.activationEnabled }),
       ...(context.activationInfluence === undefined ? {} : { activationInfluence: context.activationInfluence }),
-      ...(context.captureTrace ? { captureTrace: true } : {}),
+      captureTrace: true,
       ...(context.userEventDocumentId ? { userEventDocumentId: context.userEventDocumentId } : {}),
     });
     if (epoch !== this.cacheEpoch) return finish('', 'fenced');
     const text = read.text;
     if (text && plan.route === 'standard') {
-      this.recallCache.set(key, { at: Date.now(), value: text });
+      this.recallCache.set(key, { at: Date.now(), value: text, trace: read.trace });
       if (this.recallCache.size > 64) {
         const oldest = this.recallCache.keys().next();
         if (!oldest.done) this.recallCache.delete(oldest.value);
       }
     }
     return finish(text, read.status, read.trace);
+  }
+
+  markRecallInjected(text: string): void {
+    if (text && this.lastRecall?.contextHash === createHash('sha256').update(text).digest('hex')) {
+      this.lastRecall.injectedAt = new Date().toISOString();
+    }
   }
 
   /** Drop recalled text and the session portrait after an explicit write, forget or bank change. */
@@ -1832,7 +1882,7 @@ export class HindsightMemory {
     deletions: ReturnType<ForgetLedger['status']> | null;
     forget: { tombstones: number; unresolved: number; stale: boolean; damaged: boolean } | null;
     lastDelivery: { at: number; submitted: number; completed: number; verified: number; failed: number } | null;
-    recall: { fast: number; standard: number; deep: number; measured: number; avgMs: number };
+    recall: { fast: number; standard: number; deep: number; measured: number; avgMs: number; last: TurnRecallReceipt | null; limits: { timeoutMs?: number; maxSourceFactsTokens: number } };
     recent: Array<{ id: string; text: string; date: string; type: string; documentId: string | null; status?: string }>;
   }> {
     const health = await this.health();
@@ -1859,6 +1909,8 @@ export class HindsightMemory {
         deep: this.recallStats.deep,
         measured: this.recallStats.measured,
         avgMs: this.recallStats.measured > 0 ? Math.round(this.recallStats.totalMs / this.recallStats.measured) : 0,
+        last: this.lastRecall,
+        limits: { timeoutMs: this.config?.recall.timeoutMs, maxSourceFactsTokens: resolveSourceFactsTokenBudget(this.config?.recall.maxSourceFactsTokens) },
       },
       recent: health.ok ? await this.recent(limit) : [],
     };
