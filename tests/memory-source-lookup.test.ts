@@ -95,6 +95,7 @@ describe('forget with verified sources', () => {
       { id: 'coo-echo-event', original_text: `Coo repeated the ${marker} test phrase.`, document_metadata: { source_actor: 'coo', kind: 'event', status: 'completed', said_at: '2024-05-01T10:01:00Z' } },
       { id: 'prefix-only-event', original_text: `A different event contains only this prefix: ${marker.slice(0, 120)}.`, document_metadata: { source_actor: 'user', kind: 'event', status: 'completed', said_at: '2024-05-01T10:01:30Z' } },
       { id: 'unrelated-event', original_text: 'A separate event without the test phrase.', document_metadata: { source_actor: 'user', kind: 'event', status: 'completed', said_at: '2024-05-01T10:02:00Z' } },
+      { id: 'later-unrelated-event', original_text: 'A later page item without the test phrase.', document_metadata: { source_actor: 'user', kind: 'event', status: 'completed', said_at: '2024-05-01T10:03:00Z' } },
     ];
     const deleted = new Set<string>();
     const server = createServer((req, res) => {
@@ -145,9 +146,11 @@ describe('forget with verified sources', () => {
       expect(ledger.forgotten('fixture-bank', baseUrl, 'coo-echo-event')).toBe(true);
       expect(ledger.forgotten('fixture-bank', baseUrl, 'prefix-only-event')).toBe(false);
       expect(ledger.forgotten('fixture-bank', baseUrl, 'unrelated-event')).toBe(false);
+      expect(ledger.forgotten('fixture-bank', baseUrl, 'later-unrelated-event')).toBe(false);
       expect(ledger.status()).toMatchObject({ pending: 0, failed: 0, staleTargets: 0 });
       expect(await (memory as unknown as { client: HindsightClient }).client.getDocument('fixture-bank', 'prefix-only-event')).not.toBeNull();
       expect(await (memory as unknown as { client: HindsightClient }).client.getDocument('fixture-bank', 'unrelated-event')).not.toBeNull();
+      expect(await (memory as unknown as { client: HindsightClient }).client.getDocument('fixture-bank', 'later-unrelated-event')).not.toBeNull();
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()));
       closeMemoryStateStores(); rmSync(root, { recursive: true, force: true });

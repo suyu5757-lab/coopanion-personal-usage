@@ -1710,8 +1710,8 @@ export class HindsightMemory {
             if (safe.text.toLowerCase().includes(asked.toLowerCase())) documentIds.add(document.id);
             if (documentIds.size > maxSources) return finish(false, 'too-many-matches');
           }
-          if (processed < page.items.length) return finish(false, 'read-limit');
         }
+        if (processed < page.items.length) return finish(false, reads >= maxSourceReads ? 'read-limit' : 'scan-limit');
         if (offset >= total) return finish(true, 'complete');
         if (scanned >= maxDocuments) return finish(false, 'scan-limit');
         if (reads >= maxSourceReads) return finish(false, 'read-limit');
