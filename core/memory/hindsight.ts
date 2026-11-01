@@ -850,6 +850,7 @@ export class HindsightMemory {
     const epoch = this.cacheEpoch;
     const config = this.config!;
     const timeoutMs = opts.timeoutMs ?? config.recall.timeoutMs;
+    const deadline = AbortSignal.timeout(timeoutMs);
     recallTokenBudget = opts.maxTokens ?? config.recall.maxTokens;
     sourceFactsTokenBudget = resolveSourceFactsTokenBudget(opts.maxSourceFactsTokens ?? config.recall.maxSourceFactsTokens);
     try {
@@ -862,7 +863,7 @@ export class HindsightMemory {
         includeSourceFacts: true,
         maxSourceFactsTokens: sourceFactsTokenBudget,
         queryTimestamp: new Date().toISOString(),
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: deadline,
       });
       // A forget can invalidate the bank while recall is in flight; discard before reading state or source facts.
       if (epoch !== this.cacheEpoch) return finishRead([], 'fenced');
@@ -994,7 +995,7 @@ export class HindsightMemory {
       }
       return finishRead([], 'absent', sourceFactsTruncated);
     } catch (err) {
-      this.noteFailure('recall', err);
+      if (!deadline.aborted) this.noteFailure('recall', err);
       return finishRead([], 'unavailable');
     }
   }
