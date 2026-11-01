@@ -13,6 +13,68 @@ import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import { closeMemoryStateStores, openMemoryStateStore } from '../core/memory/state-store.ts';
 
 describe('original source lookup', () => {
+  it('explains a literal miss and reads sources whose preview metadata is incomplete', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'coo-source-literal-'));
+    const metadata = { source_actor: 'user', kind: 'event', status: 'completed' };
+    const documents = [
+      { id: 'source-a', original_text: 'The departure time is 09:42. Meeting note: 河边集合点旁边的石桌。', document_metadata: metadata },
+      { id: 'source-b', original_text: 'The departure gate is C7.', document_metadata: metadata },
+      { id: 'coo-source', original_text: 'The departure was repeated by Coo.', document_metadata: { ...metadata, source_actor: 'coo' } },
+      { id: 'profile-source', original_text: 'The departure is a profile field, not an event.', document_metadata: { ...metadata, kind: 'profile' } },
+    ];
+    let incompleteScan = false;
+    const server = createServer((req, res) => {
+      req.resume(); req.once('end', () => {
+        const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+        const send = (value: unknown) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
+        if (url.pathname.endsWith('/documents')) {
+          if (incompleteScan) send({ items: [], total: documents.length, limit: SOURCE_LOOKUP_LIMITS.pageSize, offset: 0 });
+          else send({ items: documents.map((doc, index) => ({
+            id: doc.id,
+            bank_id: 'fixture-bank',
+            document_metadata: index === 0 ? {} : index === 1 ? { source_actor: 'user' } : index === 2 ? { source_actor: 'coo', kind: 'event' } : { source_actor: 'user', kind: 'profile' },
+          })), total: documents.length, limit: SOURCE_LOOKUP_LIMITS.pageSize, offset: 0 });
+          return;
+        }
+        const doc = documents.find(item => url.pathname.endsWith('/documents/' + item.id));
+        if (!doc) { res.writeHead(404); res.end(); return; }
+        send({ ...doc, bank_id: 'fixture-bank', created_at: '2024-05-01T10:00:00Z', updated_at: '2024-05-01T10:00:00Z', content_hash: null, memory_unit_count: 1 });
+      });
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const store = openMemoryStateStore(join(root, 'state.sqlite')), memory = new HindsightMemory();
+    Object.assign(memory, { config: loadHindsightConfig(root, { enabled: true, autostart: false, apiUrl: baseUrl, bankId: 'fixture-bank' }), client: new HindsightClient({ baseUrl, maxAttempts: 1 }), stateStore: store, outbox: new MemoryOutbox(store), ledger: new ForgetLedger(store), ready: true, unavailableUntil: 0 });
+    const tool = memoryTools({ memory: () => memory }).find(item => item.name === 'memory_search')!;
+    try {
+      const question = '你还记得我们约定在河边集合点旁边见面的具体位置在哪里吗？';
+      const shortPhrase = '河边集合点旁边';
+      expect(question.length).toBe(28);
+      expect(shortPhrase.length).toBe(7);
+      const miss = await tool.handler({ query: question, sources: true }, { role: 'main' } as never);
+      expect(miss).toContain('literal phrase');
+      expect(miss).toContain('Try a shorter');
+      expect(miss).toContain('does not establish that the event is absent');
+      expect(miss).not.toContain('bank was not searched completely');
+      const chineseMatch = await tool.handler({ query: shortPhrase, sources: true }, { role: 'main' } as never);
+      expect(chineseMatch).toContain('河边集合点旁边的石桌');
+      const caseInsensitiveMatch = await tool.handler({ query: 'DEPARTURE GATE', sources: true }, { role: 'main' } as never);
+      expect(caseInsensitiveMatch).toContain('C7');
+      const found = await tool.handler({ query: 'departure', sources: true }, { role: 'main' } as never);
+      expect(found).toContain('09:42');
+      expect(found).toContain('C7');
+      expect((memory as unknown as { lastSourceLookup: SourceLookupReceipt }).lastSourceLookup).toMatchObject({ status: 'found', sourceReads: 2, scanIncomplete: false });
+      incompleteScan = true;
+      const incomplete = await tool.handler({ query: 'unrelated phrase', sources: true }, { role: 'main' } as never);
+      expect(incomplete).toContain('bank was not searched completely');
+      expect(incomplete).toContain('does not establish that the event is absent');
+      expect((memory as unknown as { lastSourceLookup: SourceLookupReceipt }).lastSourceLookup).toMatchObject({ status: 'incomplete', scanIncomplete: true });
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      closeMemoryStateStores(); rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   for (const forgetInFlight of [false, true]) {
     it(forgetInFlight
       ? 'withholds a source excerpt when a forget fence changes during read-back'
@@ -36,8 +98,8 @@ describe('original source lookup', () => {
           const send = (value: unknown) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
           if (url.pathname.endsWith('/documents') && !url.searchParams.has('q')) {
             const offset = Number(url.searchParams.get('offset') ?? 0);
-            const page = offset === 0 ? documents.slice(0, 4) : documents.slice(4);
-            send({ items: page.map(d => ({ id: d.id, bank_id: 'fixture-bank' })), total: documents.length, limit: SOURCE_LOOKUP_LIMITS.pageSize, offset });
+            const page = offset === 0 ? documents.slice(0, 4) : [...documents.slice(4), documents[4]!];
+            send({ items: page.map(d => ({ id: d.id, bank_id: 'fixture-bank' })), total: documents.length + 1, limit: SOURCE_LOOKUP_LIMITS.pageSize, offset });
             return;
           }
           const doc = documents.find(d => url.pathname.endsWith('/documents/' + d.id));
@@ -74,6 +136,8 @@ describe('original source lookup', () => {
           expect(read).not.toContain('fixture-only-sensitive-value');
           expect(receipt.sourceDocumentHashes).toHaveLength(2);
           expect(receipt.clippedSourceDocumentHashes).toHaveLength(1);
+          expect(receipt.scannedDocuments).toBe(documents.length);
+          expect(receipt.sourceReads).toBe(4);
         }
         expect(JSON.stringify(receipt)).not.toContain('09:42');
         expect(JSON.stringify(receipt)).not.toContain('old-source');

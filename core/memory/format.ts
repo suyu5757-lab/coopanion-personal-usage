@@ -1,5 +1,6 @@
 import type { RecallResult } from '@vectorize-io/hindsight-client';
 import type { RetrievalScoreEvidence } from './retrieval-scores.ts';
+import { MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE } from './model-text.ts';
 
 const MARKER = /【[^】]*】|<[^<>]*>/g;
 export const DEFAULT_ACTIVATION_RANK_INFLUENCE = 0.25;
@@ -234,8 +235,9 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
       usedChars: text ? usedChars : 0,
     };
   };
-  const incomplete = opts.sourceFactsTruncated
-    ? '\n[memory] Supporting source facts were truncated; some source evidence may be missing.'
+  const sourceEvidenceIncomplete = opts.sourceFactsTruncated === true || results.some((result) => result.sourceFactsIncomplete);
+  const incomplete = sourceEvidenceIncomplete
+    ? `\n${MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE}`
     : '';
   const prefix = `${header}${incomplete}\n`;
   if (prefix.length > maxChars) return { text: '', trace: makeTrace('', 0) };

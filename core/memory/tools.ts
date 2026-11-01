@@ -1,6 +1,6 @@
 import type { ToolDef } from 'cortico/core/types.ts';
 import type { HindsightMemory } from './hindsight.ts';
-import { MEMORY_SEARCH_DESCRIPTION, MEMORY_SOURCE_FACTS_TRUNCATED_NOTICE, memoryReadNotice } from './model-text.ts';
+import { MEMORY_SEARCH_DESCRIPTION, MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, memoryReadNotice } from './model-text.ts';
 
 export interface MemoryToolDeps {
   memory: () => HindsightMemory | null;
@@ -21,7 +21,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'What to look for, in natural language.' },
+          query: { type: 'string', description: 'For semantic recall, what to look for in natural language. With sources=true, one short literal phrase expected verbatim in the original text.' },
           max_tokens: { type: 'integer', description: 'How much memory text to bring back; 400–2000, default 900.' },
           sources: { type: 'boolean', description: 'Use a short literal phrase to search original retained text when semantic recall lacks a needed detail. Returns bounded source excerpts.' },
         },
@@ -40,7 +40,9 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
           : undefined;
         const read = await memory.recallBlockDetailed(text(args, 'query'), maxTokens ? { maxTokens } : {});
         const result = read.text || memoryReadNotice(read.status);
-        const notice = read.sourceFactsTruncated && read.status === 'found' ? MEMORY_SOURCE_FACTS_TRUNCATED_NOTICE : '';
+        const notice = read.sourceFactsTruncated && read.status === 'found' && !result.includes(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE)
+          ? MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE
+          : '';
         return [result, notice].filter(Boolean).join('\n');
       },
     },

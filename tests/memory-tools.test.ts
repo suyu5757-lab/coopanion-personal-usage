@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { memoryTools } from '../core/memory/tools.ts';
+import { formatRecall } from '../core/memory/format.ts';
+import { MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE } from '../core/memory/model-text.ts';
 import type { HindsightMemory } from '../core/memory/hindsight.ts';
 
 describe('memory correction tool', () => {
@@ -44,17 +46,33 @@ describe('memory correction tool', () => {
 });
 
 describe('memory read status', () => {
-  it('tells the bot to check original sources when supporting facts were truncated', async () => {
+  it('tells the bot to check original sources when supporting evidence is incomplete', async () => {
+    const text = formatRecall([{ id: 'f1', text: 'A related memory, with incomplete supporting facts.', type: 'observation' }], { sourceFactsTruncated: true });
     const memory = {
       enabled: () => true,
-      recallBlockDetailed: async () => ({ text: 'A related memory, with incomplete supporting facts.', status: 'found', sourceFactsTruncated: true }),
+      recallBlockDetailed: async () => ({ text, status: 'found', sourceFactsTruncated: true }),
     } as unknown as HindsightMemory;
     const tool = memoryTools({ memory: () => memory }).find((entry) => entry.name === 'memory_search')!;
     const result = await tool.handler({ query: 'What happened before?' }, {} as never);
 
-    expect(result).toContain('Supporting source facts were truncated');
+    expect(result).toContain('Supporting source evidence is incomplete or truncated');
     expect(result).toContain('sources=true');
     expect(result).toContain('original retained text');
+    expect(typeof result).toBe('string');
+    if (typeof result !== 'string') throw new Error('Expected a text result.');
+    expect(result.split(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE)).toHaveLength(2);
+  });
+
+  it('describes semantic recall and literal source lookup as separate query contracts', () => {
+    const tool = memoryTools({ memory: () => null }).find((entry) => entry.name === 'memory_search')!;
+    const properties = tool.parameters.properties as Record<string, { description?: string }>;
+    const query = properties.query?.description ?? '';
+    const sources = properties.sources?.description ?? '';
+    expect(query).toContain('semantic recall');
+    expect(query).toContain('natural language');
+    expect(query).toContain('short literal phrase');
+    expect(query).toContain('verbatim');
+    expect(sources).toContain('literal phrase');
   });
 
   it.each([

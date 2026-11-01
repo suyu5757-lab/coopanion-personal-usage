@@ -21,7 +21,7 @@ import { planRecall, type RecallRoute } from './router.ts';
 import { partnerSourceScopeDigest } from './partner-provenance.ts';
 import { sourceFactsTokenBudget as resolveSourceFactsTokenBudget, recallContextCharBudget } from './recall-limits.ts';
 import { summarizeSourceFacts, type SourceFactCounts } from './recall-evidence.ts';
-import { SOURCE_LOOKUP_HEADER } from './model-text.ts';
+import { SOURCE_LOOKUP_HEADER, sourceLookupMissNotice } from './model-text.ts';
 
 export type MemoryReadStatus = 'found' | 'absent' | 'unavailable' | 'fenced';
 export type TurnRecallStatus = MemoryReadStatus | 'skipped';
@@ -176,7 +176,7 @@ export interface SourceLookupReceipt {
   contextHash: string;
   contextChars: number;
   elapsedMs: number;
-  status: MemoryReadStatus;
+  status: MemoryReadStatus | 'incomplete';
   sourceDocumentHashes: string[];
   clippedSourceDocumentHashes: string[];
   scannedDocuments: number;
@@ -1101,10 +1101,10 @@ export class HindsightMemory {
     const sourceIds: string[] = [], clippedIds: string[] = [];
     let scannedDocuments = 0, sourceReads = 0, scanIncomplete = false;
     const digest = (text: string) => createHash('sha256').update(text).digest('hex');
-    const finish = (text: string, status: MemoryReadStatus): MemoryTextRead => {
+    const finish = (text: string, status: MemoryReadStatus, receiptStatus: SourceLookupReceipt['status'] = status): MemoryTextRead => {
       this.lastSourceLookup = {
         at: new Date().toISOString(), queryHash: digest(asked), contextHash: digest(text), contextChars: text.length,
-        elapsedMs: Date.now() - started, status,
+        elapsedMs: Date.now() - started, status: receiptStatus,
         sourceDocumentHashes: text ? sourceIds.map(digest) : [], clippedSourceDocumentHashes: text ? clippedIds.map(digest) : [],
         scannedDocuments, sourceReads, scanIncomplete,
       };
@@ -1129,7 +1129,10 @@ export class HindsightMemory {
         // The installed 0.10 server's q filters IDs only; inspect bounded original user sources.
         const page = await this.client!.listDocuments(config.bankId, { limit: Math.min(pageSize, maxDocuments - offset), offset, signal: deadline });
         total = page.total; offset += page.items.length;
-        if (page.items.length === 0) break;
+        if (page.items.length === 0) {
+          scanIncomplete = offset < total;
+          break;
+        }
         let processed = 0;
         for (let index = 0; index < page.items.length; index += concurrency) {
           if (scannedDocuments >= maxDocuments || sourceReads >= maxSourceReads || sourceIds.length >= maxSources || maxChars - used < 250) break;
@@ -1142,7 +1145,8 @@ export class HindsightMemory {
             if (this.forgottenSource(candidate.id)) { blocked = true; return []; }
             if (candidate.bank_id && candidate.bank_id !== config.bankId) return [];
             const preview = candidate.document_metadata;
-            if (preview && (preview.source_actor !== 'user' || preview.kind !== 'event')) return [];
+            if (preview && ((preview.source_actor !== undefined && preview.source_actor !== 'user')
+              || (preview.kind !== undefined && preview.kind !== 'event'))) return [];
             sourceReads += 1;
             return [this.client!.getDocument(config.bankId, candidate.id, { signal: deadline }).then(doc => ({ candidate, doc }))];
           });
@@ -1175,9 +1179,7 @@ export class HindsightMemory {
       if (epoch !== this.cacheEpoch || fence !== this.visibilityEpoch()) return finish('', 'fenced');
       if (sourceIds.length) return finish(lines.join(''), 'found');
       if (blocked) return finish('', 'fenced');
-      return scanIncomplete
-        ? finish('[memory] No matching original user source appeared in this bounded scan. The bank was not searched completely; this does not establish that the event is absent.', 'absent')
-        : finish('', 'absent');
+      return finish(sourceLookupMissNotice(scanIncomplete), 'absent', scanIncomplete ? 'incomplete' : 'absent');
     } catch (err) {
       scanIncomplete = true;
       if (!deadline.aborted) this.noteFailure('source-search', err);

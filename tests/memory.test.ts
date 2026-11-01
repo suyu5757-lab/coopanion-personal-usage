@@ -7,6 +7,7 @@ import { loadHindsightConfig } from '../core/memory/config.ts';
 import { hindsightConfigGroup } from '../core/memory/config-group.ts';
 import { cleanSpeech, DEFAULT_ACTIVATION_RANK_INFLUENCE, formatPortrait, formatRecall, formatRecallDetailed, type FormattedRecallResult } from '../core/memory/format.ts';
 import { captureRetrievalScores } from '../core/memory/retrieval-scores.ts';
+import { MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE } from '../core/memory/model-text.ts';
 import { sanitizeForMemory } from '../core/memory/policy.ts';
 
 const workspace = () => mkdtempSync(join(tmpdir(), 'coo-memory-'));
@@ -128,7 +129,14 @@ describe('memory formatting', () => {
   it('labels a recall whose supporting source facts were truncated', () => {
     const text = formatRecall([recallResult({ text: 'A synthetic observation.', sourceFactsIncomplete: true })], { sourceFactsTruncated: true });
 
-    expect(text).toContain('Supporting source facts were truncated');
+    expect(text).toContain('Supporting source evidence is incomplete or truncated');
+    expect(text).toContain(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE);
+    expect(text).toContain('Supporting source facts are incomplete for this result.');
+  });
+
+  it('requests original-source verification for incomplete facts even without a server truncation flag', () => {
+    const text = formatRecall([recallResult({ text: 'A synthetic observation.', sourceFactsIncomplete: true })]);
+    expect(text).toContain(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE);
     expect(text).toContain('Supporting source facts are incomplete for this result.');
   });
 
@@ -137,7 +145,7 @@ describe('memory formatting', () => {
       recallResult({ id: 'long', text: 'x'.repeat(700), sourceFactsIncomplete: true }),
     ], { header: 'H'.repeat(90), maxChars: 800, sourceFactsTruncated: true });
     expect(text.length).toBeLessThanOrEqual(800);
-    expect(text).toContain('[memory] Supporting source facts were truncated');
+    expect(text).toContain(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE);
     expect(text).toContain('Supporting source facts are incomplete for this result.');
     expect(text).toContain('xxxxxxxxxxxxxxxx');
   });
