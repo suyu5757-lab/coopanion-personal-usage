@@ -212,6 +212,7 @@ describe('Hindsight source-fact recall', () => {
     expect(read.text).toContain('Wei reviewed the shared plan.');
     expect(read.trace?.search.items).toEqual([{
       resultIndex: 0,
+      queryIndex: 0,
       resultId: 'observation-plan',
       parentDocumentId: 'doc-observation',
       declaredSourceFactIds: ['fact-coordination', 'fact-review'],

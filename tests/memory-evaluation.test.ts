@@ -142,11 +142,11 @@ describe('memory evaluation contract', () => {
       candidateResultIds: ['observation', 'direct'],
       items: [
         {
-          resultIndex: 0, resultId: 'observation', parentDocumentId: 'doc-derived', declaredSourceFactIds: ['fact-a'],
+          resultIndex: 0, queryIndex: 0, resultId: 'observation', parentDocumentId: 'doc-derived', declaredSourceFactIds: ['fact-a'],
           verifiedSources: [{ sourceFactId: 'fact-a', documentId: 'doc-a' }], disposition: 'visible', sourceFactsIncomplete: false,
         },
         {
-          resultIndex: 1, resultId: 'direct', parentDocumentId: 'doc-b', declaredSourceFactIds: [], verifiedSources: [],
+          resultIndex: 1, queryIndex: 0, resultId: 'direct', parentDocumentId: 'doc-b', declaredSourceFactIds: [], verifiedSources: [],
           disposition: 'visible', sourceFactsIncomplete: false,
         },
       ],

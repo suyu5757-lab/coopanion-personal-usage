@@ -21,18 +21,53 @@ import { planRecall, type RecallRoute } from './router.ts';
 import { partnerSourceScopeDigest } from './partner-provenance.ts';
 import { sourceFactsTokenBudget as resolveSourceFactsTokenBudget, recallContextCharBudget } from './recall-limits.ts';
 import { summarizeSourceFacts, type SourceFactCounts } from './recall-evidence.ts';
-import { SOURCE_LOOKUP_HEADER, sourceLookupMissNotice } from './model-text.ts';
+import { planRecallQueries, type SourceMatchType } from './recall-query.ts';
+import {
+  SOURCE_LOOKUP_CANDIDATE_HEADER,
+  SOURCE_LOOKUP_HEADER,
+  SOURCE_LOOKUP_INCOMPLETE_NOTICE,
+  SOURCE_LOOKUP_INVALID_CANDIDATE_NOTICE,
+  sourceLookupMissNotice,
+} from './model-text.ts';
 
 export type MemoryReadStatus = 'found' | 'absent' | 'incomplete' | 'unavailable' | 'fenced';
 export type TurnRecallStatus = MemoryReadStatus | 'skipped';
-export const SOURCE_LOOKUP_LIMITS = { pageSize: 250, maxDocuments: 2048, maxSourceReads: 1024, concurrency: 4, maxSources: 6, maxChars: 8000 } as const;
+export const SOURCE_LOOKUP_LIMITS = { pageSize: 250, maxDocuments: 2048, maxSourceReads: 2048, concurrency: 4, maxSources: 6, maxChars: 8000 } as const;
 const DEEP_RECALL_MAX_ITEMS = 20;
+const MAX_SUPPLEMENTAL_RECALL_QUERIES = 2;
+const SUPPLEMENTAL_RECALL_MAX_TOKENS = 600;
+const SUPPLEMENTAL_SOURCE_FACTS_MAX_TOKENS = 1024;
+const MAX_PRIORITY_SOURCE_DOCUMENTS = DEEP_RECALL_MAX_ITEMS;
 
 export interface MemoryTextRead {
   text: string;
   status: MemoryReadStatus;
   sourceFactsTruncated?: boolean;
   trace?: MemoryRecallTrace;
+  sourceDocuments?: OriginalSourceCandidate[];
+  rejectedSourceDocumentIds?: string[];
+}
+
+export interface OriginalSourceCandidate {
+  documentId: string;
+  originalText: string;
+  recordedAt: string;
+  sourceKind: 'event' | 'correction';
+  recordStatus: string;
+  matchType: SourceMatchType;
+  matchChars: number;
+  clipped: boolean;
+}
+
+export interface RecallQueryAttemptTrace {
+  queryHash: string;
+  strategy: 'primary' | 'topic' | 'phrase';
+  status: MemoryReadStatus;
+  elapsedMs: number;
+  resultCount: number;
+  sourceFactsTruncated: boolean;
+  recallTokenBudget?: number;
+  sourceFactsTokenBudget?: number;
 }
 
 export interface MemoryRecallTrace {
@@ -41,6 +76,7 @@ export interface MemoryRecallTrace {
   maxTokens: number;
   maxChars: number;
   sourceFactsTokenBudget?: number;
+  queryAttempts: RecallQueryAttemptTrace[];
 }
 
 export interface MemorySearchSourceFact {
@@ -50,6 +86,7 @@ export interface MemorySearchSourceFact {
   date: string;
   documentId: string;
   metadata?: Record<string, string>;
+  sourceMatchType?: SourceMatchType;
 }
 
 export interface MemorySearchResult {
@@ -65,6 +102,8 @@ export interface MemorySearchResult {
   matchScore?: number;
   activationWeight?: number;
   retrievalScores?: RetrievalScoreEvidence;
+  queryIndexes?: number[];
+  sourceMatchType?: SourceMatchType;
 }
 
 export interface MemorySearchRead {
@@ -76,12 +115,13 @@ export interface MemorySearchRead {
 
 export interface MemorySearchTraceItem {
   resultIndex: number;
+  queryIndex: number;
   resultId: string;
   parentDocumentId: string | null;
   declaredSourceFactIds: string[];
   verifiedSources: Array<{ sourceFactId: string; documentId: string }>;
   disposition: 'candidate' | 'visible' | 'filtered' | 'fenced';
-  reason?: 'forgotten-support' | 'unverified-source-fact' | 'unlinked-observation' | 'fence-unresolved' | 'ledger-unreadable';
+  reason?: 'forgotten-support' | 'unverified-source-fact' | 'unlinked-observation' | 'missing-source-id' | 'current-question-source' | 'fence-unresolved' | 'ledger-unreadable';
   sourceFactsIncomplete: boolean;
   activationWeight?: number;
   retrievalScores?: RetrievalScoreEvidence;
@@ -96,6 +136,7 @@ export interface MemorySearchTrace {
   recallTokenBudget?: number;
   sourceFactsTokenBudget?: number;
   sourceFactCounts?: SourceFactCounts;
+  queryAttempts?: RecallQueryAttemptTrace[];
 }
 
 export interface MemoryLog {
@@ -116,6 +157,7 @@ export interface RecallOptions {
   types?: string[];
   captureTrace?: boolean;
   userEventDocumentId?: string;
+  queryIndex?: number;
 }
 
 interface UserEventSource {
@@ -147,6 +189,177 @@ function historicalSourceMetadata(metadata: Record<string, string> | undefined):
     && metadata.status !== 'disputed';
 }
 
+function recallResultKey(result: MemorySearchResult): string {
+  if (result.documentId && result.type !== 'observation') return `${result.type}\0${result.documentId}`;
+  return `${result.type}\0${result.id}`;
+}
+
+function mergeRecallReads(reads: readonly MemorySearchRead[]): MemorySearchRead {
+  const merged = new Map<string, MemorySearchResult>();
+  const traceItems: MemorySearchTraceItem[] = [];
+  const attempts: RecallQueryAttemptTrace[] = [];
+  const sourceFactCounts: SourceFactCounts = { declared: 0, returned: 0, valid: 0, missing: 0, invalid: 0, parsed: 0 };
+  let recallTokenBudget = 0, sourceFactsTokenBudget = 0;
+  let hasRecallBudget = false, hasSourceBudget = false, sourceFactsTruncated = false;
+
+  for (const read of reads) {
+    if (read.trace) {
+      traceItems.push(...read.trace.items);
+      if (read.trace.recallTokenBudget !== undefined) { recallTokenBudget += read.trace.recallTokenBudget; hasRecallBudget = true; }
+      if (read.trace.sourceFactsTokenBudget !== undefined) { sourceFactsTokenBudget += read.trace.sourceFactsTokenBudget; hasSourceBudget = true; }
+      for (const key of ['declared', 'returned', 'valid', 'missing', 'invalid', 'parsed'] as const) {
+        sourceFactCounts[key] = (sourceFactCounts[key] ?? 0) + (read.trace.sourceFactCounts?.[key] ?? 0);
+      }
+    }
+    if (read.trace?.queryAttempts) attempts.push(...read.trace.queryAttempts);
+    sourceFactsTruncated ||= read.sourceFactsTruncated === true;
+    for (const result of read.results) {
+      const key = recallResultKey(result);
+      const current = merged.get(key);
+      if (!current) {
+        merged.set(key, result);
+        continue;
+      }
+      const texts = [...new Set([current.text, result.text].map((value) => value.trim()).filter(Boolean))];
+      const facts = new Map<string, MemorySearchSourceFact>();
+      for (const fact of [...(current.sourceFacts ?? []), ...(result.sourceFacts ?? [])]) {
+        const factKey = `${fact.documentId}\0${fact.id}`;
+        const existing = facts.get(factKey);
+        if (!existing || existing.text.length < fact.text.length) facts.set(factKey, fact);
+      }
+      const matchScore = Math.max(current.matchScore ?? Number.NEGATIVE_INFINITY, result.matchScore ?? Number.NEGATIVE_INFINITY);
+      merged.set(key, {
+        ...current,
+        text: texts.join('\n'),
+        ...(facts.size ? { sourceFacts: [...facts.values()] } : {}),
+        sourceFactsIncomplete: current.sourceFactsIncomplete === true || result.sourceFactsIncomplete === true,
+        ...(Number.isFinite(matchScore) ? { matchScore } : {}),
+        queryIndexes: [...new Set([...(current.queryIndexes ?? []), ...(result.queryIndexes ?? [])])],
+        ...(current.sourceMatchType ?? result.sourceMatchType ? { sourceMatchType: current.sourceMatchType ?? result.sourceMatchType } : {}),
+      });
+    }
+  }
+  const results = [...merged.values()];
+  const status = results.length ? 'found' : reads.some((read) => read.status === 'fenced') ? 'fenced'
+    : reads.some((read) => read.status === 'incomplete') ? 'incomplete'
+      : reads.some((read) => read.status === 'unavailable') ? 'unavailable' : 'absent';
+  const trace: MemorySearchTrace = {
+    items: traceItems,
+    candidateResultIndexes: results.map((_, index) => index),
+    candidateResultIds: results.map((result) => result.id),
+    status,
+    sourceFactsTruncated,
+    ...(hasRecallBudget ? { recallTokenBudget } : {}),
+    ...(hasSourceBudget ? { sourceFactsTokenBudget } : {}),
+    ...(traceItems.length ? { sourceFactCounts } : {}),
+    ...(attempts.length ? { queryAttempts: attempts } : {}),
+  };
+  return { results, status, ...(sourceFactsTruncated ? { sourceFactsTruncated: true } : {}), trace };
+}
+
+function recallEvidenceCoversQuery(read: MemorySearchRead, phrases: readonly string[]): boolean {
+  if (read.status !== 'found' || read.sourceFactsTruncated) return false;
+  const complete = read.results.filter((result) => !result.sourceFactsIncomplete);
+  if (complete.length === 0) return false;
+  const sourceTexts = complete.flatMap((result) => [
+    ...(result.metadata?.source_actor === 'user' && ['event', 'correction'].includes(result.metadata.kind ?? '') ? [result.text] : []),
+    ...(result.sourceFacts ?? []).filter((fact) => fact.metadata?.source_actor === 'user'
+      && ['event', 'correction'].includes(fact.metadata.kind ?? '')).map((fact) => fact.text),
+  ]).map((text) => text.toLocaleLowerCase());
+  if (sourceTexts.length === 0) return false;
+  const required = [...new Set(phrases.filter((phrase) => [...phrase].length >= 3))];
+  if (required.length === 0) return true;
+  return sourceTexts.some((sourceText) => {
+    const matched = required.filter((phrase) => sourceText.includes(phrase.toLocaleLowerCase()))
+      .sort((left, right) => [...right].length - [...left].length);
+    if (matched.some((phrase) => [...phrase].length >= 8
+      && (phrase.includes(' ') || /\p{Script=Han}/u.test(phrase)))) return true;
+    const distinct = matched.filter((phrase, index) => !matched.slice(0, index)
+      .some((previous) => previous.includes(phrase) || phrase.includes(previous)));
+    return distinct.length >= Math.min(2, required.length);
+  });
+}
+
+/** Source facts already carry validated support; only direct user records need an original-document read-back. */
+function sourceDocumentIdsFromRecall(results: readonly MemorySearchResult[], excludeDocumentId?: string): string[] {
+  const ids = new Set<string>();
+  for (const result of results) {
+    if (result.type !== 'observation' && result.documentId
+      && result.metadata?.source_actor === 'user' && ['event', 'correction'].includes(result.metadata.kind ?? '')
+      && result.documentId !== excludeDocumentId) ids.add(result.documentId);
+  }
+  return [...ids];
+}
+
+function mergeOriginalSources(read: MemorySearchRead, sources: readonly OriginalSourceCandidate[]): MemorySearchRead {
+  if (sources.length === 0) return read;
+  const results = [...read.results];
+  for (const source of sources) {
+    const matching = results.findIndex((result) => result.documentId === source.documentId
+      || result.sourceFacts?.some((fact) => fact.documentId === source.documentId));
+    if (matching < 0) {
+      results.push({
+        id: `source-candidate:${hash(source.documentId)}`,
+        text: source.originalText,
+        type: 'world',
+        date: source.recordedAt,
+        documentId: source.documentId,
+        metadata: { source_actor: 'user', kind: source.sourceKind, status: source.recordStatus },
+        sourceMatchType: source.matchType,
+      });
+      continue;
+    }
+    const result = results[matching]!;
+    if (result.documentId === source.documentId) {
+      const text = result.text.includes(source.originalText) ? result.text : `${result.text}\n${source.originalText}`;
+      results[matching] = { ...result, text, sourceMatchType: source.matchType };
+      continue;
+    }
+    const facts = result.sourceFacts?.map((fact) => fact.documentId === source.documentId
+      ? {
+        ...fact,
+        text: fact.text.includes(source.originalText) ? fact.text : `${fact.text}\n${source.originalText}`,
+        sourceMatchType: source.matchType,
+      }
+      : fact);
+    results[matching] = { ...result, ...(facts ? { sourceFacts: facts } : {}) };
+  }
+  const matchPriority: Record<SourceMatchType, number> = { query_prefix: 0, literal_phrase: 1, semantic_candidate: 2 };
+  results.sort((left, right) => {
+    const leftType = left.sourceMatchType ?? left.sourceFacts?.find((fact) => fact.sourceMatchType)?.sourceMatchType;
+    const rightType = right.sourceMatchType ?? right.sourceFacts?.find((fact) => fact.sourceMatchType)?.sourceMatchType;
+    if (!leftType && !rightType) return 0;
+    if (!leftType) return 1;
+    if (!rightType) return -1;
+    return matchPriority[leftType] - matchPriority[rightType];
+  });
+  return { ...read, results };
+}
+
+function rejectInvalidSourceCandidates(read: MemorySearchRead, invalidIds: readonly string[]): MemorySearchRead {
+  const invalid = new Set(invalidIds);
+  if (invalid.size === 0) return read;
+  const results = read.results.flatMap((result): MemorySearchResult[] => {
+    if (result.documentId && invalid.has(result.documentId)) {
+      for (const item of read.trace?.items ?? []) {
+        if (item.resultId === result.id) {
+          item.disposition = 'filtered';
+          item.reason = 'missing-source-id';
+        }
+      }
+      return [];
+    }
+    return [result];
+  });
+  const trace = read.trace ? {
+    ...read.trace,
+    candidateResultIndexes: results.map((_, index) => index),
+    candidateResultIds: results.map((result) => result.id),
+    status: results.length ? 'found' as const : 'incomplete' as const,
+  } : undefined;
+  return { ...read, results, status: results.length ? 'found' : 'incomplete', ...(trace ? { trace } : {}) };
+}
+
 export interface TurnRecall {
   text: string;
   route: RecallRoute;
@@ -170,25 +383,20 @@ export interface TurnRecallReceipt {
   timeoutMs: number;
   maxChars: number;
   sourceFactCounts?: SourceFactCounts;
+  queryAttempts?: RecallQueryAttemptTrace[];
   serverTruncated?: boolean;
   includedResults: number;
   omittedResults: number;
   clippedResults: number;
   includedSourceFactHashes: string[];
   includedSourceDocumentHashes: string[];
-  automaticSourceLookup?: {
-    status: SourceLookupReceipt['status'];
-    sourceDocumentHashes: string[];
-    scannedDocuments: number;
-    sourceReads: number;
-    scanIncomplete: boolean;
-    elapsedMs: number;
-  };
+  automaticSourceLookup?: AutomaticSourceLookupReceipt;
 }
 
 export interface SourceLookupReceipt {
   at: string;
   queryHash: string;
+  queryHashes: string[];
   contextHash: string;
   contextChars: number;
   elapsedMs: number;
@@ -198,6 +406,24 @@ export interface SourceLookupReceipt {
   scannedDocuments: number;
   sourceReads: number;
   scanIncomplete: boolean;
+  queryPrefixMatches: number;
+  phraseCandidates: number;
+  semanticCandidates: number;
+  invalidCandidateHashes: string[];
+}
+
+export interface AutomaticSourceLookupReceipt {
+  status: SourceLookupReceipt['status'];
+  queryHashes: string[];
+  sourceDocumentHashes: string[];
+  scannedDocuments: number;
+  sourceReads: number;
+  scanIncomplete: boolean;
+  queryPrefixMatches: number;
+  phraseCandidates: number;
+  semanticCandidates: number;
+  invalidCandidateCount: number;
+  elapsedMs: number;
 }
 
 export interface ForgetSourceScanReceipt {
@@ -936,6 +1162,7 @@ export class HindsightMemory {
         const sourceFactIds = [...new Set(result.source_fact_ids ?? [])];
         const traceItem: MemorySearchTraceItem | undefined = opts.captureTrace ? {
           resultIndex,
+          queryIndex: opts.queryIndex ?? 0,
           resultId: result.id,
           parentDocumentId: documentId,
           declaredSourceFactIds: sourceFactIds,
@@ -947,6 +1174,7 @@ export class HindsightMemory {
         if (traceItem) traceItems.push(traceItem);
         let missingSourceFact = false;
         let forgottenSupport = false;
+        let currentQuestionSupport = false;
         for (const sourceFactId of sourceFactIds) {
           const fact = sourceFactsById[sourceFactId];
           const factDocumentId = fact?.document_id?.trim();
@@ -957,6 +1185,11 @@ export class HindsightMemory {
           }
           if (this.forgottenSource(factDocumentId)) {
             forgottenSupport = true;
+            continue;
+          }
+          if (factDocumentId === opts.userEventDocumentId) {
+            currentQuestionSupport = true;
+            missingSourceFact = true;
             continue;
           }
           const factMetadata = fact.metadata ? { ...fact.metadata } : {};
@@ -979,15 +1212,20 @@ export class HindsightMemory {
         const cannotVerifySupport = sourceFactIds.length > 0 && missingSourceFact && sourceFacts.length === 0;
         // An observation's parent document does not identify the sources it was derived from.
         const unlinkedObservation = result.type === 'observation' && sourceFactIds.length === 0;
+        const currentQuestionResult = !!documentId && documentId === opts.userEventDocumentId;
+        const missingDirectSource = result.type !== 'observation' && !documentId && sourceFacts.length === 0;
         const unverifiedDirectSource = result.type !== 'observation' && !historicalSourceMetadata(metadata);
         if (traceItem) traceItem.sourceFactsIncomplete = sourceFactIds.length > 0 && missingSourceFact;
-        if (forgottenSupport || cannotVerifySupport || unlinkedObservation || unverifiedDirectSource) {
+        if (forgottenSupport || currentQuestionSupport || currentQuestionResult || cannotVerifySupport
+          || unlinkedObservation || missingDirectSource || unverifiedDirectSource) {
           blockedDerivedResults += 1;
           if (traceItem) {
             traceItem.disposition = 'filtered';
             traceItem.reason = forgottenSupport ? 'forgotten-support'
-              : cannotVerifySupport || unverifiedDirectSource ? 'unverified-source-fact'
-                : 'unlinked-observation';
+              : currentQuestionSupport || currentQuestionResult ? 'current-question-source'
+                : missingDirectSource ? 'missing-source-id'
+                  : cannotVerifySupport || unverifiedDirectSource ? 'unverified-source-fact'
+                    : 'unlinked-observation';
           }
           return [];
         }
@@ -1008,6 +1246,7 @@ export class HindsightMemory {
           ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
           ...(sourceFacts.length > 0 ? { sourceFacts } : {}),
           ...(sourceFactsIncomplete ? { sourceFactsIncomplete: true } : {}),
+          queryIndexes: [opts.queryIndex ?? 0],
         };
         if (sourceFactIds.length > 0 && !missingSourceFact) verifiedSupport.add(mapped);
         if (traceItem) traceByMapped?.set(mapped, traceItem);
@@ -1065,6 +1304,10 @@ export class HindsightMemory {
     if (opts.activationEnabled !== false && opts.userEventDocumentId && read.status === 'found') {
       this.reinforceFromUserTurn(read.results, opts.userEventDocumentId, query);
     }
+    return this.formatSearchReadDetailed(read, opts);
+  }
+
+  private formatSearchReadDetailed(read: MemorySearchRead, opts: RecallOptions = {}): MemoryTextRead {
     const config = this.config;
     const maxTokens = opts.maxTokens ?? config?.recall.maxTokens ?? 900;
     const maxChars = opts.maxChars ?? recallContextCharBudget(maxTokens, resolveSourceFactsTokenBudget(opts.maxSourceFactsTokens ?? config?.recall.maxSourceFactsTokens));
@@ -1080,6 +1323,7 @@ export class HindsightMemory {
       ...(result.sourceFactsIncomplete ? { sourceFactsIncomplete: true } : {}),
       ...(result.activationWeight === undefined ? {} : { activationWeight: result.activationWeight }),
       ...(result.retrievalScores ? { retrievalScores: result.retrievalScores } : {}),
+      ...(result.sourceMatchType ? { sourceMatchType: result.sourceMatchType } : {}),
     }));
     const formatOptions = {
       maxChars,
@@ -1104,6 +1348,7 @@ export class HindsightMemory {
           maxTokens,
           maxChars,
           ...(read.trace.sourceFactsTokenBudget === undefined ? {} : { sourceFactsTokenBudget: read.trace.sourceFactsTokenBudget }),
+          queryAttempts: read.trace.queryAttempts ?? [],
         },
       };
     }
@@ -1117,91 +1362,217 @@ export class HindsightMemory {
     return (await this.recallBlockDetailed(query, opts)).text;
   }
 
-  /** Bounded literal lookup of original sources when semantic recall omits a needed detail. */
-  async searchSourceDocuments(query: string, opts: { excludeDocumentId?: string } = {}): Promise<MemoryTextRead> {
+  /** Reads original user events selected by Recall, then searches a bounded set of literal topic phrases. */
+  async searchSourceDocuments(query: string, opts: {
+    excludeDocumentId?: string;
+    candidateDocumentIds?: readonly string[];
+    fallbackPhrases?: readonly string[];
+    candidateOnly?: boolean;
+    timeoutMs?: number;
+  } = {}): Promise<MemoryTextRead> {
     const started = Date.now();
-    const asked = sanitizeForMemory(query).text.trim().slice(0, 120);
-    const sourceIds: string[] = [], clippedIds: string[] = [];
-    let scannedDocuments = 0, sourceReads = 0, scanIncomplete = false;
+    const safeQuery = sanitizeForMemory(query);
+    const asked = safeQuery.skip ? '' : safeQuery.text.trim().slice(0, 120);
+    const phraseCandidates = (opts.fallbackPhrases ?? []).flatMap((candidate) => {
+      const safe = sanitizeForMemory(candidate);
+      const text = safe.skip ? '' : safe.text.trim();
+      return text.length >= 2 ? [text] : [];
+    });
+    const needleMap = new Map<string, { text: string; type: SourceMatchType }>();
+    if (asked) needleMap.set(asked.toLocaleLowerCase(), { text: asked, type: 'query_prefix' });
+    for (const text of phraseCandidates) {
+      if (!needleMap.has(text.toLocaleLowerCase())) needleMap.set(text.toLocaleLowerCase(), { text, type: 'literal_phrase' });
+    }
+    const needles = [...needleMap.values()];
     const digest = (text: string) => createHash('sha256').update(text).digest('hex');
+    const renderedSourceDocuments: OriginalSourceCandidate[] = [];
+    const clippedIds: string[] = [];
+    let scannedDocuments = 0, sourceReads = 0, scanIncomplete = false, blocked = false;
+    const rejectedSourceDocumentIds = new Set<string>();
+    let queryPrefixMatches = 0, phraseMatches = 0, semanticCandidates = 0;
+    const queryHashes = needles.map((needle) => digest(needle.text));
     const finish = (text: string, status: MemoryReadStatus, receiptStatus: SourceLookupReceipt['status'] = status): MemoryTextRead => {
       this.lastSourceLookup = {
-        at: new Date().toISOString(), queryHash: digest(asked), contextHash: digest(text), contextChars: text.length,
+        at: new Date().toISOString(), queryHash: digest(asked), queryHashes,
+        contextHash: digest(text), contextChars: text.length,
         elapsedMs: Date.now() - started, status: receiptStatus,
-        sourceDocumentHashes: text ? sourceIds.map(digest) : [], clippedSourceDocumentHashes: text ? clippedIds.map(digest) : [],
+        sourceDocumentHashes: renderedSourceDocuments.map((source) => digest(source.documentId)),
+        clippedSourceDocumentHashes: clippedIds.map(digest),
         scannedDocuments, sourceReads, scanIncomplete,
+        queryPrefixMatches, phraseCandidates: phraseMatches, semanticCandidates,
+        invalidCandidateHashes: [...rejectedSourceDocumentIds].map((id) => digest(id)),
       };
-      return { text, status };
+      return {
+        text,
+        status,
+        ...(renderedSourceDocuments.length ? { sourceDocuments: [...renderedSourceDocuments] } : {}),
+        ...(rejectedSourceDocumentIds.size ? { rejectedSourceDocumentIds: [...rejectedSourceDocumentIds] } : {}),
+      };
     };
-    if (!asked) return finish('', 'absent');
+    if (needles.length === 0 && !(opts.candidateDocumentIds?.length)) return finish('', 'absent');
     if (this.forgetScanDepth > 0) return finish('', 'fenced');
     if (!this.stateStore || !this.outbox?.readable() || !this.ledger || this.ledger.damaged()) return finish('', 'fenced');
     if (!this.canTry() || !await this.ensureStarted()) return finish('', 'unavailable');
     const config = this.config!, epoch = this.cacheEpoch, fence = this.visibilityEpoch();
-    const deadline = AbortSignal.timeout(config.recall.timeoutMs);
-    const lines = [SOURCE_LOOKUP_HEADER];
-    const { maxChars, maxDocuments, maxSourceReads, maxSources, pageSize, concurrency } = SOURCE_LOOKUP_LIMITS;
-    let used = SOURCE_LOOKUP_HEADER.length;
-    let blocked = false;
+    const timeoutMs = Math.min(config.recall.timeoutMs, opts.timeoutMs ?? config.recall.timeoutMs);
+    if (timeoutMs <= 0) return finish('', 'unavailable');
+    const deadline = AbortSignal.timeout(timeoutMs);
+    const {
+      maxChars, maxDocuments, maxSourceReads, maxSources, pageSize, concurrency,
+    } = SOURCE_LOOKUP_LIMITS;
+    const header = opts.fallbackPhrases?.length || opts.candidateDocumentIds?.length
+      ? SOURCE_LOOKUP_CANDIDATE_HEADER
+      : SOURCE_LOOKUP_HEADER;
+    const incompleteNotice = SOURCE_LOOKUP_INCOMPLETE_NOTICE;
+    let blockedCandidates = false;
     try {
       const superseded = this.stateStore.supersededSources(config.bankId, config.apiUrl);
       const currentRevisions = this.stateStore.currentRevisionSources(config.bankId, config.apiUrl);
       const seen = new Set<string>();
+      const listedCandidates: Array<Omit<OriginalSourceCandidate, 'originalText' | 'clipped'>> = [];
+      const candidateBodies = new Map<string, { text: string; clipped: boolean }>();
+      const recordDocument = (candidateId: string, doc: Awaited<ReturnType<NonNullable<typeof this.client>['getDocument']>> | null, semanticCandidate: boolean): void => {
+        if (!doc || doc.id !== candidateId || doc.bank_id !== config.bankId || this.forgottenSource(candidateId)) {
+          if (semanticCandidate && !this.forgottenSource(candidateId)) rejectedSourceDocumentIds.add(candidateId);
+          return;
+        }
+        const metadata = (doc.document_metadata ?? {}) as Record<string, string>;
+        if (metadata.source_actor !== 'user' || !['event', 'correction'].includes(metadata.kind ?? '')) {
+          if (semanticCandidate) rejectedSourceDocumentIds.add(candidateId);
+          return;
+        }
+        const safe = sanitizeForMemory(doc.original_text ?? '');
+        if (!safe.text) {
+          if (semanticCandidate) rejectedSourceDocumentIds.add(candidateId);
+          return;
+        }
+        const matched = needles.filter((needle) => safe.text.toLocaleLowerCase().includes(needle.text.toLocaleLowerCase()));
+        if (!semanticCandidate && matched.length === 0) return;
+        const matchType: SourceMatchType = matched.some((needle) => needle.type === 'query_prefix') ? 'query_prefix'
+          : matched.length > 0 ? 'literal_phrase' : 'semantic_candidate';
+        const state = currentRevisions.has(doc.id) ? 'current' : superseded.has(doc.id) ? 'superseded'
+          : typeof metadata.status === 'string' ? metadata.status : 'unknown';
+        const recordedAt = typeof metadata.said_at === 'string' ? metadata.said_at : doc.created_at;
+        if (matchType === 'semantic_candidate') semanticCandidates += 1;
+        else if (matchType === 'query_prefix') queryPrefixMatches += 1;
+        else phraseMatches += 1;
+        const sourceKind = metadata.kind === 'correction' ? 'correction' : 'event';
+        listedCandidates.push({
+          documentId: doc.id,
+          recordedAt,
+          sourceKind,
+          recordStatus: state,
+          matchType,
+          matchChars: matched.reduce((length, needle) => Math.max(length, needle.text.length), 0),
+        });
+        const bounded = safe.text.slice(0, maxChars);
+        candidateBodies.set(doc.id, { text: bounded, clipped: bounded.length < safe.text.length });
+      };
+
+      const candidateLimit = opts.candidateOnly ? maxSources : MAX_PRIORITY_SOURCE_DOCUMENTS;
+      const prioritizedIds = [...new Set((opts.candidateDocumentIds ?? []).filter((id) => !!id && id !== opts.excludeDocumentId))]
+        .slice(0, candidateLimit);
+      if ((opts.candidateDocumentIds?.length ?? 0) > prioritizedIds.length) scanIncomplete = true;
+      for (let index = 0; index < prioritizedIds.length && sourceReads < maxSourceReads && scannedDocuments < maxDocuments; index += concurrency) {
+        const batch = prioritizedIds.slice(index, index + concurrency).filter((id) => !seen.has(id));
+        for (const id of batch) { seen.add(id); scannedDocuments += 1; }
+        const pending = batch.flatMap((id) => {
+          if (this.forgottenSource(id)) { blockedCandidates = true; return []; }
+          sourceReads += 1;
+          return [this.client!.getDocument(config.bankId, id, { signal: deadline }).then((doc) => ({ id, doc })).catch((err: unknown) => {
+            if (err instanceof HindsightError && err.statusCode === 404) {
+              rejectedSourceDocumentIds.add(id);
+              return { id, doc: null };
+            }
+            throw err;
+          })];
+        });
+        const documents = await Promise.all(pending);
+        if (epoch !== this.cacheEpoch || fence !== this.visibilityEpoch()) return finish('', 'fenced');
+        for (const { id, doc } of documents) recordDocument(id, doc, true);
+      }
+
       let offset = 0, total = Infinity;
-      while (offset < total && offset < maxDocuments && sourceReads < maxSourceReads && sourceIds.length < maxSources) {
-        // The installed 0.10 server's q filters IDs only; inspect bounded original user sources.
-        const page = await this.client!.listDocuments(config.bankId, { limit: Math.min(pageSize, maxDocuments - offset), offset, signal: deadline });
-        total = page.total; offset += page.items.length;
+      let textScanIncomplete = false;
+      const shouldScanText = opts.candidateOnly !== true || prioritizedIds.length === 0 || listedCandidates.length === 0;
+      const literalCandidateCount = () => listedCandidates.filter((candidate) => candidate.matchType !== 'semantic_candidate').length;
+      while (shouldScanText && offset < total && scannedDocuments < maxDocuments && sourceReads < maxSourceReads
+        && literalCandidateCount() < maxSources && !deadline.aborted) {
+        const limit = Math.min(pageSize, maxDocuments - scannedDocuments);
+        const page = await this.client!.listDocuments(config.bankId, { limit, offset, signal: deadline });
+        total = page.total;
+        offset += page.items.length;
         if (page.items.length === 0) {
-          scanIncomplete = offset < total;
+          textScanIncomplete = offset < total;
           break;
         }
         let processed = 0;
         for (let index = 0; index < page.items.length; index += concurrency) {
-          if (scannedDocuments >= maxDocuments || sourceReads >= maxSourceReads || sourceIds.length >= maxSources || maxChars - used < 250) break;
-          const pending = page.items.slice(index, index + concurrency).flatMap(candidate => {
-            if (scannedDocuments >= maxDocuments || sourceReads >= maxSourceReads) return [];
+          if (scannedDocuments >= maxDocuments || sourceReads >= maxSourceReads
+            || literalCandidateCount() >= maxSources || deadline.aborted) break;
+          const pending = page.items.slice(index, index + concurrency).flatMap((candidate) => {
             processed += 1;
             if (seen.has(candidate.id)) return [];
-            seen.add(candidate.id); scannedDocuments += 1;
+            seen.add(candidate.id);
+            scannedDocuments += 1;
             if (candidate.id === opts.excludeDocumentId) return [];
             if (this.forgottenSource(candidate.id)) { blocked = true; return []; }
             if (candidate.bank_id && candidate.bank_id !== config.bankId) return [];
-            const preview = candidate.document_metadata;
+            const preview = candidate.document_metadata as Record<string, string> | undefined;
             if (preview && ((preview.source_actor !== undefined && preview.source_actor !== 'user')
-              || (preview.kind !== undefined && preview.kind !== 'event'))) return [];
+              || (preview.kind !== undefined && !['event', 'correction'].includes(preview.kind)))) return [];
             sourceReads += 1;
-            return [this.client!.getDocument(config.bankId, candidate.id, { signal: deadline }).then(doc => ({ candidate, doc }))];
+            return [this.client!.getDocument(config.bankId, candidate.id, { signal: deadline })
+              .then((doc) => ({ id: candidate.id, doc }))
+              .catch((err: unknown) => {
+                if (err instanceof HindsightError && err.statusCode === 404) {
+                  scanIncomplete = true;
+                  rejectedSourceDocumentIds.add(candidate.id);
+                  return { id: candidate.id, doc: null };
+                }
+                throw err;
+              })];
           });
           const documents = await Promise.all(pending);
           if (epoch !== this.cacheEpoch || fence !== this.visibilityEpoch()) return finish('', 'fenced');
-          for (const { candidate, doc } of documents) {
-            if (sourceIds.length >= maxSources) break;
-            if (!doc || doc.id !== candidate.id || doc.bank_id !== config.bankId || this.forgottenSource(doc.id)) continue;
-            const metadata = doc.document_metadata ?? {};
-            if (metadata.source_actor !== 'user' || metadata.kind !== 'event') continue;
-            const safe = sanitizeForMemory(doc.original_text ?? '');
-            if (!safe.text || !safe.text.toLowerCase().includes(asked.toLowerCase())) continue;
-            const state = currentRevisions.has(doc.id) ? 'current' : superseded.has(doc.id) ? 'superseded'
-              : typeof metadata.status === 'string' ? metadata.status : 'unknown';
-            const at = typeof metadata.said_at === 'string' ? metadata.said_at : doc.created_at;
-            const prefix = `\n- (source_id:${doc.id}, recorded_at:${at}, actor:user, record_status:${state}) `;
-            const notice = '\n  [Source excerpt truncated.]';
-            const remaining = maxChars - used - prefix.length;
-            if (remaining <= notice.length) break;
-            const clipped = safe.text.length > remaining;
-            const text = clipped ? safe.text.slice(0, remaining - notice.length) + notice : safe.text;
-            const line = prefix + text;
-            lines.push(line); used += line.length; sourceIds.push(doc.id);
-            if (clipped) clippedIds.push(doc.id);
-          }
+          for (const { id, doc } of documents) recordDocument(id, doc, false);
         }
-        scanIncomplete = offset < total || processed < page.items.length;
+        textScanIncomplete = offset < total || processed < page.items.length;
         if (processed < page.items.length) break;
       }
+      if (deadline.aborted) textScanIncomplete = true;
+      scanIncomplete ||= textScanIncomplete;
       if (epoch !== this.cacheEpoch || fence !== this.visibilityEpoch()) return finish('', 'fenced');
-      if (sourceIds.length) return finish(lines.join(''), 'found');
-      if (blocked) return finish('', 'fenced');
+      if (listedCandidates.length === 0 && blockedCandidates) return finish('', 'fenced');
+      if (listedCandidates.length === 0 && blocked) return finish('', 'fenced');
+
+      const matchPriority: Record<SourceMatchType, number> = { query_prefix: 0, literal_phrase: 1, semantic_candidate: 2 };
+      listedCandidates.sort((left, right) => matchPriority[left.matchType] - matchPriority[right.matchType]
+        || right.matchChars - left.matchChars);
+      const lines = [header];
+      let used = header.length;
+      for (const candidate of listedCandidates.slice(0, maxSources)) {
+        const body = candidateBodies.get(candidate.documentId);
+        if (!body) continue;
+        const prefix = `\n- (source_id:${candidate.documentId}, recorded_at:${candidate.recordedAt}, actor:user, kind:${candidate.sourceKind}, record_status:${candidate.recordStatus}, match_type:${candidate.matchType}) `;
+        const truncationNotice = '\n  [Source excerpt truncated.]';
+        const reserve = incompleteNotice.length + 1;
+        const remaining = maxChars - used - prefix.length - reserve;
+        if (remaining <= truncationNotice.length) { scanIncomplete = true; break; }
+        const clipped = body.clipped || body.text.length > remaining;
+        const excerpt = clipped ? body.text.slice(0, Math.max(0, remaining - truncationNotice.length)) + truncationNotice : body.text;
+        const line = prefix + excerpt;
+        if (used + line.length > maxChars - reserve) { scanIncomplete = true; break; }
+        lines.push(line);
+        used += line.length;
+        renderedSourceDocuments.push({ ...candidate, originalText: excerpt, clipped });
+        if (clipped) clippedIds.push(candidate.documentId);
+      }
+      if (renderedSourceDocuments.length > 0) {
+        const notice = scanIncomplete ? `\n${incompleteNotice}` : '';
+        return finish(lines.join('') + notice, scanIncomplete ? 'incomplete' : 'found');
+      }
+      if (blockedCandidates || blocked) return finish('', 'fenced');
       return finish(sourceLookupMissNotice(scanIncomplete), 'absent', scanIncomplete ? 'incomplete' : 'absent');
     } catch (err) {
       scanIncomplete = true;
@@ -1236,6 +1607,7 @@ export class HindsightMemory {
         route: plan.route, status, elapsedMs: Date.now() - started, cacheHit,
         maxTokens: plan.maxTokens, maxSourceFactsTokens: plan.maxSourceFactsTokens, timeoutMs: plan.timeoutMs, maxChars: plan.maxChars,
         ...(trace?.search.sourceFactCounts ? { sourceFactCounts: trace.search.sourceFactCounts } : {}),
+        ...(trace?.queryAttempts.length ? { queryAttempts: trace.queryAttempts } : {}),
         ...(trace ? { serverTruncated: trace.search.sourceFactsTruncated } : {}),
         includedResults: trace?.format.includedResultIds.length ?? 0,
         omittedResults: trace?.format.omittedResultIds.length ?? 0,
@@ -1245,10 +1617,15 @@ export class HindsightMemory {
         ...(automaticSourceLookup ? {
           automaticSourceLookup: {
             status: automaticSourceLookup.status,
+            queryHashes: automaticSourceLookup.queryHashes,
             sourceDocumentHashes: automaticSourceLookup.sourceDocumentHashes,
             scannedDocuments: automaticSourceLookup.scannedDocuments,
             sourceReads: automaticSourceLookup.sourceReads,
             scanIncomplete: automaticSourceLookup.scanIncomplete,
+            queryPrefixMatches: automaticSourceLookup.queryPrefixMatches,
+            phraseCandidates: automaticSourceLookup.phraseCandidates,
+            semanticCandidates: automaticSourceLookup.semanticCandidates,
+            invalidCandidateCount: automaticSourceLookup.invalidCandidateHashes.length,
             elapsedMs: automaticSourceLookup.elapsedMs,
           },
         } : {}),
@@ -1265,49 +1642,143 @@ export class HindsightMemory {
     const key = `${config?.bankId ?? ''}|${config?.apiUrl ?? ''}|${this.visibilityEpoch()}|${plan.route}|${context.userEventDocumentId ?? ''}|${context.activationEnabled === false ? 'disabled' : 'enabled'}|${context.activationInfluence ?? 'default'}|${query.trim().toLowerCase().slice(0, 300)}`;
     const cached = !context.captureTrace && plan.route === 'standard' ? this.recallCache.get(key) : undefined;
     if (cached && Date.now() - cached.at < 5 * 60_000) return finish(cached.value, 'found', cached.trace, true);
-    const read = await this.recallBlockDetailed(query, {
+    if (plan.route === 'standard') {
+      const read = await this.recallBlockDetailed(query, {
+        budget: plan.budget,
+        maxTokens: plan.maxTokens,
+        maxSourceFactsTokens: plan.maxSourceFactsTokens,
+        timeoutMs: plan.timeoutMs,
+        maxChars: plan.maxChars,
+        ...(context.activationEnabled === undefined ? {} : { activationEnabled: context.activationEnabled }),
+        ...(context.activationInfluence === undefined ? {} : { activationInfluence: context.activationInfluence }),
+        captureTrace: true,
+        ...(context.userEventDocumentId ? { userEventDocumentId: context.userEventDocumentId } : {}),
+      });
+      if (epoch !== this.cacheEpoch) return finish('', 'fenced');
+      if (read.text) {
+        this.recallCache.set(key, { at: Date.now(), value: read.text, trace: read.trace });
+        if (this.recallCache.size > 64) {
+          const oldest = this.recallCache.keys().next();
+          if (!oldest.done) this.recallCache.delete(oldest.value);
+        }
+      }
+      return finish(read.text, read.status, read.trace);
+    }
+    const queryPlan = planRecallQueries(query);
+    const queryAttempts: RecallQueryAttemptTrace[] = [];
+    const reads: MemorySearchRead[] = [];
+    const queryHash = (value: string) => createHash('sha256').update(value).digest('hex');
+    const runRecall = async (
+      searchQuery: string,
+      queryIndex: number,
+      strategy: RecallQueryAttemptTrace['strategy'],
+      supplemental: boolean,
+    ): Promise<MemorySearchRead> => {
+      const elapsedStart = Date.now();
+      const remaining = Math.max(0, plan.timeoutMs - (elapsedStart - started));
+      if (remaining <= 0) return { results: [], status: 'unavailable' };
+      const read = await this.searchResultsDetailed(searchQuery, {
+        budget: supplemental ? 'low' : plan.budget,
+        maxTokens: supplemental ? Math.min(SUPPLEMENTAL_RECALL_MAX_TOKENS, plan.maxTokens) : plan.maxTokens,
+        maxSourceFactsTokens: supplemental
+          ? Math.min(SUPPLEMENTAL_SOURCE_FACTS_MAX_TOKENS, plan.maxSourceFactsTokens)
+          : plan.maxSourceFactsTokens,
+        timeoutMs: remaining,
+        ...(context.activationEnabled === undefined ? {} : { activationEnabled: context.activationEnabled }),
+        ...(context.activationInfluence === undefined ? {} : { activationInfluence: context.activationInfluence }),
+        captureTrace: true,
+        ...(context.userEventDocumentId ? { userEventDocumentId: context.userEventDocumentId } : {}),
+        queryIndex,
+      });
+      queryAttempts.push({
+        queryHash: queryHash(searchQuery),
+        strategy,
+        status: read.status,
+        elapsedMs: Date.now() - elapsedStart,
+        resultCount: read.results.length,
+        sourceFactsTruncated: read.sourceFactsTruncated === true,
+        ...(read.trace?.recallTokenBudget === undefined ? {} : { recallTokenBudget: read.trace.recallTokenBudget }),
+        ...(read.trace?.sourceFactsTokenBudget === undefined ? {} : { sourceFactsTokenBudget: read.trace.sourceFactsTokenBudget }),
+      });
+      reads.push(read);
+      return read;
+    };
+
+    const primary = await runRecall(query, 0, 'primary', false);
+    if (epoch !== this.cacheEpoch || primary.status === 'fenced') return finish('', 'fenced');
+    let merged = mergeRecallReads(reads);
+    let evidenceCovered = recallEvidenceCoversQuery(merged, queryPlan.sourcePhrases);
+    if (plan.route === 'deep' && !evidenceCovered && primary.status !== 'unavailable') {
+      for (const [index, supplementalQuery] of queryPlan.supplementalQueries.entries()) {
+        if (index >= MAX_SUPPLEMENTAL_RECALL_QUERIES || Date.now() - started >= plan.timeoutMs) break;
+        const read = await runRecall(supplementalQuery, index + 1, index === 0 ? 'topic' : 'phrase', true);
+        if (epoch !== this.cacheEpoch || read.status === 'fenced') return finish('', 'fenced');
+        merged = mergeRecallReads(reads);
+        evidenceCovered = recallEvidenceCoversQuery(merged, queryPlan.sourcePhrases);
+        if (read.status === 'unavailable' || evidenceCovered) break;
+      }
+    }
+    merged.trace = merged.trace ? { ...merged.trace, queryAttempts } : undefined;
+    if (context.activationEnabled !== false && context.userEventDocumentId && merged.status === 'found') {
+      this.reinforceFromUserTurn(merged.results, context.userEventDocumentId, query);
+    }
+    if (epoch !== this.cacheEpoch) return finish('', 'fenced');
+
+    let automaticSourceLookup: SourceLookupReceipt | undefined;
+    let sourceRead: MemoryTextRead | undefined;
+    if (plan.route === 'deep' && merged.status !== 'unavailable') {
+      const remaining = Math.max(0, plan.timeoutMs - (Date.now() - started));
+      sourceRead = await this.searchSourceDocuments(query, {
+        ...(context.userEventDocumentId ? { excludeDocumentId: context.userEventDocumentId } : {}),
+        candidateDocumentIds: sourceDocumentIdsFromRecall(merged.results, context.userEventDocumentId),
+        fallbackPhrases: queryPlan.sourcePhrases,
+        ...(evidenceCovered ? { candidateOnly: true } : {}),
+        timeoutMs: remaining,
+      });
+      automaticSourceLookup = this.lastSourceLookup ?? undefined;
+      if (epoch !== this.cacheEpoch || sourceRead.status === 'fenced') return finish('', 'fenced', undefined, false, automaticSourceLookup);
+      if (sourceRead.rejectedSourceDocumentIds?.length) {
+        merged = rejectInvalidSourceCandidates(merged, sourceRead.rejectedSourceDocumentIds);
+      }
+      if (sourceRead.sourceDocuments?.length) merged = mergeOriginalSources(merged, sourceRead.sourceDocuments);
+    }
+
+    let notice = '';
+    let status = merged.status;
+    if (sourceRead?.rejectedSourceDocumentIds?.length) {
+      notice = SOURCE_LOOKUP_INVALID_CANDIDATE_NOTICE;
+      status = 'incomplete';
+    }
+    if (sourceRead?.status === 'absent' || sourceRead?.status === 'incomplete') {
+      const sourceNotice = sourceRead.sourceDocuments?.length ? SOURCE_LOOKUP_INCOMPLETE_NOTICE : sourceRead.text;
+      notice = [notice, sourceNotice].filter(Boolean).join('\n');
+      if ((sourceRead.status === 'incomplete' || automaticSourceLookup?.scanIncomplete)
+        && (sourceRead.sourceDocuments?.length || merged.results.length === 0)) status = 'incomplete';
+    }
+    else if (sourceRead?.status === 'unavailable') {
+      notice = [notice, '[memory] The bounded original-source check could not complete. Use only other verified source evidence; this does not mean the record is absent.']
+        .filter(Boolean).join('\n');
+      if (merged.results.length === 0) status = 'unavailable';
+    } else if (sourceRead?.status === 'found' && automaticSourceLookup?.scanIncomplete) {
+      notice = [notice, SOURCE_LOOKUP_INCOMPLETE_NOTICE].filter(Boolean).join('\n');
+    }
+    if (merged.results.length > 0 && sourceRead?.sourceDocuments?.length) {
+      status = sourceRead.rejectedSourceDocumentIds?.length || automaticSourceLookup?.scanIncomplete ? 'incomplete' : 'found';
+    }
+    const formatMaxChars = Math.max(1, plan.maxChars - notice.length - (notice ? 1 : 0));
+    const formatted = this.formatSearchReadDetailed(merged, {
       budget: plan.budget,
       maxTokens: plan.maxTokens,
       maxSourceFactsTokens: plan.maxSourceFactsTokens,
-      timeoutMs: plan.timeoutMs,
-      maxChars: plan.maxChars,
+      maxChars: formatMaxChars,
       ...(plan.route === 'deep' ? { maxItems: DEEP_RECALL_MAX_ITEMS } : {}),
       ...(context.activationEnabled === undefined ? {} : { activationEnabled: context.activationEnabled }),
       ...(context.activationInfluence === undefined ? {} : { activationInfluence: context.activationInfluence }),
       captureTrace: true,
-      ...(context.userEventDocumentId ? { userEventDocumentId: context.userEventDocumentId } : {}),
     });
-    if (epoch !== this.cacheEpoch) return finish('', 'fenced');
-    let text = read.text;
-    let status = read.status;
-    let automaticSourceLookup: SourceLookupReceipt | undefined;
-    if (plan.route === 'deep' && status !== 'unavailable') {
-      const sourceRead = await this.searchSourceDocuments(query, {
-        ...(context.userEventDocumentId ? { excludeDocumentId: context.userEventDocumentId } : {}),
-      });
-      automaticSourceLookup = this.lastSourceLookup ?? undefined;
-      if (epoch !== this.cacheEpoch || sourceRead.status === 'fenced') {
-        return finish('', 'fenced', read.trace, false, automaticSourceLookup);
-      }
-      if (sourceRead.status === 'found') {
-        text = [text, sourceRead.text].filter(Boolean).join('\n\n');
-        status = 'found';
-      } else if (sourceRead.status === 'absent') {
-        text = [text, sourceRead.text].filter(Boolean).join('\n\n');
-      } else if (sourceRead.status === 'unavailable') {
-        text = [text, '[memory] The bounded original-source check could not complete. Use only other verified source evidence; this does not mean the record is absent.']
-          .filter(Boolean).join('\n\n');
-        if (!read.text) status = 'unavailable';
-      }
-    }
-    if (text && plan.route === 'standard') {
-      this.recallCache.set(key, { at: Date.now(), value: text, trace: read.trace });
-      if (this.recallCache.size > 64) {
-        const oldest = this.recallCache.keys().next();
-        if (!oldest.done) this.recallCache.delete(oldest.value);
-      }
-    }
-    return finish(text, status, read.trace, false, automaticSourceLookup);
+    const text = [formatted.text, notice].filter(Boolean).join('\n');
+    if (formatted.trace && queryAttempts.length > 0) formatted.trace.queryAttempts = queryAttempts;
+    return finish(text, status, formatted.trace, false, automaticSourceLookup);
   }
 
   markRecallInjected(text: string): void {

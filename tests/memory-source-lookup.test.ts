@@ -14,13 +14,18 @@ import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import { closeMemoryStateStores, openMemoryStateStore } from '../core/memory/state-store.ts';
 
 describe('original source lookup', () => {
-  it('keeps deep Recall candidates past twelve and verifies one original source without the current question', async () => {
+  it('keeps deep Recall candidates through twenty and verifies one original source without the current question', async () => {
     const root = mkdtempSync(join(tmpdir(), 'coo-deep-source-fallback-'));
     const question = 'Remember the departure at the station';
     const metadata = { source_actor: 'user', kind: 'event', status: 'completed', said_at: '2024-05-01T10:00:00Z' };
     const documents = [
       { id: 'current-question', original_text: question, document_metadata: metadata },
       { id: 'old-source', original_text: `The person said: ${question}. The departure gate is C7.`, document_metadata: metadata },
+      ...Array.from({ length: 13 }, (_, index) => ({
+        id: `recall-${index + 1}`,
+        original_text: `Synthetic retained source ${index + 1}.`,
+        document_metadata: metadata,
+      })),
     ];
     const recall = {
       results: Array.from({ length: 13 }, (_, index) => ({
@@ -74,7 +79,8 @@ describe('original source lookup', () => {
       expect(result.trace?.format.includedResultIds).toContain('result-13');
       expect(result.text).toContain('source_id:old-source');
       expect(result.text).not.toContain('source_id:current-question');
-      expect(status.automaticSourceLookup).toMatchObject({ status: 'found', sourceDocumentHashes: [createHash('sha256').update('old-source').digest('hex')], sourceReads: 1, scanIncomplete: false });
+      expect(status.automaticSourceLookup).toMatchObject({ status: 'found', sourceReads: 14, invalidCandidateCount: 0, scanIncomplete: false });
+      expect(status.automaticSourceLookup?.sourceDocumentHashes).toContain(createHash('sha256').update('old-source').digest('hex'));
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       closeMemoryStateStores();
