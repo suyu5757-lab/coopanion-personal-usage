@@ -29,6 +29,11 @@ export interface PartnerTextResult {
   status: PartnerProvenanceRead['status'];
   includedSegments: number;
   withheldSegments: number;
+  segments: Array<{
+    text: string;
+    origin: PartnerEntryOrigin;
+    sourceIds: string[];
+  }>;
 }
 
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -111,12 +116,12 @@ export function filterPartnerMarkdown(
 ): PartnerTextResult {
   const segments = partnerSegments(markdown);
   if (provenance.status !== 'ok') {
-    return { text: '', status: provenance.status, includedSegments: 0, withheldSegments: segments.length };
+    return { text: '', status: provenance.status, includedSegments: 0, withheldSegments: segments.length, segments: [] };
   }
   const entries = new Map(provenance.file.entries.map((entry) => [entry.segmentDigest, entry]));
   const digestCounts = new Map<string, number>();
   for (const segment of segments) digestCounts.set(segment.digest, (digestCounts.get(segment.digest) ?? 0) + 1);
-  const included: string[] = [];
+  const included: Array<{ text: string; origin: PartnerEntryOrigin; sourceIds: string[] }> = [];
   for (const segment of segments) {
     const entry = entries.get(segment.digest);
     if (!entry || (digestCounts.get(segment.digest) ?? 0) !== 1 || entry.state !== 'current') continue;
@@ -125,13 +130,18 @@ export function filterPartnerMarkdown(
       try { visible = entry.sourceIds.every(sourceVisible); }
       catch { visible = false; }
     }
-    if (visible) included.push(segment.text);
+    if (visible) included.push({
+      text: segment.text,
+      origin: entry.origin,
+      sourceIds: entry.origin === 'derived' ? [...entry.sourceIds] : [],
+    });
   }
   return {
-    text: included.join('\n\n'),
+    text: included.map((segment) => segment.text).join('\n\n'),
     status: 'ok',
     includedSegments: included.length,
     withheldSegments: segments.length - included.length,
+    segments: included,
   };
 }
 

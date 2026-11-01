@@ -53,7 +53,16 @@ describe('PARTNER provenance sidecar', () => {
     const result = filterPartnerMarkdown(`${authored}\n\n${derived}\n\n${stale}\n\n${untracked}`,
       readPartnerProvenance(file, workspaceDigest), scopeDigest, (id) => id === 'source-piano');
 
-    expect(result).toEqual({ text: `${authored}\n\n${derived}`, status: 'ok', includedSegments: 2, withheldSegments: 2 });
+    expect(result).toEqual({
+      text: `${authored}\n\n${derived}`,
+      status: 'ok',
+      includedSegments: 2,
+      withheldSegments: 2,
+      segments: [
+        { text: authored, origin: 'user-authored', sourceIds: [] },
+        { text: derived, origin: 'derived', sourceIds: ['source-piano'] },
+      ],
+    });
   });
 
   it('withholds a derived paragraph when one source is no longer visible', () => {

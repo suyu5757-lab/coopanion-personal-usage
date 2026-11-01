@@ -16,6 +16,7 @@ describe('supporting evidence budgets', () => {
     const root = mkdtempSync(join(tmpdir(), 'coo-evidence-budget-'));
     const facts = Array.from({ length: 64 }, (_, index) => ({
       id: `fact-${index}`, document_id: `source-${index}`, type: 'world',
+      metadata: { source_actor: 'user', kind: 'event' },
       text: `${'Supporting detail. '.repeat(32)}${index === 24 ? 'Necessary evidence is cobalt.' : 'Other detail.'}`,
     }));
     const server = createServer((request, response) => {

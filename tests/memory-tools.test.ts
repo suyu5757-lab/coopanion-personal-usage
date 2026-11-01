@@ -77,6 +77,7 @@ describe('memory read status', () => {
 
   it.each([
     ['absent', 'No verified source record matched'],
+    ['incomplete', 'could not be fully verified'],
     ['unavailable', 'This does not mean the record is absent'],
     ['fenced', 'Historical memory is restricted'],
   ] as const)('reports %s separately from an empty result', async (status, expected) => {

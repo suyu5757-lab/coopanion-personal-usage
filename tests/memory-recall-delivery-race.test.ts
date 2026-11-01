@@ -31,7 +31,7 @@ describe('recall during source read-back', () => {
             void responseReleased.then(() => {
               response.writeHead(200, { 'content-type': 'application/json' });
               response.end(JSON.stringify({
-                results: [{ id: 'existing-fact', document_id: 'existing-event', type: 'world', text: 'The remembered marker is cobalt.' }],
+                results: [{ id: 'existing-fact', document_id: 'existing-event', type: 'world', text: 'The remembered marker is cobalt.', metadata: { source_actor: 'user', kind: 'event' } }],
               }));
             });
           } else if (request.method === 'GET' && path.endsWith('/documents/new-event')) {

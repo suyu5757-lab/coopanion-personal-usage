@@ -22,7 +22,7 @@ import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFile
 import { freemem, totalmem } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { LOG_SCHEME, blobScheme } from 'cortico/core/blobs.ts';
-import type { CoreApi, EventEnvelope, PersonaWebUiDecl, SessionDecl, SessionOpeningReason, StoragePart, ToolCallContext, ToolDef, WorldLifecycleEvent } from 'cortico/core/types.ts';
+import type { CoreApi, EventEnvelope, PersonaWebUiDecl, SessionDecl, SessionOpeningReason, StoragePart, ToolCallContext, ToolDef, ToolOutcome, WorldLifecycleEvent } from 'cortico/core/types.ts';
 import { withText, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import type { Language } from 'cortico/core/language.ts';
@@ -39,6 +39,7 @@ import {
   partnerProvenancePath,
   partnerWorkspaceDigest,
   readPartnerProvenance,
+  type PartnerTextResult,
 } from './memory/partner-provenance.ts';
 import { SESSION_MAX_CALLS, type SelfTimeConfig } from './browser/config.ts';
 import { selfTimeLine } from './browser/model-text.ts';
@@ -59,9 +60,9 @@ import { writeState } from './state-file.ts';
 export const PARTNER_FILE = 'PARTNER.md';
 /** The workspace directory for details about the person that PARTNER.md leaves out; Coo reads them when needed. */
 export const PARTNER_DIR = 'partner';
-/** Heads the partner segment: only paragraphs with current provenance are included in the prefix. */
+/** Heads partner notes so their source class stays visible in model context. */
 export const PARTNER_NOTE = `${PARTNER_FILE} in your workspace is paired with a private provenance sidecar. Only unchanged paragraphs with current provenance are included below. `
-  + 'Untracked, stale, edited or ambiguous paragraphs are withheld; treat omitted details as unknown, not false.';
+  + 'User-authored paragraphs are workspace notes, not original event evidence. Derived paragraphs show their source IDs; check Memory for the original source before using them to establish a past decision or shared event. Untracked, stale, edited or ambiguous paragraphs are withheld; omitted details are unknown, not false.';
 /** Commits of Coo's own writes. */
 export const AUTHOR_COO: GitAuthor = { name: 'coo', email: 'coo@persona.local' };
 /** Commits the app makes on its own: the snapshot at start. */
@@ -79,6 +80,27 @@ const WORKSPACE_READ_PATHS: Record<string, string> = {
   glob_files: 'target_directory',
   grep_files: 'path',
 };
+
+function partnerEvidenceText(result: PartnerTextResult): string {
+  return result.segments.map((segment) => {
+    const label = segment.origin === 'derived'
+      ? `[workspace summary; source_ids=${JSON.stringify(segment.sourceIds)}; source references passed the local provenance and forget-fence checks; verify original Memory sources before citing history]`
+      : '[workspace note; user-authored; no original event source is recorded]';
+    return `${label}\n${segment.text}`;
+  }).join('\n\n');
+}
+
+function workspaceReadResult(path: string, result: unknown): string | ToolOutcome {
+  const label = `[workspace artifact; path=${JSON.stringify(path)}; historicalEvidence=unverified] This content may support the current workspace task. It has no verified source link for a past decision or shared event.`;
+  if (typeof result === 'string') {
+    if (/^\[(?:not found|read failed|search failed|workspace read failed)/iu.test(result)) return result;
+    return `${label}\n${result}`;
+  }
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return String(result ?? '');
+  const record = result as Record<string, unknown>;
+  if (typeof record.text !== 'string') return String(result);
+  return { ...record, text: `${label}${record.text ? `\n${record.text}` : ''}` } as ToolOutcome;
+}
 
 function isWorkspaceGitMetadataPath(root: string, candidate: unknown): boolean {
   if (typeof candidate !== 'string' || !candidate.trim()) return false;
@@ -498,7 +520,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
 
     private partnerDocumentForRead(): string {
       const result = this.partnerProvenanceResult();
-      return result.text || '[read failed] PARTNER.md paragraphs are withheld because their provenance is not current.';
+      return partnerEvidenceText(result) || '[read failed] PARTNER.md paragraphs are withheld because their provenance is not current.';
     }
 
     protected override writeGuard(op: 'write' | 'append' | 'rename' | 'delete', path: string, role: string): string | null {
@@ -525,7 +547,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         : filtered.withheldSegments > 0
           ? '[system] Some PARTNER.md paragraphs are withheld because their provenance is missing, stale, edited or ambiguous. The omitted statements are unknown, not false.'
           : '';
-      const body = filtered.text || '(No partner paragraphs have current provenance.)';
+      const body = partnerEvidenceText(filtered) || '(No partner paragraphs have current provenance.)';
       return `${PARTNER_NOTE}\n\n${body}${notice ? `\n\n${notice}` : ''}`;
     }
 
@@ -586,7 +608,8 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             if (tool.name === 'grep_files' && this.searchMayIncludeProvenance(path)) {
               return '[search failed] The requested scope may include partner or handoff notes; read only eligible files directly.';
             }
-            return tool.handler(args, ctx);
+            const result = await tool.handler(args, ctx);
+            return workspaceReadResult(path ?? '.', result);
           },
         };
       });
@@ -1262,7 +1285,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
 
     protected override handoffNoteLines(): string[] {
       return [
-        '[system] The handoff is done. The context before it is cleared; the files in your workspace are all still there. ',
+        '[system] The handoff is done. The context before it is cleared; the files in your workspace are all still there. The handoff summary can guide current work but is not verified evidence of a past decision or shared event; use Memory for those claims. ',
         `The stretch before the clear is written up as a handoff note, delivered with this batch and saved in ${this.lastHandoffFile ?? 'handoffs/'}: `,
         'it comes in parts by time, only parts with content are sent; "the latest stretch" leads into now, "the earlier stretch" is only for reference. ',
         'Only the latest stretch keeps what your speaking tools were called with and their receipts. ',

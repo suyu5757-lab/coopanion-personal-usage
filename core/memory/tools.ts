@@ -1,6 +1,6 @@
 import type { ToolDef } from 'cortico/core/types.ts';
 import type { HindsightMemory } from './hindsight.ts';
-import { MEMORY_SEARCH_DESCRIPTION, MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, memoryReadNotice } from './model-text.ts';
+import { MEMORY_SEARCH_DESCRIPTION, MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, WORKSPACE_HISTORY_EVIDENCE_DESCRIPTION, memoryReadNotice } from './model-text.ts';
 
 export interface MemoryToolDeps {
   memory: () => HindsightMemory | null;
@@ -15,7 +15,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
   return [
     {
       name: 'memory_search',
-      description: MEMORY_SEARCH_DESCRIPTION,
+      description: `${MEMORY_SEARCH_DESCRIPTION} ${WORKSPACE_HISTORY_EVIDENCE_DESCRIPTION}`,
       tags: ['read'],
       barrierAfter: true,
       parameters: {

@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +14,74 @@ import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import { closeMemoryStateStores, openMemoryStateStore } from '../core/memory/state-store.ts';
 
 describe('original source lookup', () => {
+  it('keeps deep Recall candidates past twelve and verifies one original source without the current question', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'coo-deep-source-fallback-'));
+    const question = 'Remember the departure at the station';
+    const metadata = { source_actor: 'user', kind: 'event', status: 'completed', said_at: '2024-05-01T10:00:00Z' };
+    const documents = [
+      { id: 'current-question', original_text: question, document_metadata: metadata },
+      { id: 'old-source', original_text: `The person said: ${question}. The departure gate is C7.`, document_metadata: metadata },
+    ];
+    const recall = {
+      results: Array.from({ length: 13 }, (_, index) => ({
+        id: `result-${index + 1}`,
+        text: index === 12 ? 'Rank thirteen carries the synthetic departure detail.' : `Unrelated synthetic memory ${index + 1}.`,
+        type: 'world',
+        document_id: `recall-${index + 1}`,
+        metadata,
+      })),
+      source_facts: {},
+      source_facts_truncated: false,
+    };
+    const server = createServer((req, res) => {
+      req.resume();
+      req.once('end', () => {
+        const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+        const send = (value: unknown) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
+        if (url.pathname.endsWith('/memories/recall')) {
+          send(recall);
+          return;
+        }
+        if (url.pathname.endsWith('/documents') && req.method === 'GET') {
+          send({ items: documents.map((doc) => ({ id: doc.id, bank_id: 'fixture-bank', document_metadata: doc.document_metadata })), total: documents.length, limit: SOURCE_LOOKUP_LIMITS.pageSize, offset: 0 });
+          return;
+        }
+        const id = decodeURIComponent(url.pathname.split('/').at(-1) ?? '');
+        const doc = documents.find((item) => item.id === id);
+        if (!doc) { res.writeHead(404); res.end(); return; }
+        send({ ...doc, bank_id: 'fixture-bank', created_at: metadata.said_at, updated_at: metadata.said_at, content_hash: null, memory_unit_count: 1 });
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const store = openMemoryStateStore(join(root, 'state.sqlite'));
+    const memory = new HindsightMemory();
+    Object.assign(memory, {
+      config: loadHindsightConfig(root, { enabled: true, autostart: false, apiUrl: baseUrl, bankId: 'fixture-bank' }),
+      client: new HindsightClient({ baseUrl, maxAttempts: 1 }),
+      stateStore: store,
+      outbox: new MemoryOutbox(store),
+      ledger: new ForgetLedger(store),
+      ready: true,
+      unavailableUntil: 0,
+    });
+    try {
+      const result = await memory.recallForTurn(question, { userEventDocumentId: 'current-question', captureTrace: true });
+      const status = (memory as unknown as { lastRecall: { automaticSourceLookup?: SourceLookupReceipt } }).lastRecall;
+
+      expect(result.status).toBe('found');
+      expect(result.text).toContain('Rank thirteen carries the synthetic departure detail.');
+      expect(result.trace?.format.includedResultIds).toContain('result-13');
+      expect(result.text).toContain('source_id:old-source');
+      expect(result.text).not.toContain('source_id:current-question');
+      expect(status.automaticSourceLookup).toMatchObject({ status: 'found', sourceDocumentHashes: [createHash('sha256').update('old-source').digest('hex')], sourceReads: 1, scanIncomplete: false });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      closeMemoryStateStores();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('explains a literal miss and reads sources whose preview metadata is incomplete', async () => {
     const root = mkdtempSync(join(tmpdir(), 'coo-source-literal-'));
     const metadata = { source_actor: 'user', kind: 'event', status: 'completed' };

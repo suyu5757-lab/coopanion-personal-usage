@@ -22,7 +22,7 @@ describe('recall failure scope', () => {
         req.resume();req.once('end',()=>{
           requests++;
           if(requests===1 && serviceFailure){res.writeHead(503,{'content-type':'application/json'});res.end(JSON.stringify({detail:'Fixture service unavailable.'}));return;}
-          const send=()=>{res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({results:[{id:'fixture-fact',document_id:'fixture-source',type:'world',text:'The fixture marker is amber.'}]}));};
+          const send=()=>{res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({results:[{id:'fixture-fact',document_id:'fixture-source',type:'world',text:'The fixture marker is amber.',metadata:{source_actor:'user',kind:'event'}}]}));};
           if(requests===1)setTimeout(send,180);else send();
         });
       });

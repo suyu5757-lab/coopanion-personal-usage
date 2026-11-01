@@ -5,8 +5,9 @@ import { partnerSourceScopeDigest } from '../core/memory/partner-provenance.ts';
 const result = (documentId: string) => ({
   id: `fact-${documentId}`,
   text: 'A synthetic remembered fact.',
-  type: 'observation',
+  type: 'world',
   document_id: documentId,
+  metadata: { source_actor: 'user', kind: 'event' },
   occurred_start: '2026-10-27T00:00:00.000Z',
 });
 

@@ -28,9 +28,19 @@ async function hindsightServer(response: unknown): Promise<{ baseUrl: string; re
     const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
     req.on('end', () => {
-      requests.push(JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>);
-      res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(response));
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      if (url.pathname.endsWith('/memories/recall')) {
+        const body = Buffer.concat(chunks).toString('utf8');
+        requests.push(body ? JSON.parse(body) as Record<string, unknown> : {});
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(response));
+      } else if (url.pathname.endsWith('/documents') && req.method === 'GET') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ items: [], total: 0, limit: Number(url.searchParams.get('limit') ?? 0), offset: Number(url.searchParams.get('offset') ?? 0) }));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
     });
   });
   servers.push(server);
@@ -57,7 +67,7 @@ async function bankHindsightServer(): Promise<{ baseUrl: string }> {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       results: [{ id: `observation-${marker}`, text: `Bank ${marker} observation.`, type: 'observation', document_id: `doc-observation-${marker}`, source_fact_ids: [id] }],
-      source_facts: { [id]: { id, text: `Bank ${marker} source fact.`, type: 'world', document_id: `doc-${marker}` } },
+      source_facts: { [id]: { id, text: `Bank ${marker} source fact.`, type: 'world', document_id: `doc-${marker}`, metadata: { source_actor: 'user', kind: 'event', status: 'completed' } } },
       source_facts_truncated: false,
     }));
   });
@@ -140,12 +150,14 @@ describe('Hindsight source-fact recall', () => {
           text: 'Lin coordinated the shared materials.',
           type: 'world',
           document_id: 'doc-coordination',
+          metadata: { source_actor: 'user', kind: 'event', status: 'completed' },
         },
         'fact-review': {
           id: 'fact-review',
           text: 'Wei reviewed the shared plan.',
           type: 'experience',
           document_id: 'doc-review',
+          metadata: { source_actor: 'user', kind: 'event', status: 'completed' },
         },
       },
       source_facts_truncated: false,
@@ -407,7 +419,7 @@ describe('Hindsight source-fact recall', () => {
         type: 'world',
         document_id: 'doc-preference',
         created_at: createdAt,
-        metadata: { source_actor: 'user', kind: 'fact', status: 'current' },
+        metadata: { source_actor: 'user', kind: 'event', status: 'current' },
         scores: { semantic: 0.99 },
       }],
       source_facts: {},
@@ -536,8 +548,8 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
         source_fact_ids: ['fact-one', 'fact-two'],
       }],
       source_facts: {
-        'fact-one': { id: 'fact-one', text: 'Lin coordinated the materials.', type: 'world', document_id: 'doc-one' },
-        'fact-two': { id: 'fact-two', text: 'Wei reviewed the plan.', type: 'experience', document_id: 'doc-two' },
+        'fact-one': { id: 'fact-one', text: 'Lin coordinated the materials.', type: 'world', document_id: 'doc-one', metadata: { source_actor: 'user', kind: 'event' } },
+        'fact-two': { id: 'fact-two', text: 'Wei reviewed the plan.', type: 'experience', document_id: 'doc-two', metadata: { source_actor: 'user', kind: 'event' } },
       },
       source_facts_truncated: false,
     });
@@ -601,8 +613,8 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
   it('passes Hindsight scores through the memory reader while preserving service order and matchScore', async () => {
     const api = await hindsightServer({
       results: [
-        { id: 'first', text: 'The first synthetic result.', type: 'observation', document_id: 'doc-first', scores: { final: 0.1, reranker: 0.2, semantic: null, keyword: 3 } },
-        { id: 'second', text: 'The second synthetic result.', type: 'observation', document_id: 'doc-second', scores: { final: 0.99, reranker: 0.98, semantic: 0.97, keyword: null } },
+        { id: 'first', text: 'The first synthetic result.', type: 'world', document_id: 'doc-first', metadata: { source_actor: 'user', kind: 'event' }, scores: { final: 0.1, reranker: 0.2, semantic: null, keyword: 3 } },
+        { id: 'second', text: 'The second synthetic result.', type: 'world', document_id: 'doc-second', metadata: { source_actor: 'user', kind: 'event' }, scores: { final: 0.99, reranker: 0.98, semantic: 0.97, keyword: null } },
       ],
       source_facts: {},
       source_facts_truncated: false,
@@ -758,9 +770,8 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
 
     const read = await memory.recallBlockDetailed('What project is the observation about?');
 
-    expect(read.status).toBe('found');
-    expect(read.text).toContain('A synthetic observation with unverified support.');
-    expect(read.text).toContain('Supporting source facts are incomplete for this result.');
+    expect(read.status).toBe('incomplete');
+    expect(read.text).toBe('');
     expect(read.text).not.toContain('Unrelated synthetic text must not enter the prompt.');
   });
 
@@ -816,7 +827,7 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
     expect(await memory.recallBlockDetailed('What did the attachment establish?')).toEqual({ text: '', status: 'fenced' });
   });
 
-  it.each(['no fence', 'another bank', 'another endpoint'] as const)('keeps an unlinked observation available with %s', async (scope) => {
+  it.each(['no fence', 'another bank', 'another endpoint'] as const)('withholds an unlinked observation with %s', async (scope) => {
     const api = await hindsightServer({
       results: [{ id: 'observation-visible', text: 'An observation in the current bank.', type: 'observation', document_id: 'doc-derived' }],
       source_facts: {},
@@ -835,18 +846,18 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
 
     const read = await memory.recallBlockDetailed('What does this bank record?');
 
-    expect(read.status).toBe('found');
-    expect(read.text).toContain('An observation in the current bank.');
+    expect(read.status).toBe('incomplete');
+    expect(read.text).not.toContain('An observation in the current bank.');
   });
 
   it('keeps direct facts and verified observations while withholding unlinked observations from a fenced bank', async () => {
     const api = await hindsightServer({
       results: [
-        { id: 'fact-direct', text: 'A direct fact from a visible document.', type: 'world', document_id: 'doc-direct' },
+        { id: 'fact-direct', text: 'A direct fact from a visible document.', type: 'world', document_id: 'doc-direct', metadata: { source_actor: 'user', kind: 'event' } },
         { id: 'observation-linked', text: 'A relationship with verified support.', type: 'observation', document_id: 'doc-derived-linked', source_fact_ids: ['fact-support'] },
         { id: 'observation-unlinked', text: 'An unsupported relationship.', context: 'Unsupported relationship context.', type: 'observation', document_id: 'doc-derived-unlinked' },
       ],
-      source_facts: { 'fact-support': { id: 'fact-support', text: 'The supporting fact is still visible.', type: 'world', document_id: 'doc-support' } },
+      source_facts: { 'fact-support': { id: 'fact-support', text: 'The supporting fact is still visible.', type: 'world', document_id: 'doc-support', metadata: { source_actor: 'user', kind: 'event' } } },
     });
     const root = mkdtempSync(join(tmpdir(), 'coo-mixed-source-fence-'));
     roots.push(root);
@@ -889,8 +900,8 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
     const api = await hindsightServer({
       results: [{ id: 'supported-parentless', text: 'Lin coordinated and Wei reviewed the plan.', type: 'observation', document_id: null, source_fact_ids: ['fact-a', 'fact-b'] }],
       source_facts: {
-        'fact-a': { id: 'fact-a', text: 'Lin coordinated the materials.', type: 'world', document_id: 'doc-a' },
-        'fact-b': { id: 'fact-b', text: 'Wei reviewed the shared plan.', type: 'world', document_id: 'doc-b' },
+        'fact-a': { id: 'fact-a', text: 'Lin coordinated the materials.', type: 'world', document_id: 'doc-a', metadata: { source_actor: 'user', kind: 'event' } },
+        'fact-b': { id: 'fact-b', text: 'Wei reviewed the shared plan.', type: 'world', document_id: 'doc-b', metadata: { source_actor: 'user', kind: 'event' } },
       },
       source_facts_truncated: truncated,
     });
@@ -916,7 +927,7 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
         { id: 'shared-id', text: 'A supported relationship.', type: 'observation', document_id: null, source_fact_ids: ['fact-a'] },
         { id: 'shared-id', text: 'An unsupported source-free claim.', type: 'world', document_id: null },
       ],
-      source_facts: { 'fact-a': { id: 'fact-a', text: 'A verified source event.', type: 'world', document_id: 'doc-a' } },
+      source_facts: { 'fact-a': { id: 'fact-a', text: 'A verified source event.', type: 'world', document_id: 'doc-a', metadata: { source_actor: 'user', kind: 'event' } } },
     });
     const root = mkdtempSync(join(tmpdir(), 'coo-support-result-identity-'));
     roots.push(root);

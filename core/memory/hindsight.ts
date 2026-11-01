@@ -23,9 +23,10 @@ import { sourceFactsTokenBudget as resolveSourceFactsTokenBudget, recallContextC
 import { summarizeSourceFacts, type SourceFactCounts } from './recall-evidence.ts';
 import { SOURCE_LOOKUP_HEADER, sourceLookupMissNotice } from './model-text.ts';
 
-export type MemoryReadStatus = 'found' | 'absent' | 'unavailable' | 'fenced';
+export type MemoryReadStatus = 'found' | 'absent' | 'incomplete' | 'unavailable' | 'fenced';
 export type TurnRecallStatus = MemoryReadStatus | 'skipped';
 export const SOURCE_LOOKUP_LIMITS = { pageSize: 250, maxDocuments: 2048, maxSourceReads: 1024, concurrency: 4, maxSources: 6, maxChars: 8000 } as const;
+const DEEP_RECALL_MAX_ITEMS = 20;
 
 export interface MemoryTextRead {
   text: string;
@@ -139,6 +140,13 @@ function userEventSources(result: MemorySearchResult): UserEventSource[] {
   }).map(({ documentId, date }) => ({ documentId, date }));
 }
 
+function historicalSourceMetadata(metadata: Record<string, string> | undefined): boolean {
+  return !!metadata
+    && ['user', 'coo', 'affinity', 'tool'].includes(metadata.source_actor ?? '')
+    && ['event', 'correction'].includes(metadata.kind ?? '')
+    && metadata.status !== 'disputed';
+}
+
 export interface TurnRecall {
   text: string;
   route: RecallRoute;
@@ -168,6 +176,14 @@ export interface TurnRecallReceipt {
   clippedResults: number;
   includedSourceFactHashes: string[];
   includedSourceDocumentHashes: string[];
+  automaticSourceLookup?: {
+    status: SourceLookupReceipt['status'];
+    sourceDocumentHashes: string[];
+    scannedDocuments: number;
+    sourceReads: number;
+    scanIncomplete: boolean;
+    elapsedMs: number;
+  };
 }
 
 export interface SourceLookupReceipt {
@@ -944,6 +960,10 @@ export class HindsightMemory {
             continue;
           }
           const factMetadata = fact.metadata ? { ...fact.metadata } : {};
+          if (!historicalSourceMetadata(factMetadata)) {
+            missingSourceFact = true;
+            continue;
+          }
           if (currentRevisions.has(factDocumentId)) factMetadata.status = 'current';
           else if (superseded.has(factDocumentId)) factMetadata.status = 'superseded';
           sourceFacts.push({
@@ -956,19 +976,22 @@ export class HindsightMemory {
           });
           traceItem?.verifiedSources.push({ sourceFactId, documentId: factDocumentId });
         }
-        const cannotVerifySupport = sourceFactIds.length > 0 && missingSourceFact && (unresolved > 0 || hasFencedSources);
+        const cannotVerifySupport = sourceFactIds.length > 0 && missingSourceFact && sourceFacts.length === 0;
         // An observation's parent document does not identify the sources it was derived from.
-        const unlinkedObservationWithFence = result.type === 'observation' && sourceFactIds.length === 0 && hasFencedSources;
-        if (traceItem) traceItem.sourceFactsIncomplete = sourceFactIds.length > 0 && (missingSourceFact || sourceFactsTruncated);
-        if (forgottenSupport || cannotVerifySupport || unlinkedObservationWithFence) {
+        const unlinkedObservation = result.type === 'observation' && sourceFactIds.length === 0;
+        const unverifiedDirectSource = result.type !== 'observation' && !historicalSourceMetadata(metadata);
+        if (traceItem) traceItem.sourceFactsIncomplete = sourceFactIds.length > 0 && missingSourceFact;
+        if (forgottenSupport || cannotVerifySupport || unlinkedObservation || unverifiedDirectSource) {
           blockedDerivedResults += 1;
           if (traceItem) {
             traceItem.disposition = 'filtered';
-            traceItem.reason = forgottenSupport ? 'forgotten-support' : cannotVerifySupport ? 'unverified-source-fact' : 'unlinked-observation';
+            traceItem.reason = forgottenSupport ? 'forgotten-support'
+              : cannotVerifySupport || unverifiedDirectSource ? 'unverified-source-fact'
+                : 'unlinked-observation';
           }
           return [];
         }
-        const sourceFactsIncomplete = sourceFactIds.length > 0 && (missingSourceFact || sourceFactsTruncated);
+        const sourceFactsIncomplete = sourceFactIds.length > 0 && missingSourceFact;
         const mapped: MemorySearchResult = {
           id: result.id,
           text: String(result.text ?? ''),
@@ -1024,7 +1047,7 @@ export class HindsightMemory {
         return finishRead(weighted, 'found', sourceFactsTruncated);
       }
       if (results.length > 0 || response.results.length > 0 || unresolved > 0 || blockedDerivedResults > 0) {
-        return finishRead([], 'fenced', sourceFactsTruncated);
+        return finishRead([], hasFencedSources || unresolved > 0 ? 'fenced' : 'incomplete', sourceFactsTruncated);
       }
       return finishRead([], 'absent', sourceFactsTruncated);
     } catch (err) {
@@ -1201,7 +1224,7 @@ export class HindsightMemory {
       maxSourceFactsTokens: config.recall.maxSourceFactsTokens,
       budget: config.recall.budget,
     } : {});
-    const finish = (text: string, status: TurnRecallStatus, trace?: MemoryRecallTrace, cacheHit = false): TurnRecall => {
+    const finish = (text: string, status: TurnRecallStatus, trace?: MemoryRecallTrace, cacheHit = false, automaticSourceLookup?: SourceLookupReceipt): TurnRecall => {
       this.recallStats[plan.route] += 1;
       if (plan.route !== 'fast') {
         this.recallStats.measured += 1;
@@ -1219,11 +1242,21 @@ export class HindsightMemory {
         clippedResults: trace?.format.clippedResultIds.length ?? 0,
         includedSourceFactHashes: (trace?.format.includedSourceFactIds ?? []).map(hash),
         includedSourceDocumentHashes: (trace?.format.includedSourceDocumentIds ?? []).map(hash),
+        ...(automaticSourceLookup ? {
+          automaticSourceLookup: {
+            status: automaticSourceLookup.status,
+            sourceDocumentHashes: automaticSourceLookup.sourceDocumentHashes,
+            scannedDocuments: automaticSourceLookup.scannedDocuments,
+            sourceReads: automaticSourceLookup.sourceReads,
+            scanIncomplete: automaticSourceLookup.scanIncomplete,
+            elapsedMs: automaticSourceLookup.elapsedMs,
+          },
+        } : {}),
       };
       return {
         text,
         route: plan.route,
-        found: !!text,
+        found: status === 'found' && !!text,
         status,
         ...(context.captureTrace && trace ? { trace } : {}),
       };
@@ -1238,13 +1271,35 @@ export class HindsightMemory {
       maxSourceFactsTokens: plan.maxSourceFactsTokens,
       timeoutMs: plan.timeoutMs,
       maxChars: plan.maxChars,
+      ...(plan.route === 'deep' ? { maxItems: DEEP_RECALL_MAX_ITEMS } : {}),
       ...(context.activationEnabled === undefined ? {} : { activationEnabled: context.activationEnabled }),
       ...(context.activationInfluence === undefined ? {} : { activationInfluence: context.activationInfluence }),
       captureTrace: true,
       ...(context.userEventDocumentId ? { userEventDocumentId: context.userEventDocumentId } : {}),
     });
     if (epoch !== this.cacheEpoch) return finish('', 'fenced');
-    const text = read.text;
+    let text = read.text;
+    let status = read.status;
+    let automaticSourceLookup: SourceLookupReceipt | undefined;
+    if (plan.route === 'deep' && status !== 'unavailable') {
+      const sourceRead = await this.searchSourceDocuments(query, {
+        ...(context.userEventDocumentId ? { excludeDocumentId: context.userEventDocumentId } : {}),
+      });
+      automaticSourceLookup = this.lastSourceLookup ?? undefined;
+      if (epoch !== this.cacheEpoch || sourceRead.status === 'fenced') {
+        return finish('', 'fenced', read.trace, false, automaticSourceLookup);
+      }
+      if (sourceRead.status === 'found') {
+        text = [text, sourceRead.text].filter(Boolean).join('\n\n');
+        status = 'found';
+      } else if (sourceRead.status === 'absent') {
+        text = [text, sourceRead.text].filter(Boolean).join('\n\n');
+      } else if (sourceRead.status === 'unavailable') {
+        text = [text, '[memory] The bounded original-source check could not complete. Use only other verified source evidence; this does not mean the record is absent.']
+          .filter(Boolean).join('\n\n');
+        if (!read.text) status = 'unavailable';
+      }
+    }
     if (text && plan.route === 'standard') {
       this.recallCache.set(key, { at: Date.now(), value: text, trace: read.trace });
       if (this.recallCache.size > 64) {
@@ -1252,7 +1307,7 @@ export class HindsightMemory {
         if (!oldest.done) this.recallCache.delete(oldest.value);
       }
     }
-    return finish(text, read.status, read.trace);
+    return finish(text, status, read.trace, false, automaticSourceLookup);
   }
 
   markRecallInjected(text: string): void {

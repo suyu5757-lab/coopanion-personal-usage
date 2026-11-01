@@ -162,8 +162,8 @@ describe('persistence acknowledgement', () => {
     const memory = memoryWith(outbox, ledger, {
       getDocument: async (_bankId, documentId) => documentId === 'doc-old' ? { id: documentId } : null,
       recall: async () => ({ results: [
-        { id: 'old', text: 'The person plans to move to Kyoto.', type: 'observation', document_id: 'doc-old' },
-        { id: 'new', text: 'The person plans to move to Osaka.', type: 'observation', document_id: correctionId, metadata: { source_actor: 'user', status: 'current', user_verified: 'true' } },
+        { id: 'old', text: 'The person plans to move to Kyoto.', type: 'experience', document_id: 'doc-old', metadata: { source_actor: 'user', kind: 'event', status: 'current', user_verified: 'false' } },
+        { id: 'new', text: 'The person plans to move to Osaka.', type: 'experience', document_id: correctionId, metadata: { source_actor: 'user', kind: 'correction', status: 'current', user_verified: 'true' } },
       ] }),
     });
     expect(await memory.correct('The person plans to move to Osaka.', ['doc-old'])).toBe('queued');
@@ -496,7 +496,7 @@ describe('the fence covers reads and writes', () => {
     const ledger = new ForgetLedger(join(root, 'forget.json'));
     outbox.add(item({ documentId: 'trip', content: 'synthetic trip to Hangzhou' }));
     const client: FakeClient = {
-      recall: async () => ({ results: [{ id: 'm1', text: 'synthetic trip to Hangzhou', type: 'observation', document_id: 'trip' }] }),
+      recall: async () => ({ results: [{ id: 'm1', text: 'synthetic trip to Hangzhou', type: 'world', document_id: 'trip', metadata: { source_actor: 'user', kind: 'event' } }] }),
       deleteDocument: async () => {},
     };
     const memory = memoryWith(outbox, ledger, client);
@@ -574,9 +574,9 @@ describe('the fence covers reads and writes', () => {
       },
     ];
     const sourceFacts: Record<string, FakeRecallResult> = {
-      'fact-coordination': { id: 'fact-coordination', text: 'Lin coordinated the shared materials.', type: 'world', document_id: 'doc-coordination' },
-      'fact-review': { id: 'fact-review', text: 'Wei reviewed the shared plan.', type: 'experience', document_id: 'doc-review' },
-      'fact-forgotten': { id: 'fact-forgotten', text: 'Lin and Wei planned the forgotten trip.', type: 'world', document_id: 'doc-forgotten' },
+      'fact-coordination': { id: 'fact-coordination', text: 'Lin coordinated the shared materials.', type: 'world', document_id: 'doc-coordination', metadata: { source_actor: 'user', kind: 'event' } },
+      'fact-review': { id: 'fact-review', text: 'Wei reviewed the shared plan.', type: 'experience', document_id: 'doc-review', metadata: { source_actor: 'user', kind: 'event' } },
+      'fact-forgotten': { id: 'fact-forgotten', text: 'Lin and Wei planned the forgotten trip.', type: 'world', document_id: 'doc-forgotten', metadata: { source_actor: 'user', kind: 'event' } },
     };
     const memory = memoryWith(outbox, ledger, {
       recall: async (_bank, _query, options) => ({

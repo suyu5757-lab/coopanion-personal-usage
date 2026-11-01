@@ -104,7 +104,9 @@ describe('PARTNER.md', () => {
       const prefix = (await p.systemSegments({ now: new Date(), timezone: 'UTC', worlds: [] })).map((s) => s.text).join('\n');
       expect(prefix).toContain(`${PARTNER_NOTE}
 
+[workspace note; user-authored; no original event source is recorded]
 Likes cats. Works late.`);
+      expect(String(await run('read_file', { path: PARTNER_FILE }))).toContain('[workspace note; user-authored; no original event source is recorded]');
       expect(String(await run('read_file', { path: PARTNER_FILE }))).toContain('Likes cats. Works late.');
       const grep = String(await run('grep_files', { pattern: 'cats', path: '.' }));
       expect(grep).toContain('[search failed]');
@@ -113,6 +115,24 @@ Likes cats. Works late.`);
     } finally {
       rmSync(workspace, { recursive: true, force: true });
       rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it('labels ordinary workspace reads while preserving them for project work', async () => {
+    const { dir, run } = persona();
+    try {
+      mkdirSync(join(dir, 'agenda'));
+      writeFileSync(join(dir, 'agenda', 'now.md'), 'Synthetic task note: prepare the project outline.');
+
+      const read = String(await run('read_file', { path: 'agenda/now.md' }));
+      const search = String(await run('grep_files', { pattern: 'project outline', path: 'agenda' }));
+
+      expect(read).toContain('[workspace artifact; path="agenda/now.md"; historicalEvidence=unverified]');
+      expect(read).toContain('Synthetic task note: prepare the project outline.');
+      expect(search).toContain('[workspace artifact; path="agenda"; historicalEvidence=unverified]');
+      expect(search).toContain('Synthetic task note: prepare the project outline.');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
