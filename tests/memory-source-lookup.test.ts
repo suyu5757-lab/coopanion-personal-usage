@@ -13,6 +13,13 @@ import { MemoryOutbox } from '../core/memory/outbox.ts';
 import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import { closeMemoryStateStores, openMemoryStateStore } from '../core/memory/state-store.ts';
 
+function toolText(value: unknown): string {
+  return typeof value === 'string' ? value
+    : value && typeof value === 'object' && typeof (value as { text?: unknown }).text === 'string'
+      ? (value as { text: string }).text
+      : String(value);
+}
+
 describe('original source lookup', () => {
   it('keeps deep Recall candidates through twenty and verifies one original source without the current question', async () => {
     const root = mkdtempSync(join(tmpdir(), 'coo-deep-source-fallback-'));
@@ -126,21 +133,21 @@ describe('original source lookup', () => {
       const shortPhrase = '河边集合点旁边';
       expect(question.length).toBe(28);
       expect(shortPhrase.length).toBe(7);
-      const miss = await tool.handler({ query: question, sources: true }, { role: 'main' } as never);
+      const miss = toolText(await tool.handler({ query: question, sources: true }, { role: 'main' } as never));
       expect(miss).toContain('literal phrase');
       expect(miss).toContain('Try a shorter');
       expect(miss).toContain('does not establish that the event is absent');
       expect(miss).not.toContain('bank was not searched completely');
-      const chineseMatch = await tool.handler({ query: shortPhrase, sources: true }, { role: 'main' } as never);
+      const chineseMatch = toolText(await tool.handler({ query: shortPhrase, sources: true }, { role: 'main' } as never));
       expect(chineseMatch).toContain('河边集合点旁边的石桌');
-      const caseInsensitiveMatch = await tool.handler({ query: 'DEPARTURE GATE', sources: true }, { role: 'main' } as never);
+      const caseInsensitiveMatch = toolText(await tool.handler({ query: 'DEPARTURE GATE', sources: true }, { role: 'main' } as never));
       expect(caseInsensitiveMatch).toContain('C7');
-      const found = await tool.handler({ query: 'departure', sources: true }, { role: 'main' } as never);
+      const found = toolText(await tool.handler({ query: 'departure', sources: true }, { role: 'main' } as never));
       expect(found).toContain('09:42');
       expect(found).toContain('C7');
       expect((memory as unknown as { lastSourceLookup: SourceLookupReceipt }).lastSourceLookup).toMatchObject({ status: 'found', sourceReads: 2, scanIncomplete: false });
       incompleteScan = true;
-      const incomplete = await tool.handler({ query: 'unrelated phrase', sources: true }, { role: 'main' } as never);
+      const incomplete = toolText(await tool.handler({ query: 'unrelated phrase', sources: true }, { role: 'main' } as never));
       expect(incomplete).toContain('bank was not searched completely');
       expect(incomplete).toContain('does not establish that the event is absent');
       expect((memory as unknown as { lastSourceLookup: SourceLookupReceipt }).lastSourceLookup).toMatchObject({ status: 'incomplete', scanIncomplete: true });
@@ -197,7 +204,7 @@ describe('original source lookup', () => {
           ledger.addMany([{ bankId: 'fixture-bank', endpoint: baseUrl, documentId: 'old-source', reason: 'Fixture in-flight forget' }], 'Fixture in-flight forget');
           release();
         }
-        const read = await pending as string;
+        const read = toolText(await pending);
         const receipt = (memory as unknown as { lastSourceLookup: SourceLookupReceipt }).lastSourceLookup;
         expect(receipt.status).toBe(forgetInFlight ? 'fenced' : 'found');
         if (forgetInFlight) expect(read).not.toContain('09:42');

@@ -155,6 +155,7 @@ describe('memory evaluation contract', () => {
       candidateResultIndexes: [0, 1], candidateResultIds: ['observation', 'direct'],
       includedResultIndexes: [0, 1], includedResultIds: ['observation', 'direct'], omittedResultIndexes: [], omittedResultIds: [],
       includedSourceFactIds: ['fact-a'],
+      sourceSegments: [],
       deduplicatedResultIndexes: [], deduplicatedResultIds: [], includedSourceDocumentIds: ['doc-a', 'doc-b'], omittedSourceDocumentIds: [],
       incompleteResultIds: [], clippedResultIds: [], clippedContextResultIds: [], clippedSourceFactIds: [],
       sourceFactsTruncated: false, coverageWeight: 0.5, activationInfluence: DEFAULT_ACTIVATION_RANK_INFLUENCE, activationWeights: [], retrievalScores: [], maxChars: 2000, usedChars: 400,

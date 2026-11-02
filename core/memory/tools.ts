@@ -1,11 +1,30 @@
-import type { ToolDef } from 'cortico/core/types.ts';
+import type { ToolDef, ToolOutcome } from 'cortico/core/types.ts';
 import type { HindsightMemory } from './hindsight.ts';
+import { evidenceCoversText } from './source-evidence.ts';
 import { MEMORY_SEARCH_DESCRIPTION, MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, WORKSPACE_HISTORY_EVIDENCE_DESCRIPTION, memoryReadNotice } from './model-text.ts';
 
 export interface MemoryToolDeps {
   memory: () => HindsightMemory | null;
   currentUserSource?: (session: string) => string | null;
   currentReadSource?: (session: string) => string | null;
+}
+
+function evidenceComplete(
+  read: { text: string; trace?: { format: { sourceSegments: Array<{ documentId: string; start: number; end: number }> } }; sourceSegments?: Array<{ documentId: string; start: number; end: number }> },
+  evidence: ToolOutcome['evidence'],
+  requireFullTextCoverage: boolean,
+): boolean {
+  if (!read.text) return true;
+  const segments = read.sourceSegments ?? read.trace?.format.sourceSegments ?? [];
+  if (segments.length === 0 || evidence?.length !== segments.length
+    || evidence.some((attachment) => attachment.validationStatus !== 'validated' || attachment.revisionState !== 'current')) return false;
+  return !requireFullTextCoverage || evidenceCoversText(read.text, evidence);
+}
+
+function withIncompleteEvidence(text: string): string {
+  return text.includes(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE)
+    ? text
+    : [text, MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE].filter(Boolean).join('\n');
 }
 
 const text = (args: Record<string, unknown>, key: string): string =>
@@ -33,17 +52,24 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         if (args.sources === true) {
           const excludeDocumentId = deps.currentReadSource?.(ctx.role) ?? deps.currentUserSource?.(ctx.role) ?? undefined;
           const read = await memory.searchSourceDocuments(text(args, 'query'), { excludeDocumentId });
-          return read.text || memoryReadNotice(read.status);
+          if (!read.text) return memoryReadNotice(read.status);
+          const evidence = await memory.evidenceForRead(read);
+          const output = evidenceComplete(read, evidence, false) ? read.text : withIncompleteEvidence(read.text);
+          return evidence.length ? { text: output, evidence } satisfies ToolOutcome : output;
         }
         const maxTokens = typeof args.max_tokens === 'number' && Number.isFinite(args.max_tokens)
           ? Math.min(2000, Math.max(400, Math.round(args.max_tokens)))
           : undefined;
-        const read = await memory.recallBlockDetailed(text(args, 'query'), maxTokens ? { maxTokens } : {});
+        const read = await memory.recallBlockDetailed(text(args, 'query'), { ...(maxTokens ? { maxTokens } : {}), captureTrace: true });
         const result = read.text || memoryReadNotice(read.status);
         const notice = read.sourceFactsTruncated && read.status === 'found' && !result.includes(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE)
           ? MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE
           : '';
-        return [result, notice].filter(Boolean).join('\n');
+        let output = [result, notice].filter(Boolean).join('\n');
+        if (!read.text) return output;
+        const evidence = await memory.evidenceForRead(read);
+        if (!evidenceComplete(read, evidence, true)) output = withIncompleteEvidence(output);
+        return evidence.length ? { text: output, evidence } satisfies ToolOutcome : output;
       },
     },
     {
@@ -151,7 +177,8 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         const memory = deps.memory();
         if (!memory?.enabled()) return '[memory] Long-term memory is not available.';
         const answer = await memory.reflectDetailed(text(args, 'question'));
-        return answer.text || memoryReadNotice(answer.status);
+        const result = answer.text || memoryReadNotice(answer.status);
+        return answer.status === 'found' && answer.text ? withIncompleteEvidence(result) : result;
       },
     },
   ];

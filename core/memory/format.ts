@@ -59,6 +59,7 @@ export interface RecallFormatTrace {
   deduplicatedResultIds: string[];
   includedSourceDocumentIds: string[];
   includedSourceFactIds: string[];
+  sourceSegments: Array<{ documentId: string; sourceFactId?: string; start: number; end: number }>;
   omittedSourceDocumentIds: string[];
   incompleteResultIds: string[];
   clippedResultIds: string[];
@@ -181,6 +182,7 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
   const rankedCandidates = rankRecallCandidates(candidates, coverageWeight, activationInfluence);
   const includedSourceDocumentIds = new Set<string>();
   const includedSourceFactIds = new Set<string>();
+  const sourceSegments: RecallFormatTrace['sourceSegments'] = [];
   const incompleteResultIds: string[] = [];
   const clippedResultIds: string[] = [];
   const clippedContextResultIds: string[] = [];
@@ -202,6 +204,7 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
       includedResultIndexes: [], includedResultIds: [], omittedResultIndexes: [], omittedResultIds: [],
       deduplicatedResultIndexes: [], deduplicatedResultIds: [],
       includedSourceDocumentIds: [], includedSourceFactIds: [], omittedSourceDocumentIds: [], incompleteResultIds: [], clippedResultIds: [],
+      sourceSegments: [],
       clippedContextResultIds: [], clippedSourceFactIds: [], sourceFactsTruncated: false, coverageWeight: 0, maxChars,
       activationInfluence: 0, activationWeights: [], retrievalScores: [],
       usedChars: text ? usedChars : 0,
@@ -221,6 +224,7 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
       deduplicatedResultIds: deduplicatedResultIndexes.map((index) => results[index]!.id),
       includedSourceDocumentIds: [...includedSourceDocumentIds],
       includedSourceFactIds: [...includedSourceFactIds],
+      sourceSegments: [...sourceSegments],
       omittedSourceDocumentIds: [...allSourceDocumentIds].filter((id) => !includedSourceDocumentIds.has(id)),
       incompleteResultIds: [...new Set(incompleteResultIds)],
       clippedResultIds: [...new Set(clippedResultIds)],
@@ -270,6 +274,7 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
       return {
         id: fact.id,
         documentId: fact.documentId,
+        text: factText,
         line: `  supporting source (${fact.type}, ${fact.date ? fact.date.slice(0, 10) : 'undated'}${provenance(fact.metadata)}${factSource}) ${factText}`,
         clipped: normalized.length > factText.length,
       };
@@ -334,6 +339,22 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
         includedSourceFactIds.add(fact.id);
         includedSourceDocumentIds.add(fact.documentId);
         if (fact.clipped) clippedSourceFactIds.push(fact.id);
+      }
+      const lineOffset = used + separator;
+      if (includedFacts.length > 0) {
+        let sourceLineOffset = lineOffset + baseLine.length + 1 + (contextLine ? contextLine.length + 1 : 0);
+        for (const fact of includedFacts) {
+          const start = sourceLineOffset + fact.line.length - fact.text.length;
+          sourceSegments.push({ documentId: fact.documentId, sourceFactId: fact.id, start, end: start + fact.text.length });
+          sourceLineOffset += fact.line.length + 1;
+        }
+      } else if (!result.sourceFactsIncomplete && typeof result.document_id === 'string' && result.document_id) {
+        const displayed = clip(rawText, textBudget);
+        const visibleLength = rawText.length > textBudget ? Math.max(0, displayed.length - 1) : displayed.length;
+        if (visibleLength > 0) {
+          const start = lineOffset + linePrefix.length;
+          sourceSegments.push({ documentId: result.document_id, start, end: start + visibleLength });
+        }
       }
       if (result.sourceFactsIncomplete || omittedSourceFact) incompleteResultIds.push(result.id);
     }

@@ -18,18 +18,19 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, statfsSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, fstatSync, lstatSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, statfsSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { freemem, totalmem } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { LOG_SCHEME, blobScheme } from 'cortico/core/blobs.ts';
-import type { CoreApi, EventEnvelope, PersonaWebUiDecl, SessionDecl, SessionOpeningReason, StoragePart, ToolCallContext, ToolDef, ToolOutcome, WorldLifecycleEvent } from 'cortico/core/types.ts';
+import type { CoreApi, ContextHandoffPrepareContext, EvidenceAttachment, EventEnvelope, HandoffCommitCheck, PersonaWebUiDecl, PreparedContextHandoff, SessionDecl, SessionOpeningReason, StoragePart, ToolCallContext, ToolDef, ToolOutcome, WorldLifecycleEvent } from 'cortico/core/types.ts';
 import { withText, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import type { Language } from 'cortico/core/language.ts';
-import type { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
+import { HANDOFF_DIR, type Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import type { GitAuthor, WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
 import { memoryTools } from './memory/tools.ts';
-import type { HindsightMemory } from './memory/hindsight.ts';
+import type { HindsightMemory, MemoryEvidenceSegment } from './memory/hindsight.ts';
+import { evidenceCoversText } from './memory/source-evidence.ts';
 import { isMemoryForgetRequest } from './memory/router.ts';
 import { memoryStorageText } from './memory/strings.ts';
 import {
@@ -45,16 +46,17 @@ import { SESSION_MAX_CALLS, type SelfTimeConfig } from './browser/config.ts';
 import { selfTimeLine } from './browser/model-text.ts';
 import { GROWTH_DEFAULTS, type GrowthConfig } from './growth/config.ts';
 import { GROWTH_SESSION, GROWTH_TOOL_NAMES, GrowthReview, growthMemorySearchTool } from './growth/review.ts';
-import { ExperienceCards, readExperienceCardInput } from './growth/experience-cards.ts';
+import { EXPERIENCE_CONTEXT_HEADER, ExperienceCards, readExperienceCardInput } from './growth/experience-cards.ts';
 import { GrowthProposals, type GrowthProposal } from './growth/proposals.ts';
 import { GROWTH_CHECK_MS, GrowthSchedule } from './growth/schedule.ts';
 import { readResourcePressure } from './resource-pressure.ts';
-import { memoryReadNotice } from './memory/model-text.ts';
+import { MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, memoryReadNotice } from './memory/model-text.ts';
 import type { ModelLanguage } from './language.ts';
 import type { FileSystemActionAuthorization, FileSystemActionAuthorizationRequest } from './action-authorization.ts';
 import type { ActionReceiptLedger, ActionReceiptReviewDecision } from './action-receipts.ts';
 import type { FileSystemTargetEvidence } from './task-grants.ts';
 import { writeState } from './state-file.ts';
+import { HANDOFF_NOTE_TYPE, handoffNoteStamp, renderHandoffNote } from '../vendor/cortico/bots/cormini/persona/handoffNote.ts';
 
 /** The workspace file that goes into the prefix as Coo's notes on the person. */
 export const PARTNER_FILE = 'PARTNER.md';
@@ -359,10 +361,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return dir ? new ExperienceCards(join(dir, 'experience-cards')) : null;
     }
 
-    private injectMemoryContext(text: string): void {
+    private injectMemoryContext(text: string, evidence?: EvidenceAttachment[]): void {
       if (!text) return;
       this.memoryContextBlocks.add(text);
-      this.core?.injectInternal(text, 'memory');
+      this.core?.injectInternal(text, 'memory', evidence);
       if (this.core) this.longTerm?.markRecallInjected(text);
     }
 
@@ -404,10 +406,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         && sourceIds.every((id) => memory.sourceVisible(id));
     }
 
-    private async experienceContext(): Promise<string> {
+    private async experienceContext(): Promise<{ text: string; evidence: EvidenceAttachment[] }> {
       const cards = this.experienceCards();
       const memory = this.longTerm;
-      if (!cards || !memory?.enabled() || !memory.settled()) return '';
+      if (!cards || !memory?.enabled() || !memory.settled()) return { text: '', evidence: [] };
       const valid = new Set<string>();
       for (const card of cards.list('approved').slice(0, 8)) {
         const sourcesValid = card.userExplicit
@@ -415,8 +417,31 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           : await this.verifiedRepeatedUserEventSources(card.sourceIds);
         if (sourcesValid) valid.add(card.id);
       }
-      if (!memory.enabled() || !memory.settled()) return '';
-      return cards.approvedContext(8, 3200, (card) => valid.has(card.id));
+      if (!memory.enabled() || !memory.settled()) return { text: '', evidence: [] };
+      const entries = cards.approvedContextEntries(8, 3200, (card) => valid.has(card.id));
+      const included: Array<{ text: string; evidence: EvidenceAttachment[] }> = [];
+      for (const entry of entries) {
+        const sourceIds = [...new Set(entry.card.sourceIds)];
+        const segments: MemoryEvidenceSegment[] = sourceIds.map((documentId) => ({
+          documentId, start: 0, end: entry.text.length, derived: true,
+        }));
+        const evidence = await memory.evidenceForSegments(entry.text, segments);
+        if (evidence.length !== segments.length || !evidenceCoversText(entry.text, evidence)) continue;
+        included.push({ text: entry.text, evidence });
+      }
+      if (!memory.enabled() || !memory.settled() || included.length === 0) return { text: '', evidence: [] };
+      const text = `${EXPERIENCE_CONTEXT_HEADER}\n${included.map((entry) => entry.text).join('\n')}`;
+      const evidence: EvidenceAttachment[] = [];
+      let offset = EXPERIENCE_CONTEXT_HEADER.length + 1;
+      for (let index = 0; index < included.length; index++) {
+        const entry = included[index]!;
+        evidence.push(...entry.evidence.map((attachment) => ({
+          ...attachment,
+          segment: { ...attachment.segment, start: attachment.segment.start + offset, end: attachment.segment.end + offset },
+        })));
+        offset += entry.text.length + (index + 1 < included.length ? 1 : 0);
+      }
+      return { text, evidence };
     }
 
     private systemHealth(): Record<string, unknown> {
@@ -1057,10 +1082,17 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         if (!card) throw new Error('The experience card is no longer in that state. Refresh the list.');
         if (action === 'approved') {
           const context = await this.experienceContext();
-          if (context) this.injectMemoryContext(context);
+          if (context.text) this.injectMemoryContext(context.text, context.evidence);
         } else if (action === 'deprecated') {
           const context = await this.experienceContext();
-          this.injectMemoryContext(`[memory] The user revoked the experience strategy “${before?.title ?? id}”. Do not follow it anymore. ${context || 'No approved experience strategies remain active.'}`);
+          const notice = `[memory] The user revoked the experience strategy “${before?.title ?? id}”. Do not follow it anymore.`;
+          const text = context.text ? `${notice} ${context.text}` : `${notice} No approved experience strategies remain active.`;
+          const offset = notice.length + 1;
+          const evidence = context.evidence.map((attachment) => ({
+            ...attachment,
+            segment: { ...attachment.segment, start: attachment.segment.start + offset, end: attachment.segment.end + offset },
+          }));
+          this.injectMemoryContext(text, evidence);
         }
         return card;
       }
@@ -1163,10 +1195,11 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       if (!this.longTerm?.enabled() && !this.experienceCards()?.list('approved').length) return;
       this.core?.injectDeferred('memory', async () => {
         const briefing = this.longTerm?.enabled() ? await this.longTerm.sessionBriefing().catch(() => null) : null;
-        const context = [briefing?.text?.trim(), await this.experienceContext()].filter(Boolean).join('\n\n');
-        if (!context) return null;
-        this.memoryContextBlocks.add(context);
-        return context;
+        const portrait = briefing?.text?.trim() ?? '';
+        const strategies = await this.experienceContext();
+        if (portrait) this.injectMemoryContext(`${portrait}\n${MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE}`);
+        if (strategies.text) this.injectMemoryContext(strategies.text, strategies.evidence);
+        return null;
       });
     }
 
@@ -1222,20 +1255,33 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       if (!latest || !this.longTerm?.enabled()) return;
       const recalled = await this.longTerm.recallForTurn(latest, {
         ...(latestUserDocumentId ? { userEventDocumentId: latestUserDocumentId } : {}),
+        captureTrace: true,
       });
-      if (recalled.text) this.injectMemoryContext(recalled.text);
+      if (recalled.text) {
+        const sourceSegments = recalled.trace?.format.sourceSegments ?? [];
+        const evidence = await this.longTerm.evidenceForSegments(recalled.text, sourceSegments);
+        const complete = sourceSegments.length > 0 && evidenceCoversText(recalled.text, evidence);
+        this.injectMemoryContext(complete ? recalled.text : `${recalled.text}\n${MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE}`, evidence);
+      }
       else if (recalled.route === 'deep' && recalled.status !== 'skipped') {
         this.injectMemoryContext(`${memoryReadNotice(recalled.status)} If you are not sure, say so; do not invent dates, names or past events.`);
       }
     }
 
-    /** Handoff notes omit Memory payloads and source events covered by a persisted forget fence. */
-    override async onHandoff(snapshot: ContextRecord[], ctx: { hardTokens: number | null }) {
+    private handoffIsProtected(snapshot: readonly ContextRecord[]): boolean {
+      if (this.memoryContextBlocks.size > 0) return true;
+      if (snapshot.some((record) => record.context.frame?.events.some((event) => event.type === HANDOFF_NOTE_TYPE))) return true;
+      if (snapshot.some((record) => (record.context.evidence?.length ?? 0) > 0)) return true;
+      if (snapshot.some((record) => record.item.type === 'function_call'
+        && (MEMORY_TOOL_NAMES.has(record.item.name) || WORKSPACE_READ_PATHS[record.item.name] !== undefined))) return true;
+      return false;
+    }
+
+    private handoffSnapshot(snapshot: ContextRecord[]): ContextRecord[] {
       const memory = this.longTerm;
-      if (!memory) return super.onHandoff(snapshot, ctx);
       const memoryCallIds = new Set(snapshot.flatMap((record) => record.item.type === 'function_call'
         && MEMORY_TOOL_NAMES.has(record.item.name) ? [record.item.call_id] : []));
-      const filtered = snapshot
+      return snapshot
         .filter((record) => !(record.item.type === 'function_call'
           && MEMORY_TOOL_NAMES.has(record.item.name))
           && !(record.item.type === 'function_call_output' && memoryCallIds.has(record.item.call_id)))
@@ -1249,27 +1295,200 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             text = text.split(block).join(blank);
             changed = true;
           }
-          const spans = (record.context.frame?.events ?? []).flatMap((event) => {
+          const sourceSpans = (record.context.evidence ?? []).flatMap((attachment) => {
+            const current = memory?.sourceVisible(attachment.documentId) && memory.sourceCurrentForContext(attachment.documentId);
+            return current ? [] : [{ start: attachment.segment.start, end: attachment.segment.end }];
+          });
+          const fencedEventSpans = (record.context.frame?.events ?? []).flatMap((event) => {
             if (event.source !== 'desktop-pet') return [];
             const documentId = event.type === 'desktop-pet.touch'
               ? `touch:main:${event.cursor}`
               : ['desktop-pet.message', 'desktop-pet.speech', 'desktop-pet.answer'].includes(event.type)
                 ? `user:main:${event.cursor}`
                 : null;
-            return documentId && memory.sourceFenced(documentId)
+            return documentId && memory?.sourceFenced(documentId)
               ? [{ start: event.start, end: event.start + event.chars }]
               : [];
-          }).sort((a, b) => b.start - a.start);
-          for (const { start, end } of spans) {
+          });
+          for (const { start, end } of [...sourceSpans, ...fencedEventSpans].sort((a, b) => b.start - a.start)) {
             const segment = text.slice(start, end);
             text = `${text.slice(0, start)}${segment.replace(/[^\r\n]/g, ' ')}${text.slice(end)}`;
             changed = true;
           }
           return changed ? withText(record, text) : record;
         });
-      const result = await super.onHandoff(filtered, ctx);
-      this.memoryContextBlocks.clear();
-      return result;
+    }
+
+    async prepareHandoff(snapshot: ContextRecord[], ctx: ContextHandoffPrepareContext): Promise<PreparedContextHandoff> {
+      const memory = this.longTerm;
+      const protectedHandoff = this.handoffIsProtected(snapshot);
+      const expectedMemoryEpoch = memory?.evidenceEpoch() ?? null;
+      const memorySourcesVerified = !!memory && !!expectedMemoryEpoch
+        && ctx.sourceEvidence.mappingState === 'complete'
+        && await memory.verifyExposureSources(ctx.sourceEvidence.exposedSources, expectedMemoryEpoch);
+      const sourceFree = !protectedHandoff && ctx.sourceEvidence.exposedSources.length === 0;
+      const filtered = this.handoffSnapshot(snapshot);
+      const now = new Date();
+      const { maxTokens, keepRatio } = this.context();
+      const note = renderHandoffNote(filtered, {
+        speechTools: this.core?.toolsTagged('speak') ?? new Set<string>(),
+        flowTools: this.core?.toolsTagged('flow') ?? new Set<string>(),
+        snapshotTools: this.core?.toolsTagged('snapshot') ?? new Set<string>(),
+        now,
+        budgetTokens: Math.floor(maxTokens * keepRatio),
+        splitAtMs: this.pressureSplitAt,
+      });
+      const handoffPath = join(this.memoryDir, HANDOFF_DIR);
+      const stagingPath = join(handoffPath, '.staging');
+      let ownsHandoffDirectory = false;
+      let ownsStagingDirectory = false;
+      let stageIdentity: { dev: number; ino: number } | null = null;
+      let finalPath: string | null = null;
+      let finalIdentity: { dev: number; ino: number } | null = null;
+      let committedFile: string | null = null;
+      const persona = this;
+      const previousHandoffFile = this.lastHandoffFile;
+      const previousPressureWarned = this.pressureWarned;
+      const previousPressureSplitAt = this.pressureSplitAt;
+      const previousMemoryContextBlocks = [...this.memoryContextBlocks];
+      const stagePath = join(stagingPath, `${randomUUID()}.md`);
+      const makeDirectory = (path: string): boolean => {
+        try {
+          mkdirSync(path, { mode: 0o700 });
+          return true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST' || !statSync(path).isDirectory()) throw error;
+          return false;
+        }
+      };
+      const removeOwnedFile = (path: string | null, identity: { dev: number; ino: number } | null): void => {
+        if (!path || !identity || !existsSync(path)) return;
+        try {
+          const current = statSync(path);
+          if (current.dev === identity.dev && current.ino === identity.ino) unlinkSync(path);
+        } catch { /* Keep a file whose ownership cannot be confirmed. */ }
+      };
+      const cleanupStage = (): void => {
+        removeOwnedFile(stagePath, stageIdentity);
+        stageIdentity = null;
+        if (ownsStagingDirectory) {
+          try { rmdirSync(stagingPath); } catch { /* Keep a directory that now contains another entry. */ }
+          ownsStagingDirectory = false;
+        }
+      };
+      const cleanupOwnedDirs = (): void => {
+        if (ownsStagingDirectory) {
+          try { rmdirSync(stagingPath); } catch { /* Keep a directory that now contains another entry. */ }
+          ownsStagingDirectory = false;
+        }
+        if (ownsHandoffDirectory) {
+          try { rmdirSync(handoffPath); } catch { /* Keep a directory that now contains another entry. */ }
+          ownsHandoffDirectory = false;
+        }
+      };
+
+      let fd: number | null = null;
+      try {
+        ownsHandoffDirectory = makeDirectory(handoffPath);
+        ownsStagingDirectory = makeDirectory(stagingPath);
+        fd = openSync(stagePath, 'wx', 0o600);
+        const opened = fstatSync(fd);
+        stageIdentity = { dev: opened.dev, ino: opened.ino };
+        writeFileSync(fd, note.text, { encoding: 'utf8' });
+        const closingFd = fd;
+        fd = null;
+        closeSync(closingFd);
+      } catch (error) {
+        if (fd !== null) {
+          const closingFd = fd;
+          fd = null;
+          try { closeSync(closingFd); } catch { /* Preserve the write error. */ }
+        }
+        cleanupStage();
+        cleanupOwnedDirs();
+        throw error;
+      }
+
+      const commitGuard = (): HandoffCommitCheck => {
+        const generation = this.core?.sessionInfo(ctx.sessionId).generation;
+        if (!generation || generation.status !== 'current' || generation.token !== ctx.expectedGeneration) {
+          return { status: 'stale', reason: 'generation-changed' };
+        }
+        if (protectedHandoff) {
+          if (!memory || !expectedMemoryEpoch || !memorySourcesVerified || !memory.enabled() || !memory.settled()
+            || memory.evidenceEpoch() !== expectedMemoryEpoch || ctx.sourceEvidence.mappingState !== 'complete'
+            || ctx.sourceEvidence.exposedSources.length === 0
+            || ctx.sourceEvidence.exposedSources.some((source) => !memory.sourceVisible(source.documentId)
+              || !memory.sourceCurrentForContext(source.documentId))) {
+            return { status: 'blocked', reason: 'memory-source-dependency-unverified' };
+          }
+        } else if (!sourceFree || ctx.sourceEvidence.exposedSources.length > 0) {
+          return { status: 'blocked', reason: 'source-free-dependency-unproven' };
+        }
+        return { status: 'allow' };
+      };
+      const commit = (): void => {
+        if (committedFile) throw new Error('handoff candidate was already committed');
+        if (!stageIdentity) throw new Error('handoff candidate ownership was lost');
+        const stem = handoffNoteStamp(now);
+        for (let suffix = 0; suffix < 100; suffix++) {
+          const filename = `${stem}${suffix === 0 ? '' : `-${suffix}`}.md`;
+          const candidate = join(handoffPath, filename);
+          try {
+            linkSync(stagePath, candidate);
+            finalPath = candidate;
+            const linkedIdentity = { ...stageIdentity };
+            finalIdentity = linkedIdentity;
+            const stat = statSync(candidate);
+            if (stat.dev !== linkedIdentity.dev || stat.ino !== linkedIdentity.ino) throw new Error('published handoff identity changed');
+            committedFile = `${HANDOFF_DIR}${filename}`;
+            break;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+          }
+        }
+        if (!committedFile) throw new Error('no unused handoff filename is available');
+        unlinkSync(stagePath);
+        stageIdentity = null;
+        this.lastHandoffFile = committedFile;
+        this.pressureWarned = false;
+        this.pressureSplitAt = null;
+        this.memoryContextBlocks.clear();
+        cleanupStage();
+      };
+      const discard = (): void => {
+        removeOwnedFile(finalPath, finalIdentity);
+        finalPath = null;
+        finalIdentity = null;
+        committedFile = null;
+        this.lastHandoffFile = previousHandoffFile;
+        this.pressureWarned = previousPressureWarned;
+        this.pressureSplitAt = previousPressureSplitAt;
+        this.memoryContextBlocks.clear();
+        for (const block of previousMemoryContextBlocks) this.memoryContextBlocks.add(block);
+        cleanupStage();
+        cleanupOwnedDirs();
+      };
+
+      return {
+        result: { tail: this.handoffTail(snapshot) },
+        ...(protectedHandoff ? { protected: true as const } : {}),
+        commitGuard,
+        commit,
+        discard,
+        get injections() {
+          if (!committedFile) return [];
+          return [
+            { origin: 'internal' as const, kind: 'handoff', text: persona.handoffNote() },
+            ...note.parts.map((part) => ({ origin: 'external' as const, kind: HANDOFF_NOTE_TYPE, text: part.text })),
+          ];
+        },
+      };
+    }
+
+    override async onHandoff(snapshot: ContextRecord[], ctx: { hardTokens: number | null }) {
+      if (this.handoffIsProtected(snapshot)) return { tail: null };
+      return super.onHandoff(snapshot, ctx);
     }
 
     protected override pressureNote(): string {

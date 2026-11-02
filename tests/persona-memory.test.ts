@@ -20,6 +20,7 @@ const event = (over: Partial<EventEnvelope>): EventEnvelope => ({
 function personaWith() {
   const dir = mkdtempSync(join(tmpdir(), 'coo-persona-memory-'));
   const calls: string[] = [];
+  const injections: Array<{ text: string; kind: string; evidence?: unknown[] }> = [];
   const deferred: Array<() => string | null | Promise<string | null>> = [];
   const retainUser = vi.fn((_text: string, meta: { cursor?: number } = {}) => `user:main:${meta.cursor ?? 0}:hash`);
   const retainTouch = vi.fn();
@@ -39,16 +40,20 @@ function personaWith() {
     forgetDocument,
     forgetMostRecent,
     recallForTurn,
+    evidenceForSegments: vi.fn(async () => []),
     sessionBriefing,
     clear: clearMemory,
   } as unknown as HindsightMemory;
   const Persona = coopanionPersona(Cormini, { memory });
   const p = new Persona({ memoryDir: dir });
   p['core'] = {
-    injectInternal: (text: string, kind: string) => calls.push(`${kind}:${text}`),
+    injectInternal: (text: string, kind: string, evidence?: unknown[]) => {
+      calls.push(`${kind}:${text}`);
+      injections.push({ text, kind, ...(evidence ? { evidence } : {}) });
+    },
     injectDeferred: (_kind: string, render: () => string | null | Promise<string | null>) => deferred.push(render),
   } as never;
-  return { p, calls, deferred, retainUser, retainTouch, retainAffinityChange, forgetDocument, forgetMostRecent, recallForTurn, clearMemory };
+  return { p, calls, injections, deferred, retainUser, retainTouch, retainAffinityChange, forgetDocument, forgetMostRecent, recallForTurn, clearMemory };
 }
 
 describe('Coo with long-term memory and the affinity extension', () => {
@@ -65,8 +70,8 @@ describe('Coo with long-term memory and the affinity extension', () => {
     expect(retainAffinityChange).toHaveBeenCalledWith(expect.objectContaining({ subject: 7, score: 21, delta: 1, kind: 'happy', reason: 'shared tea' }));
     expect(retainUser).toHaveBeenCalledWith('I like jasmine tea', expect.objectContaining({ session: 'main', cursor: 3 }));
     const userEventDocumentId = retainUser.mock.results[0]?.value;
-    expect(recallForTurn).toHaveBeenCalledWith('I like jasmine tea', { userEventDocumentId });
-    expect(calls).toContain('memory:[memory] you like tea');
+    expect(recallForTurn).toHaveBeenCalledWith('I like jasmine tea', { userEventDocumentId, captureTrace: true });
+    expect(calls.some((call) => call.startsWith('memory:[memory] you like tea'))).toBe(true);
   });
 
   it('does not retain a message that asks not to remember, and freezes recent writes', async () => {
@@ -90,11 +95,14 @@ describe('Coo with long-term memory and the affinity extension', () => {
   });
 
   it('injects the portrait at session start', async () => {
-    const { p, deferred } = personaWith();
+    const { p, deferred, calls, injections } = personaWith();
     p.onOpening({ reason: 'new' });
     expect(deferred).toHaveLength(1);
     const text = await deferred[0]!();
-    expect(text).toContain('[memory] portrait');
+    expect(text).toBeNull();
+    expect(calls.some((call) => call.startsWith('memory:[memory] portrait'))).toBe(true);
+    expect(injections.find((entry) => entry.text.startsWith('[memory] portrait'))).not.toHaveProperty('evidence');
+    expect(injections.find((entry) => entry.text.startsWith('[memory] portrait'))?.text).toContain('Supporting source evidence is incomplete');
   });
 
   it('adds long-term memory to the storage page', async () => {

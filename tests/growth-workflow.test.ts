@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { EventEnvelope } from 'cortico/core/types.ts';
+import type { EvidenceAttachment, EventEnvelope } from 'cortico/core/types.ts';
 import { functionCall, functionResult, message } from 'cortico/protocol/open-responses/context.ts';
 import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import { WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
@@ -11,6 +12,7 @@ import { ActionReceiptLedger } from '../core/action-receipts.ts';
 import type { HindsightMemory } from '../core/memory/hindsight.ts';
 import { ExperienceCards } from '../core/growth/experience-cards.ts';
 import { GrowthProposals } from '../core/growth/proposals.ts';
+import { MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE } from '../core/memory/model-text.ts';
 
 const roots: string[] = [];
 const temp = () => {
@@ -18,6 +20,16 @@ const temp = () => {
   roots.push(root);
   return root;
 };
+
+async function evidenceForSegments(text: string, segments: readonly { documentId: string; start: number; end: number }[]): Promise<EvidenceAttachment[]> {
+  return segments.map((segment) => ({
+    bankId: 'bank-synthetic', endpoint: 'https://bank.invalid', documentId: segment.documentId,
+    validatedEpoch: '0:0', revisionState: 'current', validationStatus: 'validated',
+    validationReceipt: createHash('sha256').update(segment.documentId).digest('hex'),
+    contentDigest: createHash('sha256').update(`source:${segment.documentId}`).digest('hex'),
+    segment: { start: segment.start, end: segment.end, digest: createHash('sha256').update(text.slice(segment.start, segment.end)).digest('hex') },
+  }));
+}
 
 /** The apply path checks that a proposal's evidence still exists. */
 const liveSources = {
@@ -169,7 +181,7 @@ describe('experience policy cards', () => {
     ]) {
       const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory: memory as unknown as HindsightMemory });
       const persona = new Persona({ memoryDir: workspace });
-      expect(await (persona as unknown as { experienceContext(): Promise<string> }).experienceContext()).toBe('');
+      expect((await (persona as unknown as { experienceContext(): Promise<{ text: string }> }).experienceContext()).text).toBe('');
     }
   });
 
@@ -238,6 +250,7 @@ describe('experience policy cards', () => {
         present: true, visible: true, actor: 'user', status: 'completed', kind: 'event',
         occurredAt: id.startsWith('same-') ? '2026-10-01T12:00:00.000Z' : id.endsWith('-1') ? '2026-10-01T12:00:00.000Z' : '2026-10-08T12:00:00.000Z',
       }),
+      evidenceForSegments,
     } as unknown as HindsightMemory;
     const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory });
     const persona = new Persona({ memoryDir: workspace });
@@ -324,6 +337,7 @@ describe('experience policy cards', () => {
       settled: () => true,
       sourceVisible: () => true,
       sourceEvidence: async () => ({ present: true, visible: true, actor: 'user', status: 'completed' }),
+      evidenceForSegments,
     } as unknown as HindsightMemory;
     const Persona = coopanionPersona(Cormini, {
       growthStateFile: join(deploy, 'growth.json'),
@@ -386,11 +400,12 @@ describe('experience policy cards', () => {
     const memory = {
       enabled: () => true, settled: () => true, sourceVisible: () => true, hasSource: async () => true, markRecallInjected: () => {},
       sourceEvidence: async () => ({ present: true, visible: true, actor: 'user', status: 'current' }),
+      evidenceForSegments,
     } as unknown as HindsightMemory;
     const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory });
     const persona = new Persona({ memoryDir: workspace });
-    const injected: string[] = [];
-    persona['core'] = { injectInternal: (text: string) => injected.push(text) } as never;
+    const injected: Array<{ text: string; evidence?: EvidenceAttachment[] }> = [];
+    persona['core'] = { injectInternal: (text: string, _kind?: string, evidence?: EvidenceAttachment[]) => injected.push({ text, evidence }) } as never;
     const invoke = persona.webUi('en').invoke!;
     const card = await invoke('hindsight', 'experience-create', [{
       title: 'Quiet coding time', situation: 'The person is coding.', lesson: 'Wait before routine interruptions.', scope: 'proactive_speech', sourceIds: ['user:focus'],
@@ -398,9 +413,11 @@ describe('experience policy cards', () => {
 
     await invoke('hindsight', 'experience-review', [card.id, 'approved']);
     await invoke('hindsight', 'experience-review', [card.id, 'deprecated']);
-    expect(injected.at(-1)).toContain('Quiet coding time');
-    expect(injected.at(-1)).toContain('Do not follow it anymore');
-    expect(injected.at(-1)).toContain('No approved experience strategies remain active.');
+    expect(injected[0]?.text).toContain('The person is coding.');
+    expect(injected[0]?.evidence?.map((attachment) => attachment.documentId)).toEqual(['user:focus']);
+    expect(injected.at(-1)?.text).toContain('Quiet coding time');
+    expect(injected.at(-1)?.text).toContain('Do not follow it anymore');
+    expect(injected.at(-1)?.text).toContain('No approved experience strategies remain active.');
   });
 
   it('rejects experience cards and proposal approval when a source is gone', async () => {
@@ -415,6 +432,7 @@ describe('experience policy cards', () => {
       sourceVisible: () => true,
       hasSource: async () => false,
       sourceEvidence: async () => ({ present: false, visible: true, actor: null, status: null }),
+      evidenceForSegments,
     } as unknown as HindsightMemory;
     const proposals = new GrowthProposals(join(deploy, 'growth-proposals'));
     const written = proposals.write(proposalInput);
@@ -477,10 +495,15 @@ describe('forget fences at handoff', () => {
     const memory = {
       enabled: () => true,
       sourceFenced: (sourceId: string) => fenced.has(sourceId),
+      sourceCurrentForContext: () => true,
+      sourceVisible: () => true,
+      evidenceEpoch: () => '0:0',
+      settled: () => true,
       markRecallInjected: () => {},
       setLifecycleHooks: () => {},
       retainUser: () => 'user:main:44',
       recallForTurn: async () => ({ text: memoryText, route: 'standard', found: true, status: 'found' }),
+      evidenceForSegments,
     } as unknown as HindsightMemory;
     const Persona = coopanionPersona(Cormini, { memory });
     const persona = new Persona({ memoryDir: workspace });
@@ -489,6 +512,7 @@ describe('forget fences at handoff', () => {
       toolsTagged: () => new Set<string>(),
       injectInternal: (text: string) => injected.push(text),
       injectExternal: () => {},
+      sessionInfo: (id: string) => ({ id, running: 0, snapshot: null, estTokens: null, hardTokens: null, generation: { token: 'generation-1', status: 'current' } }),
     };
     persona.attach(core as never);
 
@@ -497,16 +521,17 @@ describe('forget fences at handoff', () => {
       origin: 'external', text: 'A current user event.', meta: { text: 'A current user event.' },
     };
     await persona.onDelivery({ events: [currentEvent] });
-    expect(injected).toContain(memoryText);
+    expect(injected.some((text) => text.startsWith(memoryText))).toBe(true);
 
     const forgottenUser = 'Forgotten user event.';
     const forgottenTouch = 'A forgotten touch event.';
     const current = 'A current user event.';
-    const body = [memoryText, forgottenUser, forgottenTouch, current].join('\n');
-    const firstStart = memoryText.length + 1;
+    const injectedMemoryText = `${memoryText}\n${MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE}`;
+    const body = [injectedMemoryText, forgottenUser, forgottenTouch, current].join('\n');
+    const firstStart = injectedMemoryText.length + 1;
     const secondStart = firstStart + forgottenUser.length + 1;
     const thirdStart = secondStart + forgottenTouch.length + 1;
-    await persona.onHandoff([
+    const prepared = await persona.prepareHandoff([
       functionCall('memory-call', 'memory_search', JSON.stringify({ query: 'find my old event' })),
       functionResult('memory-call', memoryText),
       message('user', body, { frame: { events: [
@@ -514,14 +539,25 @@ describe('forget fences at handoff', () => {
         { cursor: 43, ts: '2026-10-31T10:00:01.000Z', type: 'desktop-pet.touch', source: 'desktop-pet', start: secondStart, chars: forgottenTouch.length },
         { cursor: 44, ts: '2026-10-31T10:00:02.000Z', type: 'desktop-pet.message', source: 'desktop-pet', start: thirdStart, chars: current.length },
       ] } }),
-    ], { hardTokens: null });
+    ], {
+      hardTokens: null, sessionId: 'main', expectedGeneration: 'generation-1', candidateSnapshotId: 'candidate-1',
+      sourceEvidence: { mappingState: 'missing', exposedSources: [] },
+    });
 
-    const notes = readdirSync(join(workspace, 'handoffs'))
-      .map((name) => readFileSync(join(workspace, 'handoffs', name), 'utf8')).join('\n');
+    const handoffDir = join(workspace, 'handoffs');
+    const stagingDir = join(handoffDir, '.staging');
+    expect(readdirSync(handoffDir).filter((name) => name.endsWith('.md'))).toEqual([]);
+    const stagedNames = readdirSync(stagingDir);
+    expect(stagedNames).toHaveLength(1);
+    const notes = readFileSync(join(stagingDir, stagedNames[0]!), 'utf8');
     expect(notes).not.toContain(memoryText);
     expect(notes).not.toContain(forgottenUser);
     expect(notes).not.toContain(forgottenTouch);
     expect(notes).not.toContain('find my old event');
     expect(notes).toContain(current);
+    expect(prepared.commitGuard?.()).toMatchObject({ status: 'blocked' });
+    prepared.discard?.();
+    expect(existsSync(stagingDir)).toBe(false);
+    expect(existsSync(handoffDir)).toBe(false);
   });
 });

@@ -38,6 +38,11 @@ type HarnessOptions = {
 };
 
 const eventMetadata = { source_actor: 'user', kind: 'event', status: 'completed', said_at: '2025-04-03T12:00:00Z' };
+const toolText = (value: unknown): string => typeof value === 'string'
+  ? value
+  : value && typeof value === 'object' && typeof (value as { text?: unknown }).text === 'string'
+    ? (value as { text: string }).text
+    : String(value);
 
 async function localMemory(options: HarnessOptions = {}) {
   const root = mkdtempSync(join(tmpdir(), 'coo-n3-source-workspace-'));
@@ -703,8 +708,8 @@ describe('N3 local source and workspace validation', () => {
       const memoryTool = await project.run('memory_search', { query: 'confirmed option B', sources: true });
       const oldDraft = String(await project.run('read_file', { path: 'agenda/now.md' }));
       const linkedPartnerSummary = String(await project.run('read_file', { path: PARTNER_FILE }));
-      expect(String(memoryTool)).toContain('source_id:source-option-b');
-      expect(String(memoryTool)).toContain(sourceText);
+      expect(toolText(memoryTool)).toContain('source_id:source-option-b');
+      expect(toolText(memoryTool)).toContain(sourceText);
       expect(oldDraft).toContain('historicalEvidence=unverified');
       expect(oldDraft).toContain('采用 A 方案');
       expect(linkedPartnerSummary).toContain('source_ids=["source-option-b"]');

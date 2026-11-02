@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { closeSync, existsSync, openSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import type { EvidenceAttachment, SourceExposureRef } from 'cortico/core/types.ts';
 import { createClient, createConfig, HindsightClient, HindsightError, sdk } from '@vectorize-io/hindsight-client';
 import {
   activationAt,
@@ -45,7 +46,16 @@ export interface MemoryTextRead {
   sourceFactsTruncated?: boolean;
   trace?: MemoryRecallTrace;
   sourceDocuments?: OriginalSourceCandidate[];
+  sourceSegments?: MemoryEvidenceSegment[];
   rejectedSourceDocumentIds?: string[];
+}
+
+export interface MemoryEvidenceSegment {
+  documentId: string;
+  start: number;
+  end: number;
+  /** Experience cards keep an explicit sourceIds link to each verified source. */
+  derived?: true;
 }
 
 export interface OriginalSourceCandidate {
@@ -476,6 +486,15 @@ export interface MemorySourceEvidence {
   status: string | null;
   kind?: string;
   occurredAt?: string;
+}
+
+interface MemorySourceExposure {
+  attachment: Omit<EvidenceAttachment, 'segment'>;
+  originalText: string;
+}
+
+function canonicalEvidenceText(value: string): string {
+  return value.normalize('NFC').replace(/\s+/gu, ' ').trim();
 }
 
 function sourceMetadata(meta: SourceMeta): Record<string, string> {
@@ -1386,6 +1405,7 @@ export class HindsightMemory {
     const needles = [...needleMap.values()];
     const digest = (text: string) => createHash('sha256').update(text).digest('hex');
     const renderedSourceDocuments: OriginalSourceCandidate[] = [];
+    const sourceSegments: MemoryEvidenceSegment[] = [];
     const clippedIds: string[] = [];
     let scannedDocuments = 0, sourceReads = 0, scanIncomplete = false, blocked = false;
     const rejectedSourceDocumentIds = new Set<string>();
@@ -1406,6 +1426,7 @@ export class HindsightMemory {
         text,
         status,
         ...(renderedSourceDocuments.length ? { sourceDocuments: [...renderedSourceDocuments] } : {}),
+        ...(sourceSegments.length ? { sourceSegments: [...sourceSegments] } : {}),
         ...(rejectedSourceDocumentIds.size ? { rejectedSourceDocumentIds: [...rejectedSourceDocumentIds] } : {}),
       };
     };
@@ -1563,6 +1584,12 @@ export class HindsightMemory {
         const excerpt = clipped ? body.text.slice(0, Math.max(0, remaining - truncationNotice.length)) + truncationNotice : body.text;
         const line = prefix + excerpt;
         if (used + line.length > maxChars - reserve) { scanIncomplete = true; break; }
+        const visibleExcerptLength = clipped ? Math.max(0, excerpt.length - truncationNotice.length) : excerpt.length;
+        if (visibleExcerptLength > 0) sourceSegments.push({
+          documentId: candidate.documentId,
+          start: used + prefix.length,
+          end: used + prefix.length + visibleExcerptLength,
+        });
         lines.push(line);
         used += line.length;
         renderedSourceDocuments.push({ ...candidate, originalText: excerpt, clipped });
@@ -2587,6 +2614,122 @@ export class HindsightMemory {
       if (isMissing(err)) return { present: false, visible: this.sourceVisible(documentId), actor: null, status: null };
       throw err;
     }
+  }
+
+  /** A process-local stamp for the bank namespace, read cache and persisted forget epoch. */
+  evidenceEpoch(): string | null {
+    const config = this.config;
+    const ledger = this.ledger;
+    const store = this.stateStore;
+    if (!config || !ledger || !store || this.storageError || ledger.damaged()) return null;
+    try {
+      return `${this.cacheEpoch}:${ledger.epoch(config.bankId, config.apiUrl)}`;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Re-reads one source before it is attached to context text. */
+  private async readSourceExposure(documentId: string, expectedEpoch: string): Promise<MemorySourceExposure | null> {
+    if (!documentId || !this.canTry() || !await this.ensureStarted()) return null;
+    const config = this.config;
+    const client = this.client;
+    const store = this.stateStore;
+    const ledger = this.ledger;
+    const epoch = this.evidenceEpoch();
+    if (!config || !client || !store || !ledger || !epoch || epoch !== expectedEpoch || !this.sourceVisible(documentId)) return null;
+    const fenceEpoch = this.visibilityEpoch();
+    try {
+      const document = await client.getDocument(config.bankId, documentId, { signal: AbortSignal.timeout(5_000) });
+      if (!document || document.id !== documentId || document.bank_id !== config.bankId
+        || typeof document.original_text !== 'string' || !document.original_text
+        || this.evidenceEpoch() !== expectedEpoch || fenceEpoch !== this.visibilityEpoch()
+        || ledger.damaged() || !this.sourceVisible(documentId)) return null;
+
+      const metadata = document.document_metadata && typeof document.document_metadata === 'object'
+        ? document.document_metadata as Record<string, unknown>
+        : {};
+      const localCurrent = store.currentRevisionSources(config.bankId, config.apiUrl).has(documentId);
+      const superseded = store.supersededSources(config.bankId, config.apiUrl).has(documentId)
+        || metadata.status === 'superseded';
+      const knownStatus = localCurrent || ['current', 'planned', 'completed'].includes(String(metadata.status));
+      const revisionState: EvidenceAttachment['revisionState'] = superseded ? 'superseded' : knownStatus ? 'current' : 'unknown';
+      const validationStatus: EvidenceAttachment['validationStatus'] = superseded ? 'stale' : knownStatus ? 'validated' : 'unknown';
+      const contentDigest = createHash('sha256').update(document.original_text, 'utf8').digest('hex');
+      const validationReceipt = createHash('sha256').update(JSON.stringify([
+        config.bankId, config.apiUrl, document.id, document.updated_at, document.content_hash,
+        contentDigest, expectedEpoch, localCurrent, revisionState, validationStatus,
+      ])).digest('hex');
+      return {
+        attachment: {
+          bankId: config.bankId,
+          endpoint: config.apiUrl,
+          documentId,
+          validatedEpoch: expectedEpoch,
+          revisionState,
+          validationStatus,
+          validationReceipt,
+          contentDigest,
+        },
+        originalText: document.original_text,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Maps final formatted text ranges to current Hindsight source read-backs. */
+  async evidenceForSegments(text: string, segments: readonly MemoryEvidenceSegment[]): Promise<EvidenceAttachment[]> {
+    const expectedEpoch = this.evidenceEpoch();
+    if (!expectedEpoch || !text || segments.length === 0) return [];
+    const readbacks = new Map<string, Promise<MemorySourceExposure | null>>();
+    const evidence: EvidenceAttachment[] = [];
+    for (const segment of segments) {
+      if (!Number.isInteger(segment.start) || !Number.isInteger(segment.end)
+        || segment.start < 0 || segment.end <= segment.start || segment.end > text.length || !segment.documentId) continue;
+      let readback = readbacks.get(segment.documentId);
+      if (!readback) {
+        readback = this.readSourceExposure(segment.documentId, expectedEpoch);
+        readbacks.set(segment.documentId, readback);
+      }
+      const source = await readback;
+      if (!source) continue;
+      const segmentText = text.slice(segment.start, segment.end);
+      const sourceText = sanitizeForMemory(source.originalText).text;
+      const matched = segment.derived === true
+        || canonicalEvidenceText(sourceText).includes(canonicalEvidenceText(segmentText));
+      const attachment = source.attachment;
+      evidence.push({
+        ...attachment,
+        ...(matched ? {} : {
+          validationStatus: 'unknown' as const,
+          validationReceipt: createHash('sha256').update(JSON.stringify([attachment.validationReceipt, 'segment-unmatched'])).digest('hex'),
+        }),
+        segment: {
+          start: segment.start,
+          end: segment.end,
+          digest: createHash('sha256').update(segmentText, 'utf8').digest('hex'),
+        },
+      });
+    }
+    return this.evidenceEpoch() === expectedEpoch ? evidence : [];
+  }
+
+  evidenceForRead(read: MemoryTextRead): Promise<EvidenceAttachment[]> {
+    const segments = read.sourceSegments ?? read.trace?.format.sourceSegments.map(({ documentId, start, end }) => ({ documentId, start, end })) ?? [];
+    return this.evidenceForSegments(read.text, segments);
+  }
+
+  async verifyExposureSources(sources: readonly SourceExposureRef[], expectedEpoch: string): Promise<boolean> {
+    if (!expectedEpoch || sources.length === 0 || this.evidenceEpoch() !== expectedEpoch) return false;
+    for (const source of sources) {
+      if (source.validatedEpoch !== expectedEpoch) return false;
+      const readback = await this.readSourceExposure(source.documentId, expectedEpoch);
+      if (!readback || readback.attachment.bankId !== source.bankId || readback.attachment.endpoint !== source.endpoint
+        || readback.attachment.contentDigest !== source.contentDigest || readback.attachment.revisionState !== 'current'
+        || readback.attachment.validationStatus !== 'validated') return false;
+    }
+    return this.evidenceEpoch() === expectedEpoch;
   }
 
   async recent(limit = 20): Promise<Array<{ id: string; text: string; date: string; type: string; documentId: string | null; status?: string }>> {

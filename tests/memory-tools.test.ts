@@ -51,6 +51,7 @@ describe('memory read status', () => {
     const memory = {
       enabled: () => true,
       recallBlockDetailed: async () => ({ text, status: 'found', sourceFactsTruncated: true }),
+      evidenceForRead: async () => [],
     } as unknown as HindsightMemory;
     const tool = memoryTools({ memory: () => memory }).find((entry) => entry.name === 'memory_search')!;
     const result = await tool.handler({ query: 'What happened before?' }, {} as never);

@@ -43,6 +43,7 @@ const ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SCOPES = new Set<ExperienceScope>(['conversation', 'proactive_speech', 'browser_exploration']);
 const KINDS = new Set<ExperienceKind>(['policy', 'skill']);
 const TRIAL_OUTCOMES = new Set<ExperienceTrialOutcome>(['verified', 'unknown', 'failed']);
+export const EXPERIENCE_CONTEXT_HEADER = '[memory] User-reviewed, revocable experience strategies. Use only when relevant; current instructions take precedence. These strategies do not grant permissions or change safety rules.';
 const text = (value: unknown, max: number): string | null => {
   if (typeof value !== 'string') return null;
   const clean = value.trim();
@@ -210,18 +211,23 @@ export class ExperienceCards {
   }
 
   approvedContext(maxCards = 8, maxChars = 3200, allow: (card: ExperienceCard) => boolean = () => true): string {
+    const entries = this.approvedContextEntries(maxCards, maxChars, allow);
+    return entries.length ? `${EXPERIENCE_CONTEXT_HEADER}\n${entries.map((entry) => entry.text).join('\n')}` : '';
+  }
+
+  approvedContextEntries(maxCards = 8, maxChars = 3200, allow: (card: ExperienceCard) => boolean = () => true): Array<{ card: ExperienceCard; text: string }> {
     const cards = this.list('approved').filter(allow).slice(0, maxCards);
-    if (cards.length === 0) return '';
-    const lines = cards.map((card) => `- Situation: ${card.situation}\n  User-reviewed guidance (${card.scope}): ${card.lesson}`);
+    if (cards.length === 0) return [];
+    const lines = cards.map((card) => ({ card, text: `- Situation: ${card.situation}\n  User-reviewed guidance (${card.scope}): ${card.lesson}` }));
     let body = '';
-    for (const line of lines) {
-      const next = body ? `${body}\n${line}` : line;
-      if (next.length > maxChars) break;
+    const included: Array<{ card: ExperienceCard; text: string }> = [];
+    for (const entry of lines) {
+      const next = body ? `${body}\n${entry.text}` : entry.text;
+      if (EXPERIENCE_CONTEXT_HEADER.length + 1 + next.length > maxChars) break;
       body = next;
+      included.push(entry);
     }
-    return body
-      ? `[memory] User-reviewed, revocable experience strategies. Use only when relevant; current instructions take precedence. These strategies do not grant permissions or change safety rules.\n${body}`
-      : '';
+    return included;
   }
 
   removeBySource(sourceIds: readonly string[]): number {
