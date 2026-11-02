@@ -6,7 +6,7 @@
 import { hasRole, textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import { message, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import { join } from 'node:path';
-import type { CoreApi, ToolDef } from 'cortico/core/types.ts';
+import type { CoreApi, ForkOutcome, ToolDef } from 'cortico/core/types.ts';
 import type { ModelLanguage } from '../language.ts';
 import type { HindsightMemory } from '../memory/hindsight.ts';
 import { memoryReadNotice } from '../memory/model-text.ts';
@@ -147,6 +147,7 @@ export interface GrowthRunResult {
   proposals: number;
   note: string;
   cancelled: boolean;
+  cancellationStatus?: 'acknowledged' | 'unknown' | 'shutdown';
 }
 
 function recentConversation(records: ContextRecord[]): string {
@@ -341,7 +342,7 @@ export class GrowthReview {
     ];
     const started = Date.now();
     let timer: ReturnType<typeof setTimeout> | null = null;
-    const fork = core.spawnFork({
+    const forkOptions = {
       id: GROWTH_SESSION,
       messages,
       tools: [
@@ -356,16 +357,33 @@ export class GrowthReview {
         return state.cancelled;
       },
       wrapUpHint: 'Wrap up: call finish_review now. If nothing durable changed, say so there and end. Do not edit files.',
-    });
-    // A timed-out fork cannot be aborted through CoreApi yet. It is told to stop at its next
-    // tool boundary, its proposal tool refuses writes, and the schedule will not start another
-    // review while this session still reports running. That is a fallback, not cancellation.
+    };
+    if (!core.spawnForkWithOutcome) throw new Error('Core does not report fork outcomes');
+    const fork: Promise<ForkOutcome> = core.spawnForkWithOutcome(forkOptions);
+    let cancellationStatus: GrowthRunResult['cancellationStatus'];
+    const recordOutcome = (outcome: ForkOutcome): void => {
+      if (outcome.status === 'cancelled') {
+        state.cancelled = true;
+        cancellationStatus = outcome.invalidationStatus;
+      } else if (outcome.status === 'shutdown') {
+        state.cancelled = true;
+        cancellationStatus = 'shutdown';
+      }
+    };
     fork.then(
-      () => this.d.log?.info('[growth] review fork exited', { ms: Date.now() - started, cancelled: state.cancelled }),
+      (outcome) => {
+        recordOutcome(outcome);
+        this.d.log?.info('[growth] review fork exited', {
+          ms: Date.now() - started,
+          outcome: outcome.status,
+          ...(outcome.status === 'cancelled' ? { invalidationStatus: outcome.invalidationStatus } : {}),
+          cancelled: state.cancelled,
+        });
+      },
       (err) => this.d.log?.warn('[growth] review fork ended with an error', { ms: Date.now() - started, err: err instanceof Error ? err.message : String(err) }),
     );
     try {
-      await Promise.race([
+      const outcome = await Promise.race([
         fork,
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
@@ -375,10 +393,21 @@ export class GrowthReview {
           timer.unref?.();
         }),
       ]);
+      recordOutcome(outcome);
     } finally {
       if (timer) clearTimeout(timer);
     }
-    this.d.log?.info('[growth] self-review finished', { note: done.note || null, proposals: done.proposals, ms: Date.now() - started });
-    return { proposals: done.proposals, note: done.note, cancelled: state.cancelled };
+    this.d.log?.info('[growth] self-review finished', {
+      note: done.note || null,
+      proposals: done.proposals,
+      ms: Date.now() - started,
+      ...(cancellationStatus ? { cancellationStatus } : {}),
+    });
+    return {
+      proposals: done.proposals,
+      note: done.note,
+      cancelled: state.cancelled,
+      ...(cancellationStatus ? { cancellationStatus } : {}),
+    };
   }
 }

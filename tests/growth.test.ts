@@ -275,6 +275,28 @@ describe('the growth schedule', () => {
     expect(state.lastProposalCount).toBe(1);
   });
 
+  it('records unresolved Core cancellation without describing it as a deadline', async () => {
+    const start = new Date('2026-10-01T00:00:00.000Z');
+    let now = start;
+    const stateFile = tempState();
+    const s = new GrowthSchedule({
+      stateFile,
+      config: () => ({ ...GROWTH_DEFAULTS, enabled: true }),
+      timers: new FakeTimers(),
+      run: async () => ({ proposals: 0, note: '', cancelled: true, cancellationStatus: 'unknown' }),
+      now: () => new Date(now),
+    });
+    s.start();
+    now = new Date('2026-10-08T00:00:00.000Z');
+
+    await s.check();
+
+    expect(s.status()).toMatchObject({
+      lastStatus: 'failed',
+      lastError: 'Core cancellation timed out; tracked fork work remains unresolved',
+    });
+  });
+
   it('does not start a second review while an old fork still runs', async () => {
     let now = new Date('2026-10-01T00:00:00.000Z');
     const timers = new FakeTimers();
@@ -360,9 +382,11 @@ describe('the growth review session', () => {
 
   it('feeds the system prefix, the recent stretch and the portrait to a fork with read tools and a proposal tool', async () => {
     const captured: ForkOptions[] = [];
+    const spawnFork = vi.fn(async (opts: ForkOptions) => { captured.push(opts); return ''; });
     const core = {
       sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
-      spawnFork: vi.fn(async (opts: ForkOptions) => { captured.push(opts); return ''; }),
+      spawnFork,
+      spawnForkWithOutcome: vi.fn(async (opts: ForkOptions) => ({ status: 'completed' as const, text: await spawnFork(opts) })),
     } as unknown as CoreApi;
     const memory = {
       enabled: () => true,
@@ -379,7 +403,7 @@ describe('the growth review session', () => {
       timezone: () => 'UTC',
       now: () => new Date('2026-10-26T10:00:00.000Z'),
     });
-    await review.run();
+    expect(await review.run()).toMatchObject({ cancelled: false });
     const opts = captured[0]!;
     expect(opts.id).toBe(GROWTH_SESSION);
     expect(opts.messages).toHaveLength(2);
@@ -390,6 +414,48 @@ describe('the growth review session', () => {
     expect(textOf(opts.messages[1]!)).toContain('propose_experience');
     expect(textOf(opts.messages[1]!)).toContain('remain a candidate for the person\'s review');
     expect(opts.tools?.map((entry) => entry.name)).toEqual(['read_file', 'memory_search', PROPOSE_GROWTH_TOOL, PROPOSE_EXPERIENCE_TOOL, 'finish_review']);
+  });
+
+  it('reports an unknown Core cancellation instead of treating an empty fork as a completed review', async () => {
+    const core = {
+      sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
+      spawnFork: vi.fn(async () => ''),
+      spawnForkWithOutcome: vi.fn(async () => ({ status: 'cancelled' as const, invalidationStatus: 'unknown' as const })),
+    } as unknown as CoreApi;
+    const review = new GrowthReview({
+      core: () => core,
+      snapshot: prefix,
+      tools: () => [],
+      memory: () => null,
+      proposalsDir: tempDir('coo-growth-proposals-'),
+      modelLanguage: () => 'en',
+      timezone: () => 'UTC',
+    });
+
+    const result = await review.run();
+
+    expect(result).toEqual({ proposals: 0, note: '', cancelled: true, cancellationStatus: 'unknown' });
+    expect(core.spawnForkWithOutcome).toHaveBeenCalledOnce();
+    expect(core.spawnFork).not.toHaveBeenCalled();
+  });
+
+  it('does not run a review when Core cannot report fork outcomes', async () => {
+    const core = {
+      sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
+      spawnFork: vi.fn(async () => ''),
+    } as unknown as CoreApi;
+    const review = new GrowthReview({
+      core: () => core,
+      snapshot: prefix,
+      tools: () => [],
+      memory: () => null,
+      proposalsDir: tempDir('coo-growth-proposals-'),
+      modelLanguage: () => 'en',
+      timezone: () => 'UTC',
+    });
+
+    await expect(review.run()).rejects.toThrow('Core does not report fork outcomes');
+    expect(core.spawnFork).not.toHaveBeenCalled();
   });
 
   it('declares a growth session with read and memory tools but no file writes or speaking', () => {
@@ -412,26 +478,28 @@ describe('the growth review session', () => {
 
   it('saves a proposal as a candidate file and never touches the Persona', async () => {
     const captured: ForkOptions[] = [];
+    const spawnFork = vi.fn(async (opts: ForkOptions) => {
+      captured.push(opts);
+      const search = opts.tools!.find((entry) => entry.name === 'memory_search')!;
+      await search.handler({ query: 'coding preferences' }, {} as never);
+      const propose = opts.tools!.find((entry) => entry.name === PROPOSE_GROWTH_TOOL)!;
+      const finish = opts.tools!.find((entry) => entry.name === 'finish_review')!;
+      const result = await propose.handler({
+        title: 'Focus mode',
+        summary: 'Be quieter while the person is programming.',
+        evidence: ['Person: 我写程序的时候别总来打扰'],
+        sourceIds: ['user-turn-42'],
+        risk: 'low',
+        changes: [{ file: 'CONSTITUTION.md', from: 'old line', to: 'new line', reason: 'the person asked for quiet' }],
+      }, {} as never);
+      expect(result).toContain('[proposal saved]');
+      await finish.handler({ note: 'proposed focus mode' }, {} as never);
+      return '';
+    });
     const core = {
       sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
-      spawnFork: vi.fn(async (opts: ForkOptions) => {
-        captured.push(opts);
-        const search = opts.tools!.find((entry) => entry.name === 'memory_search')!;
-        await search.handler({ query: 'coding preferences' }, {} as never);
-        const propose = opts.tools!.find((entry) => entry.name === PROPOSE_GROWTH_TOOL)!;
-        const finish = opts.tools!.find((entry) => entry.name === 'finish_review')!;
-        const result = await propose.handler({
-          title: 'Focus mode',
-          summary: 'Be quieter while the person is programming.',
-          evidence: ['Person: 我写程序的时候别总来打扰'],
-          sourceIds: ['user-turn-42'],
-          risk: 'low',
-          changes: [{ file: 'CONSTITUTION.md', from: 'old line', to: 'new line', reason: 'the person asked for quiet' }],
-        }, {} as never);
-        expect(result).toContain('[proposal saved]');
-        await finish.handler({ note: 'proposed focus mode' }, {} as never);
-        return '';
-      }),
+      spawnFork,
+      spawnForkWithOutcome: vi.fn(async (opts: ForkOptions) => ({ status: 'completed' as const, text: await spawnFork(opts) })),
     } as unknown as CoreApi;
     const proposalsDir = tempDir('coo-growth-proposals-');
     const memory = {
@@ -461,41 +529,43 @@ describe('the growth review session', () => {
 
   it('stores a repeated experience as an inactive source-linked candidate', async () => {
     const captured: ForkOptions[] = [];
+    const spawnFork = vi.fn(async (opts: ForkOptions) => {
+      captured.push(opts);
+      const search = opts.tools!.find((entry) => entry.name === 'memory_search')!;
+      await search.handler({ query: 'repeated experiences' }, {} as never);
+      const propose = opts.tools!.find((entry) => entry.name === PROPOSE_EXPERIENCE_TOOL)!;
+      const finish = opts.tools!.find((entry) => entry.name === 'finish_review')!;
+      const saved = await propose.handler({
+        title: 'Quiet coding time',
+        situation: 'The person is coding.',
+        lesson: 'Wait before routine interruptions.',
+        scope: 'proactive_speech',
+        sourceIds: ['user:focus-1', 'user:focus-2'],
+      }, {} as never);
+      expect(saved).toContain('[experience candidate saved]');
+      expect(await propose.handler({
+        title: 'Unsearched source', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation',
+        sourceIds: ['user:not-returned-1', 'user:not-returned-2'],
+      }, {} as never)).toContain('was not returned by memory_search');
+      hiddenSources.add('user:forgotten');
+      expect(await propose.handler({
+        title: 'Forgotten source', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation', sourceIds: ['user:focus-1', 'user:forgotten'],
+      }, {} as never)).toContain('[candidate rejected] Source user:forgotten is missing or fenced.');
+      expect(await propose.handler({
+        title: 'Same-day repeats', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation',
+        sourceIds: ['user:focus-1', 'user:focus-same-day'],
+      }, {} as never)).toContain('[candidate rejected] User-event sources must span different dates.');
+      expect(await propose.handler({
+        title: 'Undated event', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation',
+        sourceIds: ['user:focus-1', 'user:undated'],
+      }, {} as never)).toContain('has no verifiable user-event date');
+      await finish.handler({ note: 'saved a recurring experience' }, {} as never);
+      return '';
+    });
     const core = {
       sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
-      spawnFork: vi.fn(async (opts: ForkOptions) => {
-        captured.push(opts);
-        const search = opts.tools!.find((entry) => entry.name === 'memory_search')!;
-        await search.handler({ query: 'repeated experiences' }, {} as never);
-        const propose = opts.tools!.find((entry) => entry.name === PROPOSE_EXPERIENCE_TOOL)!;
-        const finish = opts.tools!.find((entry) => entry.name === 'finish_review')!;
-        const saved = await propose.handler({
-          title: 'Quiet coding time',
-          situation: 'The person is coding.',
-          lesson: 'Wait before routine interruptions.',
-          scope: 'proactive_speech',
-          sourceIds: ['user:focus-1', 'user:focus-2'],
-        }, {} as never);
-        expect(saved).toContain('[experience candidate saved]');
-        expect(await propose.handler({
-          title: 'Unsearched source', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation',
-          sourceIds: ['user:not-returned-1', 'user:not-returned-2'],
-        }, {} as never)).toContain('was not returned by memory_search');
-        hiddenSources.add('user:forgotten');
-        expect(await propose.handler({
-          title: 'Forgotten source', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation', sourceIds: ['user:focus-1', 'user:forgotten'],
-        }, {} as never)).toContain('[candidate rejected] Source user:forgotten is missing or fenced.');
-        expect(await propose.handler({
-          title: 'Same-day repeats', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation',
-          sourceIds: ['user:focus-1', 'user:focus-same-day'],
-        }, {} as never)).toContain('[candidate rejected] User-event sources must span different dates.');
-        expect(await propose.handler({
-          title: 'Undated event', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation',
-          sourceIds: ['user:focus-1', 'user:undated'],
-        }, {} as never)).toContain('has no verifiable user-event date');
-        await finish.handler({ note: 'saved a recurring experience' }, {} as never);
-        return '';
-      }),
+      spawnFork,
+      spawnForkWithOutcome: vi.fn(async (opts: ForkOptions) => ({ status: 'completed' as const, text: await spawnFork(opts) })),
     } as unknown as CoreApi;
     const proposalsDir = tempDir('coo-growth-proposals-');
     const experienceCardsDir = join(proposalsDir, 'experience-cards');
@@ -547,11 +617,16 @@ describe('the growth review session', () => {
   it('stops accepting proposals after the deadline', async () => {
     const captured: ForkOptions[] = [];
     const read = vi.fn(async () => 'file contents');
+    const never = new Promise<string>(() => {});
     const core = {
       sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
       spawnFork: vi.fn((opts: ForkOptions) => {
         captured.push(opts);
-        return new Promise<string>(() => {});
+        return never;
+      }),
+      spawnForkWithOutcome: vi.fn((opts: ForkOptions) => {
+        captured.push(opts);
+        return new Promise<import('cortico/core/types.ts').ForkOutcome>(() => {});
       }),
     } as unknown as CoreApi;
     const proposalsDir = tempDir('coo-growth-proposals-');

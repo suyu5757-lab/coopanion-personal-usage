@@ -158,7 +158,13 @@ export class GrowthSchedule {
         lastReviewAt: finishedAt.toISOString(),
         nextReviewAt: addDays(finishedAt, config.everyDays),
         lastStatus: result?.cancelled ? 'failed' : 'ok',
-        ...(result?.cancelled ? { lastError: 'the review deadline passed before it finished' } : {}),
+        ...(result?.cancelled ? { lastError: result.cancellationStatus === 'unknown'
+          ? 'Core cancellation timed out; tracked fork work remains unresolved'
+          : result.cancellationStatus === 'acknowledged'
+            ? 'Core acknowledged cancellation after tracked fork work ended'
+            : result.cancellationStatus === 'shutdown'
+              ? 'Core shut down before the review completed'
+              : 'the review deadline passed before it finished' } : {}),
         lastFinishedAt: finishedAt.toISOString(),
         lastProposalCount: result?.proposals ?? 0,
       });
