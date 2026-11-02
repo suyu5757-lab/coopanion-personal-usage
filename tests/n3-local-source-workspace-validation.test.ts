@@ -257,6 +257,47 @@ describe('N3 local source and workspace validation', () => {
     expect(plan.supplementalQueries.join(' ')).toContain('失物招领');
   });
 
+  it.each([
+    { query: '之前关于东岸陶板展柜的除湿材料，我们最后决定使用哪一种？', target: '东岸陶板展柜的除湿材料为硅胶包。', noise: '西岸陶板展柜的除湿材料为活性炭片。' },
+    { query: '之前东岸陶板展柜使用哪一种除湿材料？', target: '东岸陶板展柜的除湿材料为硅胶包。', noise: '西岸陶板展柜的除湿材料为活性炭片。' },
+    { query: '上次关于东岸陶板展柜的除湿材料我们最后决定使用哪一种', target: '东岸陶板展柜的除湿材料为硅胶包。', noise: '西岸陶板展柜的除湿材料为活性炭片。' },
+    { query: '关于晨雾泵房的排水巡检，我们当时确定什么顺序？', target: '晨雾泵房的排水巡检顺序是先检查阀门再启动水泵。', noise: '晚霞泵房的排水巡检顺序是先启动水泵再检查阀门。' },
+    { query: '之前晨雾泵房按什么顺序进行排水巡检？', target: '晨雾泵房的排水巡检顺序是先检查阀门再启动水泵。', noise: '晚霞泵房的排水巡检顺序是先启动水泵再检查阀门。' },
+  ])('excludes another entity sharing generic attributes in one scan and at most three Recall requests: $query', async ({ query, target, noise }) => {
+    const fixture = await localMemory({ documents: [
+      { id: 'source-focus-target', original_text: target, document_metadata: eventMetadata },
+      { id: 'source-other-entity', original_text: noise, document_metadata: eventMetadata },
+    ] });
+    try {
+      const result = await fixture.memory.recallForTurn(query, { captureTrace: true, activationEnabled: false });
+      expect(result.route).toBe('deep');
+      expect(result.text).toContain('source_id:source-focus-target');
+      expect(result.text).not.toContain('source_id:source-other-entity');
+      expect(result.text).toContain('candidate relevance to the full question is still unresolved');
+      expect(fixture.calls.lists).toBe(1);
+      expect(fixture.calls.recall).toBeLessThanOrEqual(3);
+      expect(lastAutomaticLookup(fixture.memory)?.scanIncomplete).toBe(false);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  it('keeps both named entities while excluding a third entity that shares their material query', async () => {
+    const fixture = await localMemory({ documents: [
+      { id: 'source-cabinet-one', original_text: '若岚标本柜的防潮材料是硅胶包。', document_metadata: eventMetadata },
+      { id: 'source-cabinet-two', original_text: '星溪样品箱的防潮材料是吸水纸。', document_metadata: eventMetadata },
+      { id: 'source-cabinet-noise', original_text: '落霞展示柜的防潮材料是活性炭片。', document_metadata: eventMetadata },
+    ] });
+    try {
+      const result = await fixture.memory.recallForTurn('我们之前关于若岚标本柜和星溪样品箱的防潮材料，最后采用了什么方案？', { captureTrace: true, activationEnabled: false });
+      expect(result.text).toContain('source_id:source-cabinet-one');
+      expect(result.text).toContain('source_id:source-cabinet-two');
+      expect(result.text).not.toContain('source_id:source-cabinet-noise');
+    } finally {
+      await fixture.close();
+    }
+  });
+
   it('automatically finds the supplied A1 source while preserving source identity', async () => {
     const source = '评论先人工确认，暂时不自动发布。';
     const suppliedQuestion = `${source}这个决定是什么？`;

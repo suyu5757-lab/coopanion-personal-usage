@@ -20,6 +20,7 @@ const QUERY_CANDIDATE_SCORE = {
   backgroundTopic: 820,
   focusedTopic: 1_400,
   focusedQuestionTarget: 1_460,
+  linkedChineseSubject: 1_760,
   focusedTokens: 1_100,
   markedTopicTokens: 1_120,
   timeWhenAsked: 1_180,
@@ -38,7 +39,7 @@ const REDUNDANCY_PENALTY = 100;
 const GENERIC_PHRASES = new Set(['什么', '哪个', '哪里', '谁', '怎么', '如何', '为什么', '是否', '吗', '呢', '方式', '方案', '功能', '决定', '约定', '结果', '说法', '一起', '我们', '你我', '之前', '以前', '关于', '最终', '最后', '去年', '前年', '当时', '具体', '采用', '选择', '计划', '一下', '同学', '同事', '项目', '什么是', '人工智能']);
 const QUERY_FILLER = /(?:我们|咱们|你我|之前|以前|上次|上回|去年|前年|关于|最终|最后|当时|这个|那个|那项|这项|决定|约定|选择|采用|采取|功能|具体|请问|告诉我|记得|还记得|什么|哪种|哪一个|哪个|方式|方案|做法|结果|是什么|如何|怎么|的|吗|呢|吧)/gu;
 const LATIN_STOP = new Set(['a', 'about', 'and', 'an', 'as', 'at', 'back', 'be', 'but', 'by', 'can', 'could', 'did', 'do', 'for', 'from', 'had', 'have', 'how', 'i', 'in', 'is', 'it', 'me', 'of', 'on', 'or', 'our', 'the', 'that', 'then', 'there', 'these', 'this', 'those', 'to', 'we', 'what', 'when', 'where', 'which', 'who', 'why', 'with', 'you', 'your']);
-const CLAUSE_BOUNDARY = /[,，;；。！？?!\n]+/u;
+const CLAUSE_BOUNDARY = /[,，;；。！？?!\n]+|(?<!\d)[:：](?!\d)/u;
 const SENTENCE_BOUNDARY = /(?<=[。！？?!\n])/u;
 const TOPIC_MARKER = /(?:关于|针对|围绕|有关|对于|about|regarding|concerning)\s*([^,，;；。！？?!\n]{2,100})/giu;
 const ENGLISH_FOCUS_RELATION = /\b(?:about|for|on|regarding|concerning)\s+(?:(?:the|a|an|our|their|my|your)\s+)?([^,，;；。！？?!\n]{2,100})/giu;
@@ -47,6 +48,10 @@ const TIME_QUESTION = /(?:什么时候|哪年|哪月|哪天|何时|多久|几月
 const TIME_HINT = /(?:\b(?:19|20)\d{2}(?:年)?\b|去年|前年|今年|明年|上周|上个月|昨天|前天|刚才|刚刚|那天|那年|周[一二三四五六日天]|星期[一二三四五六日天])/gu;
 const ANAPHORIC_TAIL = /(?:这个|那个|上述|前述|该决定|该方案|该选择|同一个决定)|\b(?:that decision|this decision|the decision|what was it|what about it)\b/iu;
 const ZH_WORD_SEGMENTER = new Intl.Segmenter('zh-CN', { granularity: 'word' });
+const CHINESE_TOPIC_MARKER = /(?:关于|针对|围绕|有关|对于)(.{2,100})|在(.{2,100}?)方面/u;
+const CHINESE_LEADING_FRAME = /^(?:(?:我们|咱们|你我|大家|之前|以前|上次|上回|去年|前年|当时|最后|最终|后来|曾经|一起|先|又|已经|还|再|这个|那个|(?:讨论|谈论|聊|提)(?:了|过|到)(?:的)?|(?:确认|决定|确定|约定)(?:了)?)\s*)+/u;
+const CHINESE_QUERY_PREDICATE = /(?:我们|咱们|你我|大家|最后|最终|当时|应该|应当|需要|采用|使用|采取|选用|选定|选择|决定|确定|约定|更正|改为|改到|定了|选了|(?:是)?用(?=什么|哪)|按(?=什么|哪)|按照|如何|怎么|怎样|是什么|什么|哪一?种|哪个|哪天|几|多久|多少|何时|谁|是否|吗)/u;
+const CHINESE_GENERIC_TOPIC = /(?:材料|顺序|方案|方式|安排|结果|决定|约定|讨论|使用|采用|采取|处理|进行|一种|几次|后来|然后|什么|哪个|如何|怎么|呢)/gu;
 
 interface WordToken {
   text: string;
@@ -126,6 +131,63 @@ function englishPhrases(text: string): string[] {
   return phrases;
 }
 
+function chineseSubject(clause: string): string {
+  const marked = clause.match(CHINESE_TOPIC_MARKER);
+  let subject = (marked?.[1] ?? marked?.[2] ?? clause).trim().replace(CHINESE_LEADING_FRAME, '');
+  const predicate = subject.search(CHINESE_QUERY_PREDICATE);
+  if (predicate >= 0) subject = subject.slice(0, predicate);
+  subject = subject.replace(/(?:的)?(?:讨论|话题|事情|问题)$/u, '').replace(/[的\s]+$/u, '').trim();
+  if (!/^\p{Script=Han}/u.test(subject) || subject.length > 100
+    || subject.replace(CHINESE_GENERIC_TOPIC, '').replace(/[^\p{L}\p{N}]/gu, '').length < 2) return '';
+  return subject;
+}
+
+// This literal fallback links a question tail to one nearby subject; it does not establish historical relevance.
+function chineseFocusFallback(clauses: readonly string[]): { topic: string; sourcePhrases: string[] } | undefined {
+  const question = clauses.at(-1) ?? '';
+  if (!/(?:什么|哪|如何|怎么|怎样|几|多久|多少|何时|谁|是否|吗|呢)/u.test(question)) return undefined;
+  let topic = chineseSubject(question);
+  if (!topic) {
+    const preceding = clauses.slice(-4, -1).reverse();
+    const markedClause = preceding.find((clause) => CHINESE_TOPIC_MARKER.test(clause));
+    if (markedClause) topic = chineseSubject(markedClause);
+    else {
+      const previous = preceding[0] ?? '';
+      const possessive = previous.includes('的');
+      const discussion = /^(?:(?:我们|咱们|你我|之前|以前|上次|当时)\s*)*(?:讨论|谈|聊|提)(?:过|了|到)/u.test(previous);
+      const list = [...ZH_WORD_SEGMENTER.segment(previous)].some((segment) => ['和', '与', '及', '以及', '、'].includes(segment.segment));
+      if (possessive || (discussion && !list)) topic = chineseSubject(previous);
+    }
+  }
+  if (!topic) return undefined;
+
+  const parts: string[] = [];
+  let start = 0;
+  for (const segment of ZH_WORD_SEGMENTER.segment(topic)) {
+    if (!['和', '与', '及', '以及', '、'].includes(segment.segment)) continue;
+    parts.push(topic.slice(start, segment.index).trim());
+    start = segment.index + segment.segment.length;
+  }
+  parts.push(topic.slice(start).trim());
+  const subjects = parts.filter((part, index) => part && (index === 0 || part.includes('的')
+    || !parts.slice(0, index).some((previous) => previous.includes('的'))));
+  const phrases: string[] = [];
+  const add = (value: string): void => {
+    const phrase = safePhrase(value);
+    if ([...phrase].length < 2 || [...phrase].length > MAX_SOURCE_PHRASE_CHARS) return;
+    if (!phrases.includes(phrase)) phrases.push(phrase);
+  };
+  for (const subject of subjects) add(subject.split('的')[0] ?? subject);
+  add(topic);
+  for (const subject of subjects) {
+    add(subject);
+    add(compactTopic(subject));
+    const unwrapped = compactTopic(subject.replace(/(?:功能|话题|事项|问题)$/u, ''));
+    if ([...unwrapped].length <= 4) for (const word of salientWords(unwrapped)) add(word);
+  }
+  return phrases.length ? { topic, sourcePhrases: phrases } : undefined;
+}
+
 export function planRecallQueries(input: string): RecallQueryPlan {
   const safe = sanitizeForMemory(input);
   if (safe.skip || !safe.text) return { sourcePhrases: [], supplementalQueries: [] };
@@ -139,6 +201,8 @@ export function planRecallQueries(input: string): RecallQueryPlan {
   const focusTopic = compactTopic(focusStem) || compactTopic(focusText);
   const stem = questionStem(text);
   const topic = compactTopic(stem);
+  const chineseFocus = chineseFocusFallback(clauses);
+  const chineseLiterals = new Set(chineseFocus?.sourcePhrases.map((phrase) => phrase.toLocaleLowerCase()));
   const asksTime = TIME_QUESTION.test(text);
   const phraseCandidates = new Map<string, PhraseCandidate>();
   let candidateOrder = 0;
@@ -165,6 +229,9 @@ export function planRecallQueries(input: string): RecallQueryPlan {
   const stated = text.match(/(?:原话|原文|具体表述|约定(?:是|为)|决定(?:是|为)|采用的是|选择的是)(?:是)?[：:]\s*([^。；;？！?]{2,80})/u)?.[1];
   if (stated) addPhrase(stated, QUERY_CANDIDATE_SCORE.explicitRestatement);
   if (precedingSentence && ANAPHORIC_TAIL.test(focusText)) addPhrase(precedingSentence, QUERY_CANDIDATE_SCORE.explicitRestatement - 50);
+  for (const [index, phrase] of (chineseFocus?.sourcePhrases ?? []).entries()) {
+    addPhrase(phrase, QUERY_CANDIDATE_SCORE.linkedChineseSubject - index * 10);
+  }
 
   const focusOffset = Math.max(0, text.lastIndexOf(focusText));
   const topicMatches = [...text.matchAll(TOPIC_MARKER)].flatMap((match) => {
@@ -226,7 +293,9 @@ export function planRecallQueries(input: string): RecallQueryPlan {
     addPhrase(phrase, QUERY_CANDIDATE_SCORE.englishNgrams + index / Math.max(1, text.length));
   }
 
-  const rankedCandidates = [...phraseCandidates.values()];
+  const rankedCandidates = [...phraseCandidates.values()].filter((candidate) => !chineseFocus
+    || chineseLiterals.has(candidate.text.toLocaleLowerCase())
+    || candidate.score >= QUERY_CANDIDATE_SCORE.explicitRestatement - 50);
   const selected: PhraseCandidate[] = [];
   // Topic and focus candidates outrank background terms; short overlapping phrases remain useful as literal fallbacks.
   while (selected.length < MAX_SOURCE_PHRASES && selected.length < rankedCandidates.length) {
@@ -265,19 +334,25 @@ export function planRecallQueries(input: string): RecallQueryPlan {
     if (supplementalQueries.some((query) => query.toLocaleLowerCase() === normalized)) return;
     supplementalQueries.push(safeQuery);
   };
-  const bestTopic = topicMatches
-    .filter((match) => match.focused)
-    .map((match) => ({ text: compactTopic(match.text) || match.text, position: match.position }))
-    .sort((left, right) => right.position - left.position)[0]?.text;
-  addQuery(bestTopic || focusTopic || focusStem);
-  const complementaryTokens = [...new Set([
-    ...(englishQuestionTarget ? [englishQuestionTarget] : []),
-    ...topicMatches.filter((match) => match.focused).flatMap((match) => salientWords(match.text)),
-    ...salientWords(focusText),
-    ...(asksTime ? [...text.matchAll(TIME_HINT)].map((match) => match[0]) : []),
-    ...nearbyClauses.slice(-2).flatMap((clause) => salientWords(clause)),
-  ])];
-  addQuery(complementaryTokens.slice(0, 8).join(' '));
+  if (chineseFocus) {
+    addQuery(chineseFocus.topic);
+    const question = safePhrase(focusText).slice(0, Math.max(0, MAX_SUPPLEMENTAL_QUERY_CHARS - chineseFocus.topic.length - 1));
+    addQuery(`${chineseFocus.topic} ${question}`);
+  } else {
+    const bestTopic = topicMatches
+      .filter((match) => match.focused)
+      .map((match) => ({ text: compactTopic(match.text) || match.text, position: match.position }))
+      .sort((left, right) => right.position - left.position)[0]?.text;
+    addQuery(bestTopic || focusTopic || focusStem);
+    const complementaryTokens = [...new Set([
+      ...(englishQuestionTarget ? [englishQuestionTarget] : []),
+      ...topicMatches.filter((match) => match.focused).flatMap((match) => salientWords(match.text)),
+      ...salientWords(focusText),
+      ...(asksTime ? [...text.matchAll(TIME_HINT)].map((match) => match[0]) : []),
+      ...nearbyClauses.slice(-2).flatMap((clause) => salientWords(clause)),
+    ])];
+    addQuery(complementaryTokens.slice(0, 8).join(' '));
+  }
 
   return {
     sourcePhrases: selected.map((candidate) => candidate.text),
