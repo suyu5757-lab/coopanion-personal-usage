@@ -455,7 +455,7 @@ describe('with a pet page', () => {
     await tab.next((m) => m.t === 'watching');
     tab.send({ t: 'text', text: 'hi' });
     await expect.poll(() => host.events.length).toBe(1);
-    expect(host.events[0]).toMatchObject({ type: 'desktop-pet.message', text: '[typed] 伙伴:hi' });
+    expect(host.events[0]).toMatchObject({ type: 'desktop-pet.message', dependencyOrigin: 'user-input', text: '[typed] 伙伴:hi' });
     const theme = DESKTOP_PET_DEFAULTS.theme === 'dark' ? 'light' : 'dark';
     tab.send({ t: 'prefs', theme });
     expect((await win.next((m) => m.t === 'prefs')).theme).toBe(theme);
@@ -632,7 +632,7 @@ describe('chat page', () => {
     chat.send({ t: 'send', id: 1, text: '帮我看看这个报错' });
     await expect.poll(() => chat.last('sent')).toMatchObject({ id: 1 });
     const sent = host.events.at(-1)!;
-    expect(sent).toMatchObject({ type: 'desktop-pet.message', text: '[typed] 伙伴:帮我看看这个报错', meta: { via: 'chat' } });
+    expect(sent).toMatchObject({ type: 'desktop-pet.message', dependencyOrigin: 'user-input', text: '[typed] 伙伴:帮我看看这个报错', meta: { via: 'chat' } });
     expect(host.pushOpts.at(-1)).toEqual({ trigger: 'preempt' });
     expect(chat.last('item')).toMatchObject({ pending: true, item: { kind: 'user', cursor: sent.cursor } });
     world.onEventsSettled([sent], 'delivered');

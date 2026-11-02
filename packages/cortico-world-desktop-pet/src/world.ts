@@ -1298,7 +1298,10 @@ export class DesktopPetWorld implements World {
     const host = this.host;
     if (!host) return null;
     try {
-      const e = await host.pushEvent({ type, source: this.id, senderKey, ts: nowIso(this.opts.timezone), text: this.stamp() + text, ...extra }, { trigger });
+      const directUserInput = type === 'desktop-pet.message' || type === 'desktop-pet.speech' || type === 'desktop-pet.touch'
+        || (type === 'desktop-pet.answer' && extra.meta?.dismissed !== true);
+      const e = await host.pushEvent({ type, source: this.id, senderKey, ts: nowIso(this.opts.timezone), text: this.stamp() + text,
+        ...(directUserInput ? { dependencyOrigin: 'user-input' as const } : {}), ...extra }, { trigger });
       const item = chatItem(e);
       if (!item) return e;
       const pending = item.kind === 'user' && e.contextDelivery === 'deliver';
