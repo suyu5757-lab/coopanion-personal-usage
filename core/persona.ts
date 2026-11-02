@@ -22,8 +22,8 @@ import { appendFileSync, closeSync, existsSync, fstatSync, lstatSync, linkSync, 
 import { freemem, totalmem } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { LOG_SCHEME, blobScheme } from 'cortico/core/blobs.ts';
-import type { CoreApi, ContextHandoffPrepareContext, EvidenceAttachment, EventEnvelope, HandoffCommitCheck, PersonaWebUiDecl, PreparedContextHandoff, SessionDecl, SessionOpeningReason, StoragePart, ToolCallContext, ToolDef, ToolOutcome, WorldLifecycleEvent } from 'cortico/core/types.ts';
-import { withText, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
+import type { CoreApi, ContextEvidenceInspection, ContextHandoffPrepareContext, ContextHandoffSourceExcerpt, EvidenceAttachment, EventEnvelope, HandoffCommitCheck, PersonaWebUiDecl, PreparedContextHandoff, SessionDecl, SessionOpeningReason, StoragePart, ToolCallContext, ToolDef, ToolOutcome, WorldLifecycleEvent } from 'cortico/core/types.ts';
+import { message, withText, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import type { Language } from 'cortico/core/language.ts';
 import { HANDOFF_DIR, type Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
@@ -1277,60 +1277,122 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return false;
     }
 
-    private handoffSnapshot(snapshot: ContextRecord[]): ContextRecord[] {
+    private handoffSnapshot(snapshot: ContextRecord[], sourceEvidence: ContextEvidenceInspection): {
+      records: ContextRecord[];
+      sourceExcerpts: ContextHandoffSourceExcerpt[];
+    } {
       const memory = this.longTerm;
-      const memoryCallIds = new Set(snapshot.flatMap((record) => record.item.type === 'function_call'
-        && MEMORY_TOOL_NAMES.has(record.item.name) ? [record.item.call_id] : []));
-      return snapshot
-        .filter((record) => !(record.item.type === 'function_call'
-          && MEMORY_TOOL_NAMES.has(record.item.name))
-          && !(record.item.type === 'function_call_output' && memoryCallIds.has(record.item.call_id)))
-        .map((record) => {
-          if (record.item.type !== 'message') return record;
-          let text = textOf(record);
-          let changed = false;
-          for (const block of this.memoryContextBlocks) {
-            if (!block || !text.includes(block)) continue;
-            const blank = block.replace(/[^\r\n]/g, ' ');
-            text = text.split(block).join(blank);
-            changed = true;
-          }
-          const sourceSpans = (record.context.evidence ?? []).flatMap((attachment) => {
-            const current = memory?.sourceVisible(attachment.documentId) && memory.sourceCurrentForContext(attachment.documentId);
-            return current ? [] : [{ start: attachment.segment.start, end: attachment.segment.end }];
-          });
-          const fencedEventSpans = (record.context.frame?.events ?? []).flatMap((event) => {
-            if (event.source !== 'desktop-pet') return [];
-            const documentId = event.type === 'desktop-pet.touch'
-              ? `touch:main:${event.cursor}`
-              : ['desktop-pet.message', 'desktop-pet.speech', 'desktop-pet.answer'].includes(event.type)
-                ? `user:main:${event.cursor}`
-                : null;
-            return documentId && memory?.sourceFenced(documentId)
-              ? [{ start: event.start, end: event.start + event.chars }]
-              : [];
-          });
-          for (const { start, end } of [...sourceSpans, ...fencedEventSpans].sort((a, b) => b.start - a.start)) {
-            const segment = text.slice(start, end);
-            text = `${text.slice(0, start)}${segment.replace(/[^\r\n]/g, ' ')}${text.slice(end)}`;
-            changed = true;
-          }
-          return changed ? withText(record, text) : record;
+      const coverage = new Map(sourceEvidence.items.map((item) => [item.itemId, item]));
+      const fenced = (event: NonNullable<ContextRecord['context']['frame']>['events'][number]): boolean => {
+        if (event.source !== 'desktop-pet') return false;
+        const documentId = event.type === 'desktop-pet.touch'
+          ? `touch:main:${event.cursor}`
+          : ['desktop-pet.message', 'desktop-pet.speech', 'desktop-pet.answer'].includes(event.type)
+            ? `user:main:${event.cursor}`
+            : null;
+        return documentId ? memory?.sourceFenced(documentId) === true : false;
+      };
+      const validSpan = (text: string, span: { start: number; end: number; digest: string }): boolean =>
+        Number.isInteger(span.start) && Number.isInteger(span.end) && span.start >= 0 && span.end > span.start
+        && span.end <= text.length && /^[a-f0-9]{64}$/.test(span.digest)
+        && createHash('sha256').update(text.slice(span.start, span.end), 'utf8').digest('hex') === span.digest;
+      const safeRecord = (record: ContextRecord): ContextRecord | null => {
+        const itemCoverage = record.item.id ? coverage.get(record.item.id) : undefined;
+        if (!itemCoverage || !record.item.id) return null;
+        if (record.item.type === 'function_call') {
+          return itemCoverage.mappingState === 'complete' && itemCoverage.disposition !== 'unknown-derived-incomplete' ? record : null;
+        }
+        if (record.item.type !== 'message' && record.item.type !== 'function_call_output') {
+          return itemCoverage.mappingState === 'complete' && itemCoverage.disposition !== 'unknown-derived-incomplete' ? record : null;
+        }
+        const text = textOf(record);
+        const evidence = (record.context.evidence ?? []).filter((attachment) => {
+          const { start, end } = attachment.segment;
+          if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end <= start || end > text.length) return false;
+          if (!memory?.sourceVisible(attachment.documentId) || !memory.sourceCurrentForContext(attachment.documentId)) return false;
+          const segment = text.slice(start, end);
+          return evidenceCoversText(segment, [{ ...attachment, segment: { start: 0, end: segment.length, digest: attachment.segment.digest } }]);
         });
+        const independent = (record.context.sourceIndependentSpans ?? []).filter((span) => validSpan(text, span)
+          && !((record.context.frame?.events ?? []).some((event) => fenced(event)
+            && event.start < span.end && event.start + event.chars > span.start)));
+        const dependencies = (record.context.sourceDependencySpans ?? []).filter((span) => validSpan(text, span)
+          && span.exposedSources.every((source) => memory?.sourceVisible(source.documentId)
+            && memory.sourceCurrentForContext(source.documentId)));
+        const safeRanges = [
+          ...evidence.map((attachment) => ({ start: attachment.segment.start, end: attachment.segment.end })),
+          ...independent.map((span) => ({ start: span.start, end: span.end })),
+          ...dependencies.map((span) => ({ start: span.start, end: span.end })),
+        ];
+        const safe = new Uint8Array(text.length);
+        for (const range of safeRanges) for (let at = range.start; at < range.end; at++) safe[at] = 1;
+        const redacted = Array.from({ length: text.length }, (_, at) => safe[at] || /\s/u.test(text[at]!) ? text[at]! : ' ').join('');
+        if (!redacted.trim()) return null;
+        const frameEvents = record.context.frame?.events.filter((event) =>
+          safeRanges.some((range) => range.start <= event.start && range.end >= event.start + event.chars) && !fenced(event));
+        const changed = redacted !== text || evidence.length !== (record.context.evidence?.length ?? 0)
+          || independent.length !== (record.context.sourceIndependentSpans?.length ?? 0)
+          || dependencies.length !== (record.context.sourceDependencySpans?.length ?? 0)
+          || (frameEvents?.length ?? 0) !== (record.context.frame?.events.length ?? 0);
+        if (!changed) return record;
+        const updated = withText(record, redacted);
+        updated.context = {
+          ...record.context,
+          evidence,
+          sourceIndependentSpans: independent,
+          sourceDependencySpans: dependencies,
+          ...(record.context.frame ? { frame: { ...record.context.frame, events: frameEvents ?? [] } } : {}),
+        };
+        return updated;
+      };
+      const processed = snapshot.flatMap((record) => {
+        const safe = safeRecord(record);
+        return safe ? [safe] : [];
+      });
+      const outputIds = new Set(processed.flatMap((record) => record.item.type === 'function_call_output' ? [record.item.call_id] : []));
+      const callIds = new Set(processed.flatMap((record) => record.item.type === 'function_call' ? [record.item.call_id] : []));
+      const existingOutputs = new Set(snapshot.flatMap((record) => record.item.type === 'function_call_output' ? [record.item.call_id] : []));
+      const sourceExcerpts = processed.flatMap((record) => {
+        if (record.item.type !== 'function_call_output' || callIds.has(record.item.call_id) || !record.item.id) return [];
+        return (record.context.evidence ?? []).map((attachment) => ({ sourceRecordId: record.item.id!, attachment }));
+      });
+      const records = processed.filter((record) => record.item.type === 'function_call_output'
+        ? callIds.has(record.item.call_id)
+        : record.item.type === 'function_call' && existingOutputs.has(record.item.call_id)
+          ? outputIds.has(record.item.call_id)
+          : true);
+      return { records, sourceExcerpts };
     }
 
     async prepareHandoff(snapshot: ContextRecord[], ctx: ContextHandoffPrepareContext): Promise<PreparedContextHandoff> {
       const memory = this.longTerm;
-      const protectedHandoff = this.handoffIsProtected(snapshot);
+      const protectedSnapshot = this.handoffIsProtected(snapshot);
       const expectedMemoryEpoch = memory?.evidenceEpoch() ?? null;
-      const memorySourcesVerified = !!memory && !!expectedMemoryEpoch
-        && ctx.sourceEvidence.mappingState === 'complete'
-        && await memory.verifyExposureSources(ctx.sourceEvidence.exposedSources, expectedMemoryEpoch);
-      const sourceFree = !protectedHandoff && ctx.sourceEvidence.exposedSources.length === 0;
-      const filtered = this.handoffSnapshot(snapshot);
+      const filtered = this.handoffSnapshot(snapshot, ctx.sourceEvidence);
+      const candidateEvidence = ctx.inspectCandidate(filtered.records, filtered.sourceExcerpts);
+      const memorySourcesVerified = !!memory && !!expectedMemoryEpoch && candidateEvidence.mappingState === 'complete'
+        && candidateEvidence.exposedSources.length > 0
+        && await memory.verifyExposureSources(candidateEvidence.exposedSources, expectedMemoryEpoch);
+      const sourceFree = filtered.records.length + filtered.sourceExcerpts.length > 0
+        && candidateEvidence.mappingState === 'complete'
+        && candidateEvidence.exposedSources.length === 0;
+      const protectedHandoff = protectedSnapshot || filtered.records.length !== ctx.sourceEvidence.items.length
+        || filtered.sourceExcerpts.length > 0 || candidateEvidence.exposedSources.length > 0;
       const now = new Date();
       const { maxTokens, keepRatio } = this.context();
-      const note = renderHandoffNote(filtered, {
+      const sourceById = new Map(snapshot.flatMap((record) => record.item.id ? [[record.item.id, record] as const] : []));
+      const excerptRecords = filtered.sourceExcerpts.flatMap((excerpt) => {
+        const source = sourceById.get(excerpt.sourceRecordId);
+        if (!source) return [];
+        const text = textOf(source).slice(excerpt.attachment.segment.start, excerpt.attachment.segment.end);
+        if (!text) return [];
+        return [message('user', text, {
+          ...(source.context.ts ? { ts: source.context.ts } : {}),
+          evidence: [{ ...excerpt.attachment, segment: { start: 0, end: text.length, digest: excerpt.attachment.segment.digest } }],
+        })];
+      });
+      const noteSnapshot = [...filtered.records, ...excerptRecords];
+      const note = renderHandoffNote(noteSnapshot, {
         speechTools: this.core?.toolsTagged('speak') ?? new Set<string>(),
         flowTools: this.core?.toolsTagged('flow') ?? new Set<string>(),
         snapshotTools: this.core?.toolsTagged('snapshot') ?? new Set<string>(),
@@ -1346,6 +1408,14 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       let finalPath: string | null = null;
       let finalIdentity: { dev: number; ino: number } | null = null;
       let committedFile: string | null = null;
+      const stem = handoffNoteStamp(now);
+      let plannedFilename: string | null = null;
+      for (let suffix = 0; suffix < 100; suffix++) {
+        const filename = `${stem}${suffix === 0 ? '' : `-${suffix}`}.md`;
+        if (!existsSync(join(handoffPath, filename))) { plannedFilename = filename; break; }
+      }
+      if (!plannedFilename) throw new Error('no unused handoff filename is available');
+      const plannedFile = `${HANDOFF_DIR}${plannedFilename}`;
       const persona = this;
       const previousHandoffFile = this.lastHandoffFile;
       const previousPressureWarned = this.pressureWarned;
@@ -1414,15 +1484,20 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         if (!generation || generation.status !== 'current' || generation.token !== ctx.expectedGeneration) {
           return { status: 'stale', reason: 'generation-changed' };
         }
-        if (protectedHandoff) {
+        if (!stageIdentity || !existsSync(stagePath) || readFileSync(stagePath, 'utf8') !== note.text) {
+          return { status: 'blocked', reason: 'staged-candidate-changed' };
+        }
+        if (candidateEvidence.mappingState !== 'complete') {
+          return { status: 'blocked', reason: 'candidate-source-mapping-incomplete' };
+        }
+        if (candidateEvidence.exposedSources.length > 0) {
           if (!memory || !expectedMemoryEpoch || !memorySourcesVerified || !memory.enabled() || !memory.settled()
-            || memory.evidenceEpoch() !== expectedMemoryEpoch || ctx.sourceEvidence.mappingState !== 'complete'
-            || ctx.sourceEvidence.exposedSources.length === 0
-            || ctx.sourceEvidence.exposedSources.some((source) => !memory.sourceVisible(source.documentId)
+            || memory.evidenceEpoch() !== expectedMemoryEpoch
+            || candidateEvidence.exposedSources.some((source) => !memory.sourceVisible(source.documentId)
               || !memory.sourceCurrentForContext(source.documentId))) {
             return { status: 'blocked', reason: 'memory-source-dependency-unverified' };
           }
-        } else if (!sourceFree || ctx.sourceEvidence.exposedSources.length > 0) {
+        } else if (!sourceFree) {
           return { status: 'blocked', reason: 'source-free-dependency-unproven' };
         }
         return { status: 'allow' };
@@ -1430,24 +1505,14 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       const commit = (): void => {
         if (committedFile) throw new Error('handoff candidate was already committed');
         if (!stageIdentity) throw new Error('handoff candidate ownership was lost');
-        const stem = handoffNoteStamp(now);
-        for (let suffix = 0; suffix < 100; suffix++) {
-          const filename = `${stem}${suffix === 0 ? '' : `-${suffix}`}.md`;
-          const candidate = join(handoffPath, filename);
-          try {
-            linkSync(stagePath, candidate);
-            finalPath = candidate;
-            const linkedIdentity = { ...stageIdentity };
-            finalIdentity = linkedIdentity;
-            const stat = statSync(candidate);
-            if (stat.dev !== linkedIdentity.dev || stat.ino !== linkedIdentity.ino) throw new Error('published handoff identity changed');
-            committedFile = `${HANDOFF_DIR}${filename}`;
-            break;
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-          }
-        }
-        if (!committedFile) throw new Error('no unused handoff filename is available');
+        const candidate = join(handoffPath, plannedFilename!);
+        linkSync(stagePath, candidate);
+        finalPath = candidate;
+        const linkedIdentity = { ...stageIdentity };
+        finalIdentity = linkedIdentity;
+        const stat = statSync(candidate);
+        if (stat.dev !== linkedIdentity.dev || stat.ino !== linkedIdentity.ino) throw new Error('published handoff identity changed');
+        committedFile = plannedFile;
         unlinkSync(stagePath);
         stageIdentity = null;
         this.lastHandoffFile = committedFile;
@@ -1471,18 +1536,28 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       };
 
       return {
-        result: { tail: this.handoffTail(snapshot) },
+        result: { tail: this.handoffTail(filtered.records) },
+        candidate: {
+          snapshotId: ctx.candidateSnapshotId,
+          records: filtered.records,
+          sourceExcerpts: filtered.sourceExcerpts,
+          content: note.text,
+          injections: note.parts.map((part) => ({
+            origin: 'external' as const,
+            kind: HANDOFF_NOTE_TYPE,
+            text: part.text,
+            sourceDependencies: candidateEvidence.exposedSources,
+          })),
+        },
         ...(protectedHandoff ? { protected: true as const } : {}),
         commitGuard,
         commit,
         discard,
-        get injections() {
-          if (!committedFile) return [];
-          return [
-            { origin: 'internal' as const, kind: 'handoff', text: persona.handoffNote() },
-            ...note.parts.map((part) => ({ origin: 'external' as const, kind: HANDOFF_NOTE_TYPE, text: part.text })),
-          ];
-        },
+        injections: [
+          { origin: 'internal' as const, kind: 'handoff', text: persona.handoffNoteAt(plannedFile), sourceDependencies: [] },
+          ...note.parts.map((part) => ({ origin: 'external' as const, kind: HANDOFF_NOTE_TYPE,
+            text: part.text, sourceDependencies: candidateEvidence.exposedSources })),
+        ],
       };
     }
 
@@ -1502,10 +1577,14 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return `[system] You got stuck ${count} times and could not speak for ${span}; it was not your choice. You can speak again now.`;
     }
 
-    protected override handoffNoteLines(): string[] {
+    private handoffNoteAt(file: string): string {
+      return this.handoffNoteLinesFor(file).join('');
+    }
+
+    private handoffNoteLinesFor(file: string): string[] {
       return [
         '[system] The handoff is done. The context before it is cleared; the files in your workspace are all still there. The handoff summary can guide current work but is not verified evidence of a past decision or shared event; use Memory for those claims. ',
-        `The stretch before the clear is written up as a handoff note, delivered with this batch and saved in ${this.lastHandoffFile ?? 'handoffs/'}: `,
+        `The stretch before the clear is written up as a handoff note, delivered with this batch and saved in ${file}: `,
         'it comes in parts by time, only parts with content are sent; "the latest stretch" leads into now, "the earlier stretch" is only for reference. ',
         'Only the latest stretch keeps what your speaking tools were called with and their receipts. ',
         'What a call was given is what you meant to say; whether the person saw it is in the receipt and the events after it. ',
@@ -1513,6 +1592,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         'Never call a speaking tool with empty content; nothing would show. ',
         'To say something, put it straight into the call. If you have nothing to say this turn, call end_turn.',
       ];
+    }
+
+    protected override handoffNoteLines(): string[] {
+      return this.handoffNoteLinesFor(this.lastHandoffFile ?? 'handoffs/');
     }
 
     protected override softCapHint(): string | null {

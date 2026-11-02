@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { EvidenceAttachment, EventEnvelope } from 'cortico/core/types.ts';
+import { digestText, inspectContextEvidence } from 'cortico/core/evidence.ts';
 import { functionCall, functionResult, message } from 'cortico/protocol/open-responses/context.ts';
 import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import { WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
@@ -531,17 +532,23 @@ describe('forget fences at handoff', () => {
     const firstStart = injectedMemoryText.length + 1;
     const secondStart = firstStart + forgottenUser.length + 1;
     const thirdStart = secondStart + forgottenTouch.length + 1;
-    const prepared = await persona.prepareHandoff([
+    const snapshot = [
       functionCall('memory-call', 'memory_search', JSON.stringify({ query: 'find my old event' })),
       functionResult('memory-call', memoryText),
       message('user', body, { frame: { events: [
         { cursor: 42, ts: '2026-10-31T10:00:00.000Z', type: 'desktop-pet.message', source: 'desktop-pet', start: firstStart, chars: forgottenUser.length },
         { cursor: 43, ts: '2026-10-31T10:00:01.000Z', type: 'desktop-pet.touch', source: 'desktop-pet', start: secondStart, chars: forgottenTouch.length },
         { cursor: 44, ts: '2026-10-31T10:00:02.000Z', type: 'desktop-pet.message', source: 'desktop-pet', start: thirdStart, chars: current.length },
-      ] } }),
-    ], {
+      ] }, sourceIndependentSpans: [
+        { start: firstStart, end: firstStart + forgottenUser.length, digest: digestText(forgottenUser), origin: 'user-input' },
+        { start: secondStart, end: secondStart + forgottenTouch.length, digest: digestText(forgottenTouch), origin: 'user-input' },
+        { start: thirdStart, end: thirdStart + current.length, digest: digestText(current), origin: 'user-input' },
+      ] }),
+    ];
+    const prepared = await persona.prepareHandoff(snapshot, {
       hardTokens: null, sessionId: 'main', expectedGeneration: 'generation-1', candidateSnapshotId: 'candidate-1',
-      sourceEvidence: { mappingState: 'missing', exposedSources: [] },
+      sourceEvidence: inspectContextEvidence(snapshot),
+      inspectCandidate: (records) => inspectContextEvidence(records),
     });
 
     const handoffDir = join(workspace, 'handoffs');
@@ -555,7 +562,7 @@ describe('forget fences at handoff', () => {
     expect(notes).not.toContain(forgottenTouch);
     expect(notes).not.toContain('find my old event');
     expect(notes).toContain(current);
-    expect(prepared.commitGuard?.()).toMatchObject({ status: 'blocked' });
+    expect(prepared.commitGuard?.()).toMatchObject({ status: 'allow' });
     prepared.discard?.();
     expect(existsSync(stagingDir)).toBe(false);
     expect(existsSync(handoffDir)).toBe(false);

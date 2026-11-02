@@ -1,12 +1,13 @@
 import { createServer, type Server } from 'node:http';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { HindsightClient } from '@vectorize-io/hindsight-client';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { CoreApi, World, WorldHost } from 'cortico/core/types.ts';
+import { inspectContextEvidence } from 'cortico/core/evidence.ts';
 import { message } from 'cortico/protocol/open-responses/context.ts';
 import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
@@ -40,11 +41,15 @@ async function waitFor(check: () => boolean, timeoutMs = 5000): Promise<void> {
   }
 }
 
-async function hindsightServer(sourceAvailable: boolean, factText = SOURCE_TEXT): Promise<{ baseUrl: string; recallRequests: () => number }> {
+async function hindsightServer(
+  sourceAvailable: boolean,
+  factText = SOURCE_TEXT,
+  beforeDocumentRead?: () => Promise<void>,
+): Promise<{ baseUrl: string; recallRequests: () => number }> {
   let recallCount = 0;
   const server = createServer((req, res) => {
     req.resume();
-    req.once('end', () => {
+    req.once('end', async () => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       const send = (value: unknown) => {
         res.writeHead(200, { 'content-type': 'application/json' });
@@ -75,6 +80,7 @@ async function hindsightServer(sourceAvailable: boolean, factText = SOURCE_TEXT)
         res.end();
         return;
       }
+      await beforeDocumentRead?.();
       send({
         id: 'doc-1', bank_id: 'fixture-bank', original_text: SOURCE_TEXT,
         content_hash: 'synthetic-content-hash', created_at: '2024-05-01T10:00:00.000Z',
@@ -92,11 +98,11 @@ async function hindsightServer(sourceAvailable: boolean, factText = SOURCE_TEXT)
   return { baseUrl: `http://127.0.0.1:${address.port}`, recallRequests: () => recallCount };
 }
 
-async function buildRig(sourceAvailable: boolean, factText?: string) {
+async function buildRig(sourceAvailable: boolean, factText?: string, beforeDocumentRead?: () => Promise<void>) {
   const root = mkdtempSync(join(tmpdir(), 'coo-memory-evidence-consumer-'));
   roots.push(root);
   const memoryDir = join(root, 'persona');
-  const server = await hindsightServer(sourceAvailable, factText);
+  const server = await hindsightServer(sourceAvailable, factText, beforeDocumentRead);
   const store = openMemoryStateStore(join(memoryDir, 'memory-state.sqlite'));
   const memory = new HindsightMemory();
   Object.assign(memory, {
@@ -193,7 +199,7 @@ describe('Memory source evidence through the real Core consumer', () => {
     const candidates = await rig.memory.searchResultsDetailed('jasmine tea preference');
     expect(candidates.results).toHaveLength(1);
     await rig.host().pushEvent({
-      type: 'desktop-pet.message', source: 'desktop-pet', ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
     }, { trigger: 'flush' });
     await waitFor(() => rig.api().generationEvidence('main').length >= 3);
 
@@ -217,18 +223,63 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(attachment?.segment.digest).toBe(createHash('sha256').update(SOURCE_TEXT, 'utf8').digest('hex'));
     expect(JSON.stringify(rig.llm.calls[1]?.messages)).toContain(SOURCE_TEXT);
 
-    const recordsBeforeHandoff = rig.core.session.records.length;
     expect(rig.api().requestContextHandoff()).toBe(true);
-    await waitFor(() => rig.api().handoffOutcome() !== null);
-    expect(rig.api().handoffOutcome()).toMatchObject({ status: 'blocked', mappingState: 'missing' });
+    await waitFor(() => rig.api().handoffOutcome()?.status === 'committed');
+    expect(rig.api().handoffOutcome()).toMatchObject({ status: 'committed', mappingState: 'complete' });
+    const handoffDir = join(rig.memoryDir, 'handoffs');
+    const files = readdirSync(handoffDir).filter((name) => name.endsWith('.md'));
+    expect(files).toHaveLength(1);
+    const note = readFileSync(join(handoffDir, files[0]!), 'utf8');
+    expect(note).toContain(SOURCE_TEXT);
+    expect(note).not.toContain('Supporting source evidence is incomplete');
+    await waitFor(() => rig.api().sessionInfo('main').snapshot?.some((entry) => textOf(entry).includes(SOURCE_TEXT)) === true);
+    await waitFor(() => rig.api().generationEvidence('main').length >= 4);
+    const notice = rig.core.session.records.find((entry) => entry.item.type === 'message'
+      && entry.item.role === 'user' && textOf(entry).includes('1 new event.'));
+    expect(notice?.context.sourceDependencySpans?.flatMap((span) => span.exposedSources.map((source) => source.documentId)))
+      .toContain('doc-1');
+    expect(rig.api().generationEvidence('main').at(-1)).toMatchObject({
+      mappingState: 'missing', actualEvidenceUsed: 'unknown',
+      exposedSources: [expect.objectContaining({ documentId: 'doc-1', validationStatus: 'validated', revisionState: 'current' })],
+    });
+  });
+
+  it('blocks the real Core handoff when Forget fences a source during prepare read-back', async () => {
+    let pauseRead = false;
+    let releaseRead!: () => void;
+    let signalStarted!: () => void;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const readStarted = new Promise<void>((resolve) => { signalStarted = resolve; });
+    const rig = await buildRig(true, undefined, async () => {
+      if (!pauseRead) return;
+      signalStarted();
+      await readGate;
+    });
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(),
+      text: 'hello', meta: { text: 'hello' },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.api().generationEvidence('main').length >= 3);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    const recordsBeforeHandoff = rig.core.session.records.length;
+    pauseRead = true;
+    expect(rig.api().requestContextHandoff()).toBe(true);
+    await readStarted;
+
+    const ledger = (rig.memory as unknown as { ledger: ForgetLedger }).ledger;
+    ledger.addMany([{ bankId: 'fixture-bank', endpoint: rig.baseUrl, documentId: 'doc-1', reason: 'handoff race' }], 'handoff race');
+    releaseRead();
+    await waitFor(() => rig.api().handoffOutcome()?.status === 'blocked');
+    expect(rig.api().handoffOutcome()).toMatchObject({ status: 'blocked', mappingState: 'complete' });
     expect(rig.core.session.records).toHaveLength(recordsBeforeHandoff);
     expect(existsSync(join(rig.memoryDir, 'handoffs'))).toBe(false);
+    expect(rig.api().sessionInfo('main').snapshot?.some((entry) => JSON.stringify(entry).includes('handoff-note'))).toBe(false);
   });
 
   it('leaves a recalled source unexposed when document read-back is missing', async () => {
     const rig = await buildRig(false);
     await rig.host().pushEvent({
-      type: 'desktop-pet.message', source: 'desktop-pet', ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
     }, { trigger: 'flush' });
     await waitFor(() => rig.api().generationEvidence('main').length >= 3);
 
@@ -242,7 +293,7 @@ describe('Memory source evidence through the real Core consumer', () => {
   it('keeps a source attachment unverified when its rendered fact does not match read-back text', async () => {
     const rig = await buildRig(true, 'The person prefers dark roast coffee.');
     await rig.host().pushEvent({
-      type: 'desktop-pet.message', source: 'desktop-pet', ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
     }, { trigger: 'flush' });
     await waitFor(() => rig.api().generationEvidence('main').length >= 3);
 
@@ -266,7 +317,7 @@ describe('Memory source evidence through the real Core consumer', () => {
       return readEvidence(read);
     };
     await rig.host().pushEvent({
-      type: 'desktop-pet.message', source: 'desktop-pet', ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
     }, { trigger: 'flush' });
     await readbackStarted;
 
@@ -284,7 +335,7 @@ describe('Memory source evidence through the real Core consumer', () => {
     await expect(invalidation).resolves.toMatchObject({ status: 'acknowledged' });
 
     await rig.host().pushEvent({
-      type: 'desktop-pet.message', source: 'desktop-pet', ts: new Date().toISOString(), text: 'hello again', meta: { text: 'hello again' },
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(), text: 'hello again', meta: { text: 'hello again' },
     }, { trigger: 'flush' });
     await waitFor(() => rig.api().generationEvidence('main').length >= 2);
     const envelopes = rig.api().generationEvidence('main');
@@ -311,7 +362,7 @@ describe('Memory source evidence through the real Core consumer', () => {
   it('blocks a staged protected handoff when the forget epoch changes before commit', async () => {
     const rig = await buildRig(true);
     await rig.host().pushEvent({
-      type: 'desktop-pet.message', source: 'desktop-pet', ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
     }, { trigger: 'flush' });
     await waitFor(() => rig.api().generationEvidence('main').length >= 3);
     await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
@@ -321,10 +372,11 @@ describe('Memory source evidence through the real Core consumer', () => {
     const sourceText = SOURCE_TEXT;
     const [attachment] = await rig.memory.evidenceForSegments(sourceText, [{ documentId: 'doc-1', start: 0, end: sourceText.length }]);
     if (!attachment) throw new Error('Synthetic source read-back did not produce an attachment');
-    const { segment: _segment, ...source } = attachment;
-    const prepared = await rig.persona.prepareHandoff([message('user', sourceText, { evidence: [attachment] })], {
+    const snapshot = [message('user', sourceText, { evidence: [attachment] })];
+    const prepared = await rig.persona.prepareHandoff(snapshot, {
       hardTokens: null, sessionId: 'main', expectedGeneration: generation.token, candidateSnapshotId: 'protected-candidate',
-      sourceEvidence: { mappingState: 'complete', exposedSources: [source] },
+      sourceEvidence: inspectContextEvidence(snapshot),
+      inspectCandidate: (records) => inspectContextEvidence(records),
     });
     expect(prepared.commitGuard?.()).toEqual({ status: 'allow' });
     const handoffDir = join(rig.memoryDir, 'handoffs');
@@ -336,6 +388,30 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(prepared.commitGuard?.()).toMatchObject({ status: 'blocked' });
     prepared.discard?.();
     expect(existsSync(handoffDir)).toBe(false);
+  });
+
+  it('publishes once and discard removes only the candidate file it owns', async () => {
+    const rig = await buildRig(true);
+    const generation = rig.api().sessionInfo('main').generation;
+    if (!generation) throw new Error('Core did not provide a generation token');
+    const [attachment] = await rig.memory.evidenceForSegments(SOURCE_TEXT, [{ documentId: 'doc-1', start: 0, end: SOURCE_TEXT.length }]);
+    if (!attachment) throw new Error('Synthetic source read-back did not produce an attachment');
+    const snapshot = [message('user', SOURCE_TEXT, { evidence: [attachment] })];
+    const handoffDir = join(rig.memoryDir, 'handoffs');
+    mkdirSync(handoffDir, { recursive: true });
+    const otherFile = join(handoffDir, 'owned-elsewhere.md');
+    writeFileSync(otherFile, 'preserve');
+    const prepared = await rig.persona.prepareHandoff(snapshot, {
+      hardTokens: null, sessionId: 'main', expectedGeneration: generation.token, candidateSnapshotId: 'owned-candidate',
+      sourceEvidence: inspectContextEvidence(snapshot), inspectCandidate: (records) => inspectContextEvidence(records),
+    });
+    expect(prepared.commitGuard?.()).toEqual({ status: 'allow' });
+    prepared.commit?.();
+    expect(() => prepared.commit?.()).toThrow('already committed');
+    expect(readdirSync(handoffDir).filter((name) => name.endsWith('.md'))).toHaveLength(2);
+    prepared.discard?.();
+    expect(readdirSync(handoffDir)).toEqual(['owned-elsewhere.md']);
+    expect(readFileSync(otherFile, 'utf8')).toBe('preserve');
   });
 
   it('attaches approved ExperienceCard text only after validating every stored source ID', async () => {
@@ -361,14 +437,16 @@ describe('Memory source evidence through the real Core consumer', () => {
     const generation = rig.api().sessionInfo('main').generation;
     if (!generation) throw new Error('Core did not provide a generation token');
     const text = 'Earlier handoff summary.';
-    const prepared = await rig.persona.prepareHandoff([message('user', text, {
+    const snapshot = [message('user', text, {
       frame: { events: [{ cursor: 1, ts: new Date().toISOString(), type: 'handoff-note', source: 'persona', start: 0, chars: text.length }] },
-    })], {
+    })];
+    const prepared = await rig.persona.prepareHandoff(snapshot, {
       hardTokens: null,
       sessionId: 'main',
       expectedGeneration: generation.token,
       candidateSnapshotId: 'prior-handoff-candidate',
-      sourceEvidence: { mappingState: 'missing', exposedSources: [] },
+      sourceEvidence: inspectContextEvidence(snapshot),
+      inspectCandidate: (records) => inspectContextEvidence(records),
     });
 
     expect(prepared.protected).toBe(true);
@@ -380,7 +458,7 @@ describe('Memory source evidence through the real Core consumer', () => {
   it('stages, publishes and injects a source-free handoff after the guard allows it', async () => {
     const rig = await buildSourceFreeRig();
     await rig.host().pushEvent({
-      type: 'desktop-pet.message', source: 'desktop-pet', ts: new Date().toISOString(),
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(),
       text: 'Continue the local task.', meta: { text: 'Continue the local task.' },
     }, { trigger: 'flush' });
     await waitFor(() => rig.llm.calls.length > 0);
@@ -388,7 +466,7 @@ describe('Memory source evidence through the real Core consumer', () => {
 
     expect(rig.api().requestContextHandoff()).toBe(true);
     await waitFor(() => rig.api().handoffOutcome() !== null);
-    expect(rig.api().handoffOutcome()).toMatchObject({ status: 'committed', mappingState: 'missing' });
+    expect(rig.api().handoffOutcome()).toMatchObject({ status: 'committed', mappingState: 'complete' });
     const handoffDir = join(rig.memoryDir, 'handoffs');
     const files = readdirSync(handoffDir);
     const notes = files.filter((name) => name.endsWith('.md'));
