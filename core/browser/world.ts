@@ -1299,7 +1299,14 @@ export class BrowserWorld implements World {
       }
       let result: Record<string, unknown> | null;
       try {
-        result = asRecord(await this.call('click', index !== null ? { index, snapshotId: targetSnapshotId } : { text }, ctx.signal));
+        const click = this.call('click', index !== null ? { index, snapshotId: targetSnapshotId } : { text }, ctx.signal);
+        if (authorization) {
+          this.taskJournal?.complete(authorization.journalId, {
+            phase: 'unknown', dispatchState: 'unknown', outcome: 'unknown',
+            note: 'the browser click result has not been observed',
+          });
+        }
+        result = asRecord(await click);
       } catch (error) {
         if (authorization) this.taskJournal?.finish(authorization.journalId, 'unknown', 'the click result was not received');
         throw error;
