@@ -43,6 +43,10 @@ export interface GrowthProposalInput {
   risk?: unknown;
 }
 
+export function growthProposalArtifactText(proposal: Pick<GrowthProposal, 'title' | 'summary' | 'evidence' | 'changes' | 'risk'>): string {
+  return JSON.stringify({ title: proposal.title, summary: proposal.summary, evidence: proposal.evidence, changes: proposal.changes, risk: proposal.risk });
+}
+
 export type GrowthProposalResult =
   | { ok: true; proposal: GrowthProposal; path: string }
   | { ok: false; errors: string[] };
@@ -209,6 +213,12 @@ export class GrowthProposals {
     const next: GrowthProposal = { ...proposal, state: 'applied', appliedAt: this.now().toISOString(), appliedCommit: commit.trim() };
     writeState(join(this.dir, `${id}.json`), `${JSON.stringify(next, null, 2)}\n`);
     return next;
+  }
+
+  remove(id: string): boolean {
+    if (!PROPOSAL_ID.test(id)) return false;
+    try { unlinkSync(join(this.dir, `${id}.json`)); return true; }
+    catch { return false; }
   }
 
   removeBySource(sourceIds: readonly string[]): number {

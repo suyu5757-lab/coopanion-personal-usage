@@ -140,6 +140,7 @@ export class ForgetLedger {
   private file: LedgerFile = { v: 2, tasks: [], tombstones: [], epochs: {}, stale: [] };
   private loaded = false;
   private damagedLedger = false;
+  private persistenceBlocked = false;
   private persistenceError: string | null = null;
   private initializationError: string | null = null;
   readonly stateStore: MemoryStateStore | null;
@@ -174,6 +175,7 @@ export class ForgetLedger {
       const saved = this.stateStore.loadForgetState();
       if (saved.state) this.file = saved.state as LedgerFile;
       this.damagedLedger = saved.damaged;
+      this.persistenceBlocked ||= saved.blocked;
     } catch (err) {
       this.damagedLedger = true;
       this.persistenceError = `could not read the memory database: ${err instanceof Error ? err.message : String(err)}`;
@@ -188,11 +190,12 @@ export class ForgetLedger {
     }
     try {
       this.stateStore.saveForgetState(this.file);
-      this.persistenceError = null;
       this.damagedLedger = false;
       return true;
     } catch (err) {
       this.persistenceError = `could not write the memory database: ${err instanceof Error ? err.message : String(err)}`;
+      this.persistenceBlocked = true;
+      try { this.stateStore?.markForgetWriteBlocked(); } catch { /* The in-memory block still closes reads. */ }
       this.opts.log?.warn('[memory] could not write the forget ledger', { message: err instanceof Error ? err.message : String(err) });
       return false;
     }
@@ -205,11 +208,12 @@ export class ForgetLedger {
     }
     try {
       this.stateStore.clearMemoryTarget(bankId, endpoint, this.file);
-      this.persistenceError = null;
       this.damagedLedger = false;
       return true;
     } catch (err) {
       this.persistenceError = `could not write the memory database: ${err instanceof Error ? err.message : String(err)}`;
+      this.persistenceBlocked = true;
+      try { this.stateStore?.markForgetWriteBlocked(); } catch { /* The in-memory block still closes reads. */ }
       this.opts.log?.warn('[memory] could not write the cleared target state', { message: err instanceof Error ? err.message : String(err) });
       return false;
     }
@@ -272,6 +276,8 @@ export class ForgetLedger {
       this.file = before;
       return { tasks: [], failed: Math.max(1, inputs.length) };
     }
+    this.persistenceBlocked = false;
+    this.persistenceError = null;
     return { tasks, failed: 0 };
   }
 
@@ -284,7 +290,8 @@ export class ForgetLedger {
   forgotten(bankId: string, endpoint: string, documentId: string): boolean {
     this.load();
     return this.file.tombstones.some((entry) =>
-      entry.bankId === bankId && entry.endpoint === endpoint && entry.documentId === documentId);
+      entry.bankId === bankId && entry.endpoint === endpoint
+      && (entry.documentId === documentId || entry.documentId === '*'));
   }
 
   /** Whether any source in this bank has a durable forget fence. */
@@ -293,10 +300,23 @@ export class ForgetLedger {
     return this.file.tombstones.some((entry) => entry.bankId === bankId && entry.endpoint === endpoint);
   }
 
+  bankClearPending(bankId: string, endpoint: string): boolean {
+    this.load();
+    return this.file.tombstones.some((entry) =>
+      entry.bankId === bankId && entry.endpoint === endpoint && entry.documentId === '*');
+  }
+
   /** The file exists but could not be read, so its tombstones are unknown. */
   damaged(): boolean {
     this.load();
-    return this.damagedLedger;
+    return this.damagedLedger || this.persistenceBlocked;
+  }
+
+  /** Keep reads and activation closed after a forget transaction failed outside the ledger write. */
+  markUnavailable(message: string): void {
+    this.persistenceBlocked = true;
+    this.persistenceError ??= message.slice(0, 300);
+    try { this.stateStore?.markForgetWriteBlocked(); } catch { /* The in-memory block still closes reads. */ }
   }
 
   /** Bumped by every new fence; a read that started before it must not return its result. */
@@ -349,7 +369,7 @@ export class ForgetLedger {
     this.file = { v: 2, tasks: [], tombstones: [], epochs: {}, stale: [] };
     this.loaded = false;
     this.damagedLedger = false;
-    this.persistenceError = null;
+    if (!this.persistenceBlocked) this.persistenceError = null;
   }
 
   /**
@@ -431,23 +451,68 @@ export class ForgetLedger {
     return status;
   }
 
-  /** The whole bank is gone, so its open deletions have nothing left to remove. The fence stays. */
-  clearTarget(bankId: string, endpoint: string): boolean {
+  /** Block every source in a bank before the remote clear begins. */
+  beginClearTarget(bankId: string, endpoint: string): boolean {
     this.load();
+    if (this.damagedLedger || !this.stateStore) return false;
     const before = this.file;
     const at = this.now().toISOString();
+    const target = key(bankId, endpoint);
+    const hasWildcard = this.file.tombstones.some((entry) =>
+      entry.bankId === bankId && entry.endpoint === endpoint && entry.documentId === '*');
+    const tombstones = hasWildcard ? this.file.tombstones : [
+      ...this.file.tombstones,
+      { bankId, endpoint, documentId: '*', reason: 'the memory bank is being cleared', at },
+    ];
+    const epochs = hasWildcard ? this.file.epochs : { ...this.file.epochs, [target]: (this.file.epochs[target] ?? 0) + 1 };
     this.file = {
       ...this.file,
-      tasks: this.file.tasks.map((task) => task.bankId === bankId && task.endpoint === endpoint && task.state !== 'done'
-        ? { ...task, state: 'done', lastError: undefined, updatedAt: at }
-        : task),
-      stale: this.file.stale.filter((entry) => entry !== key(bankId, endpoint)),
+      tombstones,
+      epochs,
+      stale: [...new Set([...this.file.stale, target])],
     };
     if (!this.persistClearedTarget(bankId, endpoint)) {
       this.file = before;
       return false;
     }
+    this.persistenceBlocked = false;
+    this.persistenceError = null;
     return true;
+  }
+
+  /** The remote clear succeeded; release the wildcard only after its result is known. */
+  finishClearTarget(bankId: string, endpoint: string): boolean {
+    this.load();
+    if (this.damagedLedger || !this.stateStore) return false;
+    const before = this.file;
+    const at = this.now().toISOString();
+    const target = key(bankId, endpoint);
+    const hasWildcard = this.file.tombstones.some((entry) =>
+      entry.bankId === bankId && entry.endpoint === endpoint && entry.documentId === '*');
+    this.file = {
+      ...this.file,
+      tasks: this.file.tasks.map((task) => task.bankId === bankId && task.endpoint === endpoint && task.state !== 'done'
+        ? { ...task, state: 'done', lastError: undefined, updatedAt: at }
+        : task),
+      tombstones: this.file.tombstones.filter((entry) =>
+        !(entry.bankId === bankId && entry.endpoint === endpoint && entry.documentId === '*')),
+      epochs: hasWildcard
+        ? { ...this.file.epochs, [target]: (this.file.epochs[target] ?? 0) + 1 }
+        : this.file.epochs,
+      stale: [...new Set([...this.file.stale, target])],
+    };
+    if (!this.persistClearedTarget(bankId, endpoint)) {
+      this.file = before;
+      return false;
+    }
+    this.persistenceBlocked = false;
+    this.persistenceError = null;
+    return true;
+  }
+
+  /** Compatibility entry point for callers whose remote clear has already completed. */
+  clearTarget(bankId: string, endpoint: string): boolean {
+    return this.beginClearTarget(bankId, endpoint) && this.finishClearTarget(bankId, endpoint);
   }
 
   /** How a specific set of tasks ended, for the forget receipt. */

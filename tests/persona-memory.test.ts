@@ -94,15 +94,14 @@ describe('Coo with long-term memory and the affinity extension', () => {
     expect(forgetMostRecent).toHaveBeenCalledWith('main', expect.any(Date));
   });
 
-  it('injects the portrait at session start', async () => {
+  it('withholds a mental-model portrait that has no source evidence', async () => {
     const { p, deferred, calls, injections } = personaWith();
     p.onOpening({ reason: 'new' });
     expect(deferred).toHaveLength(1);
     const text = await deferred[0]!();
     expect(text).toBeNull();
-    expect(calls.some((call) => call.startsWith('memory:[memory] portrait'))).toBe(true);
-    expect(injections.find((entry) => entry.text.startsWith('[memory] portrait'))).not.toHaveProperty('evidence');
-    expect(injections.find((entry) => entry.text.startsWith('[memory] portrait'))?.text).toContain('Supporting source evidence is incomplete');
+    expect(calls.some((call) => call.startsWith('memory:[memory] portrait'))).toBe(false);
+    expect(injections.find((entry) => entry.text.startsWith('[memory] portrait'))).toBeUndefined();
   });
 
   it('adds long-term memory to the storage page', async () => {

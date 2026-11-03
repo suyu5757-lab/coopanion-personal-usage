@@ -38,6 +38,8 @@ import {
   markPartnerDerivedStale,
   markPartnerSourcesStale,
   partnerProvenancePath,
+  partnerSegmentDigest,
+  partnerSegments,
   partnerWorkspaceDigest,
   readPartnerProvenance,
   type PartnerTextResult,
@@ -46,8 +48,8 @@ import { SESSION_MAX_CALLS, type SelfTimeConfig } from './browser/config.ts';
 import { selfTimeLine } from './browser/model-text.ts';
 import { GROWTH_DEFAULTS, type GrowthConfig } from './growth/config.ts';
 import { GROWTH_SESSION, GROWTH_TOOL_NAMES, GrowthReview, growthMemorySearchTool } from './growth/review.ts';
-import { EXPERIENCE_CONTEXT_HEADER, ExperienceCards, readExperienceCardInput } from './growth/experience-cards.ts';
-import { GrowthProposals, type GrowthProposal } from './growth/proposals.ts';
+import { EXPERIENCE_CONTEXT_HEADER, ExperienceCards, experienceCardArtifactText, readExperienceCardInput } from './growth/experience-cards.ts';
+import { GrowthProposals, growthProposalArtifactText, type GrowthProposal } from './growth/proposals.ts';
 import { GROWTH_CHECK_MS, GrowthSchedule } from './growth/schedule.ts';
 import { readResourcePressure } from './resource-pressure.ts';
 import { MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, memoryReadNotice } from './memory/model-text.ts';
@@ -83,13 +85,15 @@ const WORKSPACE_READ_PATHS: Record<string, string> = {
   grep_files: 'path',
 };
 
+function partnerSegmentContextText(segment: { text: string; origin: 'user-authored' | 'derived'; sourceIds: string[] }): string {
+  const label = segment.origin === 'derived'
+    ? `[workspace summary; source_ids=${JSON.stringify(segment.sourceIds)}; source references passed the local provenance and forget-fence checks; verify original Memory sources before citing history]`
+    : '[workspace note; user-authored; no original event source is recorded]';
+  return `${label}\n${segment.text}`;
+}
+
 function partnerEvidenceText(result: PartnerTextResult): string {
-  return result.segments.map((segment) => {
-    const label = segment.origin === 'derived'
-      ? `[workspace summary; source_ids=${JSON.stringify(segment.sourceIds)}; source references passed the local provenance and forget-fence checks; verify original Memory sources before citing history]`
-      : '[workspace note; user-authored; no original event source is recorded]';
-    return `${label}\n${segment.text}`;
-  }).join('\n\n');
+  return result.segments.map(partnerSegmentContextText).join('\n\n');
 }
 
 function workspaceReadResult(path: string, result: unknown): string | ToolOutcome {
@@ -253,8 +257,12 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     private growthCheck: ReturnType<typeof setInterval> | null = null;
     private lastUserMemory: { documentId: string; at: number } | null = null;
     private readonly memoryContextBlocks = new Set<string>();
+    private readonly partnerArtifacts = new Set<string>();
+    private partnerArtifactEpoch: string | null = null;
+    private attachedCore: CoreApi | null = null;
 
     override attach(core: CoreApi): void {
+      this.attachedCore = core;
       super.attach(core);
       this.longTerm?.setLifecycleHooks({
         forgetSources: (ids) => {
@@ -266,13 +274,13 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             catch (error) { sidecarError = error; }
           }
           const forgotten = new Set(ids);
+          const proposals = this.growthProposals()?.list().filter((proposal) => proposal.sourceIds.some((id) => forgotten.has(id))) ?? [];
           const policies = this.experienceCards()?.list().filter((card) => card.sourceIds.some((id) => forgotten.has(id))) ?? [];
-          const removed = this.growthProposals()?.removeBySource(ids) ?? 0;
-          const cards = this.experienceCards()?.removeBySource(ids) ?? 0;
-          if (removed + cards > 0) {
+          if (proposals.length + policies.length > 0) {
             const titles = policies.map((card) => card.title).slice(0, 8);
-            const detail = titles.length ? ` Withdraw these policies: ${titles.join('; ')}.` : '';
-            this.injectMemoryContext(`[memory] A source was forgotten. Do not rely on any proposal or experience policy derived from it; the linked records were removed.${detail}`);
+            const proposalTitles = proposals.map((proposal) => proposal.title).slice(0, 8);
+            const detail = [...proposalTitles, ...titles].length ? ` Withdraw these proposals or policies: ${[...proposalTitles, ...titles].join('; ')}.` : '';
+            this.injectMemoryContext(`[memory] A source was forgotten. Do not use any linked proposal or experience policy.${detail}`);
           }
           if (sidecarError) throw sidecarError;
         },
@@ -283,9 +291,12 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             try { markPartnerDerivedStale(sidecar, partnerWorkspaceDigest(this.memoryDir), this.longTerm?.sourceScopeDigest() ?? null); }
             catch (error) { sidecarError = error; }
           }
-          this.growthProposals()?.clear();
-          this.experienceCards()?.clear();
-          this.injectMemoryContext('[memory] Long-term memory was cleared. Disregard all Hindsight-derived experience strategies injected earlier in this session; none remain active.');
+          const proposals = this.growthProposals()?.list().filter((proposal) => proposal.state === 'approved') ?? [];
+          const cards = this.experienceCards()?.list('approved') ?? [];
+          if (proposals.length + cards.length > 0) {
+            this.injectMemoryContext('[memory] Long-term memory was cleared. Do not use the retained Growth proposals or Experience cards; their source records are unavailable.');
+          }
+          this.injectMemoryContext('[memory] Long-term memory was cleared. Do not rely on Hindsight-derived context from before the clear.');
           if (sidecarError) throw sidecarError;
         },
       });
@@ -416,6 +427,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       if (!cards || !memory?.enabled() || !memory.settled()) return { text: '', evidence: [] };
       const valid = new Set<string>();
       for (const card of cards.list('approved').slice(0, 8)) {
+        const body = experienceCardArtifactText(card);
+        const artifact = memory.derivedArtifact(card.id);
+        if (artifact?.reviewState !== 'approved' || !memory.derivedArtifactIsCurrent(card.id, body)
+          || !await memory.verifyDerivedArtifact(card.id, body)) continue;
         const sourcesValid = card.userExplicit
           ? await this.verifiedMemorySources(card.sourceIds)
           : await this.verifiedRepeatedUserEventSources(card.sourceIds);
@@ -521,6 +536,51 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return root ? partnerProvenancePath(root, this.memoryDir) : null;
     }
 
+    private async ensurePartnerArtifacts(): Promise<void> {
+      const memory = this.longTerm;
+      this.partnerArtifacts.clear();
+      this.partnerArtifactEpoch = memory?.evidenceEpoch() ?? null;
+      if (!memory?.enabled() || !memory.settled() || !this.partnerArtifactEpoch) return;
+      try {
+        const file = this.partnerDocFile();
+        if (!existsSync(file) || !statSync(file).isFile()
+          || !insidePath(realpathSync(this.memoryDir), realpathSync(file))) return;
+        const source = readFileSync(file, 'utf8');
+        const sidecar = this.partnerProvenanceFile();
+        if (!sidecar) return;
+        const provenance = readPartnerProvenance(sidecar, partnerWorkspaceDigest(this.memoryDir));
+        if (provenance.status !== 'ok') return;
+        const filtered = filterPartnerMarkdown(source, provenance, memory.sourceScopeDigest(),
+          (sourceId) => memory.sourceCurrentForContext(sourceId));
+        if (filtered.status !== 'ok') return;
+        const entries = new Map(provenance.file.entries.map((entry) => [entry.segmentDigest, entry]));
+        const expectedEpoch = this.partnerArtifactEpoch;
+        for (const segment of filtered.segments) {
+          if (segment.origin !== 'derived' || segment.sourceIds.length === 0) continue;
+          const entry = entries.get(partnerSegmentDigest(segment.text));
+          if (!entry) continue;
+          const artifactId = `partner:${entry.id}`;
+          const content = partnerSegmentContextText(segment);
+          const artifact = await memory.registerDerivedArtifactFromSources({
+            artifactId,
+            kind: 'partner-segment',
+            target: `${PARTNER_FILE}#${entry.id}`,
+            content,
+            origin: 'model-derived',
+            reviewState: 'unreviewed',
+            creatorOperationId: `partner-sidecar:${entry.id}`,
+            sourceIds: segment.sourceIds,
+            expectedEpoch,
+          });
+          if (!artifact || !await memory.verifyDerivedArtifact(artifactId, content)) continue;
+          this.partnerArtifacts.add(entry.id);
+        }
+        if (memory.evidenceEpoch() !== expectedEpoch) this.partnerArtifacts.clear();
+      } catch {
+        this.partnerArtifacts.clear();
+      }
+    }
+
     private workspaceRelativePath(candidate: unknown): string | null {
       if (typeof candidate !== 'string' || !candidate.trim()) return null;
       const root = resolve(this.memoryDir);
@@ -543,8 +603,25 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       source ??= readFileSync(file, 'utf8');
       const sidecar = this.partnerProvenanceFile();
       const provenance = sidecar ? readPartnerProvenance(sidecar, partnerWorkspaceDigest(this.memoryDir)) : { status: 'missing' as const };
-      return filterPartnerMarkdown(source, provenance, this.longTerm?.sourceScopeDigest() ?? null,
+      const filtered = filterPartnerMarkdown(source, provenance, this.longTerm?.sourceScopeDigest() ?? null,
         (sourceId) => this.longTerm?.sourceCurrentForContext(sourceId) === true);
+      if (filtered.status !== 'ok' || provenance.status !== 'ok') return filtered;
+      const entries = new Map(provenance.file.entries.map((entry) => [entry.segmentDigest, entry]));
+      const epochCurrent = !!this.longTerm && this.partnerArtifactEpoch === this.longTerm.evidenceEpoch();
+      const segments = filtered.segments.filter((segment) => {
+        if (segment.origin === 'user-authored') return true;
+        const entry = entries.get(partnerSegmentDigest(segment.text));
+        return !!entry && epochCurrent && this.partnerArtifacts.has(entry.id)
+          && this.longTerm?.derivedArtifactIsCurrent(`partner:${entry.id}`, partnerSegmentContextText(segment)) === true;
+      });
+      const excluded = filtered.segments.length - segments.length;
+      return {
+        ...filtered,
+        text: segments.map((segment) => segment.text).join('\n\n'),
+        segments,
+        includedSegments: segments.length,
+        withheldSegments: filtered.withheldSegments + excluded,
+      };
     }
 
     private partnerDocumentForRead(): string {
@@ -581,6 +658,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     }
 
     override async systemSegments(ctx: SystemPrefixContext): Promise<PrefixSegment[]> {
+      await this.ensurePartnerArtifacts();
       const segments = await super.systemSegments(ctx);
       const partner = segments.find((segment) => segment.title === 'PARTNER');
       if (partner) {
@@ -621,16 +699,16 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         : filtered.withheldSegments > 0
           ? '[system] Some PARTNER.md paragraphs are withheld because their provenance is missing, stale, edited or ambiguous. The omitted statements are unknown, not false.'
           : '';
-      const renderedSegments = filtered.segments.map((segment) => {
-        const label = segment.origin === 'derived'
-          ? `[workspace summary; source_ids=${JSON.stringify(segment.sourceIds)}; source references passed the local provenance and forget-fence checks; verify original Memory sources before citing history]`
-          : '[workspace note; user-authored; no original event source is recorded]';
-        return { segment, text: `${label}\n${segment.text}` };
-      });
+      const renderedSegments = filtered.segments.map((segment) => ({ segment, text: partnerSegmentContextText(segment) }));
       const body = renderedSegments.map((entry) => entry.text).join('\n\n')
         || '(No partner paragraphs have current provenance.)';
       const expected = `${PARTNER_NOTE}\n\n${body}${notice ? `\n\n${notice}` : ''}`;
       if (expected !== text) return unknown();
+      const sidecar = this.partnerProvenanceFile();
+      const provenance = sidecar ? readPartnerProvenance(sidecar, partnerWorkspaceDigest(this.memoryDir)) : { status: 'missing' as const };
+      const entries = provenance.status === 'ok'
+        ? new Map(provenance.file.entries.map((entry) => [entry.segmentDigest, entry]))
+        : new Map();
 
       const spans: SourceMapSpan[] = [];
       const pushLiteral = (start: number, end: number): void => {
@@ -648,11 +726,18 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           const start = at;
           const end = start + entry.text.length;
           if (entry.segment.origin === 'derived' && this.longTerm) {
-            const evidence = await this.longTerm.evidenceForSegments(entry.text,
-              entry.segment.sourceIds.map((documentId) => ({ documentId, start: 0, end: entry.text.length, derived: true })));
+            const provenanceEntry = entries.get(partnerSegmentDigest(entry.segment.text));
+            const artifactId = provenanceEntry ? `partner:${provenanceEntry.id}` : '';
+            const registered = !!provenanceEntry && this.partnerArtifactEpoch === this.longTerm.evidenceEpoch()
+              && this.partnerArtifacts.has(provenanceEntry.id)
+              && await this.longTerm.verifyDerivedArtifact(artifactId, entry.text);
+            const evidence = registered
+              ? await this.longTerm.evidenceForSegments(entry.text,
+                  entry.segment.sourceIds.map((documentId) => ({ documentId, start: 0, end: entry.text.length, derived: true })))
+              : [];
             const exposedSources = evidence.map(({ segment: _segment, ...sourceRef }) => sourceRef);
             const sourceIds = new Set(entry.segment.sourceIds);
-            const complete = sourceIds.size === exposedSources.length
+            const complete = registered && sourceIds.size === exposedSources.length
               && exposedSources.every((sourceRef) => sourceIds.has(sourceRef.documentId))
               && evidenceCoversText(entry.text, evidence);
             spans.push(complete
@@ -725,7 +810,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
               return `[workspace read failed] Git metadata is not available through workspace tools.`;
             }
             const path = this.workspaceRelativePath(args[pathArgument]);
-            if (tool.name === 'read_file' && path === PARTNER_FILE) return this.partnerDocumentForRead();
+            if (tool.name === 'read_file' && path === PARTNER_FILE) {
+              await this.ensurePartnerArtifacts();
+              return this.partnerDocumentForRead();
+            }
             if (tool.name === 'read_file' && path
               && (path.startsWith(`${PARTNER_DIR}/`) || path.startsWith('handoffs/'))) {
               return '[read failed] This workspace area is withheld until its content has provenance sidecar entries.';
@@ -1091,7 +1179,11 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           browser: this.systemHealth().browser,
         };
       }
-      if (method === 'growth-proposals') return this.growthProposals()?.list() ?? [];
+      if (method === 'growth-proposals') {
+        const memory = this.longTerm;
+        return this.growthProposals()?.list().filter((proposal) =>
+          memory?.derivedArtifactIsCurrent(proposal.id, growthProposalArtifactText(proposal)) === true) ?? [];
+      }
       if (method === 'growth-proposal-review') {
         const id = String(args[0] ?? ''), action = String(args[1] ?? '');
         if (action !== 'approved' && action !== 'rejected') throw new Error('Review action must be approved or rejected.');
@@ -1102,9 +1194,16 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           if (!current || !memory?.enabled() || !await this.verifiedMemorySources(current.sourceIds)) {
             throw new Error('The proposal sources cannot be verified.');
           }
+          if (!await memory.verifyDerivedArtifact(current.id, growthProposalArtifactText(current))) {
+            throw new Error('The proposal provenance is missing, stale or no longer matches its sources.');
+          }
+          if (!memory.setDerivedArtifactReviewState(current.id, 'approved')) {
+            throw new Error('The proposal artifact could not be approved in the provenance store.');
+          }
         }
         const proposal = store?.transition(id, action, String(args[2] ?? ''));
         if (!proposal) throw new Error('The proposal is no longer a candidate. Refresh the list.');
+        if (action === 'rejected') this.longTerm?.setDerivedArtifactReviewState(id, 'rejected');
         return proposal;
       }
       if (method === 'growth-proposal-apply') throw new Error('Growth proposal application is not enabled.');
@@ -1114,6 +1213,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         const card = cards?.get(id);
         if (!card || card.state !== 'candidate' || card.kind !== 'skill') throw new Error('A skill candidate is required.');
         const memory = this.longTerm;
+        if (!memory?.derivedArtifactIsCurrent(card.id, experienceCardArtifactText(card))
+          || !await memory.verifyDerivedArtifact(card.id, experienceCardArtifactText(card))) {
+          throw new Error('The experience provenance is missing or stale.');
+        }
         const sourcesValid = card.userExplicit
           ? await this.verifiedMemorySources(card.sourceIds)
           : await this.verifiedRepeatedUserEventSources(card.sourceIds);
@@ -1131,6 +1234,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         const card = cards?.get(id);
         if (!card || card.state !== 'candidate' || card.kind !== 'skill') throw new Error('A skill candidate is required.');
         const memory = this.longTerm;
+        if (!memory?.derivedArtifactIsCurrent(card.id, experienceCardArtifactText(card))
+          || !await memory.verifyDerivedArtifact(card.id, experienceCardArtifactText(card))) {
+          throw new Error('The experience provenance is missing or stale.');
+        }
         const sourcesValid = card.userExplicit
           ? await this.verifiedMemorySources(card.sourceIds)
           : await this.verifiedRepeatedUserEventSources(card.sourceIds);
@@ -1149,11 +1256,29 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         const parsed = readExperienceCardInput(input);
         if ('errors' in parsed) throw new Error(parsed.errors.join('; '));
         const memory = this.longTerm;
-        if (!memory?.enabled() || !await this.verifiedMemorySources(parsed.card.sourceIds)) {
+        const expectedEpoch = memory?.evidenceEpoch();
+        if (!memory?.enabled() || !expectedEpoch || !await this.verifiedMemorySources(parsed.card.sourceIds)
+          || memory.evidenceEpoch() !== expectedEpoch) {
           throw new Error('The experience sources are missing, fenced or lack current provenance.');
         }
-        const result = this.experienceCards()?.create(input);
+        const cards = this.experienceCards();
+        const result = cards?.create(input);
         if (!result?.ok) throw new Error(result?.errors.join('; ') ?? 'Experience cards are unavailable.');
+        const registered = await memory.registerDerivedArtifactFromSources({
+          artifactId: result.card.id,
+          kind: 'experience-card',
+          target: `experience-cards/${result.card.id}.json`,
+          content: experienceCardArtifactText(result.card),
+          origin: 'user-authored',
+          reviewState: 'unreviewed',
+          creatorOperationId: `experience-create:${result.card.id}`,
+          sourceIds: result.card.sourceIds,
+          expectedEpoch,
+        });
+        if (!registered) {
+          cards?.remove(result.card.id);
+          throw new Error('The experience provenance changed before the card was saved.');
+        }
         return result.card;
       }
       if (method === 'experience-review') {
@@ -1174,12 +1299,20 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           const sourcesValid = before && (before.userExplicit
             ? await this.verifiedMemorySources(before.sourceIds)
             : await this.verifiedRepeatedUserEventSources(before.sourceIds));
-          if (!memory?.enabled() || !sourcesValid) {
+          if (!memory?.enabled() || !sourcesValid || !await memory.verifyDerivedArtifact(id, experienceCardArtifactText(before))) {
             throw new Error('The experience sources cannot be verified.');
+          }
+          if (!memory.setDerivedArtifactReviewState(id, 'approved')) {
+            throw new Error('The experience artifact could not be approved in the provenance store.');
           }
         }
         const card = cards?.transition(id, action);
         if (!card) throw new Error('The experience card is no longer in that state. Refresh the list.');
+        if (action === 'rejected') this.longTerm?.setDerivedArtifactReviewState(id, 'rejected');
+        if (action === 'deprecated') {
+          this.longTerm?.setDerivedArtifactReviewState(id, 'rejected');
+          this.longTerm?.withdrawDerivedArtifact(id, 'experience-policy-deprecated');
+        }
         if (action === 'approved') {
           const context = await this.experienceContext();
           if (context.text) this.injectMemoryContext(context.text, context.evidence);
@@ -1228,11 +1361,19 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         // the app was off, so the proposal's list is checked against the bank again here.
         const memory = this.longTerm;
         if (!memory?.enabled()) throw new Error('Long-term memory is off, so the proposal sources cannot be checked. Turn it on and try again.');
+        const expectedMemoryEpoch = memory.evidenceEpoch();
+        if (!expectedMemoryEpoch) throw new Error('The proposal source epoch is unavailable. It was not applied.');
+        if (memory.derivedArtifact(id)?.reviewState !== 'approved'
+          || !memory.derivedArtifactIsCurrent(id, growthProposalArtifactText(proposal))
+          || !await memory.verifyDerivedArtifact(id, growthProposalArtifactText(proposal))) {
+          throw new Error('The proposal provenance is missing or stale. It was not applied.');
+        }
         const missing: string[] = [];
         for (const sourceId of proposal.sourceIds) {
           if (!await memory.hasSource(sourceId)) missing.push(sourceId);
         }
         if (missing.length > 0) throw new Error(`The proposal sources are gone: ${missing.join(', ')}. It was not applied.`);
+        if (memory.evidenceEpoch() !== expectedMemoryEpoch) throw new Error('The proposal sources changed during review. It was not applied.');
 
         // Every change is resolved against the same snapshot and every file's final text is built
         // in memory first, so a later change that no longer matches leaves no earlier one applied.
@@ -1297,10 +1438,19 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         const briefing = this.longTerm?.enabled() ? await this.longTerm.sessionBriefing().catch(() => null) : null;
         const portrait = briefing?.text?.trim() ?? '';
         const strategies = await this.experienceContext();
-        if (portrait) this.injectMemoryContext(`${portrait}\n${MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE}`);
+        if (portrait && briefing?.evidence?.length) this.injectMemoryContext(portrait, briefing.evidence);
         if (strategies.text) this.injectMemoryContext(strategies.text, strategies.evidence);
         return null;
       });
+    }
+
+    retainCooOutput(text: string, meta: { session?: string; callId?: string; timestamp?: string }): void {
+      const session = meta.session ?? 'main';
+      const envelopes = meta.callId
+        ? this.attachedCore?.generationEvidence(session).filter((envelope) => envelope.sessionId === session
+            && envelope.outputToolCalls.some((output) => output.toolCallId === meta.callId)) ?? []
+        : [];
+      this.longTerm?.retainCoo(text, meta, envelopes.length === 1 ? envelopes[0] : undefined);
     }
 
     override onWorldLifecycle(event: WorldLifecycleEvent): void {
@@ -1526,6 +1676,20 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       }
       if (!plannedFilename) throw new Error('no unused handoff filename is available');
       const plannedFile = `${HANDOFF_DIR}${plannedFilename}`;
+      const handoffArtifactId = `handoff:${sha256(JSON.stringify([ctx.sessionId, ctx.candidateSnapshotId, plannedFilename]))}`;
+      const handoffSegmentDigests = new Map<string, string>();
+      const sourceSegmentDigests = new Map<string, string[]>();
+      for (const item of candidateEvidence.items) for (const span of item.spans) for (const source of span.exposedSources) {
+        const key = JSON.stringify([source.bankId, source.endpoint, source.documentId]);
+        const digests = sourceSegmentDigests.get(key) ?? [];
+        digests.push(span.digest);
+        sourceSegmentDigests.set(key, digests);
+      }
+      for (const source of candidateEvidence.exposedSources) {
+        const key = JSON.stringify([source.bankId, source.endpoint, source.documentId]);
+        const digests = sourceSegmentDigests.get(key) ?? [];
+        if (digests.length > 0) handoffSegmentDigests.set(key, sha256(JSON.stringify([...digests].sort())));
+      }
       const persona = this;
       const previousHandoffFile = this.lastHandoffFile;
       const previousPressureWarned = this.pressureWarned;
@@ -1612,7 +1776,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         }
         return { status: 'allow' };
       };
-      const commit = (): void => {
+      const publish = (): void => {
         if (committedFile) throw new Error('handoff candidate was already committed');
         if (!stageIdentity) throw new Error('handoff candidate ownership was lost');
         const candidate = join(handoffPath, plannedFilename!);
@@ -1631,8 +1795,27 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         this.memoryContextBlocks.clear();
         cleanupStage();
       };
+      const commit = (): void => {
+        if (!memory || !memory.enabled()) {
+          if (!sourceFree || candidateEvidence.exposedSources.length > 0) throw new Error('Memory provenance is unavailable for this handoff');
+          publish();
+          return;
+        }
+        if (!expectedMemoryEpoch) throw new Error('Memory epoch is unavailable for this handoff');
+        const stored = memory.commitHandoffArtifact({
+          artifactId: handoffArtifactId,
+          target: plannedFile,
+          content: note.text,
+          expectedEpoch: expectedMemoryEpoch,
+          mappingState: sourceFree ? 'source-independent' : 'complete',
+          sources: candidateEvidence.exposedSources,
+          segmentDigests: handoffSegmentDigests,
+        }, publish);
+        if (!stored) throw new Error('Handoff provenance could not be committed with the candidate.');
+      };
       const discard = (): void => {
         removeOwnedFile(finalPath, finalIdentity);
+        memory?.withdrawDerivedArtifact(handoffArtifactId, 'handoff-candidate-discarded');
         finalPath = null;
         finalIdentity = null;
         committedFile = null;

@@ -373,7 +373,7 @@ describe('remote deletion tasks', () => {
     expect([...outbox.matching((entry) => entry.state === 'pending')].map((entry) => entry.documentId)).toContain('preference');
   });
 
-  it('removes source-linked Growth state on forget and clears it with the whole bank', async () => {
+  it('revokes source-linked Growth state without discarding files or completed receipts', async () => {
     const root = dir();
     const sourceId = 'user:focus';
     const otherSourceId = 'user:other';
@@ -442,9 +442,9 @@ describe('remote deletion tasks', () => {
 
     const result = await memory.forgetDocument(sourceId);
     expect(result).toMatchObject({ deleted: 1, pending: 0, failed: 0 });
-    expect(cards.approvedContext()).toBe('');
-    expect(cards.list()).toEqual([]);
-    expect(proposals.list()).toEqual([]);
+    expect(cards.list().map((card) => card.id)).toEqual([created.card.id]);
+    expect(proposals.list().map((entry) => entry.id)).toEqual([proposal.proposal.id]);
+    expect((await (persona as unknown as { experienceContext(): Promise<{ text: string }> }).experienceContext()).text).toBe('');
     expect(memory.sourceFenced(sourceId)).toBe(true);
     const afterForget = readPartnerProvenance(partnerSidecar, partnerWorkspaceDigest(workspace));
     expect(afterForget.status).toBe('ok');
@@ -458,8 +458,12 @@ describe('remote deletion tasks', () => {
     });
     expect(secondCard.ok && secondProposal.ok).toBe(true);
     await memory.clear();
-    expect(cards.list()).toEqual([]);
-    expect(proposals.list()).toEqual([]);
+    expect(cards.list().map((card) => card.id).sort()).toEqual([created.card.id, ...(secondCard.ok ? [secondCard.card.id] : [])].sort());
+    expect(proposals.list().map((entry) => entry.id).sort()).toEqual([
+      proposal.proposal.id,
+      ...(secondProposal.ok ? [secondProposal.proposal.id] : []),
+    ].sort());
+    expect((await (persona as unknown as { experienceContext(): Promise<{ text: string }> }).experienceContext()).text).toBe('');
     const afterClear = readPartnerProvenance(partnerSidecar, partnerWorkspaceDigest(workspace));
     expect(afterClear.status).toBe('ok');
     if (afterClear.status !== 'ok') throw new Error('sidecar should remain readable after bank clear');
@@ -655,7 +659,7 @@ describe('the fence covers reads and writes', () => {
     expect(outbox.status().active).toBe(0);
   });
 
-  it('clears the portraits on forget and serves none until they are rebuilt', async () => {
+  it('withholds mental-model portraits without source mapping and clears them on forget', async () => {
     const root = dir();
     const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
     const ledger = new ForgetLedger(join(root, 'forget.json'));
@@ -667,7 +671,7 @@ describe('the fence covers reads and writes', () => {
       recall: async () => ({ results: [] }),
     };
     const memory = memoryWith(outbox, ledger, client);
-    expect((await memory.sessionBriefing()).text).toContain('Hangzhou');
+    expect(await memory.sessionBriefing()).toEqual({ text: '', source: 'none' });
     await memory.forgetDocument('trip');
     expect(cleared).toBe(true);
     expect(await memory.sessionBriefing()).toEqual({ text: '', source: 'none' });

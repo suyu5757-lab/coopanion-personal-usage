@@ -32,14 +32,56 @@ async function evidenceForSegments(text: string, segments: readonly { documentId
   }));
 }
 
-/** The apply path checks that a proposal's evidence still exists. */
-const liveSources = {
+const testArtifacts = new Map<string, Record<string, unknown>>();
+const testDigest = (text: string): string => createHash('sha256').update(text).digest('hex');
+
+function memoryFor(overrides: Record<string, unknown> = {}): HindsightMemory {
+  const artifact = (id: string) => testArtifacts.get(id) ?? {
+    artifactId: id, lifecycleState: 'active', reviewState: 'approved', lineageState: 'complete',
+    bodyDigest: null, sources: [],
+  };
+  const memory = {
   enabled: () => true,
+  settled: () => true,
   markRecallInjected: () => {},
   sourceVisible: () => true,
   hasSource: async () => true,
+  evidenceEpoch: () => '1:0',
   sourceEvidence: async () => ({ present: true, visible: true, actor: 'user', status: 'current' }),
-} as unknown as HindsightMemory;
+  registerDerivedArtifactFromSources: async (input: Record<string, unknown>) => {
+    const saved = { ...input, bodyDigest: testDigest(String(input.content)), lifecycleState: 'active', lineageState: 'complete', sources: [] };
+    testArtifacts.set(String(input.artifactId), saved);
+    return saved;
+  },
+  derivedArtifact: (id: string) => artifact(id),
+  derivedArtifactIsCurrent: (id: string, content: string) => {
+    const saved = artifact(id);
+    return saved.lifecycleState === 'active' && (saved.bodyDigest === null || saved.bodyDigest === testDigest(content));
+  },
+  verifyDerivedArtifact: async (id: string, content: string) => {
+    const saved = artifact(id);
+    return saved.lifecycleState === 'active' && (saved.bodyDigest === null || saved.bodyDigest === testDigest(content));
+  },
+  setDerivedArtifactReviewState: (id: string, state: string) => {
+    const saved = artifact(id);
+    const next = { ...saved, reviewState: state };
+    testArtifacts.set(id, next);
+    return next;
+  },
+  withdrawDerivedArtifact: (id: string) => {
+    const saved = artifact(id);
+    const next = { ...saved, lifecycleState: 'withdrawn' };
+    testArtifacts.set(id, next);
+    return next;
+  },
+  evidenceForSegments,
+  ...overrides,
+  };
+  return memory as unknown as HindsightMemory;
+}
+
+/** The apply path checks that a proposal's evidence still exists. */
+const liveSources = memoryFor();
 
 function applyGrowthInternally(persona: object, id: string): Promise<unknown> {
   return (persona as unknown as { applyGrowthProposal(id: string): Promise<unknown> }).applyGrowthProposal(id);
@@ -153,7 +195,7 @@ describe('growth proposal review and apply', () => {
     const written = store.write(proposalInput);
     if (!written.ok) throw new Error(written.errors.join('; '));
     store.transition(written.proposal.id, 'approved');
-    const forgotten = { enabled: () => true, hasSource: async () => false } as unknown as HindsightMemory;
+    const forgotten = memoryFor({ hasSource: async () => false });
     const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory: forgotten });
     const persona = new Persona({ memoryDir: workspace });
 
@@ -177,10 +219,10 @@ describe('experience policy cards', () => {
     cards.transition(created.card.id, 'approved');
 
     for (const memory of [
-      { enabled: () => false, settled: () => true, sourceVisible: () => true },
-      { enabled: () => true, settled: () => false, sourceVisible: () => true },
+      memoryFor({ enabled: () => false, settled: () => true }),
+      memoryFor({ enabled: () => true, settled: () => false }),
     ]) {
-      const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory: memory as unknown as HindsightMemory });
+      const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory });
       const persona = new Persona({ memoryDir: workspace });
       expect((await (persona as unknown as { experienceContext(): Promise<{ text: string }> }).experienceContext()).text).toBe('');
     }
@@ -242,17 +284,12 @@ describe('experience policy cards', () => {
       scope: 'proactive_speech', sourceIds: ['same-1', 'same-2'],
     });
     if (!sameDay.ok) throw new Error(sameDay.errors.join('; '));
-    const memory = {
-      enabled: () => true,
-      markRecallInjected: () => {},
-      settled: () => true,
-      sourceVisible: () => true,
+    const memory = memoryFor({
       sourceEvidence: async (id: string) => ({
         present: true, visible: true, actor: 'user', status: 'completed', kind: 'event',
         occurredAt: id.startsWith('same-') ? '2026-10-01T12:00:00.000Z' : id.endsWith('-1') ? '2026-10-01T12:00:00.000Z' : '2026-10-08T12:00:00.000Z',
       }),
-      evidenceForSegments,
-    } as unknown as HindsightMemory;
+    });
     const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory });
     const persona = new Persona({ memoryDir: workspace });
     const invoke = persona.webUi('en').invoke!;
@@ -333,13 +370,9 @@ describe('experience policy cards', () => {
     let listCalls = 0;
     const listTrialReceipts = ledger.listExperienceTrialReceipts.bind(ledger);
     ledger.listExperienceTrialReceipts = (after) => { listCalls += 1; return listTrialReceipts(after); };
-    const memory = {
-      enabled: () => true,
-      settled: () => true,
-      sourceVisible: () => true,
+    const memory = memoryFor({
       sourceEvidence: async () => ({ present: true, visible: true, actor: 'user', status: 'completed' }),
-      evidenceForSegments,
-    } as unknown as HindsightMemory;
+    });
     const Persona = coopanionPersona(Cormini, {
       growthStateFile: join(deploy, 'growth.json'),
       memory,
@@ -398,11 +431,9 @@ describe('experience policy cards', () => {
     const deploy = join(root, 'deploy');
     mkdirSync(workspace);
     mkdirSync(deploy);
-    const memory = {
-      enabled: () => true, settled: () => true, sourceVisible: () => true, hasSource: async () => true, markRecallInjected: () => {},
+    const memory = memoryFor({
       sourceEvidence: async () => ({ present: true, visible: true, actor: 'user', status: 'current' }),
-      evidenceForSegments,
-    } as unknown as HindsightMemory;
+    });
     const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory });
     const persona = new Persona({ memoryDir: workspace });
     const injected: Array<{ text: string; evidence?: EvidenceAttachment[] }> = [];
@@ -427,14 +458,10 @@ describe('experience policy cards', () => {
     const deploy = join(root, 'deploy');
     mkdirSync(workspace);
     mkdirSync(deploy);
-    const memory = {
-      enabled: () => true,
-      settled: () => true,
-      sourceVisible: () => true,
+    const memory = memoryFor({
       hasSource: async () => false,
       sourceEvidence: async () => ({ present: false, visible: true, actor: null, status: null }),
-      evidenceForSegments,
-    } as unknown as HindsightMemory;
+    });
     const proposals = new GrowthProposals(join(deploy, 'growth-proposals'));
     const written = proposals.write(proposalInput);
     if (!written.ok) throw new Error(written.errors.join('; '));
@@ -466,13 +493,10 @@ describe('experience policy cards', () => {
     });
     if (!created.ok) throw new Error(created.errors.join('; '));
     cards.transition(created.card.id, 'approved');
-    const memory = {
-      enabled: () => true,
-      settled: () => true,
-      sourceVisible: () => true,
+    const memory = memoryFor({
       sourceEvidence: async () => ({ present: false, visible: true, actor: null, status: null }),
       sessionBriefing: async () => ({ text: '', source: 'none' }),
-    } as unknown as HindsightMemory;
+    });
     const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory });
     const persona = new Persona({ memoryDir: workspace });
     let deferred: (() => string | null | Promise<string | null>) | null = null;
@@ -493,19 +517,13 @@ describe('forget fences at handoff', () => {
     mkdirSync(workspace);
     const fenced = new Set(['user:main:42', 'touch:main:43']);
     const memoryText = '[memory] Past record.\n- (observation, 2026-10-01, source_id:user:main:42) A forgotten fact.';
-    const memory = {
-      enabled: () => true,
+    const memory = memoryFor({
       sourceFenced: (sourceId: string) => fenced.has(sourceId),
       sourceCurrentForContext: () => true,
-      sourceVisible: () => true,
-      evidenceEpoch: () => '0:0',
-      settled: () => true,
-      markRecallInjected: () => {},
       setLifecycleHooks: () => {},
       retainUser: () => 'user:main:44',
       recallForTurn: async () => ({ text: memoryText, route: 'standard', found: true, status: 'found' }),
-      evidenceForSegments,
-    } as unknown as HindsightMemory;
+    });
     const Persona = coopanionPersona(Cormini, { memory });
     const persona = new Persona({ memoryDir: workspace });
     const injected: string[] = [];

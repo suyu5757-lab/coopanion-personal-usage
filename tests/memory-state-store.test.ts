@@ -457,7 +457,7 @@ describe('the memory transaction database', () => {
     expect(outbox.status()).toMatchObject({ completed: 0, unverified: 0, verified: 1, active: 0 });
   });
 
-  it('rolls local cancellation back when the source fence cannot commit', async () => {
+  it('keeps source visibility closed when the source fence cannot commit, then accepts a durable retry', async () => {
     const dir = root();
     const path = join(dir, 'memory-state.sqlite');
     const store = openMemoryStateStore(path);
@@ -472,17 +472,52 @@ describe('the memory transaction database', () => {
 
     const memory = new HindsightMemory() as unknown as {
       config: { enabled: boolean; bankId: string; apiUrl: string };
+      client: object | null;
       outbox: MemoryOutbox;
+      stateStore: ReturnType<typeof openMemoryStateStore>;
       ledger: ForgetLedger;
       forgetDocument(documentId: string): Promise<{ local: number; deleted: number; pending: number; failed: number }>;
+      sourceVisible(documentId: string): boolean;
     };
     memory.config = { enabled: true, bankId: 'bank-a', apiUrl: 'http://hindsight.test' };
+    memory.client = {};
     memory.outbox = outbox;
+    memory.stateStore = store;
     memory.ledger = ledger;
+    expect(memory.sourceVisible('doc-a')).toBe(true);
 
     expect(await memory.forgetDocument('doc-a')).toMatchObject({ local: 0, failed: 1 });
     expect(outbox.get(queued.id)?.state).toBe('pending');
     expect(ledger.forgotten('bank-a', 'http://hindsight.test', 'doc-a')).toBe(false);
+    expect(ledger.damaged()).toBe(true);
+    expect(memory.sourceVisible('doc-a')).toBe(false);
+
+    closeMemoryStateStores();
+    const reopenedDb = new DatabaseSync(path);
+    reopenedDb.exec('DROP TRIGGER reject_forget');
+    reopenedDb.close();
+    const restartedStore = openMemoryStateStore(path);
+    const restartedOutbox = new MemoryOutbox(restartedStore);
+    const restartedLedger = new ForgetLedger(restartedStore);
+    const restartedMemory = new HindsightMemory() as unknown as {
+      config: { enabled: boolean; bankId: string; apiUrl: string };
+      client: object | null;
+      outbox: MemoryOutbox;
+      stateStore: ReturnType<typeof openMemoryStateStore>;
+      ledger: ForgetLedger;
+      sourceVisible(documentId: string): boolean;
+    };
+    restartedMemory.config = memory.config;
+    restartedMemory.client = {};
+    restartedMemory.outbox = restartedOutbox;
+    restartedMemory.stateStore = restartedStore;
+    restartedMemory.ledger = restartedLedger;
+    expect(restartedLedger.damaged()).toBe(true);
+    expect(restartedMemory.sourceVisible('doc-a')).toBe(false);
+
+    expect(restartedLedger.add({ bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: 'doc-a', reason: 'retry after database recovery' })).not.toBeNull();
+    expect(restartedLedger.damaged()).toBe(false);
+    expect(restartedMemory.sourceVisible('doc-a')).toBe(false);
   });
 
   it('quarantines a queued request whose content no longer matches its committed hash', () => {

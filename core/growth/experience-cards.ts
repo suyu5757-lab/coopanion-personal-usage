@@ -39,6 +39,10 @@ export interface ExperienceCardInput {
   kind?: unknown;
 }
 
+export function experienceCardArtifactText(card: Pick<ExperienceCard, 'title' | 'situation' | 'lesson' | 'scope' | 'kind'>): string {
+  return JSON.stringify({ title: card.title, situation: card.situation, lesson: card.lesson, scope: card.scope, kind: card.kind });
+}
+
 const ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SCOPES = new Set<ExperienceScope>(['conversation', 'proactive_speech', 'browser_exploration']);
 const KINDS = new Set<ExperienceKind>(['policy', 'skill']);
@@ -143,6 +147,12 @@ export class ExperienceCards {
 
   get(id: string): ExperienceCard | null {
     return ID.test(id) ? this.read(`${id}.json`) : null;
+  }
+
+  remove(id: string): boolean {
+    if (!ID.test(id)) return false;
+    try { unlinkSync(join(this.dir, `${id}.json`)); return true; }
+    catch { return false; }
   }
 
   list(state?: ExperienceState): ExperienceCard[] {

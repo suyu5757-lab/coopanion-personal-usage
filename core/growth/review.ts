@@ -10,9 +10,9 @@ import type { CoreApi, ForkOutcome, ToolDef } from 'cortico/core/types.ts';
 import type { ModelLanguage } from '../language.ts';
 import type { HindsightMemory } from '../memory/hindsight.ts';
 import { memoryReadNotice } from '../memory/model-text.ts';
-import { ExperienceCards, readExperienceCardInput } from './experience-cards.ts';
+import { ExperienceCards, experienceCardArtifactText, readExperienceCardInput } from './experience-cards.ts';
 import { SELF_REVIEW_TEXT } from './model-text.ts';
-import { GrowthProposals, readProposalInput } from './proposals.ts';
+import { GrowthProposals, growthProposalArtifactText, readProposalInput } from './proposals.ts';
 
 /** The temporary session id of a self-review; declared by Coo's Persona. */
 export const GROWTH_SESSION = 'growth';
@@ -217,10 +217,11 @@ function proposeGrowthTool(
   done: { proposals: number },
   memory: () => HindsightMemory | null,
   observedSourceIds: ReadonlySet<string>,
+  core: CoreApi,
 ): ToolDef {
   return {
     ...PROPOSE_GROWTH_DECL,
-    handler: async (args) => {
+    handler: async (args, ctx) => {
       if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] No proposal was written.';
       if (done.proposals >= 3) return '[proposal rejected] At most three proposals per review.';
       const parsed = readProposalInput(args);
@@ -229,15 +230,42 @@ function proposeGrowthTool(
       if (unseen) return `[proposal rejected] Source ${unseen} was not returned by memory_search.`;
       const source = memory();
       if (!source?.enabled()) return '[proposal rejected] Long-term memory is unavailable for source verification.';
+      const envelopeMatches = ctx.callId
+        ? core.generationEvidence(ctx.role).filter((envelope) => envelope.sessionId === ctx.role
+            && envelope.outputToolCalls.some((output) => output.toolCallId === ctx.callId))
+        : [];
+      const envelope = envelopeMatches.length === 1 ? envelopeMatches[0] : null;
+      if (!envelope || !source.recordGenerationEvidenceEnvelope(envelope, ctx.callId!)) {
+        return '[proposal rejected] The proposal generation has no complete joined source evidence.';
+      }
+      const expectedEpoch = source.evidenceEpoch();
+      if (!expectedEpoch) return '[proposal rejected] The source epoch is unavailable.';
       for (const sourceId of parsed.proposal.sourceIds) {
         if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] No proposal was written.';
         if (!source.sourceVisible(sourceId) || !await source.hasSource(sourceId) || !source.sourceVisible(sourceId)) {
           return `[proposal rejected] Source ${sourceId} is missing or fenced.`;
         }
       }
-      if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] No proposal was written.';
+      if (state.cancelled || Date.now() >= state.deadline || source.evidenceEpoch() !== expectedEpoch) return '[review cancelled] No proposal was written.';
       const result = store.write(args);
       if (!result.ok) return `[proposal rejected] ${result.errors.join('; ')}`;
+      const registered = await source.registerDerivedArtifactFromSources({
+        artifactId: result.proposal.id,
+        kind: 'growth-proposal',
+        target: `growth-proposals/${result.proposal.id}.json`,
+        content: growthProposalArtifactText(result.proposal),
+        origin: 'model-derived',
+        reviewState: 'unreviewed',
+        creatorOperationId: ctx.callId!,
+        creatorSessionId: envelope.sessionId,
+        creatorGenerationId: envelope.id,
+        sourceIds: [...new Set([...result.proposal.sourceIds, ...envelope.exposedSources.map((entry) => entry.documentId)])],
+        expectedEpoch,
+      });
+      if (!registered) {
+        store.remove(result.proposal.id);
+        return '[proposal rejected] Source provenance changed before the candidate was committed.';
+      }
       done.proposals += 1;
       return `[proposal saved] ${result.proposal.id}`;
     },
@@ -268,10 +296,11 @@ function proposeExperienceTool(
   done: { proposals: number },
   memory: () => HindsightMemory | null,
   observedSourceIds: ReadonlySet<string>,
+  core: CoreApi,
 ): ToolDef {
   return {
     ...PROPOSE_EXPERIENCE_DECL,
-    handler: async (args) => {
+    handler: async (args, ctx) => {
       if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] No experience candidate was written.';
       if (done.proposals >= 3) return '[candidate rejected] At most three candidates per review.';
       const parsed = readExperienceCardInput(args);
@@ -283,6 +312,16 @@ function proposeExperienceTool(
       }
       const source = memory();
       if (!source?.enabled()) return '[candidate rejected] Long-term memory is unavailable for source verification.';
+      const envelopeMatches = ctx.callId
+        ? core.generationEvidence(ctx.role).filter((envelope) => envelope.sessionId === ctx.role
+            && envelope.outputToolCalls.some((output) => output.toolCallId === ctx.callId))
+        : [];
+      const envelope = envelopeMatches.length === 1 ? envelopeMatches[0] : null;
+      if (!envelope || !source.recordGenerationEvidenceEnvelope(envelope, ctx.callId!)) {
+        return '[candidate rejected] The experience generation has no complete joined source evidence.';
+      }
+      const expectedEpoch = source.evidenceEpoch();
+      if (!expectedEpoch) return '[candidate rejected] The source epoch is unavailable.';
       const dates = new Set<string>();
       for (const sourceId of parsed.card.sourceIds) {
         if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] No experience candidate was written.';
@@ -297,12 +336,29 @@ function proposeExperienceTool(
         dates.add(new Date(evidence.occurredAt).toISOString().slice(0, 10));
       }
       if (dates.size < 2) return '[candidate rejected] User-event sources must span different dates.';
-      if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] No experience candidate was written.';
+      if (state.cancelled || Date.now() >= state.deadline || source.evidenceEpoch() !== expectedEpoch) return '[review cancelled] No experience candidate was written.';
       if (!parsed.card.sourceIds.every((sourceId) => source.sourceVisible(sourceId))) {
         return '[candidate rejected] One or more sources are now fenced.';
       }
       const result = store.propose(args);
       if (!result.ok) return `[candidate rejected] ${result.errors.join('; ')}`;
+      const registered = await source.registerDerivedArtifactFromSources({
+        artifactId: result.card.id,
+        kind: 'experience-card',
+        target: `experience-cards/${result.card.id}.json`,
+        content: experienceCardArtifactText(result.card),
+        origin: 'model-derived',
+        reviewState: 'unreviewed',
+        creatorOperationId: ctx.callId!,
+        creatorSessionId: envelope.sessionId,
+        creatorGenerationId: envelope.id,
+        sourceIds: [...new Set([...result.card.sourceIds, ...envelope.exposedSources.map((entry) => entry.documentId)])],
+        expectedEpoch,
+      });
+      if (!registered) {
+        store.remove(result.card.id);
+        return '[candidate rejected] Source provenance changed before the candidate was committed.';
+      }
       done.proposals += 1;
       return `[experience candidate saved] ${result.card.id}`;
     },
@@ -348,8 +404,8 @@ export class GrowthReview {
       tools: [
         ...this.d.tools().filter((tool) => tool.name !== 'memory_search').map((tool) => guardRead(tool, state)),
         guardRead(growthMemorySearchTool(() => memory, observedSourceIds), state),
-        proposeGrowthTool(store, state, done, () => memory, observedSourceIds),
-        proposeExperienceTool(experienceCards, state, done, () => memory, observedSourceIds),
+        proposeGrowthTool(store, state, done, () => memory, observedSourceIds, core),
+        proposeExperienceTool(experienceCards, state, done, () => memory, observedSourceIds, core),
         finishReviewTool(done),
       ],
       stopWhen: () => {

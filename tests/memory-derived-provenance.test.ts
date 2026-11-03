@@ -4,8 +4,10 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import {
   closeMemoryStateStores,
+  memoryArtifactScope,
   MemoryStateStore,
   openMemoryStateStore,
   type DerivedArtifactInput,
@@ -393,5 +395,91 @@ describe('SQLite v4 fail-closed schema checks (B12)', () => {
 
     expect(() => new MemoryStateStore(path)).toThrow('schema 99 is newer than this application');
     expect(versionOf(path)).toBe(99);
+  });
+});
+
+describe('C2-C derived artifact revocation', () => {
+  const activeArtifact = (
+    artifactId: string,
+    scope: string,
+    sources: MemorySourceDependency[],
+  ): DerivedArtifactInput => ({
+    artifactId, kind: 'consumer-fixture', target: `consumer/${artifactId}`, scope,
+    creatorSessionId: null, creatorGenerationId: null, creatorOperationId: `op-${artifactId}`,
+    bodyDigest: digestC, origin: 'user-authored', reviewState: 'approved', lifecycleState: 'active',
+    lineageState: sources.length ? 'complete' : 'source-independent', lineageReceiptDigest: digestB,
+    lineageValidatedAt: at, statusReason: null, createdAt: at, updatedAt: at, sources,
+  });
+
+  it('C2-06 fences one parent and atomically stales only dependent artifacts in that namespace across restart', () => {
+    const path = databasePath();
+    const store = openMemoryStateStore(path);
+    const namespace = memoryArtifactScope('bank-a', 'https://memory-a.test');
+    const dependent = store.saveDerivedArtifact(activeArtifact('derived-multi', namespace, [
+      source({ documentId: 'doc-shared', validatedEpoch: 4, validatedFence: '4' }),
+      source({ documentId: 'doc-second', validatedEpoch: 4, validatedFence: '4' }),
+    ]));
+    const sameIdElsewhere = store.saveDerivedArtifact(activeArtifact('same-id-other-bank',
+      memoryArtifactScope('bank-b', 'https://memory-a.test'),
+      [source({ bankId: 'bank-b', validatedEpoch: 4, validatedFence: '4' })]));
+    const independent = store.saveDerivedArtifact(activeArtifact('source-free', namespace, []));
+    const ledger = new ForgetLedger(store, { now: () => new Date(at) });
+
+    expect(ledger.add({ bankId: 'bank-a', endpoint: 'https://memory-a.test', documentId: 'doc-shared', reason: 'synthetic forget' })).not.toBeNull();
+
+    expect(store.getDerivedArtifact(dependent.artifactId)).toMatchObject({ lifecycleState: 'stale', statusReason: 'source-forgotten' });
+    expect(store.getDerivedArtifact(sameIdElsewhere.artifactId)?.lifecycleState).toBe('active');
+    expect(store.getDerivedArtifact(independent.artifactId)?.lifecycleState).toBe('active');
+    expect(ledger.forgotten('bank-a', 'https://memory-a.test', 'doc-shared')).toBe(true);
+    expect(ledger.forgotten('bank-b', 'https://memory-a.test', 'doc-shared')).toBe(false);
+
+    closeMemoryStateStores();
+    const reopened = openMemoryStateStore(path);
+    expect(reopened.getDerivedArtifact(dependent.artifactId)?.lifecycleState).toBe('stale');
+    expect(reopened.getDerivedArtifact(sameIdElsewhere.artifactId)?.lifecycleState).toBe('active');
+    expect(reopened.getDerivedArtifact(independent.artifactId)?.lineageState).toBe('source-independent');
+    expectIntegrity(path);
+  });
+
+  it('C2-07 marks source dependents stale when a verified revision is linked and keeps other scopes active', () => {
+    const store = openMemoryStateStore(databasePath());
+    const namespace = memoryArtifactScope('bank-a', 'https://memory-a.test');
+    const artifactBeforeRevision = store.saveDerivedArtifact(activeArtifact('revision-dependent', namespace,
+      [source({ documentId: 'doc-old', validatedEpoch: 4, validatedFence: '4' })]));
+    const otherNamespace = store.saveDerivedArtifact(activeArtifact('revision-other-scope',
+      memoryArtifactScope('bank-b', 'https://memory-a.test'),
+      [source({ bankId: 'bank-b', documentId: 'doc-old', validatedEpoch: 4, validatedFence: '4' })]));
+    store.saveOutbox({
+      id: 'revision-event', bankId: 'bank-a', endpoint: 'https://memory-a.test', documentId: 'doc-new',
+      operationId: 'revision-operation', state: 'verified', attempts: 1, nextAttemptAt: at, updatedAt: at,
+      createdAt: at, content: 'synthetic revision', context: 'test', tags: [], metadata: {
+        source_actor: 'user', supersedes_source_ids: JSON.stringify(['doc-old']),
+      }, timestamp: at,
+    });
+
+    expect(store.getDerivedArtifact(artifactBeforeRevision.artifactId)).toMatchObject({
+      lifecycleState: 'stale', statusReason: 'source-revised',
+    });
+    expect(store.getDerivedArtifact(otherNamespace.artifactId)?.lifecycleState).toBe('active');
+  });
+
+  it('C2-07 keeps a wildcard clear fence until the remote clear is confirmed and leaves the namespace stale after release', () => {
+    const store = openMemoryStateStore(databasePath());
+    const namespace = memoryArtifactScope('bank-a', 'https://memory-a.test');
+    const artifactBeforeClear = store.saveDerivedArtifact(activeArtifact('clear-dependent', namespace,
+      [source({ validatedEpoch: 4, validatedFence: '4' })]));
+    const ledger = new ForgetLedger(store, { now: () => new Date(at) });
+    const before = ledger.epoch('bank-a', 'https://memory-a.test');
+
+    expect(ledger.beginClearTarget('bank-a', 'https://memory-a.test')).toBe(true);
+    expect(ledger.bankClearPending('bank-a', 'https://memory-a.test')).toBe(true);
+    expect(ledger.forgotten('bank-a', 'https://memory-a.test', 'unseen-document')).toBe(true);
+    expect(ledger.epoch('bank-a', 'https://memory-a.test')).toBe(before + 1);
+    expect(store.getDerivedArtifact(artifactBeforeClear.artifactId)?.lifecycleState).toBe('stale');
+
+    expect(ledger.finishClearTarget('bank-a', 'https://memory-a.test')).toBe(true);
+    expect(ledger.bankClearPending('bank-a', 'https://memory-a.test')).toBe(false);
+    expect(ledger.stale('bank-a', 'https://memory-a.test')).toBe(true);
+    expect(store.getDerivedArtifact(artifactBeforeClear.artifactId)?.lifecycleState).toBe('stale');
   });
 });

@@ -6,21 +6,21 @@ import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { HindsightClient } from '@vectorize-io/hindsight-client';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { CoreApi, World, WorldHost } from 'cortico/core/types.ts';
+import type { CoreApi, ToolDef, World, WorldHost } from 'cortico/core/types.ts';
 import { inspectContextEvidence } from 'cortico/core/evidence.ts';
 import { message } from 'cortico/protocol/open-responses/context.ts';
 import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import { Core } from '../vendor/cortico/tests/core/fixture-core.ts';
-import { FakeLLM, makeCfg, makeFakeIO, makeLoaded, textReply, toolReply } from '../vendor/cortico/tests/core/helpers.ts';
+import { FakeLLM, makeCfg, makeFakeIO, makeLoaded, makeTool, textReply, toolReply } from '../vendor/cortico/tests/core/helpers.ts';
 import { coopanionPersona, PARTNER_FILE } from '../core/persona.ts';
-import { ExperienceCards } from '../core/growth/experience-cards.ts';
+import { ExperienceCards, experienceCardArtifactText } from '../core/growth/experience-cards.ts';
 import { HindsightMemory } from '../core/memory/hindsight.ts';
 import { loadHindsightConfig } from '../core/memory/config.ts';
 import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import { MemoryOutbox } from '../core/memory/outbox.ts';
 import { closeMemoryStateStores, openMemoryStateStore } from '../core/memory/state-store.ts';
-import { partnerProvenancePath, partnerSegmentDigest, partnerSourceScopeDigest, partnerWorkspaceDigest, writePartnerProvenance } from '../core/memory/partner-provenance.ts';
+import { partnerProvenancePath, partnerSegmentDigest, partnerSourceScopeDigest, partnerWorkspaceDigest, readPartnerProvenance, writePartnerProvenance } from '../core/memory/partner-provenance.ts';
 
 const SOURCE_TEXT = 'The person prefers jasmine tea.';
 const roots: string[] = [];
@@ -114,7 +114,7 @@ async function buildRig(
   sourceAvailable: boolean,
   factText?: string,
   beforeDocumentRead?: () => Promise<void>,
-  options: { partnerSummary?: string } = {},
+  options: { partnerSummary?: string; partnerUserNote?: string; tools?: ToolDef[] } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'coo-memory-evidence-consumer-'));
   roots.push(root);
@@ -140,14 +140,21 @@ async function buildRig(
   const Persona = coopanionPersona(Cormini, { memory, ...(growthStateFile ? { growthStateFile } : {}) });
   const persona = new Persona({ memoryDir });
   if (options.partnerSummary) {
-    writeFileSync(join(memoryDir, PARTNER_FILE), `${options.partnerSummary}\n`, 'utf8');
+    const partnerText = [options.partnerSummary, options.partnerUserNote].filter(Boolean).join('\n\n');
+    writeFileSync(join(memoryDir, PARTNER_FILE), `${partnerText}\n`, 'utf8');
     writePartnerProvenance(partnerProvenancePath(join(root, 'growth'), memoryDir), {
       v: 1,
       workspaceDigest: partnerWorkspaceDigest(memoryDir),
-      entries: [{
-        id: '00000000-0000-0000-0000-000000000001', segmentDigest: partnerSegmentDigest(options.partnerSummary), origin: 'derived',
-        sourceIds: ['doc-1'], sourceScopeDigest: partnerSourceScopeDigest('fixture-bank', server.baseUrl), state: 'current',
-      }],
+      entries: [
+        {
+          id: '00000000-0000-0000-0000-000000000001', segmentDigest: partnerSegmentDigest(options.partnerSummary), origin: 'derived',
+          sourceIds: ['doc-1'], sourceScopeDigest: partnerSourceScopeDigest('fixture-bank', server.baseUrl), state: 'current',
+        },
+        ...(options.partnerUserNote ? [{
+          id: '00000000-0000-0000-0000-000000000002', segmentDigest: partnerSegmentDigest(options.partnerUserNote), origin: 'user-authored' as const,
+          sourceIds: [], sourceScopeDigest: null, state: 'current' as const,
+        }] : []),
+      ],
     });
   }
   persona.onOpening = () => {};
@@ -155,7 +162,7 @@ async function buildRig(
   const attach = persona.attach.bind(persona);
   persona.attach = (value) => { api = value; attach(value); };
   let host: WorldHost | null = null;
-  const world = makeFakeIO('desktop-pet');
+  const world = makeFakeIO('desktop-pet', options.tools ?? []);
   const startWorld = world.start?.bind(world);
   world.start = async (currentHost) => { host = currentHost; await startWorld?.(currentHost); };
   const llm = new FakeLLM();
@@ -581,7 +588,22 @@ describe('Memory source evidence through the real Core consumer', () => {
       scope: 'conversation', sourceIds: ['doc-1'],
     });
     if (!created.ok) throw new Error(created.errors.join('; '));
+    const expectedEpoch = rig.memory.evidenceEpoch();
+    if (!expectedEpoch) throw new Error('Memory evidence epoch is unavailable');
+    const artifact = await rig.memory.registerDerivedArtifactFromSources({
+      artifactId: created.card.id,
+      kind: 'experience-card',
+      target: `experience-cards/${created.card.id}.json`,
+      content: experienceCardArtifactText(created.card),
+      origin: 'user-authored',
+      reviewState: 'unreviewed',
+      creatorOperationId: `test-experience:${created.card.id}`,
+      sourceIds: created.card.sourceIds,
+      expectedEpoch,
+    });
+    if (!artifact) throw new Error('Experience artifact provenance was not saved');
     cards.transition(created.card.id, 'approved');
+    rig.memory.setDerivedArtifactReviewState(created.card.id, 'approved');
     const Persona = coopanionPersona(Cormini, { memory: rig.memory, growthStateFile: join(rig.memoryDir, 'growth.json') });
     const persona = new Persona({ memoryDir: rig.memoryDir });
     const context = await (persona as unknown as { experienceContext(): Promise<{ text: string; evidence: Array<{ documentId: string; validationStatus: string }> }> }).experienceContext();
@@ -589,6 +611,109 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(context.text).toContain('Offer jasmine tea.');
     expect(context.evidence.map((attachment) => attachment.documentId)).toEqual(['doc-1']);
     expect(context.evidence.every((attachment) => attachment.validationStatus === 'validated')).toBe(true);
+
+    const original = rig.memory as unknown as { config: unknown; client: unknown };
+    closeMemoryStateStores();
+    const reopenedStore = openMemoryStateStore(join(rig.memoryDir, 'memory-state.sqlite'));
+    const reopenedMemory = new HindsightMemory();
+    Object.assign(reopenedMemory, {
+      config: original.config,
+      client: original.client,
+      stateStore: reopenedStore,
+      outbox: new MemoryOutbox(reopenedStore),
+      ledger: new ForgetLedger(reopenedStore),
+      ready: true,
+      unavailableUntil: 0,
+    });
+    expect(reopenedMemory.derivedArtifact(created.card.id)).toMatchObject({
+      lifecycleState: 'active', reviewState: 'approved', lineageState: 'complete',
+      sources: [expect.objectContaining({ documentId: 'doc-1', validationState: 'validated' })],
+    });
+    expect(await reopenedMemory.verifyDerivedArtifact(created.card.id, experienceCardArtifactText(created.card))).toBe(true);
+  });
+
+  it('persists Coo output as withheld when its tool call has no joined source envelope', async () => {
+    const rig = await buildRig(true);
+    const text = 'Coo gave an answer without source mapping.';
+    const digest = createHash('sha256').update(text, 'utf8').digest('hex');
+    const documentId = `coo:main:call-unmapped:${digest.slice(0, 8)}`;
+    rig.memory.retainCoo(text, { session: 'main', callId: 'call-unmapped' });
+
+    const state = rig.memory as unknown as {
+      stateStore: ReturnType<typeof openMemoryStateStore>;
+      outbox: MemoryOutbox;
+    };
+    expect(state.stateStore.getDerivedArtifact(`coo-output:${documentId}`)).toMatchObject({
+      lifecycleState: 'withheld', lineageState: 'unknown', reviewState: 'unreviewed',
+      target: documentId, bodyDigest: digest,
+    });
+    expect(state.outbox.matching((item) => item.documentId === documentId)).toEqual([]);
+    expect(rig.memory.sourceVisible(documentId)).toBe(false);
+  });
+
+  it('uses the matching Core generation envelope for a successful Coo output call', async () => {
+    const rig = await buildRig(true, undefined, undefined, {
+      tools: [makeTool('pet_say', 'The controlled fake pet accepted the script.')],
+    });
+    rig.llm.queue.splice(0, rig.llm.queue.length);
+    const text = 'A source-free line from Coo.';
+    rig.llm.script(toolReply([{ name: 'pet_say', args: { script: text }, id: 'pet-say-call' }]), textReply('Done.'));
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(),
+      text: 'Say hello.', meta: { text: 'Say hello.' },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.llm.calls.length === 2);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+
+    const envelope = rig.api().generationEvidence('main').find((entry) =>
+      entry.outputToolCalls.some((output) => output.toolCallId === 'pet-say-call'));
+    expect(envelope).toMatchObject({
+      requestState: 'sent', responseJoinState: 'matched', mappingState: 'missing',
+      exposedSources: [], actualEvidenceUsed: 'unknown',
+      outputToolCalls: [expect.objectContaining({ toolCallId: 'pet-say-call', joinState: 'matched' })],
+    });
+    if (!envelope) throw new Error('Core did not retain the pet_say generation envelope');
+    rig.persona.retainCooOutput(text, { session: 'main', callId: 'pet-say-call' });
+
+    const digest = createHash('sha256').update(text, 'utf8').digest('hex');
+    const documentId = `coo:main:pet-say-call:${digest.slice(0, 8)}`;
+    const state = rig.memory as unknown as {
+      stateStore: ReturnType<typeof openMemoryStateStore>;
+      outbox: MemoryOutbox;
+    };
+    expect(state.stateStore.getGenerationEvidence(envelope.sessionId, envelope.id)).toMatchObject({
+      mappingState: 'missing', actualEvidenceUsed: 'unknown', sources: [],
+    });
+    expect(state.stateStore.getDerivedArtifact(`coo-output:${documentId}`)).toMatchObject({
+      lifecycleState: 'withheld', lineageState: 'missing', bodyDigest: digest,
+    });
+    expect(state.outbox.matching((item) => item.documentId === documentId)).toEqual([]);
+    expect(rig.memory.sourceVisible(documentId)).toBe(false);
+  });
+
+  it('keeps a user-authored PARTNER paragraph when a derived paragraph is forgotten', async () => {
+    const derivedSummary = 'Derived paragraph from the jasmine tea source.';
+    const userNote = 'User-authored note: ask before scheduling a call.';
+    const rig = await buildRig(true, undefined, undefined, {
+      partnerSummary: derivedSummary, partnerUserNote: userNote,
+    });
+    const persona = rig.persona as unknown as {
+      ensurePartnerArtifacts(): Promise<void>;
+      partnerDocumentForRead(): string;
+    };
+    await persona.ensurePartnerArtifacts();
+    expect(persona.partnerDocumentForRead()).toContain(derivedSummary);
+    expect(persona.partnerDocumentForRead()).toContain(userNote);
+
+    await rig.memory.forgetDocument('doc-1');
+    expect(persona.partnerDocumentForRead()).toContain(userNote);
+    expect(persona.partnerDocumentForRead()).not.toContain(derivedSummary);
+    expect(readFileSync(join(rig.memoryDir, PARTNER_FILE), 'utf8')).toContain(derivedSummary);
+    expect(readFileSync(join(rig.memoryDir, PARTNER_FILE), 'utf8')).toContain(userNote);
+    const sidecar = readPartnerProvenance(partnerProvenancePath(join(rig.root, 'growth'), rig.memoryDir), partnerWorkspaceDigest(rig.memoryDir));
+    expect(sidecar.status).toBe('ok');
+    if (sidecar.status !== 'ok') throw new Error('synthetic PARTNER sidecar should remain readable');
+    expect(sidecar.file.entries.map((entry) => entry.state)).toEqual(['stale', 'current']);
   });
 
   it('keeps an earlier handoff note from entering the source-free compatibility path', async () => {

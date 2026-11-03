@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { CoreApi, ForkOptions, TimerEntry, TimersApi, ToolDef } from 'cortico/core/types.ts';
+import type { CoreApi, ForkOptions, GenerationEvidenceEnvelope, TimerEntry, TimersApi, ToolDef } from 'cortico/core/types.ts';
 import { message, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
@@ -67,6 +67,47 @@ function memoryRead(sourceIds: string[], text = '[memory] Synthetic dated event 
   trace: { format: { includedSourceDocumentIds: string[] } };
 } {
   return { text, status: 'found', trace: { format: { includedSourceDocumentIds: sourceIds } } };
+}
+
+function generationEnvelope(toolCallId: string): GenerationEvidenceEnvelope {
+  return {
+    id: `generation:${toolCallId}`,
+    sessionId: GROWTH_SESSION,
+    sessionGenerationToken: `generation-token:${toolCallId}`,
+    providerGenerationId: `provider-generation:${toolCallId}`,
+    providerAttemptId: `provider-attempt:${toolCallId}`,
+    responseId: `response:${toolCallId}`,
+    responseJoinState: 'matched',
+    requestState: 'sent',
+    exposedSources: [],
+    mappingState: 'complete',
+    actualEvidenceUsed: 'unknown',
+    outputToolCalls: [{
+      toolCallId,
+      responseId: `response:${toolCallId}`,
+      outputDigest: 'a'.repeat(64),
+      joinState: 'matched',
+    }],
+    items: [{
+      itemId: `input:${toolCallId}`,
+      disposition: 'provably-source-independent',
+      mappingState: 'complete',
+      exposedSources: [],
+      spans: [{
+        start: 0, end: 1, digest: 'b'.repeat(64), origin: 'user-input', mappingState: 'complete',
+        exposedSources: [], serializedRanges: [],
+      }],
+    }],
+    serializedBodyDigest: 'c'.repeat(64),
+  };
+}
+
+function generationMemoryMethods() {
+  return {
+    evidenceEpoch: () => '0:0',
+    recordGenerationEvidenceEnvelope: () => true,
+    registerDerivedArtifactFromSources: async (input: { artifactId: string }) => ({ artifactId: input.artifactId }),
+  };
 }
 
 afterEach(() => {
@@ -491,13 +532,14 @@ describe('the growth review session', () => {
         sourceIds: ['user-turn-42'],
         risk: 'low',
         changes: [{ file: 'CONSTITUTION.md', from: 'old line', to: 'new line', reason: 'the person asked for quiet' }],
-      }, {} as never);
+      }, { role: GROWTH_SESSION, callId: 'growth-proposal-call' } as never);
       expect(result).toContain('[proposal saved]');
       await finish.handler({ note: 'proposed focus mode' }, {} as never);
       return '';
     });
     const core = {
       sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
+      generationEvidence: () => [generationEnvelope('growth-proposal-call')],
       spawnFork,
       spawnForkWithOutcome: vi.fn(async (opts: ForkOptions) => ({ status: 'completed' as const, text: await spawnFork(opts) })),
     } as unknown as CoreApi;
@@ -508,6 +550,7 @@ describe('the growth review session', () => {
       hasSource: async () => true,
       recallBlockDetailed: async () => memoryRead(['user-turn-42']),
       selfPortrait: async () => '',
+      ...generationMemoryMethods(),
     } as unknown as HindsightMemory;
     const review = new GrowthReview({
       core: () => core,
@@ -541,7 +584,7 @@ describe('the growth review session', () => {
         lesson: 'Wait before routine interruptions.',
         scope: 'proactive_speech',
         sourceIds: ['user:focus-1', 'user:focus-2'],
-      }, {} as never);
+      }, { role: GROWTH_SESSION, callId: 'experience-proposal-call' } as never);
       expect(saved).toContain('[experience candidate saved]');
       expect(await propose.handler({
         title: 'Unsearched source', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation',
@@ -550,20 +593,26 @@ describe('the growth review session', () => {
       hiddenSources.add('user:forgotten');
       expect(await propose.handler({
         title: 'Forgotten source', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation', sourceIds: ['user:focus-1', 'user:forgotten'],
-      }, {} as never)).toContain('[candidate rejected] Source user:forgotten is missing or fenced.');
+      }, { role: GROWTH_SESSION, callId: 'experience-forgotten-call' } as never)).toContain('[candidate rejected] Source user:forgotten is missing or fenced.');
       expect(await propose.handler({
         title: 'Same-day repeats', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation',
         sourceIds: ['user:focus-1', 'user:focus-same-day'],
-      }, {} as never)).toContain('[candidate rejected] User-event sources must span different dates.');
+      }, { role: GROWTH_SESSION, callId: 'experience-same-day-call' } as never)).toContain('[candidate rejected] User-event sources must span different dates.');
       expect(await propose.handler({
         title: 'Undated event', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation',
         sourceIds: ['user:focus-1', 'user:undated'],
-      }, {} as never)).toContain('has no verifiable user-event date');
+      }, { role: GROWTH_SESSION, callId: 'experience-undated-call' } as never)).toContain('has no verifiable user-event date');
       await finish.handler({ note: 'saved a recurring experience' }, {} as never);
       return '';
     });
     const core = {
       sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
+      generationEvidence: () => [
+        generationEnvelope('experience-proposal-call'),
+        generationEnvelope('experience-forgotten-call'),
+        generationEnvelope('experience-same-day-call'),
+        generationEnvelope('experience-undated-call'),
+      ],
       spawnFork,
       spawnForkWithOutcome: vi.fn(async (opts: ForkOptions) => ({ status: 'completed' as const, text: await spawnFork(opts) })),
     } as unknown as CoreApi;
@@ -574,6 +623,7 @@ describe('the growth review session', () => {
       enabled: () => true,
       sourceVisible: (id: string) => !hiddenSources.has(id),
       hasSource: async (id: string) => !hiddenSources.has(id),
+      ...generationMemoryMethods(),
       sourceEvidence: async (id: string) => hiddenSources.has(id)
         ? { present: false, visible: false, actor: null, status: null }
         : id === 'user:undated'

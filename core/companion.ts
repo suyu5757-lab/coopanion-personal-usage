@@ -874,7 +874,7 @@ export async function main(): Promise<void> {
         : input.tool === 'pet_ask' && typeof input.args.question === 'string'
           ? cleanSpeech(input.args.question)
           : '';
-      if (said) longTerm.retainCoo(said, { session: input.role, callId: entry.call, timestamp: entry.ts });
+      if (said) coo?.retainCooOutput(said, { session: input.role, callId: entry.call, timestamp: entry.ts });
     }
     return entry;
   };

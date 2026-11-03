@@ -587,6 +587,10 @@ export function stateDatabasePath(file: string): string {
   return ['.sqlite', '.db'].includes(extname(path)) ? path : resolve(dirname(path), 'memory-state.sqlite');
 }
 
+export function memoryArtifactScope(bankId: string, endpoint: string): string {
+  return JSON.stringify([requiredText(bankId, 'bankId'), requiredText(endpoint, 'endpoint')]);
+}
+
 const stores = new Map<string, MemoryStateStore>();
 
 export function openMemoryStateStore(file: string): MemoryStateStore {
@@ -746,6 +750,9 @@ export class MemoryStateStore {
       `);
       for (const sourceId of new Set(supersededDocumentIds.filter(Boolean))) {
         insert.run(eventId, item.bank_id, item.endpoint, item.document_id, sourceId, state, item.updated_at);
+        if (state === 'active') {
+          this.markDerivedArtifactsForSource(item.bank_id, item.endpoint, sourceId, 'source-revised', item.updated_at);
+        }
       }
       return true;
     });
@@ -763,10 +770,11 @@ export class MemoryStateStore {
     return rows.map((row) => row.document_id);
   }
 
-  loadForgetState(): { state: ForgetStateSnapshot | null; damaged: boolean } {
+  loadForgetState(): { state: ForgetStateSnapshot | null; damaged: boolean; blocked: boolean } {
     this.assertOpen();
-    if (this.meta('forget:present') !== '1') return { state: null, damaged: this.meta('forget:damaged') === '1' };
-    if (this.meta('forget:damaged') === '1') return { state: null, damaged: true };
+    const blocked = this.meta('forget:write-blocked') === '1';
+    if (this.meta('forget:present') !== '1') return { state: null, damaged: this.meta('forget:damaged') === '1', blocked };
+    if (this.meta('forget:damaged') === '1') return { state: null, damaged: true, blocked };
     try {
       const tasks = (this.db.prepare('SELECT record_json FROM memory_deletions ORDER BY task_id').all() as Array<{ record_json: string }>)
         .map((row) => JSON.parse(row.record_json) as Record<string, unknown>);
@@ -790,10 +798,15 @@ export class MemoryStateStore {
           stale,
         },
         damaged: false,
+        blocked,
       };
     } catch {
-      return { state: null, damaged: true };
+      return { state: null, damaged: true, blocked };
     }
+  }
+
+  markForgetWriteBlocked(): void {
+    this.transaction(() => this.setMeta('forget:write-blocked', '1'));
   }
 
   saveForgetState(state: ForgetStateSnapshot): void {
@@ -1138,6 +1151,27 @@ export class MemoryStateStore {
     });
   }
 
+  setDerivedArtifactReviewState(
+    artifactId: string,
+    reviewState: DerivedArtifactReviewState,
+    updatedAt: string,
+  ): DerivedArtifact | null {
+    if (!['unreviewed', 'approved', 'rejected', 'unknown'].includes(reviewState)) {
+      throw new Error('derived artifact reviewState is invalid');
+    }
+    return this.transaction(() => {
+      const current = this.readDerivedArtifact(requiredText(artifactId, 'artifactId'));
+      if (!current) return null;
+      if (reviewState === 'approved' && current.lifecycleState !== 'active') {
+        throw new Error('a non-active derived artifact cannot be approved');
+      }
+      this.db.prepare(`
+        UPDATE derived_artifact SET review_state = ?, updated_at = ? WHERE artifact_id = ?
+      `).run(reviewState, validTimestamp(updatedAt, 'updatedAt'), current.artifactId);
+      return this.readDerivedArtifact(current.artifactId);
+    });
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -1326,6 +1360,9 @@ export class MemoryStateStore {
       if (typeof item.bankId !== 'string' || typeof item.endpoint !== 'string') continue;
       revision.run(item.id, item.bankId, item.endpoint, item.documentId, sourceId, revisionState,
         typeof item.createdAt === 'string' ? item.createdAt : item.updatedAt);
+      if (revisionState === 'active') {
+        this.markDerivedArtifactsForSource(item.bankId, item.endpoint, sourceId, 'source-revised', item.updatedAt);
+      }
     }
   }
 
@@ -1338,8 +1375,41 @@ export class MemoryStateStore {
 
   private isFenced(bankId: string, endpoint: string, documentId: string): boolean {
     return !!this.db.prepare(`
-      SELECT 1 AS fenced FROM memory_fences WHERE bank_id = ? AND endpoint = ? AND document_id = ?
+      SELECT 1 AS fenced FROM memory_fences
+      WHERE bank_id = ? AND endpoint = ? AND document_id IN (?, '*')
     `).get(bankId, endpoint, documentId);
+  }
+
+  private markDerivedArtifactsForSource(
+    bankId: string,
+    endpoint: string,
+    documentId: string,
+    reason: string,
+    updatedAt: string,
+  ): void {
+    this.db.prepare(`
+      UPDATE derived_artifact SET lifecycle_state = 'stale', status_reason = ?, updated_at = ?
+      WHERE lifecycle_state NOT IN ('stale', 'withdrawn')
+        AND (target = ? AND scope = ? OR artifact_id IN (
+          SELECT artifact_id FROM derived_artifact_source
+          WHERE bank_id = ? AND endpoint = ? AND document_id = ?
+        ))
+    `).run(reason, updatedAt, documentId, memoryArtifactScope(bankId, endpoint), bankId, endpoint, documentId);
+  }
+
+  private markDerivedArtifactsForNamespace(
+    bankId: string,
+    endpoint: string,
+    reason: string,
+    updatedAt: string,
+  ): void {
+    this.db.prepare(`
+      UPDATE derived_artifact SET lifecycle_state = 'stale', status_reason = ?, updated_at = ?
+      WHERE lifecycle_state NOT IN ('stale', 'withdrawn')
+        AND (scope = ? OR artifact_id IN (
+          SELECT artifact_id FROM derived_artifact_source WHERE bank_id = ? AND endpoint = ?
+        ))
+    `).run(reason, updatedAt, memoryArtifactScope(bankId, endpoint), bankId, endpoint);
   }
 
   private activationRow(bankId: string, endpoint: string, documentId: string): ActivationState | null {
@@ -1450,6 +1520,14 @@ export class MemoryStateStore {
       const bankId = entry.bankId as string;
       const endpoint = entry.endpoint as string;
       const documentId = entry.documentId as string;
+      const at = entry.at as string;
+      if (documentId === '*') {
+        this.markDerivedArtifactsForNamespace(bankId, endpoint, 'bank-cleared', at);
+        this.db.prepare('DELETE FROM memory_activation WHERE bank_id = ? AND endpoint = ?').run(bankId, endpoint);
+        this.db.prepare('DELETE FROM memory_mention_events WHERE bank_id = ? AND endpoint = ?').run(bankId, endpoint);
+        continue;
+      }
+      this.markDerivedArtifactsForSource(bankId, endpoint, documentId, 'source-forgotten', at);
       const dependents = mentionsForSource.all(bankId, endpoint, documentId) as Array<{ target_document_id: string }>;
       for (const dependent of dependents) deleteActivation.run(bankId, endpoint, dependent.target_document_id);
       deleteActivation.run(bankId, endpoint, documentId);
@@ -1467,6 +1545,7 @@ export class MemoryStateStore {
     }
     this.setMeta('forget:present', '1');
     this.setMeta('forget:damaged', damaged ? '1' : '0');
+    this.setMeta('forget:write-blocked', '0');
   }
 
   private meta(key: string): string | null {

@@ -15,6 +15,7 @@ function setup(answer = 'A warm, quiet day with tea and a short chat.') {
   const memory = {
     enabled: () => true,
     settled: () => true,
+    evidenceEpoch: () => '0:0',
     reflect,
     retainJournal,
     refreshModel,
@@ -47,6 +48,28 @@ describe('daily relationship journal', () => {
     writeFileSync(join(rootDir, 'journal.json'), JSON.stringify({ lastDay: '2026-10-22' }));
     await journal.runDue();
     expect(retainJournal).toHaveBeenCalledWith(expect.stringContaining('A quiet day'), '2026-10-23');
+  });
+
+  it('drops a reflection callback whose source epoch changed while it was running', async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), 'coo-journal-race-'));
+    let epoch = '0:0';
+    const retainJournal = vi.fn();
+    const memory = {
+      enabled: () => true,
+      settled: () => true,
+      evidenceEpoch: () => epoch,
+      reflect: async () => { epoch = '0:1'; return 'A reflection from before Forget.'; },
+      retainJournal,
+      refreshModel: vi.fn(async () => {}),
+    } as unknown as HindsightMemory;
+    writeFileSync(join(rootDir, 'journal.json'), JSON.stringify({ lastDay: '2026-10-22' }));
+    const journal = new RelationshipJournal();
+    journal.configure({ memory, rootDir, timezone: 'UTC', enabled: true, now });
+
+    await journal.runDue();
+
+    expect(retainJournal).not.toHaveBeenCalled();
+    expect(readFileSync(join(rootDir, 'journal.json'), 'utf8')).toContain('2026-10-22');
   });
 
   it('does nothing when disabled', async () => {

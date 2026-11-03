@@ -113,10 +113,12 @@ export class RelationshipJournal {
           + 'Use that day\'s affection events, affinity changes and long-term memories. '
           + 'If nothing happened, say it was a quiet day. '
           + 'Two to four sentences, first person, warm and concrete. No diagnosis, no heading, no bullet list.';
+        const expectedEpoch = memory.evidenceEpoch();
+        if (!expectedEpoch) return;
         const answer = await memory.reflect(question, { tags: ['scope:affection'], tagsMatch: 'any', timeoutMs: 120_000 });
         // A forget during the reflection makes the answer unusable, and a journal entry would
         // carry the forgotten source into a new document.
-        if (!memory.settled()) return;
+        if (!memory.settled() || memory.evidenceEpoch() !== expectedEpoch) return;
         const text = answer || 'A quiet day. Nothing much happened, and that was fine.';
         memory.retainJournal(text, day);
         this.writeLastDay(day);
