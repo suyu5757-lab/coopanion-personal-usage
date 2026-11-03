@@ -2819,6 +2819,10 @@ export class HindsightMemory {
     this.clearReadCache();
   }
 
+  forgetRecoveryBlocked(): boolean {
+    return this.config?.enabled === true && (!!this.storageError || this.ledger?.damaged() === true);
+  }
+
   async forget(query: string): Promise<ForgetResult> {
     const asked = query.trim();
     if (!asked) return { acceptance: 'not-found', local: 0, deleted: 0, pending: 0, failed: 0, activeContextInvalidated: false };
@@ -2906,6 +2910,7 @@ export class HindsightMemory {
   }
 
   private async forgetMatching(asked: string): Promise<ForgetResult> {
+    if (this.storageError) return { acceptance: 'unknown-blocked', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
     if (!this.config || !this.ledger) return { acceptance: 'not-accepted', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
     const outbox = this.outbox;
     const ledger = this.ledger;
@@ -2967,6 +2972,9 @@ export class HindsightMemory {
     }
 
     const intent = inputs.length > 0 ? ledger.beginIntents(inputs, reason) : null;
+    if (!intent && ledger.damaged()) {
+      return { acceptance: 'unknown-blocked', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
+    }
     if (intent && intent.acceptance !== 'accepted') {
       return { acceptance: intent.acceptance, local: 0, deleted: 0, pending: 0, failed: intent.failed, activeContextInvalidated: false };
     }
@@ -3088,6 +3096,7 @@ export class HindsightMemory {
   /** Forget exactly one source event; no unrelated recent item is touched. */
   async forgetDocument(documentId: string): Promise<ForgetResult> {
     if (!documentId) return { acceptance: 'not-found', local: 0, deleted: 0, pending: 0, failed: 0, activeContextInvalidated: false };
+    if (this.storageError) return { acceptance: 'unknown-blocked', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
     if (!this.config || !this.ledger) return { acceptance: 'not-accepted', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
     const outbox = this.outbox;
     const ledger = this.ledger;

@@ -633,10 +633,31 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return !path || path === '.' || path.startsWith('../') || isAbsolute(path) ? null : path;
     }
 
+    private workspaceResolvedReadPath(path: string): string | null {
+      try {
+        const root = realpathSync.native(this.memoryDir);
+        const target = realpathSync.native(join(root, path));
+        return insidePath(root, target) ? relative(root, target).split(sep).join('/') : null;
+      } catch {
+        return path;
+      }
+    }
+
     private searchMayIncludeProvenance(path: string | null): boolean {
-      if (path === null || path === '.') return true;
+      if (!path || path === '.') return true;
       const protectedPaths = [PARTNER_FILE, PARTNER_DIR, 'handoffs'];
       return protectedPaths.some((protectedPath) => path === protectedPath || path.startsWith(`${protectedPath}/`) || protectedPath.startsWith(`${path}/`));
+    }
+
+    private workspaceSearchContainsLinks(path: string): boolean {
+      const target = join(this.memoryDir, path);
+      if (!existsSync(target)) return false;
+      try {
+        return statSync(target).isDirectory()
+          && readdirSync(target, { recursive: true, withFileTypes: true }).some((entry) => entry.isSymbolicLink());
+      } catch {
+        return true;
+      }
     }
 
     private partnerProvenanceResult(source?: string) {
@@ -918,20 +939,27 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
               return `[workspace read failed] Git metadata is not available through workspace tools.`;
             }
             const path = this.workspaceRelativePath(args[pathArgument]);
-            if (tool.name === 'read_file' && path === PARTNER_FILE) {
+            const resolved = path && (tool.name === 'read_file' || tool.name === 'grep_files')
+              ? this.workspaceResolvedReadPath(path) : path;
+            if (path && resolved === null) {
+              return '[workspace read failed] The resolved path is unavailable through workspace tools.';
+            }
+            if (tool.name === 'read_file' && (path === PARTNER_FILE || resolved === PARTNER_FILE)) {
               await this.ensurePartnerArtifacts();
               return this.partnerDocumentForRead();
             }
-            if (tool.name === 'read_file' && path?.startsWith(HANDOFF_DIR)) {
+            if (tool.name === 'read_file' && (path?.startsWith(HANDOFF_DIR) || resolved?.startsWith(HANDOFF_DIR))) {
               await this.recoverHandoffFiles();
               return '[read failed] This workspace area is withheld until its content has provenance sidecar entries.';
             }
-            if (tool.name === 'read_file' && path
-              && path.startsWith(`${PARTNER_DIR}/`)) {
+            if (tool.name === 'read_file' && (path?.startsWith(`${PARTNER_DIR}/`) || resolved?.startsWith(`${PARTNER_DIR}/`))) {
               return '[read failed] This workspace area is withheld until its content has provenance sidecar entries.';
             }
-            if (tool.name === 'grep_files' && this.searchMayIncludeProvenance(path)) {
+            if (tool.name === 'grep_files' && (this.searchMayIncludeProvenance(path) || this.searchMayIncludeProvenance(resolved))) {
               return '[search failed] The requested scope may include partner or handoff notes; read only eligible files directly.';
+            }
+            if (tool.name === 'grep_files' && path && this.workspaceSearchContainsLinks(path)) {
+              return '[search failed] The requested directory contains links whose contents cannot be verified; search an eligible file directly.';
             }
             const result = await tool.handler(args, ctx);
             return workspaceReadResult(path ?? '.', result);

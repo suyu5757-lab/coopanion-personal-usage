@@ -9,6 +9,7 @@ import { MemoryOutbox, type RetainItem } from '../core/memory/outbox.ts';
 import { closeMemoryStateStores } from '../core/memory/state-store.ts';
 import { OutboxDelivery } from '../core/memory/delivery.ts';
 import { HindsightMemory, type MemorySearchRead, type MemoryTextRead } from '../core/memory/hindsight.ts';
+import { memoryTools } from '../core/memory/tools.ts';
 import { ExperienceCards } from '../core/growth/experience-cards.ts';
 import { GrowthProposals } from '../core/growth/proposals.ts';
 import { partnerProvenancePath, partnerSegmentDigest, partnerSourceScopeDigest, partnerWorkspaceDigest, readPartnerProvenance, writePartnerProvenance } from '../core/memory/partner-provenance.ts';
@@ -492,6 +493,26 @@ describe('the fence covers reads and writes', () => {
     memory.client = null;
     memory.ledger = null;
     expect(memory.sourceVisible('doc-1')).toBe(false);
+  });
+
+  it('reports a damaged Forget ledger as recovery blocked through Memory and its tool', async () => {
+    const root = dir();
+    const file = join(root, 'forget.json');
+    writeFileSync(file, '{broken');
+    const ledger = new ForgetLedger(file);
+    const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
+    outbox.add(item({ documentId: 'trip', content: 'synthetic trip to Hangzhou' }));
+    const memory = memoryWith(outbox, ledger, {});
+    const blocked = { acceptance: 'unknown-blocked', local: 0, deleted: 0, pending: 0, failed: 1 };
+
+    await expect(memory.forgetDocument('trip')).resolves.toMatchObject(blocked);
+    await expect(memory.forget('synthetic trip')).resolves.toMatchObject(blocked);
+    await expect(memory.forget('absent topic')).resolves.toMatchObject(blocked);
+    const tool = memoryTools({ memory: () => memory as unknown as HindsightMemory }).find((entry) => entry.name === 'memory_forget')!;
+    const output = await tool.handler({ query: 'absent topic' }, {} as never);
+    expect(output).toContain('[forget recovery blocked]');
+    expect(output).toContain('Memory remains blocked');
+    expect(outbox.matching((entry) => entry.documentId === 'trip')).toHaveLength(1);
   });
 
   it('does not return a source the service hands back after the deletion', async () => {

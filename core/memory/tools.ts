@@ -154,7 +154,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
       },
       handler: async (args) => {
         const memory = deps.memory();
-        if (!memory?.enabled()) return '[memory] Long-term memory is not available.';
+        if (!memory || (!memory.enabled() && !memory.forgetRecoveryBlocked())) return '[memory] Long-term memory is not available.';
         const result = await memory.forget(text(args, 'query'));
         const total = result.local + result.deleted + result.pending + result.failed;
         if (result.acceptance === 'not-found' || (total === 0 && !result.acceptance)) return '[forget not found] Nothing matching was found to forget.';

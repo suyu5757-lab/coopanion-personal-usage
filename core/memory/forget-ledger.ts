@@ -288,7 +288,7 @@ export class ForgetLedger {
     if (unique.length === 0) return { acceptance: 'not-accepted', tasks: [], failed: 0 };
     if (this.damagedLedger || !this.stateStore) {
       this.persistenceError ??= `could not write the memory database: ${this.initializationError ?? 'forget state is damaged'}`;
-      return { acceptance: this.persistenceBlocked ? 'unknown-blocked' : 'not-accepted', tasks: [], failed: unique.length };
+      return { acceptance: 'unknown-blocked', tasks: [], failed: unique.length };
     }
     if (this.persistenceBlocked
       && !sameKeys(this.blockedTargetKeys, requestedKeys)

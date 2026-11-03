@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http';
 import { createHash } from 'node:crypto';
-import { existsSync, fstatSync, fsyncSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, fstatSync, fsyncSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -893,7 +893,7 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(readdirSync(join(handoffDir, '.staging'))).toEqual([]);
   });
 
-  it('retries Handoff link, directory sync and stage cleanup failures after reopening SQLite', async () => {
+  async function reopenPendingHandoff() {
     const rig = await buildRig(true);
     const generation = rig.api().sessionInfo('main').generation;
     if (!generation) throw new Error('Core did not provide a generation token');
@@ -947,13 +947,21 @@ describe('Memory source evidence through the real Core consumer', () => {
     const restartedPersona = new Persona({ memoryDir: rig.memoryDir });
     const readFile = (restartedPersona as unknown as { tools(): ToolDef[] }).tools().find((tool) => tool.name === 'read_file');
     if (!readFile) throw new Error('Persona did not declare read_file');
-    const read = () => expect(readFile.handler({ path: target }, { role: 'main', callId: 'read-recovered-handoff' } as never))
+    const read = (path = target) => expect(readFile.handler({ path }, { role: 'main', callId: 'read-recovered-handoff' } as never))
       .resolves.toBe('[read failed] This workspace area is withheld until its content has provenance sidecar entries.');
+    return {
+      read, restartedPersona, reopenedStore, artifactId, handoffDir, stagingPath,
+      finalPath: join(rig.memoryDir, target), stagePath: join(stagingPath, stagedName),
+      filename: target.slice('handoffs/'.length),
+    };
+  }
+
+  it('retries Handoff link, directory sync and stage cleanup failures after reopening SQLite', async () => {
+    const { read, reopenedStore, artifactId, handoffDir, stagingPath, finalPath, stagePath, filename } =
+      await reopenPendingHandoff();
     const originalLink = vi.mocked(linkSync).getMockImplementation()!;
     const originalSync = vi.mocked(fsyncSync).getMockImplementation()!;
     const originalUnlink = vi.mocked(unlinkSync).getMockImplementation()!;
-    const finalPath = join(rig.memoryDir, target);
-    const stagePath = join(stagingPath, stagedName);
     const owner = statSync(stagePath);
     const directory = statSync(handoffDir);
     const foreignPath = join(stagingPath, 'unregistered.md');
@@ -997,7 +1005,48 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(statSync(finalPath).ino).toBe(owner.ino);
     expect(readdirSync(stagingPath)).toEqual(['unregistered.md']);
     expect(readFileSync(foreignPath, 'utf8')).toBe('preserve');
-    expect(readdirSync(handoffDir).filter((name) => name.endsWith('.md'))).toEqual([target.slice('handoffs/'.length)]);
+    expect(readdirSync(handoffDir).filter((name) => name.endsWith('.md'))).toEqual([filename]);
+  });
+
+  it.each(['missing file', 'different inode', 'changed digest'] as const)(
+    'withholds a pending Handoff with %s and preserves unverified files',
+    async (fault) => {
+      const { read, reopenedStore, artifactId, finalPath, stagePath } = await reopenPendingHandoff();
+      if (fault === 'missing file') unlinkSync(stagePath);
+      if (fault === 'different inode') {
+        writeFileSync(finalPath, readFileSync(stagePath));
+        expect(statSync(finalPath).ino).not.toBe(statSync(stagePath).ino);
+      }
+      if (fault === 'changed digest') {
+        linkSync(stagePath, finalPath);
+        writeFileSync(finalPath, 'changed contents');
+      }
+      const preservedFinal = existsSync(finalPath) ? readFileSync(finalPath, 'utf8') : null;
+
+      await read();
+      await read();
+      expect(reopenedStore.getDerivedArtifact(artifactId)?.lifecycleState).toBe('withdrawn');
+      expect(existsSync(stagePath)).toBe(fault === 'changed digest');
+      if (preservedFinal === null) expect(existsSync(finalPath)).toBe(false);
+      else expect(readFileSync(finalPath, 'utf8')).toBe(preservedFinal);
+    },
+  );
+
+  it('blocks reads and searches through a symlink to a pending Handoff', async () => {
+    const { read, restartedPersona, reopenedStore, artifactId, stagePath, filename } = await reopenPendingHandoff();
+    const alias = 'notes/handoff-alias.md';
+    mkdirSync(join(restartedPersona.memoryDir, 'notes'));
+    symlinkSync(stagePath, join(restartedPersona.memoryDir, alias));
+    const grep = (restartedPersona as unknown as { tools(): ToolDef[] }).tools().find((tool) => tool.name === 'grep_files')!;
+    await expect(grep.handler({ path: alias, pattern: 'synthetic' }, { role: 'main' } as never))
+      .resolves.toContain('[search failed]');
+    await expect(grep.handler({ path: 'notes', pattern: 'synthetic' }, { role: 'main' } as never))
+      .resolves.toContain('[search failed]');
+    await read(alias);
+    expect(reopenedStore.getDerivedArtifact(artifactId)?.lifecycleState).toBe('active');
+    expect(existsSync(stagePath)).toBe(false);
+    const alternateCase = `HANDOFFS/${filename}`;
+    if (existsSync(join(restartedPersona.memoryDir, alternateCase))) await read(alternateCase);
   });
 
   it('removes an owned staging link after restart when SQLite activation already committed', async () => {

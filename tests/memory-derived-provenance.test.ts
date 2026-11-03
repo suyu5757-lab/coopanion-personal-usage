@@ -128,10 +128,15 @@ describe('SQLite v4 migration (B01-B06)', () => {
     expectIntegrity(path);
   });
 
-  it('B02 leaves an unverified schema 1 marker gated without changing it', () => {
+  it('B02 rejects an unknown schema marked v1 and preserves its file, schema and rows', () => {
     const path = databasePath();
     const db = new DatabaseSync(path);
-    db.exec('PRAGMA user_version = 1');
+    db.exec(`
+      PRAGMA user_version = 1;
+      CREATE TABLE unknown_records (id INTEGER PRIMARY KEY, body TEXT NOT NULL);
+      INSERT INTO unknown_records (id, body) VALUES (1, 'synthetic historical data');
+    `);
+    const rows = db.prepare('SELECT * FROM unknown_records').all();
     db.close();
     const before = schemaSnapshot(path);
     const beforeDigest = createHash('sha256').update(readFileSync(path)).digest('hex');
@@ -140,6 +145,9 @@ describe('SQLite v4 migration (B01-B06)', () => {
     expect(versionOf(path)).toBe(1);
     expect(schemaSnapshot(path)).toBe(before);
     expect(createHash('sha256').update(readFileSync(path)).digest('hex')).toBe(beforeDigest);
+    const reopened = new DatabaseSync(path, { readOnly: true });
+    try { expect(reopened.prepare('SELECT * FROM unknown_records').all()).toEqual(rows); }
+    finally { reopened.close(); }
   });
 
   it('B03 initializes an empty database and repeats startup without schema changes', () => {
