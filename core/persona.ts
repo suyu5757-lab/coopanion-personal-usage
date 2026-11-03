@@ -22,7 +22,7 @@ import { appendFileSync, closeSync, existsSync, fstatSync, lstatSync, linkSync, 
 import { freemem, totalmem } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { LOG_SCHEME, blobScheme } from 'cortico/core/blobs.ts';
-import type { CoreApi, ContextEvidenceInspection, ContextHandoffPrepareContext, ContextHandoffSourceExcerpt, EvidenceAttachment, EventEnvelope, HandoffCommitCheck, PersonaWebUiDecl, PreparedContextHandoff, SessionDecl, SessionOpeningReason, StoragePart, ToolCallContext, ToolDef, ToolOutcome, WorldLifecycleEvent } from 'cortico/core/types.ts';
+import type { CoreApi, ContextEvidenceInspection, ContextHandoffPrepareContext, ContextHandoffSourceExcerpt, EvidenceAttachment, EventEnvelope, HandoffCommitCheck, PersonaWebUiDecl, PreparedContextHandoff, PrefixSegment, SessionDecl, SessionOpeningReason, SourceExposureRef, SourceMapSpan, StoragePart, SystemPrefixContext, ToolCallContext, ToolDef, ToolOutcome, WorldLifecycleEvent } from 'cortico/core/types.ts';
 import { message, withText, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import type { Language } from 'cortico/core/language.ts';
@@ -337,6 +337,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       this.growthCheck = null;
     }
 
+    override validateEvidenceForRequest(sources: readonly SourceExposureRef[]): boolean {
+      return sources.length === 0 || this.longTerm?.sourceExposureCurrent(sources) === true;
+    }
+
     private growthSnapshot(): ContextRecord[] {
       return this.core?.sessionInfo('main').snapshot ?? [];
     }
@@ -574,6 +578,102 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           : '';
       const body = partnerEvidenceText(filtered) || '(No partner paragraphs have current provenance.)';
       return `${PARTNER_NOTE}\n\n${body}${notice ? `\n\n${notice}` : ''}`;
+    }
+
+    override async systemSegments(ctx: SystemPrefixContext): Promise<PrefixSegment[]> {
+      const segments = await super.systemSegments(ctx);
+      const partner = segments.find((segment) => segment.title === 'PARTNER');
+      if (partner) {
+        const partnerText = this.partnerDoc();
+        const start = partnerText ? partner.text.indexOf(partnerText) : -1;
+        const unique = start >= 0 && partner.text.indexOf(partnerText, start + partnerText.length) < 0;
+        partner.sourceMapSpans = unique
+          ? (await this.partnerPrefixSourceMap(partnerText)).map((span) => ({ ...span, start: span.start + start, end: span.end + start }))
+          : partner.text ? [{ start: 0, end: partner.text.length, digest: sha256(partner.text), origin: 'unknown-derived' }] : [];
+      }
+      return segments;
+    }
+
+    private async partnerPrefixSourceMap(text: string): Promise<SourceMapSpan[]> {
+      const unknown = (): SourceMapSpan[] => text
+        ? [{ start: 0, end: text.length, digest: sha256(text), origin: 'unknown-derived' }]
+        : [];
+      const literal = (start: number, end: number): SourceMapSpan | null => start < end
+        ? { start, end, digest: sha256(text.slice(start, end)), origin: 'core-generated' }
+        : null;
+      const staticText = (value: string): SourceMapSpan[] => value === text && value.length ? [literal(0, text.length)!] : unknown();
+      let source = '';
+      try {
+        const file = this.partnerDocFile();
+        if (!existsSync(file)) return staticText(`${PARTNER_NOTE}\n\n(${PARTNER_FILE} is empty.)`);
+        if (!statSync(file).isFile() || !insidePath(realpathSync(this.memoryDir), realpathSync(file))) {
+          return staticText(`${PARTNER_NOTE}\n\n[system] PARTNER.md is withheld because its workspace path is invalid.`);
+        }
+        source = readFileSync(file, 'utf8');
+      } catch {
+        return staticText(`${PARTNER_NOTE}\n\n[system] PARTNER.md is withheld because it could not be safely read.`);
+      }
+      if (!source.trim()) return staticText(`${PARTNER_NOTE}\n\n(${PARTNER_FILE} is empty.)`);
+
+      const filtered = this.partnerProvenanceResult(source);
+      const notice = filtered.status !== 'ok'
+        ? `[system] PARTNER.md content is withheld because its provenance sidecar is ${filtered.status}. The omitted statements are unknown, not false.`
+        : filtered.withheldSegments > 0
+          ? '[system] Some PARTNER.md paragraphs are withheld because their provenance is missing, stale, edited or ambiguous. The omitted statements are unknown, not false.'
+          : '';
+      const renderedSegments = filtered.segments.map((segment) => {
+        const label = segment.origin === 'derived'
+          ? `[workspace summary; source_ids=${JSON.stringify(segment.sourceIds)}; source references passed the local provenance and forget-fence checks; verify original Memory sources before citing history]`
+          : '[workspace note; user-authored; no original event source is recorded]';
+        return { segment, text: `${label}\n${segment.text}` };
+      });
+      const body = renderedSegments.map((entry) => entry.text).join('\n\n')
+        || '(No partner paragraphs have current provenance.)';
+      const expected = `${PARTNER_NOTE}\n\n${body}${notice ? `\n\n${notice}` : ''}`;
+      if (expected !== text) return unknown();
+
+      const spans: SourceMapSpan[] = [];
+      const pushLiteral = (start: number, end: number): void => {
+        const span = literal(start, end);
+        if (span) spans.push(span);
+      };
+      pushLiteral(0, PARTNER_NOTE.length + 2);
+      let at = PARTNER_NOTE.length + 2;
+      if (renderedSegments.length === 0) {
+        pushLiteral(at, at + body.length);
+        at += body.length;
+      } else {
+        for (let index = 0; index < renderedSegments.length; index++) {
+          const entry = renderedSegments[index]!;
+          const start = at;
+          const end = start + entry.text.length;
+          if (entry.segment.origin === 'derived' && this.longTerm) {
+            const evidence = await this.longTerm.evidenceForSegments(entry.text,
+              entry.segment.sourceIds.map((documentId) => ({ documentId, start: 0, end: entry.text.length, derived: true })));
+            const exposedSources = evidence.map(({ segment: _segment, ...sourceRef }) => sourceRef);
+            const sourceIds = new Set(entry.segment.sourceIds);
+            const complete = sourceIds.size === exposedSources.length
+              && exposedSources.every((sourceRef) => sourceIds.has(sourceRef.documentId))
+              && evidenceCoversText(entry.text, evidence);
+            spans.push(complete
+              ? { start, end, digest: sha256(entry.text), origin: 'hindsight-source', exposedSources }
+              : { start, end, digest: sha256(entry.text), origin: 'unknown-derived' });
+          } else {
+            spans.push({ start, end, digest: sha256(entry.text), origin: 'unknown-derived' });
+          }
+          at = end;
+          if (index + 1 < renderedSegments.length) {
+            pushLiteral(at, at + 2);
+            at += 2;
+          }
+        }
+      }
+      if (notice) {
+        pushLiteral(at, at + 2);
+        at += 2;
+        pushLiteral(at, text.length);
+      }
+      return spans;
     }
 
     /**
@@ -1319,10 +1419,18 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         const dependencies = (record.context.sourceDependencySpans ?? []).filter((span) => validSpan(text, span)
           && span.exposedSources.every((source) => memory?.sourceVisible(source.documentId)
             && memory.sourceCurrentForContext(source.documentId)));
+        const sourceMaps = (record.context.sourceMapSpans ?? []).filter((span) => validSpan(text, span)
+          && span.origin !== 'unknown-derived'
+          && (span.origin === 'core-generated' || span.origin === 'user-input'
+            ? !span.exposedSources?.length
+            : (span.exposedSources?.length ?? 0) > 0
+              && span.exposedSources!.every((source) => memory?.sourceVisible(source.documentId)
+                && memory.sourceCurrentForContext(source.documentId))));
         const safeRanges = [
           ...evidence.map((attachment) => ({ start: attachment.segment.start, end: attachment.segment.end })),
           ...independent.map((span) => ({ start: span.start, end: span.end })),
           ...dependencies.map((span) => ({ start: span.start, end: span.end })),
+          ...sourceMaps.map((span) => ({ start: span.start, end: span.end })),
         ];
         const safe = new Uint8Array(text.length);
         for (const range of safeRanges) for (let at = range.start; at < range.end; at++) safe[at] = 1;
@@ -1333,6 +1441,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         const changed = redacted !== text || evidence.length !== (record.context.evidence?.length ?? 0)
           || independent.length !== (record.context.sourceIndependentSpans?.length ?? 0)
           || dependencies.length !== (record.context.sourceDependencySpans?.length ?? 0)
+          || sourceMaps.length !== (record.context.sourceMapSpans?.length ?? 0)
           || (frameEvents?.length ?? 0) !== (record.context.frame?.events.length ?? 0);
         if (!changed) return record;
         const updated = withText(record, redacted);
@@ -1341,6 +1450,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           evidence,
           sourceIndependentSpans: independent,
           sourceDependencySpans: dependencies,
+          sourceMapSpans: sourceMaps,
           ...(record.context.frame ? { frame: { ...record.context.frame, events: frameEvents ?? [] } } : {}),
         };
         return updated;

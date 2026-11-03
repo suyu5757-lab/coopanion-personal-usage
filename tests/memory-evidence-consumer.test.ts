@@ -13,13 +13,14 @@ import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import { Core } from '../vendor/cortico/tests/core/fixture-core.ts';
 import { FakeLLM, makeCfg, makeFakeIO, makeLoaded, textReply, toolReply } from '../vendor/cortico/tests/core/helpers.ts';
-import { coopanionPersona } from '../core/persona.ts';
+import { coopanionPersona, PARTNER_FILE } from '../core/persona.ts';
 import { ExperienceCards } from '../core/growth/experience-cards.ts';
 import { HindsightMemory } from '../core/memory/hindsight.ts';
 import { loadHindsightConfig } from '../core/memory/config.ts';
 import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import { MemoryOutbox } from '../core/memory/outbox.ts';
 import { closeMemoryStateStores, openMemoryStateStore } from '../core/memory/state-store.ts';
+import { partnerProvenancePath, partnerSegmentDigest, partnerSourceScopeDigest, partnerWorkspaceDigest, writePartnerProvenance } from '../core/memory/partner-provenance.ts';
 
 const SOURCE_TEXT = 'The person prefers jasmine tea.';
 const roots: string[] = [];
@@ -39,6 +40,17 @@ async function waitFor(check: () => boolean, timeoutMs = 5000): Promise<void> {
     if (Date.now() - started > timeoutMs) throw new Error('condition timed out');
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+}
+
+function serializedStringAt(body: string, field: string): string {
+  const tokens = field.replace(/^\$\.?/, '').replace(/\[(\d+)\]/g, '.$1').split('.').filter(Boolean);
+  let value: unknown = JSON.parse(body);
+  for (const token of tokens) {
+    if (value && typeof value === 'object') value = (value as Record<string, unknown>)[token];
+    else throw new Error(`serialized field is not an object at ${token}`);
+  }
+  if (typeof value !== 'string') throw new Error(`serialized field is not text: ${field}`);
+  return value;
 }
 
 async function hindsightServer(
@@ -98,7 +110,12 @@ async function hindsightServer(
   return { baseUrl: `http://127.0.0.1:${address.port}`, recallRequests: () => recallCount };
 }
 
-async function buildRig(sourceAvailable: boolean, factText?: string, beforeDocumentRead?: () => Promise<void>) {
+async function buildRig(
+  sourceAvailable: boolean,
+  factText?: string,
+  beforeDocumentRead?: () => Promise<void>,
+  options: { partnerSummary?: string } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), 'coo-memory-evidence-consumer-'));
   roots.push(root);
   const memoryDir = join(root, 'persona');
@@ -118,8 +135,21 @@ async function buildRig(sourceAvailable: boolean, factText?: string, beforeDocum
   const config = makeCfg();
   config.worlds.qq.enabled = false;
   config.batching = { quietGapMs: 5, minBatchAgeMs: 0, maxBatchAgeMs: 50, maxBatchSize: 50 };
-  const Persona = coopanionPersona(Cormini, { memory });
+  const growthStateFile = options.partnerSummary ? join(root, 'growth', 'state.json') : undefined;
+  if (growthStateFile) mkdirSync(join(root, 'growth'), { recursive: true });
+  const Persona = coopanionPersona(Cormini, { memory, ...(growthStateFile ? { growthStateFile } : {}) });
   const persona = new Persona({ memoryDir });
+  if (options.partnerSummary) {
+    writeFileSync(join(memoryDir, PARTNER_FILE), `${options.partnerSummary}\n`, 'utf8');
+    writePartnerProvenance(partnerProvenancePath(join(root, 'growth'), memoryDir), {
+      v: 1,
+      workspaceDigest: partnerWorkspaceDigest(memoryDir),
+      entries: [{
+        id: '00000000-0000-0000-0000-000000000001', segmentDigest: partnerSegmentDigest(options.partnerSummary), origin: 'derived',
+        sourceIds: ['doc-1'], sourceScopeDigest: partnerSourceScopeDigest('fixture-bank', server.baseUrl), state: 'current',
+      }],
+    });
+  }
   persona.onOpening = () => {};
   let api: CoreApi | null = null;
   const attach = persona.attach.bind(persona);
@@ -129,6 +159,20 @@ async function buildRig(sourceAvailable: boolean, factText?: string, beforeDocum
   const startWorld = world.start?.bind(world);
   world.start = async (currentHost) => { host = currentHost; await startWorld?.(currentHost); };
   const llm = new FakeLLM();
+  const serializedBodies: string[] = [];
+  const dispatchedBodies: string[] = [];
+  const respond = llm.respond.bind(llm);
+  llm.respond = (request, providerOptions) => respond(request, {
+    ...providerOptions,
+    onRequestReady: (info) => {
+      if (typeof info.body === 'string') serializedBodies.push(info.body);
+      return providerOptions?.onRequestReady?.(info) ?? true;
+    },
+    onRequestSent: (info) => {
+      if (typeof info.body === 'string') dispatchedBodies.push(info.body);
+      providerOptions?.onRequestSent?.(info);
+    },
+  });
   llm.script(
     toolReply([{ name: 'memory_search', args: { query: 'what did I say about tea?' }, id: 'memory-search-1' }]),
     toolReply([{ name: 'memory_search', args: { query: 'jasmine tea preference' }, id: 'memory-search-2' }]),
@@ -150,7 +194,7 @@ async function buildRig(sourceAvailable: boolean, factText?: string, beforeDocum
     return host;
   };
   return {
-    root, memoryDir, core, llm, memory, persona, baseUrl: server.baseUrl, recallRequests: server.recallRequests,
+    root, memoryDir, core, llm, memory, persona, baseUrl: server.baseUrl, recallRequests: server.recallRequests, serializedBodies, dispatchedBodies,
     api: coreApi,
     host: worldHost,
   };
@@ -195,7 +239,8 @@ async function buildSourceFreeRig() {
 
 describe('Memory source evidence through the real Core consumer', () => {
   it('attaches exact read-back spans from two tool rounds to serialized provider requests', async () => {
-    const rig = await buildRig(true);
+    const partnerSummary = 'Coo saved the note: jasmine tea 🌿';
+    const rig = await buildRig(true, undefined, undefined, { partnerSummary });
     const candidates = await rig.memory.searchResultsDetailed('jasmine tea preference');
     expect(candidates.results).toHaveLength(1);
     await rig.host().pushEvent({
@@ -205,7 +250,13 @@ describe('Memory source evidence through the real Core consumer', () => {
 
     const envelopes = rig.api().generationEvidence('main');
     expect(rig.recallRequests()).toBe(3);
-    expect(envelopes[0]).toMatchObject({ requestState: 'sent', exposedSources: [], actualEvidenceUsed: 'unknown' });
+    expect(envelopes[0]).toMatchObject({ requestState: 'sent', actualEvidenceUsed: 'unknown' });
+    expect(envelopes[0]?.exposedSources.map((source) => source.documentId)).toContain('doc-1');
+    const initialSystem = rig.core.session.records.find((record) => record.item.type === 'message' && record.item.role === 'system');
+    const initialSystemCoverage = envelopes[0]?.items.find((item) => item.itemId === initialSystem?.item.id);
+    expect(initialSystemCoverage?.mappingState).toBe('missing');
+    expect(initialSystemCoverage?.spans.some((span) => span.origin === 'hindsight-source'
+      && span.mappingState === 'complete' && span.exposedSources.some((source) => source.documentId === 'doc-1'))).toBe(true);
     expect(envelopes[1]?.exposedSources).toMatchObject([{
       bankId: 'fixture-bank', endpoint: expect.stringMatching(/^http:\/\/127\.0\.0\.1:/), documentId: 'doc-1',
       revisionState: 'current', validationStatus: 'validated', contentDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
@@ -239,9 +290,117 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(notice?.context.sourceDependencySpans?.flatMap((span) => span.exposedSources.map((source) => source.documentId)))
       .toContain('doc-1');
     expect(rig.api().generationEvidence('main').at(-1)).toMatchObject({
-      mappingState: 'missing', actualEvidenceUsed: 'unknown',
+      actualEvidenceUsed: 'unknown',
       exposedSources: [expect.objectContaining({ documentId: 'doc-1', validationStatus: 'validated', revisionState: 'current' })],
     });
+    expect(rig.api().generationEvidence('main').at(-1)?.mappingState).not.toBe('complete');
+
+    const nextRequest = rig.api().generationEvidence('main').at(-1)!;
+    const systemRecord = rig.core.session.records.find((entry) => entry.item.type === 'message' && entry.item.role === 'system');
+    if (!systemRecord) throw new Error('rebuilt system prefix is absent after Handoff');
+    const systemCoverage = nextRequest.items.find((item) => item.itemId === systemRecord.item.id);
+    const partnerSpan = systemCoverage?.spans.find((span) => span.origin === 'hindsight-source'
+      && span.exposedSources.some((source) => source.documentId === 'doc-1'));
+    expect(systemCoverage?.mappingState).toBe('missing');
+    expect(partnerSpan).toMatchObject({ mappingState: 'complete' });
+    const mappedSource = partnerSpan?.exposedSources[0];
+    expect(partnerSpan?.exposedSources).toEqual([nextRequest.exposedSources.find((source) => source.documentId === 'doc-1')]);
+    expect(mappedSource).toMatchObject({
+      bankId: 'fixture-bank', endpoint: rig.baseUrl, documentId: 'doc-1', revisionState: 'current', validationStatus: 'validated',
+      validatedEpoch: expect.any(String), validationReceipt: expect.stringMatching(/^[a-f0-9]{64}$/),
+      contentDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    const systemText = textOf(systemRecord);
+    const partnerText = systemText.slice(partnerSpan!.start, partnerSpan!.end);
+    expect(partnerText).toContain(partnerSummary);
+    expect(partnerSpan!.digest).toBe(createHash('sha256').update(partnerText, 'utf8').digest('hex'));
+    expect(partnerSpan!.serializedRanges).toHaveLength(1);
+    expect(partnerSpan!.end - partnerSpan!.start).toBe(partnerText.length);
+    const body = rig.serializedBodies.at(-1)!;
+    expect(nextRequest.serializedBodyDigest).toBe(createHash('sha256').update(body, 'utf8').digest('hex'));
+    const range = partnerSpan!.serializedRanges[0]!;
+    expect(range.end - range.start).toBe(partnerText.length);
+    expect(serializedStringAt(body, range.field).slice(range.start, range.end)).toBe(partnerText);
+    const workspaceMarker = 'Files in your workspace:';
+    const workspaceStart = systemText.indexOf(workspaceMarker);
+    expect(workspaceStart).toBeGreaterThanOrEqual(0);
+    const workspaceSpans = systemCoverage!.spans.filter((span) => span.start < workspaceStart + workspaceMarker.length
+      && span.end > workspaceStart);
+    expect(workspaceSpans.length).toBeGreaterThan(0);
+    expect(workspaceSpans.every((span) => span.origin === 'unknown-derived' && span.mappingState === 'missing')).toBe(true);
+    const handoffMemoryItem = nextRequest.items.find((item) => item.spans.some((span) => span.origin === 'generation-derived'
+      && span.mappingState === 'complete' && span.exposedSources.some((source) => source.documentId === 'doc-1')));
+    expect(handoffMemoryItem).toBeDefined();
+  });
+
+  it('blocks a rebuilt source span when Forget fences it before provider dispatch', async () => {
+    const rig = await buildRig(true, undefined, undefined, { partnerSummary: 'Coo saved the note: jasmine tea 🌿' });
+    const validate = rig.persona.validateEvidenceForRequest.bind(rig.persona);
+    let validationCount = 0;
+    let forgetResult: Promise<unknown> | null = null;
+    rig.persona.validateEvidenceForRequest = (sources) => {
+      validationCount += 1;
+      if (validationCount === 4) forgetResult = rig.memory.forgetDocument('doc-1');
+      return validate(sources);
+    };
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.api().generationEvidence('main').length >= 3);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    expect(rig.api().requestContextHandoff()).toBe(true);
+    await waitFor(() => rig.api().handoffOutcome()?.status === 'committed');
+    await waitFor(() => rig.api().generationEvidence('main').some((entry) => entry.requestState === 'unobserved'));
+    if (!forgetResult) throw new Error('the fourth serialized request did not enter the Forget race');
+    await forgetResult;
+
+    const blocked = rig.api().generationEvidence('main').find((entry) => entry.requestState === 'unobserved')!;
+    expect(validationCount).toBeGreaterThanOrEqual(4);
+    expect(rig.dispatchedBodies).toHaveLength(3);
+    expect(blocked).toMatchObject({ requestState: 'unobserved', actualEvidenceUsed: 'unknown', exposedSources: [] });
+    expect(blocked.items.some((item) => item.mappingState === 'stale'
+      && item.spans.some((span) => span.origin === 'hindsight-source' && span.mappingState === 'stale'
+        && span.exposedSources.length === 0 && span.serializedRanges.length === 0))).toBe(true);
+    expect(rig.memory.sourceVisible('doc-1')).toBe(false);
+  });
+
+  it('blocks a rebuilt source span when a verified local revision supersedes it before dispatch', async () => {
+    const rig = await buildRig(true, undefined, undefined, { partnerSummary: 'Coo saved the note: jasmine tea 🌿' });
+    const validate = rig.persona.validateEvidenceForRequest.bind(rig.persona);
+    let validationCount = 0;
+    rig.persona.validateEvidenceForRequest = (sources) => {
+      validationCount += 1;
+      if (validationCount === 4) {
+        const outbox = (rig.memory as unknown as { outbox: MemoryOutbox }).outbox;
+        expect(outbox.add({
+          bankId: 'fixture-bank', endpoint: rig.baseUrl, documentId: 'doc-2', content: 'The preference changed.',
+          context: 'synthetic correction', tags: ['correction'], metadata: { kind: 'correction', supersedes_source_ids: '["doc-1"]' },
+          priority: 'critical',
+        })).toBe('queued');
+        const correction = outbox.matching((item) => item.documentId === 'doc-2')[0]!;
+        expect(outbox.linkCorrection('doc-2', 'fixture-bank', rig.baseUrl, ['doc-1'])).toBe('pending');
+        expect(outbox.markDone(correction.id)).toBe(true);
+        expect(outbox.markVerified(correction.id)).toBe(true);
+      }
+      return validate(sources);
+    };
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.api().generationEvidence('main').length >= 3);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    expect(rig.api().requestContextHandoff()).toBe(true);
+    await waitFor(() => rig.api().handoffOutcome()?.status === 'committed');
+    await waitFor(() => rig.api().generationEvidence('main').some((entry) => entry.requestState === 'unobserved'));
+
+    const blocked = rig.api().generationEvidence('main').find((entry) => entry.requestState === 'unobserved')!;
+    expect(validationCount).toBeGreaterThanOrEqual(4);
+    expect(rig.dispatchedBodies).toHaveLength(3);
+    expect(blocked).toMatchObject({ requestState: 'unobserved', actualEvidenceUsed: 'unknown', exposedSources: [] });
+    expect(blocked.items.some((item) => item.mappingState === 'stale'
+      && item.spans.some((span) => span.origin === 'hindsight-source' && span.mappingState === 'stale'
+        && span.exposedSources.length === 0 && span.serializedRanges.length === 0))).toBe(true);
+    expect(rig.memory.sourceCurrentForContext('doc-1')).toBe(false);
   });
 
   it('blocks the real Core handoff when Forget fences a source during prepare read-back', async () => {
@@ -463,6 +622,9 @@ describe('Memory source evidence through the real Core consumer', () => {
     }, { trigger: 'flush' });
     await waitFor(() => rig.llm.calls.length > 0);
     await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    expect(rig.api().generationEvidence('main')).toMatchObject([
+      { requestState: 'sent', exposedSources: [], actualEvidenceUsed: 'unknown' },
+    ]);
 
     expect(rig.api().requestContextHandoff()).toBe(true);
     await waitFor(() => rig.api().handoffOutcome() !== null);

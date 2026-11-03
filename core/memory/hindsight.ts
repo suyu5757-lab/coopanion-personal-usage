@@ -2551,6 +2551,23 @@ export class HindsightMemory {
     catch { return false; }
   }
 
+  /** Rechecks a serialized source set against the active namespace and local Forget fence. */
+  sourceExposureCurrent(sources: readonly SourceExposureRef[]): boolean {
+    const config = this.config;
+    const epoch = this.evidenceEpoch();
+    if (!config || !epoch || !this.enabled() || this.ledger?.damaged() || sources.length === 0) return false;
+    const current = sources.every((source) => source.bankId === config.bankId
+      && source.endpoint === config.apiUrl
+      && source.validatedEpoch === epoch
+      && source.revisionState === 'current'
+      && source.validationStatus === 'validated'
+      && /^[a-f0-9]{64}$/.test(source.validationReceipt)
+      && /^[a-f0-9]{64}$/.test(source.contentDigest)
+      && this.sourceVisible(source.documentId)
+      && this.sourceCurrentForContext(source.documentId));
+    return current && this.evidenceEpoch() === epoch;
+  }
+
   /** A content-free identity for the configured source namespace used by the partner sidecar. */
   sourceScopeDigest(): string | null {
     const config = this.config;
