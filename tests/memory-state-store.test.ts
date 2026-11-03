@@ -9,6 +9,7 @@ import { MemoryOutbox, readLegacyOutbox, requestHashFor, type RetainItem } from 
 import { ForgetLedger, readLegacyForget } from '../core/memory/forget-ledger.ts';
 import { closeMemoryStateStores, openMemoryStateStore, type ForgetStateSnapshot } from '../core/memory/state-store.ts';
 import { HindsightMemory } from '../core/memory/hindsight.ts';
+import { createLegacyMemoryStateDatabase, openLegacyMemoryStateDatabase, snapshotLegacyDurableRows } from './fixtures/memory-state-legacy.ts';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 const roots: string[] = [];
@@ -47,29 +48,18 @@ describe('the memory transaction database', () => {
     }
   });
 
-  it('migrates schema 2 to 3 without dropping committed delivery records', () => {
+  it('migrates the historical schema 2 fixture to 4 without changing committed delivery records', () => {
     const path = join(root(), 'memory-state.sqlite');
-    const store = openMemoryStateStore(path);
-    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
-    const outbox = new MemoryOutbox(store);
-    outbox.add(retainItem('existing-source'));
-    closeMemoryStateStores();
+    createLegacyMemoryStateDatabase(path, 2);
+    const old = openLegacyMemoryStateDatabase(path);
+    const before = snapshotLegacyDurableRows(old, 2);
+    old.close();
 
-    const oldSchema = new DatabaseSync(path);
-    oldSchema.exec(`
-      DROP INDEX memory_mention_events_day;
-      DROP INDEX memory_mention_events_source;
-      DROP TABLE memory_mention_events;
-      DROP TABLE memory_activation;
-      PRAGMA user_version = 2;
-    `);
-    oldSchema.close();
-
-    const migrated = openMemoryStateStore(path);
-    const version = new DatabaseSync(path);
-    expect((version.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(3);
-    expect(new MemoryOutbox(migrated).matching(() => true).map((item) => item.documentId)).toEqual(['existing-source']);
-    version.close();
+    openMemoryStateStore(path);
+    const migrated = new DatabaseSync(path);
+    expect((migrated.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(4);
+    expect(snapshotLegacyDurableRows(migrated, 2)).toBe(before);
+    migrated.close();
   });
 
   it('reopens committed requests, fences, deletion work and epochs from disk', () => {

@@ -48,6 +48,74 @@ export interface UserMentionResult {
   appliedBoost?: number;
 }
 
+export type MemorySourceMappingState = 'complete' | 'source-independent' | 'missing' | 'ambiguous' | 'unknown';
+export type MemorySourceValidationState = 'validated' | 'unverified' | 'missing' | 'ambiguous' | 'stale' | 'withheld' | 'unknown';
+export type MemoryEvidenceOrigin = 'user-input' | 'provider-response' | 'tool-outcome' | 'system-context' | 'unknown';
+export type DerivedArtifactOrigin = 'user-authored' | 'trusted-system' | 'model-derived' | 'unknown';
+export type DerivedArtifactReviewState = 'unreviewed' | 'approved' | 'rejected' | 'unknown';
+export type DerivedArtifactLifecycleState = 'active' | 'pending' | 'stale' | 'withdrawn' | 'withheld' | 'unknown';
+
+export interface MemorySourceDependency {
+  bankId: string;
+  endpoint: string;
+  documentId: string;
+  validatedEpoch: number | null;
+  validatedFence: string | null;
+  revision: string | null;
+  contentDigest: string | null;
+  segmentDigest: string | null;
+  validationState: MemorySourceValidationState;
+  correlationId: string | null;
+}
+
+export interface GenerationEvidence {
+  sessionId: string;
+  generationId: string;
+  providerAttemptId: string | null;
+  responseId: string | null;
+  toolCorrelationId: string | null;
+  origin: MemoryEvidenceOrigin;
+  mappingState: MemorySourceMappingState;
+  validationReceiptDigest: string | null;
+  validatedAt: string | null;
+  exceptionReason: string | null;
+  actualEvidenceUsed: 'unknown';
+  createdAt: string;
+  sources: MemorySourceDependency[];
+}
+
+export type GenerationEvidenceInput = Omit<GenerationEvidence, 'actualEvidenceUsed'> & {
+  actualEvidenceUsed?: 'unknown';
+};
+
+export interface DerivedArtifact {
+  artifactId: string;
+  kind: string;
+  target: string;
+  scope: string;
+  creatorSessionId: string | null;
+  creatorGenerationId: string | null;
+  creatorOperationId: string | null;
+  bodyDigest: string;
+  origin: DerivedArtifactOrigin;
+  reviewState: DerivedArtifactReviewState;
+  lifecycleState: DerivedArtifactLifecycleState;
+  lineageState: MemorySourceMappingState;
+  lineageReceiptDigest: string | null;
+  lineageValidatedAt: string | null;
+  statusReason: string | null;
+  createdAt: string;
+  updatedAt: string;
+  sources: MemorySourceDependency[];
+}
+
+export type DerivedArtifactInput = Omit<DerivedArtifact, 'sources'> & {
+  sources: readonly MemorySourceDependency[];
+};
+
+type MemoryStateMigrationCheckpoint = 'after-v4-ddl';
+type MemoryStateMigrationOptions = { onCheckpoint?: (checkpoint: MemoryStateMigrationCheckpoint) => void };
+
 interface ActivationRow {
   activation_anchor_weight: number;
   activation_anchor_at: string;
@@ -63,6 +131,455 @@ interface ActivationRow {
 }
 
 const HASH = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+
+type StateDatabase = InstanceType<typeof DatabaseSync>;
+
+const BASE_TABLE_COLUMNS: Record<string, readonly string[]> = {
+  memory_metadata: ['key', 'value'],
+  memory_events: ['event_id', 'document_id', 'actor', 'occurred_at', 'intent', 'status', 'payload_hash', 'payload_json'],
+  memory_operations: ['event_id', 'bank_id', 'endpoint', 'document_id', 'operation_id', 'state', 'attempts', 'next_attempt_at', 'next_poll_at', 'updated_at', 'payload_hash', 'record_json'],
+  memory_revisions: ['event_id', 'bank_id', 'endpoint', 'document_id', 'supersedes_document_id', 'state', 'created_at'],
+  memory_deletions: ['task_id', 'bank_id', 'endpoint', 'document_id', 'operation_id', 'state', 'attempts', 'verifications', 'next_attempt_at', 'record_json'],
+  memory_fences: ['bank_id', 'endpoint', 'document_id', 'reason', 'created_at'],
+  memory_derived_state: ['bank_id', 'endpoint', 'epoch', 'stale'],
+};
+
+const V3_TABLE_COLUMNS: Record<string, readonly string[]> = {
+  memory_activation: ['bank_id', 'endpoint', 'document_id', 'activation_anchor_weight', 'activation_anchor_at', 'half_life_days', 'epsilon', 'params_version', 'last_user_mention_at', 'last_reinforced_at', 'last_retrieved_at', 'independent_mention_count', 'source_epoch', 'updated_at'],
+  memory_mention_events: ['mention_event_id', 'bank_id', 'endpoint', 'target_document_id', 'user_event_document_id', 'user_event_id', 'occurred_at', 'spacing_bucket', 'semantic_match', 'intensity', 'source_type', 'applied_boost', 'source_epoch', 'params_version'],
+};
+
+const V4_TABLE_COLUMNS: Record<string, readonly string[]> = {
+  generation_evidence: ['session_id', 'generation_id', 'provider_attempt_id', 'response_id', 'tool_correlation_id', 'origin', 'mapping_state', 'validation_receipt_digest', 'validated_at', 'exception_reason', 'actual_evidence_used', 'created_at'],
+  generation_source_dependency: ['session_id', 'generation_id', 'bank_id', 'endpoint', 'document_id', 'validated_epoch', 'validated_fence', 'source_revision', 'content_digest', 'segment_digest', 'validation_state', 'correlation_id'],
+  derived_artifact: ['artifact_id', 'kind', 'target', 'scope', 'creator_session_id', 'creator_generation_id', 'creator_operation_id', 'body_digest', 'origin', 'review_state', 'lifecycle_state', 'lineage_state', 'lineage_receipt_digest', 'lineage_validated_at', 'status_reason', 'created_at', 'updated_at'],
+  derived_artifact_source: ['artifact_id', 'bank_id', 'endpoint', 'document_id', 'validated_epoch', 'validated_fence', 'source_revision', 'content_digest', 'segment_digest', 'validation_state', 'correlation_id'],
+};
+
+const BASE_INDEXES = [
+  'memory_operations_due', 'memory_operations_source', 'memory_revisions_current', 'memory_deletions_due',
+];
+const V3_INDEXES = ['memory_mention_events_day', 'memory_mention_events_source'];
+const V4_INDEXES = [
+  'generation_evidence_attempt', 'generation_source_dependency_namespace',
+  'derived_artifact_lifecycle', 'derived_artifact_source_namespace',
+];
+
+const BASE_SCHEMA_SQL = `
+  CREATE TABLE memory_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+  CREATE TABLE memory_events (
+    event_id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    actor TEXT,
+    occurred_at TEXT,
+    intent TEXT NOT NULL,
+    status TEXT,
+    payload_hash TEXT NOT NULL,
+    payload_json TEXT NOT NULL
+  );
+  CREATE TABLE memory_operations (
+    event_id TEXT PRIMARY KEY REFERENCES memory_events(event_id) ON DELETE CASCADE,
+    bank_id TEXT,
+    endpoint TEXT,
+    document_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    attempts INTEGER NOT NULL,
+    next_attempt_at TEXT NOT NULL,
+    next_poll_at TEXT,
+    updated_at TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    record_json TEXT NOT NULL
+  );
+  CREATE INDEX memory_operations_due ON memory_operations(state, next_attempt_at, updated_at);
+  CREATE INDEX memory_operations_source ON memory_operations(bank_id, endpoint, document_id);
+  CREATE TABLE memory_revisions (
+    event_id TEXT NOT NULL,
+    bank_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    document_id TEXT NOT NULL,
+    supersedes_document_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(event_id, supersedes_document_id)
+  );
+  CREATE INDEX memory_revisions_current ON memory_revisions(bank_id, endpoint, supersedes_document_id, state);
+  CREATE TABLE memory_deletions (
+    task_id TEXT PRIMARY KEY,
+    bank_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    document_id TEXT NOT NULL,
+    operation_id TEXT,
+    state TEXT NOT NULL,
+    attempts INTEGER NOT NULL,
+    verifications INTEGER NOT NULL,
+    next_attempt_at TEXT NOT NULL,
+    record_json TEXT NOT NULL
+  );
+  CREATE INDEX memory_deletions_due ON memory_deletions(state, next_attempt_at);
+  CREATE TABLE memory_fences (
+    bank_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    document_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(bank_id, endpoint, document_id)
+  );
+  CREATE TABLE memory_derived_state (
+    bank_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    stale INTEGER NOT NULL,
+    PRIMARY KEY(bank_id, endpoint)
+  );
+`;
+
+const V3_SCHEMA_SQL = `
+  CREATE TABLE memory_activation (
+    bank_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    document_id TEXT NOT NULL,
+    activation_anchor_weight REAL NOT NULL,
+    activation_anchor_at TEXT NOT NULL,
+    half_life_days REAL NOT NULL,
+    epsilon REAL NOT NULL,
+    params_version TEXT NOT NULL,
+    last_user_mention_at TEXT,
+    last_reinforced_at TEXT,
+    last_retrieved_at TEXT,
+    independent_mention_count INTEGER NOT NULL,
+    source_epoch INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(bank_id, endpoint, document_id)
+  );
+  CREATE TABLE memory_mention_events (
+    mention_event_id TEXT PRIMARY KEY,
+    bank_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    target_document_id TEXT NOT NULL,
+    user_event_document_id TEXT NOT NULL,
+    user_event_id TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    spacing_bucket TEXT NOT NULL CHECK(spacing_bucket IN ('initial', 'same-turn', 'same-day', 'cross-day')),
+    semantic_match REAL NOT NULL CHECK(semantic_match >= 0 AND semantic_match <= 1),
+    intensity REAL NOT NULL CHECK(intensity >= 0 AND intensity <= 1),
+    source_type TEXT NOT NULL CHECK(source_type = 'user_mention'),
+    applied_boost REAL NOT NULL CHECK(applied_boost >= 0 AND applied_boost <= 1),
+    source_epoch INTEGER NOT NULL,
+    params_version TEXT NOT NULL,
+    UNIQUE(bank_id, endpoint, target_document_id, user_event_document_id)
+  );
+  CREATE INDEX memory_mention_events_day ON memory_mention_events(bank_id, endpoint, target_document_id, occurred_at);
+  CREATE INDEX memory_mention_events_source ON memory_mention_events(bank_id, endpoint, user_event_document_id);
+`;
+
+const V4_SCHEMA_SQL = `
+  CREATE TABLE generation_evidence (
+    session_id TEXT NOT NULL CHECK(length(trim(session_id)) > 0),
+    generation_id TEXT NOT NULL CHECK(length(trim(generation_id)) > 0),
+    provider_attempt_id TEXT,
+    response_id TEXT,
+    tool_correlation_id TEXT,
+    origin TEXT NOT NULL CHECK(origin IN ('user-input', 'provider-response', 'tool-outcome', 'system-context', 'unknown')),
+    mapping_state TEXT NOT NULL CHECK(mapping_state IN ('complete', 'source-independent', 'missing', 'ambiguous', 'unknown')),
+    validation_receipt_digest TEXT CHECK(validation_receipt_digest IS NULL OR (length(validation_receipt_digest) = 64 AND validation_receipt_digest NOT GLOB '*[^0-9a-f]*')),
+    validated_at TEXT,
+    exception_reason TEXT,
+    actual_evidence_used TEXT NOT NULL DEFAULT 'unknown' CHECK(actual_evidence_used = 'unknown'),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(session_id, generation_id),
+    CHECK(mapping_state NOT IN ('complete', 'source-independent') OR (validation_receipt_digest IS NOT NULL AND validated_at IS NOT NULL))
+  );
+  CREATE INDEX generation_evidence_attempt
+    ON generation_evidence(session_id, provider_attempt_id, response_id, tool_correlation_id);
+  CREATE TABLE generation_source_dependency (
+    session_id TEXT NOT NULL,
+    generation_id TEXT NOT NULL,
+    bank_id TEXT NOT NULL CHECK(length(trim(bank_id)) > 0),
+    endpoint TEXT NOT NULL CHECK(length(trim(endpoint)) > 0),
+    document_id TEXT NOT NULL CHECK(length(trim(document_id)) > 0),
+    validated_epoch INTEGER CHECK(validated_epoch IS NULL OR validated_epoch >= 0),
+    validated_fence TEXT,
+    source_revision TEXT,
+    content_digest TEXT CHECK(content_digest IS NULL OR (length(content_digest) = 64 AND content_digest NOT GLOB '*[^0-9a-f]*')),
+    segment_digest TEXT CHECK(segment_digest IS NULL OR (length(segment_digest) = 64 AND segment_digest NOT GLOB '*[^0-9a-f]*')),
+    validation_state TEXT NOT NULL CHECK(validation_state IN ('validated', 'unverified', 'missing', 'ambiguous', 'stale', 'withheld', 'unknown')),
+    correlation_id TEXT,
+    PRIMARY KEY(session_id, generation_id, bank_id, endpoint, document_id),
+    FOREIGN KEY(session_id, generation_id) REFERENCES generation_evidence(session_id, generation_id) ON DELETE CASCADE,
+    CHECK(validation_state != 'validated' OR (validated_epoch IS NOT NULL AND source_revision IS NOT NULL AND content_digest IS NOT NULL AND segment_digest IS NOT NULL))
+  );
+  CREATE INDEX generation_source_dependency_namespace
+    ON generation_source_dependency(bank_id, endpoint, document_id, session_id, generation_id);
+  CREATE TABLE derived_artifact (
+    artifact_id TEXT PRIMARY KEY CHECK(length(trim(artifact_id)) > 0),
+    kind TEXT NOT NULL CHECK(length(trim(kind)) > 0),
+    target TEXT NOT NULL CHECK(length(trim(target)) > 0),
+    scope TEXT NOT NULL CHECK(length(trim(scope)) > 0),
+    creator_session_id TEXT,
+    creator_generation_id TEXT,
+    creator_operation_id TEXT,
+    body_digest TEXT NOT NULL CHECK(length(body_digest) = 64 AND body_digest NOT GLOB '*[^0-9a-f]*'),
+    origin TEXT NOT NULL CHECK(origin IN ('user-authored', 'trusted-system', 'model-derived', 'unknown')),
+    review_state TEXT NOT NULL CHECK(review_state IN ('unreviewed', 'approved', 'rejected', 'unknown')),
+    lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('active', 'pending', 'stale', 'withdrawn', 'withheld', 'unknown')),
+    lineage_state TEXT NOT NULL CHECK(lineage_state IN ('complete', 'source-independent', 'missing', 'ambiguous', 'unknown')),
+    lineage_receipt_digest TEXT CHECK(lineage_receipt_digest IS NULL OR (length(lineage_receipt_digest) = 64 AND lineage_receipt_digest NOT GLOB '*[^0-9a-f]*')),
+    lineage_validated_at TEXT,
+    status_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK((creator_session_id IS NULL) = (creator_generation_id IS NULL)),
+    CHECK(creator_session_id IS NULL OR length(trim(creator_session_id)) > 0),
+    CHECK(creator_generation_id IS NULL OR length(trim(creator_generation_id)) > 0),
+    CHECK(creator_operation_id IS NULL OR length(trim(creator_operation_id)) > 0),
+    CHECK(lineage_state NOT IN ('complete', 'source-independent') OR (lineage_receipt_digest IS NOT NULL AND lineage_validated_at IS NOT NULL)),
+    CHECK(origin != 'model-derived' OR creator_session_id IS NOT NULL OR creator_operation_id IS NOT NULL),
+    FOREIGN KEY(creator_session_id, creator_generation_id) REFERENCES generation_evidence(session_id, generation_id)
+  );
+  CREATE INDEX derived_artifact_lifecycle ON derived_artifact(scope, lifecycle_state, kind, target);
+  CREATE TABLE derived_artifact_source (
+    artifact_id TEXT NOT NULL,
+    bank_id TEXT NOT NULL CHECK(length(trim(bank_id)) > 0),
+    endpoint TEXT NOT NULL CHECK(length(trim(endpoint)) > 0),
+    document_id TEXT NOT NULL CHECK(length(trim(document_id)) > 0),
+    validated_epoch INTEGER CHECK(validated_epoch IS NULL OR validated_epoch >= 0),
+    validated_fence TEXT,
+    source_revision TEXT,
+    content_digest TEXT CHECK(content_digest IS NULL OR (length(content_digest) = 64 AND content_digest NOT GLOB '*[^0-9a-f]*')),
+    segment_digest TEXT CHECK(segment_digest IS NULL OR (length(segment_digest) = 64 AND segment_digest NOT GLOB '*[^0-9a-f]*')),
+    validation_state TEXT NOT NULL CHECK(validation_state IN ('validated', 'unverified', 'missing', 'ambiguous', 'stale', 'withheld', 'unknown')),
+    correlation_id TEXT,
+    PRIMARY KEY(artifact_id, bank_id, endpoint, document_id),
+    FOREIGN KEY(artifact_id) REFERENCES derived_artifact(artifact_id) ON DELETE CASCADE,
+    CHECK(validation_state != 'validated' OR (validated_epoch IS NOT NULL AND source_revision IS NOT NULL AND content_digest IS NOT NULL AND segment_digest IS NOT NULL))
+  );
+  CREATE INDEX derived_artifact_source_namespace
+    ON derived_artifact_source(bank_id, endpoint, document_id, artifact_id);
+`;
+
+function expectedTables(version: number): Record<string, readonly string[]> {
+  return {
+    ...BASE_TABLE_COLUMNS,
+    ...(version >= 3 ? V3_TABLE_COLUMNS : {}),
+    ...(version >= 4 ? V4_TABLE_COLUMNS : {}),
+  };
+}
+
+function expectedIndexes(version: number): string[] {
+  return [
+    ...BASE_INDEXES,
+    ...(version >= 3 ? V3_INDEXES : []),
+    ...(version >= 4 ? V4_INDEXES : []),
+  ].sort();
+}
+
+function schemaObjects(db: StateDatabase): Array<{ name: string; type: string }> {
+  return db.prepare(`
+    SELECT name, type FROM sqlite_schema
+    WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'view', 'trigger')
+    ORDER BY type, name
+  `).all() as Array<{ name: string; type: string }>;
+}
+
+function assertStateSchema(db: StateDatabase, version: number): void {
+  const expected = expectedTables(version);
+  const objects = schemaObjects(db);
+  const expectedNames = Object.keys(expected).sort();
+  const actualNames = objects.map((item) => item.name).sort();
+  if (objects.some((item) => item.type !== 'table') || JSON.stringify(actualNames) !== JSON.stringify(expectedNames)) {
+    throw new Error(`memory database schema ${version} has an unexpected table layout`);
+  }
+  for (const [table, columns] of Object.entries(expected)) {
+    const actual = (db.prepare(`PRAGMA table_info("${table}")`).all() as Array<{ name: string }>).map((row) => row.name).sort();
+    if (JSON.stringify(actual) !== JSON.stringify([...columns].sort())) {
+      throw new Error(`memory database schema ${version} has an unexpected ${table} layout`);
+    }
+  }
+  const indexes = (db.prepare("SELECT name FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL ORDER BY name")
+    .all() as Array<{ name: string }>).map((row) => row.name);
+  if (JSON.stringify(indexes) !== JSON.stringify(expectedIndexes(version))) {
+    throw new Error(`memory database schema ${version} has an unexpected index layout`);
+  }
+  if (version >= 4) {
+    assertPrimaryKey(db, 'generation_evidence', ['session_id', 'generation_id']);
+    assertPrimaryKey(db, 'generation_source_dependency', ['session_id', 'generation_id', 'bank_id', 'endpoint', 'document_id']);
+    assertPrimaryKey(db, 'derived_artifact', ['artifact_id']);
+    assertPrimaryKey(db, 'derived_artifact_source', ['artifact_id', 'bank_id', 'endpoint', 'document_id']);
+    assertForeignKey(db, 'generation_source_dependency', 'generation_evidence', 'session_id', 'session_id');
+    assertForeignKey(db, 'generation_source_dependency', 'generation_evidence', 'generation_id', 'generation_id');
+    assertForeignKey(db, 'derived_artifact', 'generation_evidence', 'creator_session_id', 'session_id');
+    assertForeignKey(db, 'derived_artifact', 'generation_evidence', 'creator_generation_id', 'generation_id');
+    assertForeignKey(db, 'derived_artifact_source', 'derived_artifact', 'artifact_id', 'artifact_id');
+  }
+}
+
+function assertPrimaryKey(db: StateDatabase, table: string, expected: readonly string[]): void {
+  const actual = (db.prepare(`PRAGMA table_info("${table}")`).all() as Array<{ name: string; pk: number }>)
+    .filter((row) => row.pk > 0).sort((a, b) => a.pk - b.pk).map((row) => row.name);
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(`memory database has an invalid ${table} identity`);
+}
+
+function assertForeignKey(db: StateDatabase, table: string, target: string, from: string, to: string): void {
+  const rows = db.prepare(`PRAGMA foreign_key_list("${table}")`).all() as Array<{ table: string; from: string; to: string }>;
+  if (!rows.some((row) => row.table === target && row.from === from && row.to === to)) {
+    throw new Error(`memory database has an invalid ${table} relationship`);
+  }
+}
+
+function migrateStateSchema(db: StateDatabase, options: MemoryStateMigrationOptions): void {
+  const version = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
+  if (version > 4) throw new Error(`memory database schema ${version} is newer than this application`);
+  if (version === 1) throw new Error('memory database schema 1 has no verified migration contract');
+  if (version === 4) {
+    assertStateSchema(db, 4);
+    return;
+  }
+  if (version === 0) {
+    if (schemaObjects(db).length > 0) throw new Error('unversioned memory database is not empty; refusing migration');
+  } else {
+    assertStateSchema(db, version);
+  }
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    let current = version;
+    if (current === 0) {
+      db.exec(BASE_SCHEMA_SQL);
+      current = 1;
+      db.exec('PRAGMA user_version = 1');
+    }
+    if (current < 2) {
+      db.exec('PRAGMA user_version = 2');
+      current = 2;
+    }
+    if (current < 3) {
+      db.exec(V3_SCHEMA_SQL);
+      db.exec('PRAGMA user_version = 3');
+      current = 3;
+    }
+    if (current < 4) {
+      db.exec(V4_SCHEMA_SQL);
+      assertStateSchema(db, 4);
+      options.onCheckpoint?.('after-v4-ddl');
+      db.exec('PRAGMA user_version = 4');
+    }
+    assertStateSchema(db, 4);
+    const integrity = db.prepare('PRAGMA quick_check').all() as Array<{ quick_check?: string }>;
+    if (integrity.length !== 1 || integrity[0]?.quick_check !== 'ok') {
+      throw new Error(`memory database integrity check failed: ${integrity[0]?.quick_check ?? 'no result'}`);
+    }
+    const foreignKeys = db.prepare('PRAGMA foreign_key_check').all();
+    if (foreignKeys.length > 0) throw new Error('memory database foreign key check failed');
+    db.exec('COMMIT');
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch { /* Keep the migration error. */ }
+    throw error;
+  }
+}
+
+const DIGEST = /^[0-9a-f]{64}$/;
+
+function requiredText(value: unknown, field: string): string {
+  if (typeof value !== 'string' || value.trim().length === 0) throw new Error(`${field} must be non-empty`);
+  return value;
+}
+
+function optionalText(value: string | null | undefined, field: string): string | null {
+  if (value == null) return null;
+  return requiredText(value, field);
+}
+
+function optionalDigest(value: string | null | undefined, field: string): string | null {
+  const text = optionalText(value, field);
+  if (text !== null && !DIGEST.test(text)) throw new Error(`${field} must be a lowercase SHA-256 digest`);
+  return text;
+}
+
+function requiredDigest(value: string, field: string): string {
+  const digest = optionalDigest(value, field);
+  if (!digest) throw new Error(`${field} must be a lowercase SHA-256 digest`);
+  return digest;
+}
+
+function validTimestamp(value: string, field: string): string {
+  const timestamp = requiredText(value, field);
+  if (!Number.isFinite(Date.parse(timestamp))) throw new Error(`${field} must be a valid timestamp`);
+  return timestamp;
+}
+
+function normalizeSource(source: MemorySourceDependency): MemorySourceDependency {
+  const bankId = requiredText(source.bankId, 'source bankId');
+  const endpoint = requiredText(source.endpoint, 'source endpoint');
+  const documentId = requiredText(source.documentId, 'source documentId');
+  if (source.validatedEpoch !== null && (!Number.isInteger(source.validatedEpoch) || source.validatedEpoch < 0)) {
+    throw new Error('source validatedEpoch must be a non-negative integer or null');
+  }
+  const validationState = source.validationState;
+  if (!['validated', 'unverified', 'missing', 'ambiguous', 'stale', 'withheld', 'unknown'].includes(validationState)) {
+    throw new Error('source validationState is invalid');
+  }
+  const normalized: MemorySourceDependency = {
+    bankId, endpoint, documentId,
+    validatedEpoch: source.validatedEpoch,
+    validatedFence: optionalText(source.validatedFence, 'source validatedFence'),
+    revision: optionalText(source.revision, 'source revision'),
+    contentDigest: optionalDigest(source.contentDigest, 'source contentDigest'),
+    segmentDigest: optionalDigest(source.segmentDigest, 'source segmentDigest'),
+    validationState,
+    correlationId: optionalText(source.correlationId, 'source correlationId'),
+  };
+  if (validationState === 'validated'
+    && (normalized.validatedEpoch === null || normalized.revision === null
+      || normalized.contentDigest === null || normalized.segmentDigest === null)) {
+    throw new Error('validated source dependencies require epoch, revision and digests');
+  }
+  return normalized;
+}
+
+function normalizeSources(sources: readonly MemorySourceDependency[]): MemorySourceDependency[] {
+  const unique = new Map<string, MemorySourceDependency>();
+  for (const source of sources) {
+    const normalized = normalizeSource(source);
+    const identity = JSON.stringify([normalized.bankId, normalized.endpoint, normalized.documentId]);
+    const prior = unique.get(identity);
+    if (prior && JSON.stringify(prior) !== JSON.stringify(normalized)) {
+      throw new Error('source dependency identity has conflicting metadata');
+    }
+    unique.set(identity, normalized);
+  }
+  return [...unique.values()].sort((a, b) =>
+    a.bankId.localeCompare(b.bankId) || a.endpoint.localeCompare(b.endpoint) || a.documentId.localeCompare(b.documentId));
+}
+
+function assertMappingReceipt(
+  state: MemorySourceMappingState,
+  receiptDigest: string | null,
+  validatedAt: string | null,
+  sources: readonly MemorySourceDependency[],
+): void {
+  if (!['complete', 'source-independent', 'missing', 'ambiguous', 'unknown'].includes(state)) {
+    throw new Error('source mapping state is invalid');
+  }
+  if ((state === 'complete' || state === 'source-independent') && (!receiptDigest || !validatedAt)) {
+    throw new Error('complete source mapping requires a receipt and validation time');
+  }
+  if (state === 'source-independent' && sources.length > 0) throw new Error('source-independent mapping cannot contain dependencies');
+  if (state === 'complete' && sources.some((source) => source.validationState !== 'validated')) {
+    throw new Error('complete source mapping requires validated dependencies');
+  }
+}
+
+function generationIdentity(record: GenerationEvidence): string {
+  return JSON.stringify(record);
+}
+
+function artifactIdentity(record: DerivedArtifact): string {
+  return JSON.stringify(record);
+}
 
 export function stateDatabasePath(file: string): string {
   const path = resolve(file);
@@ -92,154 +609,27 @@ export class MemoryStateStore {
   private transactionDepth = 0;
   private closed = false;
 
-  constructor(readonly path: string) {
+  constructor(readonly path: string, migrationOptions: MemoryStateMigrationOptions = {}) {
     mkdirSync(dirname(path), { recursive: true });
     const fd = openSync(path, 'a', 0o600);
     closeSync(fd);
-    this.restrictFilePermissions();
     this.db = new DatabaseSync(path);
-    this.db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA synchronous = FULL;');
-    this.db.exec('PRAGMA journal_mode = WAL;');
-    const version = (this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-    if (version > 3) {
-      this.db.close();
-      this.closed = true;
-      throw new Error(`memory database schema ${version} is newer than this application`);
-    }
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS memory_metadata (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS memory_events (
-        event_id TEXT PRIMARY KEY,
-        document_id TEXT NOT NULL,
-        actor TEXT,
-        occurred_at TEXT,
-        intent TEXT NOT NULL,
-        status TEXT,
-        payload_hash TEXT NOT NULL,
-        payload_json TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS memory_operations (
-        event_id TEXT PRIMARY KEY REFERENCES memory_events(event_id) ON DELETE CASCADE,
-        bank_id TEXT,
-        endpoint TEXT,
-        document_id TEXT NOT NULL,
-        operation_id TEXT NOT NULL,
-        state TEXT NOT NULL,
-        attempts INTEGER NOT NULL,
-        next_attempt_at TEXT NOT NULL,
-        next_poll_at TEXT,
-        updated_at TEXT NOT NULL,
-        payload_hash TEXT NOT NULL,
-        record_json TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS memory_operations_due
-        ON memory_operations(state, next_attempt_at, updated_at);
-      CREATE INDEX IF NOT EXISTS memory_operations_source
-        ON memory_operations(bank_id, endpoint, document_id);
-      CREATE TABLE IF NOT EXISTS memory_revisions (
-        event_id TEXT NOT NULL,
-        bank_id TEXT NOT NULL,
-        endpoint TEXT NOT NULL,
-        document_id TEXT NOT NULL,
-        supersedes_document_id TEXT NOT NULL,
-        state TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(event_id, supersedes_document_id)
-      );
-      CREATE INDEX IF NOT EXISTS memory_revisions_current
-        ON memory_revisions(bank_id, endpoint, supersedes_document_id, state);
-      CREATE TABLE IF NOT EXISTS memory_deletions (
-        task_id TEXT PRIMARY KEY,
-        bank_id TEXT NOT NULL,
-        endpoint TEXT NOT NULL,
-        document_id TEXT NOT NULL,
-        operation_id TEXT,
-        state TEXT NOT NULL,
-        attempts INTEGER NOT NULL,
-        verifications INTEGER NOT NULL,
-        next_attempt_at TEXT NOT NULL,
-        record_json TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS memory_deletions_due
-        ON memory_deletions(state, next_attempt_at);
-      CREATE TABLE IF NOT EXISTS memory_fences (
-        bank_id TEXT NOT NULL,
-        endpoint TEXT NOT NULL,
-        document_id TEXT NOT NULL,
-        reason TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        PRIMARY KEY(bank_id, endpoint, document_id)
-      );
-      CREATE TABLE IF NOT EXISTS memory_derived_state (
-        bank_id TEXT NOT NULL,
-        endpoint TEXT NOT NULL,
-        epoch INTEGER NOT NULL,
-        stale INTEGER NOT NULL,
-        PRIMARY KEY(bank_id, endpoint)
-      );
-    `);
-    if (version < 2) this.db.exec('PRAGMA user_version = 2;');
-    if (version < 3) {
-      this.db.exec('BEGIN IMMEDIATE');
-      try {
-        this.db.exec(`
-          CREATE TABLE IF NOT EXISTS memory_activation (
-            bank_id TEXT NOT NULL,
-            endpoint TEXT NOT NULL,
-            document_id TEXT NOT NULL,
-            activation_anchor_weight REAL NOT NULL,
-            activation_anchor_at TEXT NOT NULL,
-            half_life_days REAL NOT NULL,
-            epsilon REAL NOT NULL,
-            params_version TEXT NOT NULL,
-            last_user_mention_at TEXT,
-            last_reinforced_at TEXT,
-            last_retrieved_at TEXT,
-            independent_mention_count INTEGER NOT NULL,
-            source_epoch INTEGER NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY(bank_id, endpoint, document_id)
-          );
-          CREATE TABLE IF NOT EXISTS memory_mention_events (
-            mention_event_id TEXT PRIMARY KEY,
-            bank_id TEXT NOT NULL,
-            endpoint TEXT NOT NULL,
-            target_document_id TEXT NOT NULL,
-            user_event_document_id TEXT NOT NULL,
-            user_event_id TEXT NOT NULL,
-            occurred_at TEXT NOT NULL,
-            spacing_bucket TEXT NOT NULL CHECK(spacing_bucket IN ('initial', 'same-turn', 'same-day', 'cross-day')),
-            semantic_match REAL NOT NULL CHECK(semantic_match >= 0 AND semantic_match <= 1),
-            intensity REAL NOT NULL CHECK(intensity >= 0 AND intensity <= 1),
-            source_type TEXT NOT NULL CHECK(source_type = 'user_mention'),
-            applied_boost REAL NOT NULL CHECK(applied_boost >= 0 AND applied_boost <= 1),
-            source_epoch INTEGER NOT NULL,
-            params_version TEXT NOT NULL,
-            UNIQUE(bank_id, endpoint, target_document_id, user_event_document_id)
-          );
-          CREATE INDEX IF NOT EXISTS memory_mention_events_day
-            ON memory_mention_events(bank_id, endpoint, target_document_id, occurred_at);
-          CREATE INDEX IF NOT EXISTS memory_mention_events_source
-            ON memory_mention_events(bank_id, endpoint, user_event_document_id);
-          PRAGMA user_version = 3;
-        `);
-        this.db.exec('COMMIT');
-      } catch (error) {
-        try { this.db.exec('ROLLBACK'); } catch { /* Keep the migration error. */ }
-        this.db.close();
-        this.closed = true;
-        throw error;
+    try {
+      this.db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA synchronous = FULL;');
+      migrateStateSchema(this.db, migrationOptions);
+      this.db.exec('PRAGMA journal_mode = WAL;');
+      this.restrictFilePermissions();
+      const check = this.db.prepare('PRAGMA quick_check').all() as Array<{ quick_check?: string }>;
+      if (check.length !== 1 || check[0]?.quick_check !== 'ok') {
+        throw new Error(`memory database integrity check failed: ${check[0]?.quick_check ?? 'no result'}`);
       }
-    }
-    this.restrictFilePermissions();
-    const check = this.db.prepare('PRAGMA quick_check').get() as { quick_check?: string } | undefined;
-    if (check?.quick_check !== 'ok') {
+      if (this.db.prepare('PRAGMA foreign_key_check').all().length > 0) {
+        throw new Error('memory database foreign key check failed');
+      }
+    } catch (error) {
       this.db.close();
       this.closed = true;
-      throw new Error(`memory database integrity check failed: ${check?.quick_check ?? 'no result'}`);
+      throw error;
     }
   }
 
@@ -560,10 +950,302 @@ export class MemoryStateStore {
     });
   }
 
+  saveGenerationEvidence(input: GenerationEvidenceInput): GenerationEvidence {
+    const sources = normalizeSources(input.sources);
+    const validationReceiptDigest = optionalDigest(input.validationReceiptDigest, 'validationReceiptDigest');
+    const validatedAt = input.validatedAt === null ? null : input.validatedAt === undefined ? null : validTimestamp(input.validatedAt, 'validatedAt');
+    assertMappingReceipt(input.mappingState, validationReceiptDigest, validatedAt, sources);
+    if (input.actualEvidenceUsed !== undefined && input.actualEvidenceUsed !== 'unknown') {
+      throw new Error('actualEvidenceUsed must remain unknown');
+    }
+    if (!['user-input', 'provider-response', 'tool-outcome', 'system-context', 'unknown'].includes(input.origin)) {
+      throw new Error('generation evidence origin is invalid');
+    }
+    const record: GenerationEvidence = {
+      sessionId: requiredText(input.sessionId, 'sessionId'),
+      generationId: requiredText(input.generationId, 'generationId'),
+      providerAttemptId: optionalText(input.providerAttemptId, 'providerAttemptId'),
+      responseId: optionalText(input.responseId, 'responseId'),
+      toolCorrelationId: optionalText(input.toolCorrelationId, 'toolCorrelationId'),
+      origin: input.origin,
+      mappingState: input.mappingState,
+      validationReceiptDigest,
+      validatedAt,
+      exceptionReason: optionalText(input.exceptionReason, 'exceptionReason'),
+      actualEvidenceUsed: 'unknown',
+      createdAt: validTimestamp(input.createdAt, 'createdAt'),
+      sources,
+    };
+
+    return this.transaction(() => {
+      const existing = this.readGenerationEvidence(record.sessionId, record.generationId);
+      if (existing) {
+        if (generationIdentity(existing) !== generationIdentity(record)) {
+          throw new Error('generation evidence identity has conflicting metadata');
+        }
+        return existing;
+      }
+      this.db.prepare(`
+        INSERT INTO generation_evidence(session_id, generation_id, provider_attempt_id, response_id,
+          tool_correlation_id, origin, mapping_state, validation_receipt_digest, validated_at,
+          exception_reason, actual_evidence_used, created_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?)
+      `).run(
+        record.sessionId, record.generationId, record.providerAttemptId, record.responseId,
+        record.toolCorrelationId, record.origin, record.mappingState, record.validationReceiptDigest,
+        record.validatedAt, record.exceptionReason, record.createdAt,
+      );
+      const insertSource = this.db.prepare(`
+        INSERT INTO generation_source_dependency(session_id, generation_id, bank_id, endpoint, document_id,
+          validated_epoch, validated_fence, source_revision, content_digest, segment_digest, validation_state, correlation_id)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const source of sources) insertSource.run(
+        record.sessionId, record.generationId, source.bankId, source.endpoint, source.documentId,
+        source.validatedEpoch, source.validatedFence, source.revision, source.contentDigest,
+        source.segmentDigest, source.validationState, source.correlationId,
+      );
+      return this.readGenerationEvidence(record.sessionId, record.generationId)!;
+    });
+  }
+
+  getGenerationEvidence(sessionId: string, generationId: string): GenerationEvidence | null {
+    this.assertOpen();
+    return this.readGenerationEvidence(requiredText(sessionId, 'sessionId'), requiredText(generationId, 'generationId'));
+  }
+
+  saveDerivedArtifact(input: DerivedArtifactInput): DerivedArtifact {
+    const sources = normalizeSources(input.sources);
+    const lineageReceiptDigest = optionalDigest(input.lineageReceiptDigest, 'lineageReceiptDigest');
+    const lineageValidatedAt = input.lineageValidatedAt === null
+      ? null
+      : input.lineageValidatedAt === undefined ? null : validTimestamp(input.lineageValidatedAt, 'lineageValidatedAt');
+    if (!['user-authored', 'trusted-system', 'model-derived', 'unknown'].includes(input.origin)) {
+      throw new Error('derived artifact origin is invalid');
+    }
+    if (!['unreviewed', 'approved', 'rejected', 'unknown'].includes(input.reviewState)) {
+      throw new Error('derived artifact reviewState is invalid');
+    }
+    if (!['active', 'pending', 'stale', 'withdrawn', 'withheld', 'unknown'].includes(input.lifecycleState)) {
+      throw new Error('derived artifact lifecycleState is invalid');
+    }
+    const creatorSessionId = optionalText(input.creatorSessionId, 'creatorSessionId');
+    const creatorGenerationId = optionalText(input.creatorGenerationId, 'creatorGenerationId');
+    if ((creatorSessionId === null) !== (creatorGenerationId === null)) {
+      throw new Error('creator session and generation must be provided together');
+    }
+    const record: DerivedArtifact = {
+      artifactId: requiredText(input.artifactId, 'artifactId'),
+      kind: requiredText(input.kind, 'kind'),
+      target: requiredText(input.target, 'target'),
+      scope: requiredText(input.scope, 'scope'),
+      creatorSessionId,
+      creatorGenerationId,
+      creatorOperationId: optionalText(input.creatorOperationId, 'creatorOperationId'),
+      bodyDigest: requiredDigest(input.bodyDigest, 'bodyDigest'),
+      origin: input.origin,
+      reviewState: input.reviewState,
+      lifecycleState: input.lifecycleState,
+      lineageState: input.lineageState,
+      lineageReceiptDigest,
+      lineageValidatedAt,
+      statusReason: optionalText(input.statusReason, 'statusReason'),
+      createdAt: validTimestamp(input.createdAt, 'createdAt'),
+      updatedAt: validTimestamp(input.updatedAt, 'updatedAt'),
+      sources,
+    };
+    assertMappingReceipt(record.lineageState, record.lineageReceiptDigest, record.lineageValidatedAt, sources);
+    if (record.lifecycleState === 'active' && !['complete', 'source-independent'].includes(record.lineageState)) {
+      throw new Error('artifacts with incomplete lineage cannot be active');
+    }
+    if (['stale', 'withdrawn', 'withheld', 'unknown'].includes(record.lifecycleState) && !record.statusReason) {
+      throw new Error('non-active artifact states require a reason');
+    }
+    if (record.origin === 'model-derived'
+      && record.creatorSessionId === null && record.creatorOperationId === null) {
+      throw new Error('model-derived artifacts require a generation or operation identity');
+    }
+
+    return this.transaction(() => {
+      const existing = this.readDerivedArtifact(record.artifactId);
+      if (existing) {
+        if (artifactIdentity(existing) !== artifactIdentity(record)) {
+          throw new Error('derived artifact identity has conflicting metadata');
+        }
+        return existing;
+      }
+      this.db.prepare(`
+        INSERT INTO derived_artifact(artifact_id, kind, target, scope, creator_session_id, creator_generation_id,
+          creator_operation_id, body_digest, origin, review_state, lifecycle_state, lineage_state,
+          lineage_receipt_digest, lineage_validated_at, status_reason, created_at, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        record.artifactId, record.kind, record.target, record.scope, record.creatorSessionId,
+        record.creatorGenerationId, record.creatorOperationId, record.bodyDigest, record.origin,
+        record.reviewState, record.lifecycleState, record.lineageState, record.lineageReceiptDigest, record.lineageValidatedAt,
+        record.statusReason, record.createdAt, record.updatedAt,
+      );
+      const insertSource = this.db.prepare(`
+        INSERT INTO derived_artifact_source(artifact_id, bank_id, endpoint, document_id, validated_epoch,
+          validated_fence, source_revision, content_digest, segment_digest, validation_state, correlation_id)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const source of sources) insertSource.run(
+        record.artifactId, source.bankId, source.endpoint, source.documentId, source.validatedEpoch,
+        source.validatedFence, source.revision, source.contentDigest, source.segmentDigest,
+        source.validationState, source.correlationId,
+      );
+      return this.readDerivedArtifact(record.artifactId)!;
+    });
+  }
+
+  getDerivedArtifact(artifactId: string): DerivedArtifact | null {
+    this.assertOpen();
+    return this.readDerivedArtifact(requiredText(artifactId, 'artifactId'));
+  }
+
+  derivedArtifactsForSource(bankId: string, endpoint: string, documentId: string): DerivedArtifact[] {
+    this.assertOpen();
+    const rows = this.db.prepare(`
+      SELECT artifact_id FROM derived_artifact_source
+      WHERE bank_id = ? AND endpoint = ? AND document_id = ?
+      ORDER BY artifact_id
+    `).all(requiredText(bankId, 'bankId'), requiredText(endpoint, 'endpoint'), requiredText(documentId, 'documentId')) as Array<{ artifact_id: string }>;
+    return rows.flatMap(({ artifact_id }) => {
+      const artifact = this.readDerivedArtifact(artifact_id);
+      return artifact ? [artifact] : [];
+    });
+  }
+
+  markDerivedArtifactState(
+    artifactId: string,
+    lifecycleState: Exclude<DerivedArtifactLifecycleState, 'active'>,
+    reason: string,
+    updatedAt: string,
+  ): DerivedArtifact | null {
+    if (!['pending', 'stale', 'withdrawn', 'withheld', 'unknown'].includes(lifecycleState)) {
+      throw new Error('derived artifact lifecycleState is invalid');
+    }
+    return this.transaction(() => {
+      const current = this.readDerivedArtifact(requiredText(artifactId, 'artifactId'));
+      if (!current) return null;
+      this.db.prepare(`
+        UPDATE derived_artifact SET lifecycle_state = ?, status_reason = ?, updated_at = ?
+        WHERE artifact_id = ?
+      `).run(lifecycleState, requiredText(reason, 'reason'), validTimestamp(updatedAt, 'updatedAt'), current.artifactId);
+      return this.readDerivedArtifact(current.artifactId);
+    });
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
     this.db.close();
+  }
+
+  private readGenerationEvidence(sessionId: string, generationId: string): GenerationEvidence | null {
+    const row = this.db.prepare(`
+      SELECT session_id, generation_id, provider_attempt_id, response_id, tool_correlation_id, origin,
+        mapping_state, validation_receipt_digest, validated_at, exception_reason, actual_evidence_used, created_at
+      FROM generation_evidence WHERE session_id = ? AND generation_id = ?
+    `).get(sessionId, generationId) as {
+      session_id: string; generation_id: string; provider_attempt_id: string | null; response_id: string | null;
+      tool_correlation_id: string | null; origin: string; mapping_state: string; validation_receipt_digest: string | null;
+      validated_at: string | null; exception_reason: string | null; actual_evidence_used: string; created_at: string;
+    } | undefined;
+    if (!row) return null;
+    const sourceRows = this.db.prepare(`
+      SELECT bank_id, endpoint, document_id, validated_epoch, validated_fence, source_revision,
+        content_digest, segment_digest, validation_state, correlation_id
+      FROM generation_source_dependency WHERE session_id = ? AND generation_id = ?
+      ORDER BY bank_id, endpoint, document_id
+    `).all(sessionId, generationId) as Array<{
+      bank_id: string; endpoint: string; document_id: string; validated_epoch: number | null;
+      validated_fence: string | null; source_revision: string | null; content_digest: string | null;
+      segment_digest: string | null; validation_state: string; correlation_id: string | null;
+    }>;
+    return {
+      sessionId: row.session_id,
+      generationId: row.generation_id,
+      providerAttemptId: row.provider_attempt_id,
+      responseId: row.response_id,
+      toolCorrelationId: row.tool_correlation_id,
+      origin: row.origin as MemoryEvidenceOrigin,
+      mappingState: row.mapping_state as MemorySourceMappingState,
+      validationReceiptDigest: row.validation_receipt_digest,
+      validatedAt: row.validated_at,
+      exceptionReason: row.exception_reason,
+      actualEvidenceUsed: row.actual_evidence_used as 'unknown',
+      createdAt: row.created_at,
+      sources: sourceRows.map((source) => ({
+        bankId: source.bank_id,
+        endpoint: source.endpoint,
+        documentId: source.document_id,
+        validatedEpoch: source.validated_epoch,
+        validatedFence: source.validated_fence,
+        revision: source.source_revision,
+        contentDigest: source.content_digest,
+        segmentDigest: source.segment_digest,
+        validationState: source.validation_state as MemorySourceValidationState,
+        correlationId: source.correlation_id,
+      })),
+    };
+  }
+
+  private readDerivedArtifact(artifactId: string): DerivedArtifact | null {
+    const row = this.db.prepare(`
+      SELECT artifact_id, kind, target, scope, creator_session_id, creator_generation_id, creator_operation_id,
+        body_digest, origin, review_state, lifecycle_state, lineage_state, lineage_receipt_digest,
+        lineage_validated_at, status_reason, created_at, updated_at
+      FROM derived_artifact WHERE artifact_id = ?
+    `).get(artifactId) as {
+      artifact_id: string; kind: string; target: string; scope: string; creator_session_id: string | null;
+      creator_generation_id: string | null; creator_operation_id: string | null; body_digest: string; origin: string;
+      review_state: string; lifecycle_state: string; lineage_state: string; lineage_receipt_digest: string | null;
+      lineage_validated_at: string | null; status_reason: string | null; created_at: string; updated_at: string;
+    } | undefined;
+    if (!row) return null;
+    const sourceRows = this.db.prepare(`
+      SELECT bank_id, endpoint, document_id, validated_epoch, validated_fence, source_revision,
+        content_digest, segment_digest, validation_state, correlation_id
+      FROM derived_artifact_source WHERE artifact_id = ?
+      ORDER BY bank_id, endpoint, document_id
+    `).all(artifactId) as Array<{
+      bank_id: string; endpoint: string; document_id: string; validated_epoch: number | null;
+      validated_fence: string | null; source_revision: string | null; content_digest: string | null;
+      segment_digest: string | null; validation_state: string; correlation_id: string | null;
+    }>;
+    return {
+      artifactId: row.artifact_id,
+      kind: row.kind,
+      target: row.target,
+      scope: row.scope,
+      creatorSessionId: row.creator_session_id,
+      creatorGenerationId: row.creator_generation_id,
+      creatorOperationId: row.creator_operation_id,
+      bodyDigest: row.body_digest,
+      origin: row.origin as DerivedArtifactOrigin,
+      reviewState: row.review_state as DerivedArtifactReviewState,
+      lifecycleState: row.lifecycle_state as DerivedArtifactLifecycleState,
+      lineageState: row.lineage_state as MemorySourceMappingState,
+      lineageReceiptDigest: row.lineage_receipt_digest,
+      lineageValidatedAt: row.lineage_validated_at,
+      statusReason: row.status_reason,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      sources: sourceRows.map((source) => ({
+        bankId: source.bank_id,
+        endpoint: source.endpoint,
+        documentId: source.document_id,
+        validatedEpoch: source.validated_epoch,
+        validatedFence: source.validated_fence,
+        revision: source.source_revision,
+        contentDigest: source.content_digest,
+        segmentDigest: source.segment_digest,
+        validationState: source.validation_state as MemorySourceValidationState,
+        correlationId: source.correlation_id,
+      })),
+    };
   }
 
   private writeOutbox(raw: object): void {
