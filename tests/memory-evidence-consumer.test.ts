@@ -19,7 +19,7 @@ import { HindsightMemory } from '../core/memory/hindsight.ts';
 import { loadHindsightConfig } from '../core/memory/config.ts';
 import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import { MemoryOutbox } from '../core/memory/outbox.ts';
-import { closeMemoryStateStores, openMemoryStateStore } from '../core/memory/state-store.ts';
+import { closeMemoryStateStores, memoryArtifactScope, openMemoryStateStore } from '../core/memory/state-store.ts';
 import { partnerProvenancePath, partnerSegmentDigest, partnerSourceScopeDigest, partnerWorkspaceDigest, readPartnerProvenance, writePartnerProvenance } from '../core/memory/partner-provenance.ts';
 
 const SOURCE_TEXT = 'The person prefers jasmine tea.';
@@ -57,6 +57,7 @@ async function hindsightServer(
   sourceAvailable: boolean,
   factText = SOURCE_TEXT,
   beforeDocumentRead?: () => Promise<void>,
+  additionalSources: Array<{ documentId: string; text: string }> = [],
 ): Promise<{ baseUrl: string; recallRequests: () => number }> {
   let recallCount = 0;
   const server = createServer((req, res) => {
@@ -69,15 +70,21 @@ async function hindsightServer(
       };
       if (url.pathname.endsWith('/memories/recall')) {
         recallCount += 1;
+        const sources = [
+          { factId: 'fact-1', observationId: 'observation-1', documentId: 'doc-1', text: factText },
+          ...additionalSources.map((source, index) => ({
+            factId: `fact-${index + 2}`, observationId: `observation-${index + 2}`,
+            documentId: source.documentId, text: source.text,
+          })),
+        ];
         send({
-          results: [{ id: 'observation-1', text: 'A past record.', type: 'observation', document_id: 'derived-1', source_fact_ids: ['fact-1'] }],
-          source_facts: {
-            'fact-1': {
-              id: 'fact-1', text: factText, type: 'world', document_id: 'doc-1',
+          results: sources.map((source, index) => ({ id: source.observationId, text: 'A past record.', type: 'observation',
+            document_id: `derived-${index + 1}`, source_fact_ids: [source.factId] })),
+          source_facts: Object.fromEntries(sources.map((source) => [source.factId, {
+              id: source.factId, text: source.text, type: 'world', document_id: source.documentId,
               occurred_start: '2024-05-01T10:00:00.000Z',
               metadata: { source_actor: 'user', kind: 'event', status: 'completed' },
-            },
-          },
+            }])),
           source_facts_truncated: false,
         });
         return;
@@ -87,15 +94,18 @@ async function hindsightServer(
         return;
       }
       const documentId = decodeURIComponent(url.pathname.split('/').at(-1) ?? '');
-      if (documentId !== 'doc-1' || !sourceAvailable) {
+      const document = documentId === 'doc-1'
+        ? { text: SOURCE_TEXT }
+        : additionalSources.find((source) => source.documentId === documentId);
+      if (!document || !sourceAvailable) {
         res.writeHead(404);
         res.end();
         return;
       }
       await beforeDocumentRead?.();
       send({
-        id: 'doc-1', bank_id: 'fixture-bank', original_text: SOURCE_TEXT,
-        content_hash: 'synthetic-content-hash', created_at: '2024-05-01T10:00:00.000Z',
+        id: documentId, bank_id: 'fixture-bank', original_text: document.text,
+        content_hash: createHash('sha256').update(document.text, 'utf8').digest('hex'), created_at: '2024-05-01T10:00:00.000Z',
         updated_at: '2024-05-01T10:00:00.000Z', memory_unit_count: 1,
         document_metadata: { source_actor: 'user', kind: 'event', status: 'completed', said_at: '2024-05-01T10:00:00.000Z' },
       });
@@ -114,13 +124,21 @@ async function buildRig(
   sourceAvailable: boolean,
   factText?: string,
   beforeDocumentRead?: () => Promise<void>,
-  options: { partnerSummary?: string; partnerUserNote?: string; tools?: ToolDef[] } = {},
+  options: {
+    partnerSummary?: string;
+    partnerAdditionalDerived?: Array<{ documentId: string; text: string }>;
+    partnerUserNote?: string;
+    additionalSources?: Array<{ documentId: string; text: string }>;
+    tools?: ToolDef[];
+    worldPrompt?: string;
+    llmSetup?: (llm: FakeLLM) => void;
+  } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'coo-memory-evidence-consumer-'));
   roots.push(root);
   const memoryDir = join(root, 'persona');
-  const server = await hindsightServer(sourceAvailable, factText, beforeDocumentRead);
-  const store = openMemoryStateStore(join(memoryDir, 'memory-state.sqlite'));
+  const server = await hindsightServer(sourceAvailable, factText, beforeDocumentRead, options.additionalSources);
+  const store = openMemoryStateStore(join(root, 'memory-state.sqlite'));
   const memory = new HindsightMemory();
   Object.assign(memory, {
     config: loadHindsightConfig(memoryDir, { enabled: true, autostart: false, apiUrl: server.baseUrl, bankId: 'fixture-bank' }),
@@ -135,23 +153,30 @@ async function buildRig(
   const config = makeCfg();
   config.worlds.qq.enabled = false;
   config.batching = { quietGapMs: 5, minBatchAgeMs: 0, maxBatchAgeMs: 50, maxBatchSize: 50 };
-  const growthStateFile = options.partnerSummary ? join(root, 'growth', 'state.json') : undefined;
+  const derivedPartnerParagraphs = [
+    ...(options.partnerSummary ? [{ documentId: 'doc-1', text: options.partnerSummary }] : []),
+    ...(options.partnerAdditionalDerived ?? []),
+  ];
+  const hasPartnerDocument = derivedPartnerParagraphs.length > 0 || !!options.partnerUserNote;
+  const growthStateFile = hasPartnerDocument ? join(root, 'growth', 'state.json') : undefined;
   if (growthStateFile) mkdirSync(join(root, 'growth'), { recursive: true });
   const Persona = coopanionPersona(Cormini, { memory, ...(growthStateFile ? { growthStateFile } : {}) });
   const persona = new Persona({ memoryDir });
-  if (options.partnerSummary) {
-    const partnerText = [options.partnerSummary, options.partnerUserNote].filter(Boolean).join('\n\n');
+  if (hasPartnerDocument) {
+    const partnerText = [...derivedPartnerParagraphs.map((entry) => entry.text), options.partnerUserNote].filter(Boolean).join('\n\n');
     writeFileSync(join(memoryDir, PARTNER_FILE), `${partnerText}\n`, 'utf8');
     writePartnerProvenance(partnerProvenancePath(join(root, 'growth'), memoryDir), {
       v: 1,
       workspaceDigest: partnerWorkspaceDigest(memoryDir),
       entries: [
-        {
-          id: '00000000-0000-0000-0000-000000000001', segmentDigest: partnerSegmentDigest(options.partnerSummary), origin: 'derived',
-          sourceIds: ['doc-1'], sourceScopeDigest: partnerSourceScopeDigest('fixture-bank', server.baseUrl), state: 'current',
-        },
+        ...derivedPartnerParagraphs.map((entry, index) => ({
+          id: `00000000-0000-0000-0000-${String(index + 1).padStart(12, '0')}`,
+          segmentDigest: partnerSegmentDigest(entry.text), origin: 'derived' as const,
+          sourceIds: [entry.documentId], sourceScopeDigest: partnerSourceScopeDigest('fixture-bank', server.baseUrl), state: 'current' as const,
+        })),
         ...(options.partnerUserNote ? [{
-          id: '00000000-0000-0000-0000-000000000002', segmentDigest: partnerSegmentDigest(options.partnerUserNote), origin: 'user-authored' as const,
+          id: `00000000-0000-0000-0000-${String(derivedPartnerParagraphs.length + 1).padStart(12, '0')}`,
+          segmentDigest: partnerSegmentDigest(options.partnerUserNote), origin: 'user-authored' as const,
           sourceIds: [], sourceScopeDigest: null, state: 'current' as const,
         }] : []),
       ],
@@ -162,7 +187,7 @@ async function buildRig(
   const attach = persona.attach.bind(persona);
   persona.attach = (value) => { api = value; attach(value); };
   let host: WorldHost | null = null;
-  const world = makeFakeIO('desktop-pet', options.tools ?? []);
+  const world = makeFakeIO('desktop-pet', options.tools ?? [], options.worldPrompt ?? '');
   const startWorld = world.start?.bind(world);
   world.start = async (currentHost) => { host = currentHost; await startWorld?.(currentHost); };
   const llm = new FakeLLM();
@@ -180,11 +205,12 @@ async function buildRig(
       providerOptions?.onRequestSent?.(info);
     },
   });
-  llm.script(
-    toolReply([{ name: 'memory_search', args: { query: 'what did I say about tea?' }, id: 'memory-search-1' }]),
-    toolReply([{ name: 'memory_search', args: { query: 'jasmine tea preference' }, id: 'memory-search-2' }]),
-    textReply('Done.'),
-  );
+  if (options.llmSetup) options.llmSetup(llm);
+  else llm.script(
+      toolReply([{ name: 'memory_search', args: { query: 'what did I say about tea?' }, id: 'memory-search-1' }]),
+      toolReply([{ name: 'memory_search', args: { query: 'jasmine tea preference' }, id: 'memory-search-2' }]),
+      textReply('Done.'),
+    );
   const core = new Core(makeLoaded({ config, rootDir: root, memoryDir, dataDir: join(root, 'data') }), {
     persona,
     worlds: [world],
@@ -246,7 +272,7 @@ async function buildSourceFreeRig(reply = 'Ready.') {
 
 describe('Memory source evidence through the real Core consumer', () => {
   it('attaches exact read-back spans from two tool rounds to serialized provider requests', async () => {
-    const partnerSummary = 'Coo saved the note: jasmine tea 🌿';
+    const partnerSummary = 'Coo 保存的偏好：茉莉茶 🌿；茉莉茶';
     const rig = await buildRig(true, undefined, undefined, { partnerSummary });
     const candidates = await rig.memory.searchResultsDetailed('jasmine tea preference');
     expect(candidates.results).toHaveLength(1);
@@ -333,8 +359,17 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(workspaceStart).toBeGreaterThanOrEqual(0);
     const workspaceSpans = systemCoverage!.spans.filter((span) => span.start < workspaceStart + workspaceMarker.length
       && span.end > workspaceStart);
-    expect(workspaceSpans.length).toBeGreaterThan(0);
-    expect(workspaceSpans.every((span) => span.origin === 'unknown-derived' && span.mappingState === 'missing')).toBe(true);
+    expect(workspaceSpans).toMatchObject([{ origin: 'core-generated', mappingState: 'complete' }]);
+    const partnerPathStart = systemText.indexOf(`- ${PARTNER_FILE}`, workspaceStart);
+    expect(partnerPathStart).toBeGreaterThanOrEqual(0);
+    const partnerPath = systemCoverage!.spans.find((span) => span.start <= partnerPathStart
+      && span.end >= partnerPathStart + PARTNER_FILE.length + 2);
+    expect(partnerPath).toMatchObject({ origin: 'hindsight-source', mappingState: 'complete',
+      exposedSources: [expect.objectContaining({ documentId: 'doc-1' })] });
+    const unknownSystemSpan = systemCoverage!.spans.find((span) => span.origin === 'unknown-derived'
+      && span.mappingState === 'missing');
+    expect(unknownSystemSpan).toBeDefined();
+    expect(systemText.slice(unknownSystemSpan!.start, unknownSystemSpan!.end)).toContain('desktop-petWorld 环境。');
     const handoffMemoryItem = nextRequest.items.find((item) => item.spans.some((span) => span.origin === 'generation-derived'
       && span.mappingState === 'complete' && span.exposedSources.some((source) => source.documentId === 'doc-1')));
     expect(handoffMemoryItem).toBeDefined();
@@ -580,6 +615,70 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(readFileSync(otherFile, 'utf8')).toBe('preserve');
   });
 
+  it('keeps a handoff published before a failed SQLite commit out of later workspace reads', async () => {
+    const rig = await buildRig(true);
+    const generation = rig.api().sessionInfo('main').generation;
+    if (!generation) throw new Error('Core did not provide a generation token');
+    const attachment = (await rig.memory.evidenceForSegments(SOURCE_TEXT, [
+      { documentId: 'doc-1', start: 0, end: SOURCE_TEXT.length },
+    ]))[0];
+    if (!attachment) throw new Error('Synthetic source read-back did not produce an attachment');
+    const snapshot = [message('user', SOURCE_TEXT, { evidence: [attachment] })];
+    const handoffDir = join(rig.memoryDir, 'handoffs');
+    const recordsBefore = rig.core.session.records.length;
+    const prepared = await rig.persona.prepareHandoff(snapshot, {
+      hardTokens: null, sessionId: 'main', expectedGeneration: generation.token, candidateSnapshotId: 'commit-crash-window',
+      sourceEvidence: inspectContextEvidence(snapshot), inspectCandidate: (records) => inspectContextEvidence(records),
+    });
+    expect(prepared.commitGuard?.()).toEqual({ status: 'allow' });
+
+    const state = rig.memory as unknown as { stateStore: ReturnType<typeof openMemoryStateStore> };
+    const database = (state.stateStore as unknown as { db: { exec: (sql: string) => void } }).db;
+    const originalExec = database.exec.bind(database);
+    let publishedBeforeCommit = false;
+    database.exec = (sql) => {
+      if (sql === 'COMMIT') {
+        publishedBeforeCommit = readdirSync(handoffDir).some((name) => name.endsWith('.md'));
+        if (publishedBeforeCommit) throw new Error('synthetic SQLite commit failure after file publication');
+      }
+      originalExec(sql);
+    };
+    expect(() => prepared.commit?.()).toThrow('synthetic SQLite commit failure after file publication');
+    database.exec = originalExec;
+
+    const published = readdirSync(handoffDir).find((name) => name.endsWith('.md'));
+    expect(publishedBeforeCommit).toBe(true);
+    expect(published).toBeDefined();
+    if (!published) throw new Error('the commit failure did not leave the published candidate available for review');
+    const artifactId = `handoff:${createHash('sha256')
+      .update(JSON.stringify(['main', 'commit-crash-window', published]), 'utf8').digest('hex')}`;
+    expect(rig.memory.derivedArtifact(artifactId)).toBeNull();
+    expect(rig.core.session.records).toHaveLength(recordsBefore);
+
+    await rig.core.stop();
+    activeCores.splice(activeCores.indexOf(rig.core), 1);
+    closeMemoryStateStores();
+    const persistentMemory = rig.memory as unknown as {
+      stateStore: ReturnType<typeof openMemoryStateStore>;
+      outbox: MemoryOutbox;
+      ledger: ForgetLedger;
+    };
+    const reopenedStore = openMemoryStateStore(join(rig.root, 'memory-state.sqlite'));
+    persistentMemory.stateStore = reopenedStore;
+    persistentMemory.outbox = new MemoryOutbox(reopenedStore);
+    persistentMemory.ledger = new ForgetLedger(reopenedStore);
+    expect(reopenedStore.getDerivedArtifact(artifactId)).toBeNull();
+
+    const Persona = coopanionPersona(Cormini, { memory: rig.memory });
+    const restartedPersona = new Persona({ memoryDir: rig.memoryDir });
+    const readFile = (restartedPersona as unknown as { tools(): ToolDef[] }).tools().find((tool) => tool.name === 'read_file');
+    if (!readFile) throw new Error('Persona did not declare read_file');
+    await expect(readFile.handler({ path: `handoffs/${published}` }, { role: 'main', callId: 'read-orphan' } as never))
+      .resolves.toBe('[read failed] This workspace area is withheld until its content has provenance sidecar entries.');
+    prepared.discard?.();
+    expect(existsSync(handoffDir)).toBe(false);
+  });
+
   it('attaches approved ExperienceCard text only after validating every stored source ID', async () => {
     const rig = await buildRig(true);
     const cards = new ExperienceCards(join(rig.memoryDir, 'experience-cards'));
@@ -614,7 +713,7 @@ describe('Memory source evidence through the real Core consumer', () => {
 
     const original = rig.memory as unknown as { config: unknown; client: unknown };
     closeMemoryStateStores();
-    const reopenedStore = openMemoryStateStore(join(rig.memoryDir, 'memory-state.sqlite'));
+    const reopenedStore = openMemoryStateStore(join(rig.root, 'memory-state.sqlite'));
     const reopenedMemory = new HindsightMemory();
     Object.assign(reopenedMemory, {
       config: original.config,
@@ -651,13 +750,15 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(rig.memory.sourceVisible(documentId)).toBe(false);
   });
 
-  it('uses the matching Core generation envelope for a successful Coo output call', async () => {
+  it('withholds Coo output when its World environment prompt has no source map', async () => {
     const rig = await buildRig(true, undefined, undefined, {
       tools: [makeTool('pet_say', 'The controlled fake pet accepted the script.')],
+      llmSetup: (llm) => llm.script(
+        toolReply([{ name: 'pet_say', args: { script: 'A source-free line from Coo.' }, id: 'pet-say-call' }]),
+        textReply('Done.'),
+      ),
     });
-    rig.llm.queue.splice(0, rig.llm.queue.length);
     const text = 'A source-free line from Coo.';
-    rig.llm.script(toolReply([{ name: 'pet_say', args: { script: text }, id: 'pet-say-call' }]), textReply('Done.'));
     await rig.host().pushEvent({
       type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(),
       text: 'Say hello.', meta: { text: 'Say hello.' },
@@ -667,12 +768,32 @@ describe('Memory source evidence through the real Core consumer', () => {
 
     const envelope = rig.api().generationEvidence('main').find((entry) =>
       entry.outputToolCalls.some((output) => output.toolCallId === 'pet-say-call'));
+    const systemRecord = rig.core.session.records.find((record) => record.item.type === 'message' && record.item.role === 'system');
+    const systemCoverage = envelope?.items.find((item) => item.itemId === systemRecord?.item.id);
     expect(envelope).toMatchObject({
       requestState: 'sent', responseJoinState: 'matched', mappingState: 'missing',
       exposedSources: [], actualEvidenceUsed: 'unknown',
+      sessionId: 'main', providerGenerationId: expect.any(String), providerAttemptId: expect.any(String),
+      responseId: expect.any(String),
       outputToolCalls: [expect.objectContaining({ toolCallId: 'pet-say-call', joinState: 'matched' })],
     });
-    if (!envelope) throw new Error('Core did not retain the pet_say generation envelope');
+    if (!envelope || !systemRecord) throw new Error('Core did not retain the pet_say generation envelope');
+    const unknownPrompt = systemCoverage?.spans.find((span) => span.origin === 'unknown-derived'
+      && span.mappingState === 'missing');
+    expect(unknownPrompt).toMatchObject({
+      digest: expect.stringMatching(/^[a-f0-9]{64}$/),
+      serializedRanges: [expect.objectContaining({ field: '$.instructions' })],
+    });
+    if (!unknownPrompt) throw new Error('Core did not retain the unmapped World prompt span');
+    const promptText = textOf(systemRecord).slice(unknownPrompt.start, unknownPrompt.end);
+    expect(promptText).toBe('\n## desktop-pet\ndesktop-petWorld 环境。');
+    expect(createHash('sha256').update(promptText, 'utf8').digest('hex')).toBe(unknownPrompt.digest);
+    const serializedBody = rig.serializedBodies.find((body) =>
+      createHash('sha256').update(body, 'utf8').digest('hex') === envelope.serializedBodyDigest);
+    if (!serializedBody) throw new Error('The envelope has no matching serialized request body');
+    const range = unknownPrompt.serializedRanges[0]!;
+    expect(range.end - range.start).toBe(promptText.length);
+    expect(serializedStringAt(serializedBody, range.field).slice(range.start, range.end)).toBe(promptText);
     rig.persona.retainCooOutput(text, { session: 'main', callId: 'pet-say-call' });
 
     const digest = createHash('sha256').update(text, 'utf8').digest('hex');
@@ -689,6 +810,218 @@ describe('Memory source evidence through the real Core consumer', () => {
     });
     expect(state.outbox.matching((item) => item.documentId === documentId)).toEqual([]);
     expect(rig.memory.sourceVisible(documentId)).toBe(false);
+  });
+
+  it('records a source-independent pet_say from a fully mapped Core request', async () => {
+    const rig = await buildRig(true, undefined, undefined, {
+      tools: [makeTool('pet_say', 'The controlled fake pet accepted the script.')], worldPrompt: ' ',
+      llmSetup: (llm) => llm.script(
+        toolReply([{ name: 'pet_say', args: { script: 'A source-free line from Coo.' }, id: 'pet-say-independent-call' }]),
+        textReply('Done.'),
+      ),
+    });
+    const text = 'A source-free line from Coo.';
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(),
+      text: 'Say hello.', meta: { text: 'Say hello.' },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.llm.calls.length === 2);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+
+    const envelope = rig.api().generationEvidence('main').find((entry) =>
+      entry.outputToolCalls.some((output) => output.toolCallId === 'pet-say-independent-call'));
+    expect(envelope).toMatchObject({
+      requestState: 'sent', responseJoinState: 'matched', mappingState: 'complete',
+      exposedSources: [], actualEvidenceUsed: 'unknown',
+      outputToolCalls: [expect.objectContaining({ toolCallId: 'pet-say-independent-call', joinState: 'matched' })],
+    });
+    if (!envelope) throw new Error('Core did not retain the source-independent pet_say envelope');
+    expect(envelope.items.every((item) => item.mappingState === 'complete'
+      && item.disposition !== 'unknown-derived-incomplete' && item.exposedSources.length === 0
+      && item.spans.every((span) => span.mappingState === 'complete' && span.exposedSources.length === 0))).toBe(true);
+
+    rig.persona.retainCooOutput(text, { session: 'main', callId: 'pet-say-independent-call' });
+    const digest = createHash('sha256').update(text, 'utf8').digest('hex');
+    const documentId = `coo:main:pet-say-independent-call:${digest.slice(0, 8)}`;
+    const state = rig.memory as unknown as {
+      stateStore: ReturnType<typeof openMemoryStateStore>;
+      outbox: MemoryOutbox;
+    };
+    expect(state.stateStore.getGenerationEvidence(envelope.sessionId, envelope.id)).toMatchObject({
+      mappingState: 'source-independent', actualEvidenceUsed: 'unknown', sources: [],
+    });
+    expect(state.stateStore.getDerivedArtifact(`coo-output:${documentId}`)).toMatchObject({
+      lifecycleState: 'active', lineageState: 'source-independent', bodyDigest: digest,
+    });
+    expect(state.outbox.matching((item) => item.documentId === documentId)).toHaveLength(1);
+  });
+
+  it('records source-bearing pet_say from a read-back PARTNER source span', async () => {
+    const partnerSummary = 'Coo saved the note: jasmine tea 🌿';
+    const secondSummary = 'The person also likes tea before breakfast.';
+    const rig = await buildRig(true, undefined, undefined, {
+      partnerSummary,
+      partnerAdditionalDerived: [{ documentId: 'doc-2', text: secondSummary }],
+      additionalSources: [{ documentId: 'doc-2', text: secondSummary }],
+      tools: [makeTool('pet_say', 'The controlled fake pet accepted the script.')], worldPrompt: ' ',
+      llmSetup: (llm) => llm.script(
+        toolReply([{ name: 'pet_say', args: { script: 'A line grounded in the recalled preference.' }, id: 'pet-say-source-call' }]),
+        textReply('Done.'),
+      ),
+    });
+    const text = 'A line grounded in the recalled preference.';
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(),
+      text: 'What should I drink?', meta: { text: 'What should I drink?' },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.llm.calls.length === 2);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+
+    const envelope = rig.api().generationEvidence('main').find((entry) =>
+      entry.outputToolCalls.some((output) => output.toolCallId === 'pet-say-source-call'));
+    expect(envelope).toMatchObject({
+      requestState: 'sent', responseJoinState: 'matched', mappingState: 'complete', actualEvidenceUsed: 'unknown',
+      exposedSources: expect.arrayContaining([
+        expect.objectContaining({
+          bankId: 'fixture-bank', endpoint: rig.baseUrl, documentId: 'doc-1',
+          revisionState: 'current', validationStatus: 'validated', validatedEpoch: expect.any(String),
+          validationReceipt: expect.stringMatching(/^[a-f0-9]{64}$/), contentDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+        }),
+        expect.objectContaining({
+          bankId: 'fixture-bank', endpoint: rig.baseUrl, documentId: 'doc-2',
+          revisionState: 'current', validationStatus: 'validated', validatedEpoch: expect.any(String),
+          validationReceipt: expect.stringMatching(/^[a-f0-9]{64}$/), contentDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
+        }),
+      ]),
+      outputToolCalls: [expect.objectContaining({ toolCallId: 'pet-say-source-call', joinState: 'matched' })],
+    });
+    if (!envelope) throw new Error('Core did not retain the source-bearing pet_say envelope');
+    const sourceSpan = envelope.items.flatMap((item) => item.spans)
+      .find((span) => span.origin === 'hindsight-source' && span.mappingState === 'complete'
+        && span.exposedSources.some((source) => source.documentId === 'doc-1'));
+    expect(sourceSpan).toMatchObject({ digest: expect.stringMatching(/^[a-f0-9]{64}$/), serializedRanges: [expect.any(Object)] });
+    if (!sourceSpan) throw new Error('The request has no serialized source-bearing span');
+    const serializedBody = rig.serializedBodies.find((body) =>
+      createHash('sha256').update(body, 'utf8').digest('hex') === envelope.serializedBodyDigest);
+    if (!serializedBody) throw new Error('The source envelope has no matching serialized request body');
+    const range = sourceSpan.serializedRanges[0]!;
+    const sourceText = serializedStringAt(serializedBody, range.field).slice(range.start, range.end);
+    expect(sourceText).toContain(partnerSummary);
+    expect(createHash('sha256').update(sourceText, 'utf8').digest('hex')).toBe(sourceSpan.digest);
+    const sourceSpans = envelope.items.flatMap((item) => item.spans)
+      .filter((span) => span.origin === 'hindsight-source' && span.mappingState === 'complete');
+    expect(new Set(sourceSpans.flatMap((span) => span.exposedSources.map((source) => source.documentId)))).toEqual(new Set(['doc-1', 'doc-2']));
+
+    rig.persona.retainCooOutput(text, { session: 'main', callId: 'pet-say-source-call' });
+    const digest = createHash('sha256').update(text, 'utf8').digest('hex');
+    const documentId = `coo:main:pet-say-source-call:${digest.slice(0, 8)}`;
+    const state = rig.memory as unknown as {
+      stateStore: ReturnType<typeof openMemoryStateStore>;
+      outbox: MemoryOutbox;
+    };
+    expect(state.stateStore.getGenerationEvidence(envelope.sessionId, envelope.id)).toMatchObject({
+      mappingState: 'complete', actualEvidenceUsed: 'unknown',
+      sources: expect.arrayContaining([
+        expect.objectContaining({ bankId: 'fixture-bank', endpoint: rig.baseUrl, documentId: 'doc-1' }),
+        expect.objectContaining({ bankId: 'fixture-bank', endpoint: rig.baseUrl, documentId: 'doc-2' }),
+      ]),
+    });
+    expect(state.stateStore.getDerivedArtifact(`coo-output:${documentId}`)).toMatchObject({
+      lifecycleState: 'active', lineageState: 'complete', bodyDigest: digest,
+      sources: expect.arrayContaining([
+        expect.objectContaining({ documentId: 'doc-1', validationState: 'validated' }),
+        expect.objectContaining({ documentId: 'doc-2', validationState: 'validated' }),
+      ]),
+    });
+    expect(state.outbox.matching((item) => item.documentId === documentId)).toHaveLength(1);
+
+    const bOnly = await rig.memory.registerDerivedArtifactFromSources({
+      artifactId: 'experience-b-only', kind: 'experience-card', target: 'experience-cards/b-only.json',
+      content: secondSummary, origin: 'user-authored', reviewState: 'approved',
+      creatorOperationId: 'experience-b-only-fixture', sourceIds: ['doc-2'],
+    });
+    expect(bOnly).toMatchObject({ lifecycleState: 'active', sources: [expect.objectContaining({ documentId: 'doc-2' })] });
+
+    const otherBankText = 'Independent artifact from another bank.';
+    const otherBankAt = new Date().toISOString();
+    const otherBankEndpoint = 'http://other-bank.example.test';
+    state.stateStore.saveDerivedArtifact({
+      artifactId: 'other-bank-same-document-id', kind: 'experience-card', target: 'experience-cards/other-bank.json',
+      scope: memoryArtifactScope('other-bank', otherBankEndpoint), creatorSessionId: null, creatorGenerationId: null,
+      creatorOperationId: 'other-bank-fixture', bodyDigest: createHash('sha256').update(otherBankText, 'utf8').digest('hex'),
+      origin: 'model-derived', reviewState: 'approved', lifecycleState: 'active', lineageState: 'complete',
+      lineageReceiptDigest: 'd'.repeat(64), lineageValidatedAt: otherBankAt, statusReason: null,
+      createdAt: otherBankAt, updatedAt: otherBankAt,
+      sources: [{
+        bankId: 'other-bank', endpoint: otherBankEndpoint, documentId: 'doc-1', validatedEpoch: 0,
+        validatedFence: null, revision: 'other-bank-rev-1',
+        contentDigest: createHash('sha256').update(otherBankText, 'utf8').digest('hex'),
+        segmentDigest: createHash('sha256').update(otherBankText, 'utf8').digest('hex'),
+        validationState: 'validated', correlationId: 'other-bank-readback',
+      }],
+    });
+
+    const original = rig.memory as unknown as { config: unknown; client: unknown };
+    await rig.core.stop();
+    activeCores.splice(activeCores.indexOf(rig.core), 1);
+    closeMemoryStateStores();
+    const reopenedStore = openMemoryStateStore(join(rig.root, 'memory-state.sqlite'));
+    const reopenedMemory = new HindsightMemory();
+    Object.assign(reopenedMemory, {
+      config: original.config, client: original.client, stateStore: reopenedStore,
+      outbox: new MemoryOutbox(reopenedStore), ledger: new ForgetLedger(reopenedStore), ready: true, unavailableUntil: 0,
+    });
+    expect(reopenedStore.getDerivedArtifact(`coo-output:${documentId}`)?.sources.map((source) => source.documentId).sort())
+      .toEqual(['doc-1', 'doc-2']);
+    expect(await reopenedMemory.verifyDerivedArtifact('experience-b-only', secondSummary)).toBe(true);
+
+    await reopenedMemory.forgetDocument('doc-1');
+    expect(reopenedStore.getDerivedArtifact(`coo-output:${documentId}`)).toMatchObject({ lifecycleState: 'stale' });
+    expect(reopenedStore.getDerivedArtifact('experience-b-only')).toMatchObject({
+      lifecycleState: 'active', lineageState: 'complete',
+    });
+    expect(await reopenedMemory.verifyDerivedArtifact('experience-b-only', secondSummary)).toBe(true);
+    expect(reopenedStore.getDerivedArtifact('other-bank-same-document-id')).toMatchObject({
+      lifecycleState: 'active', lineageState: 'complete',
+      sources: [expect.objectContaining({ bankId: 'other-bank', documentId: 'doc-1' })],
+    });
+  });
+
+  it('withholds output when a dynamic workspace path has no origin proof', async () => {
+    const rig = await buildRig(true, undefined, undefined, {
+      tools: [makeTool('pet_say', 'The controlled fake pet accepted the script.')], worldPrompt: ' ',
+    });
+    writeFileSync(join(rig.memoryDir, 'unmapped-note.md'), 'Synthetic unknown workspace content.\n', 'utf8');
+    rig.llm.queue.splice(0, rig.llm.queue.length);
+    const text = 'A line without a mapped workspace source.';
+    rig.llm.script(toolReply([{ name: 'pet_say', args: { script: text }, id: 'pet-say-unknown-workspace-call' }]), textReply('Done.'));
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(),
+      text: 'Say hello.', meta: { text: 'Say hello.' },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.llm.calls.length === 2);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+
+    const envelope = rig.api().generationEvidence('main').find((entry) =>
+      entry.outputToolCalls.some((output) => output.toolCallId === 'pet-say-unknown-workspace-call'));
+    expect(envelope).toMatchObject({ mappingState: 'missing', exposedSources: [], actualEvidenceUsed: 'unknown' });
+    if (!envelope) throw new Error('Core did not retain the incomplete workspace envelope');
+    const systemRecord = rig.core.session.records.find((record) => record.item.type === 'message' && record.item.role === 'system');
+    const systemCoverage = envelope.items.find((item) => item.itemId === systemRecord?.item.id);
+    expect(systemCoverage?.spans.some((span) => span.origin === 'unknown-derived' && span.mappingState === 'missing'
+      && span.end > span.start && /^[a-f0-9]{64}$/u.test(span.digest))).toBe(true);
+
+    rig.persona.retainCooOutput(text, { session: 'main', callId: 'pet-say-unknown-workspace-call' });
+    const digest = createHash('sha256').update(text, 'utf8').digest('hex');
+    const documentId = `coo:main:pet-say-unknown-workspace-call:${digest.slice(0, 8)}`;
+    const state = rig.memory as unknown as {
+      stateStore: ReturnType<typeof openMemoryStateStore>;
+      outbox: MemoryOutbox;
+    };
+    expect(state.stateStore.getDerivedArtifact(`coo-output:${documentId}`)).toMatchObject({
+      lifecycleState: 'withheld', lineageState: 'missing',
+    });
+    expect(state.outbox.matching((item) => item.documentId === documentId)).toEqual([]);
   });
 
   it('keeps a user-authored PARTNER paragraph when a derived paragraph is forgotten', async () => {
@@ -714,6 +1047,88 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(sidecar.status).toBe('ok');
     if (sidecar.status !== 'ok') throw new Error('synthetic PARTNER sidecar should remain readable');
     expect(sidecar.file.entries.map((entry) => entry.state)).toEqual(['stale', 'current']);
+  });
+
+  it('recomputes activation from current revisions after reopening SQLite', async () => {
+    const rig = await buildRig(true, undefined, undefined, {
+      additionalSources: [
+        { documentId: 'doc-2', text: 'Current corrected tea preference.' },
+        { documentId: 'doc-3', text: 'Independent preference from another source.' },
+      ],
+    });
+    const state = rig.memory as unknown as {
+      stateStore: ReturnType<typeof openMemoryStateStore>;
+      outbox: MemoryOutbox;
+    };
+    const verifiedEvent = (documentId: string, at: string, extra: Record<string, string> = {}): void => {
+      expect(state.outbox.add({
+        bankId: 'fixture-bank', endpoint: rig.baseUrl, documentId, content: `Synthetic ${documentId}.`,
+        context: 'revision integration fixture', tags: ['scope:life'], priority: 'normal', timestamp: at,
+        metadata: { source_actor: 'user', kind: 'event', status: 'completed', said_at: at, ...extra },
+      })).toBe('queued');
+      const item = state.outbox.due(new Date(Date.now() + 1000), 20).find((entry) => entry.documentId === documentId);
+      if (!item) throw new Error(`Outbox did not retain ${documentId}`);
+      expect(state.outbox.markSending(item.id)).toBe(true);
+      expect(state.outbox.markSent(item.id, item.operationId)).toBe(true);
+      expect(state.outbox.markDone(item.id)).toBe(true);
+      expect(state.outbox.markVerified(item.id)).toBe(true);
+    };
+
+    verifiedEvent('user-event-old-mention', '2024-05-02T10:00:00.000Z');
+    expect(state.stateStore.recordUserMention({
+      bankId: 'fixture-bank', endpoint: rig.baseUrl, targetDocumentId: 'doc-1',
+      userEventDocumentId: 'user-event-old-mention', targetCreatedAt: '2024-05-01T10:00:00.000Z',
+      semanticMatch: 0.95, intensity: 0.2,
+    }).status).toBe('applied');
+    verifiedEvent('user-event-current-mention', '2024-05-10T10:00:00.000Z');
+    verifiedEvent('doc-2', '2024-05-11T10:00:00.000Z', {
+      kind: 'correction', supersedes_source_ids: JSON.stringify(['doc-1']),
+    });
+    verifiedEvent('user-event-independent-mention', '2024-05-12T10:00:00.000Z');
+    expect(state.stateStore.recordUserMention({
+      bankId: 'fixture-bank', endpoint: rig.baseUrl, targetDocumentId: 'doc-2',
+      userEventDocumentId: 'user-event-current-mention', targetCreatedAt: '2024-05-01T10:00:00.000Z',
+      semanticMatch: 0.95, intensity: 0.2,
+    }).status).toBe('applied');
+    expect(state.stateStore.recordUserMention({
+      bankId: 'fixture-bank', endpoint: rig.baseUrl, targetDocumentId: 'doc-3',
+      userEventDocumentId: 'user-event-independent-mention', targetCreatedAt: '2024-05-01T10:00:00.000Z',
+      semanticMatch: 0.95, intensity: 0.2,
+    }).status).toBe('applied');
+    expect(state.stateStore.supersededSources('fixture-bank', rig.baseUrl)).toEqual(new Set(['doc-1']));
+    expect(state.stateStore.currentRevisionSources('fixture-bank', rig.baseUrl)).toContain('doc-2');
+
+    closeMemoryStateStores();
+    const reopenedStore = openMemoryStateStore(join(rig.root, 'memory-state.sqlite'));
+    const original = rig.memory as unknown as { config: unknown; client: unknown };
+    const reopenedMemory = new HindsightMemory();
+    Object.assign(reopenedMemory, {
+      config: original.config, client: original.client, stateStore: reopenedStore,
+      outbox: new MemoryOutbox(reopenedStore), ledger: new ForgetLedger(reopenedStore), ready: true, unavailableUntil: 0,
+    });
+    expect(reopenedStore.supersededSources('fixture-bank', rig.baseUrl)).toEqual(new Set(['doc-1']));
+    const reopenedRead = await reopenedMemory.searchResultsDetailed('synthetic revision integration', { captureTrace: true });
+    const old = reopenedRead.results.find((result) => result.sourceFacts?.some((source) => source.documentId === 'doc-1'));
+    const current = reopenedRead.results.find((result) => result.sourceFacts?.some((source) => source.documentId === 'doc-2'));
+    const independent = reopenedRead.results.find((result) => result.sourceFacts?.some((source) => source.documentId === 'doc-3'));
+    expect(!old || old.sourceFacts?.filter((source) => source.documentId === 'doc-1')
+      .every((source) => source.metadata?.status === 'superseded')).toBe(true);
+    expect(old?.activationWeight).toBeUndefined();
+    expect(current?.sourceFacts?.find((source) => source.documentId === 'doc-2')?.metadata?.status).toBe('current');
+    expect(current?.activationWeight).toBeGreaterThan(0);
+    expect(independent?.activationWeight).toBeGreaterThan(0);
+    await reopenedMemory.forgetDocument('doc-1');
+    expect(reopenedMemory.sourceVisible('doc-1')).toBe(false);
+    expect(reopenedMemory.sourceVisible('doc-2')).toBe(false);
+    expect(reopenedMemory.sourceVisible('doc-3')).toBe(true);
+    const afterForget = await reopenedMemory.searchResultsDetailed('synthetic revision integration', { captureTrace: true });
+    const afterForgetCurrent = afterForget.results.find((result) => result.sourceFacts?.some((source) => source.documentId === 'doc-2'));
+    const afterForgetIndependent = afterForget.results.find((result) => result.sourceFacts?.some((source) => source.documentId === 'doc-3'));
+    expect(afterForgetCurrent?.activationWeight).toBeUndefined();
+    expect(afterForgetIndependent?.activationWeight).toBeGreaterThan(0);
+    expect(await reopenedMemory.sourceCurrentForContext('doc-1')).toBe(false);
+    expect(await reopenedMemory.sourceCurrentForContext('doc-2')).toBe(false);
+    expect(await reopenedMemory.sourceCurrentForContext('doc-3')).toBe(true);
   });
 
   it('keeps an earlier handoff note from entering the source-free compatibility path', async () => {

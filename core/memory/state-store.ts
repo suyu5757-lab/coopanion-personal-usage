@@ -1310,8 +1310,10 @@ export class MemoryStateStore {
     const event = this.db.prepare(`
       INSERT INTO memory_events(event_id, document_id, actor, occurred_at, intent, status, payload_hash, payload_json)
       VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(event_id) DO UPDATE SET document_id=excluded.document_id, actor=excluded.actor,
-        occurred_at=excluded.occurred_at, intent=excluded.intent, status=excluded.status,
+      ON CONFLICT(event_id) DO UPDATE SET document_id=excluded.document_id,
+        actor=COALESCE(excluded.actor, memory_events.actor),
+        occurred_at=COALESCE(excluded.occurred_at, memory_events.occurred_at),
+        intent=excluded.intent, status=COALESCE(excluded.status, memory_events.status),
         payload_hash=excluded.payload_hash, payload_json=excluded.payload_json
     `);
     event.run(

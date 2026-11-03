@@ -908,10 +908,8 @@ export class HindsightMemory {
       || artifact.scope !== memoryArtifactScope(config.bankId, config.apiUrl)) return false;
     if (artifact.lineageState === 'source-independent') return artifact.sources.length === 0;
     if (artifact.lineageState !== 'complete' || artifact.sources.length === 0) return false;
-    const epoch = ledger.epoch(config.bankId, config.apiUrl);
     return artifact.sources.every((source) => source.validationState === 'validated'
       && source.bankId === config.bankId && source.endpoint === config.apiUrl
-      && source.validatedEpoch === epoch && source.validatedFence === String(epoch)
       && !!source.contentDigest && !!source.segmentDigest
       && !ledger.forgotten(source.bankId, source.endpoint, source.documentId)
       && !store.supersededSources(source.bankId, source.endpoint).has(source.documentId));
@@ -967,8 +965,10 @@ export class HindsightMemory {
         .map((span) => span.digest));
       if (digests.length > 0) segmentDigests.set(sourceTupleKey(source), digests);
     }
-    const independent = envelope.exposedSources.length === 0 && envelope.items.length > 0
-      && envelope.items.every((item) => item.mappingState === 'complete' && item.disposition === 'provably-source-independent');
+    const independent = envelope.mappingState === 'complete' && envelope.exposedSources.length === 0 && envelope.items.length > 0
+      && envelope.items.every((item) => item.mappingState === 'complete' && item.disposition !== 'unknown-derived-incomplete'
+        && item.exposedSources.length === 0
+        && item.spans.every((span) => span.mappingState === 'complete' && span.exposedSources.length === 0));
     const sourceBearing = envelope.exposedSources.length > 0 && envelope.mappingState === 'complete'
       && envelope.items.every((item) => item.mappingState === 'complete' && item.disposition !== 'unknown-derived-incomplete')
       && envelope.exposedSources.every((source) => segmentDigests.has(sourceTupleKey(source)))
@@ -2440,8 +2440,10 @@ export class HindsightMemory {
       && envelope.items.every((item) => item.mappingState === 'complete'
         && item.disposition !== 'unknown-derived-incomplete');
     const exposed = envelope?.exposedSources ?? [];
-    const sourceFree = requestComplete && exposed.length === 0
-      && envelope!.items.every((item) => item.disposition === 'provably-source-independent');
+    const sourceFree = requestComplete && envelope!.mappingState === 'complete' && exposed.length === 0
+      && envelope!.items.every((item) => item.mappingState === 'complete' && item.disposition !== 'unknown-derived-incomplete'
+        && item.exposedSources.length === 0
+        && item.spans.every((span) => span.mappingState === 'complete' && span.exposedSources.length === 0));
     const sourceSegmentDigests = new Map<string, string>();
     for (const source of exposed) {
       const digests = envelope?.items.flatMap((item) => item.spans
@@ -3112,10 +3114,8 @@ export class HindsightMemory {
       if (!artifact || artifact.lifecycleState !== 'active') return false;
       if (artifact.lineageState === 'source-independent') return artifact.sources.length === 0;
       if (artifact.lineageState !== 'complete' || artifact.sources.length === 0) return false;
-      const epoch = ledger.epoch(config.bankId, config.apiUrl);
       return artifact.sources.every((source) => source.validationState === 'validated'
         && source.bankId === config.bankId && source.endpoint === config.apiUrl
-        && source.validatedEpoch === epoch && source.validatedFence === String(epoch)
         && !ledger.forgotten(source.bankId, source.endpoint, source.documentId)
         && !store.supersededSources(source.bankId, source.endpoint).has(source.documentId));
     }

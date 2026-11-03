@@ -62,6 +62,7 @@ import { HANDOFF_NOTE_TYPE, handoffNoteStamp, renderHandoffNote } from '../vendo
 
 /** The workspace file that goes into the prefix as Coo's notes on the person. */
 export const PARTNER_FILE = 'PARTNER.md';
+const CONSTITUTION_FILE = 'CONSTITUTION.md';
 /** The workspace directory for details about the person that PARTNER.md leaves out; Coo reads them when needed. */
 export const PARTNER_DIR = 'partner';
 /** Heads partner notes so their source class stays visible in model context. */
@@ -669,7 +670,71 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           ? (await this.partnerPrefixSourceMap(partnerText)).map((span) => ({ ...span, start: span.start + start, end: span.end + start }))
           : partner.text ? [{ start: 0, end: partner.text.length, digest: sha256(partner.text), origin: 'unknown-derived' }] : [];
       }
+      const workspace = segments.find((segment) => segment.title === 'WORKSPACE');
+      const listing = this.prefixWorkspaceListing();
+      if (workspace) {
+        const start = listing ? workspace.text.indexOf(listing) : -1;
+        const unique = start >= 0 && workspace.text.indexOf(listing, start + listing.length) < 0;
+        const constitution = segments.find((segment) => segment.title === 'CONSTITUTION');
+        const seedConstitution = !!constitution?.sourceMapSpans?.some((span) => span.start === 0
+          && span.end === constitution.text.length && span.origin === 'core-generated'
+          && span.digest === sha256(constitution.text));
+        const partnerSources = this.partnerWorkspaceSources(segments.find((segment) => segment.title === 'PARTNER'));
+        if (unique) {
+          workspace.sourceMapSpans = this.workspaceListingSourceMap(listing, seedConstitution, partnerSources)
+            .map((span) => ({ ...span, start: span.start + start, end: span.end + start }));
+        }
+      }
       return segments;
+    }
+
+    private partnerWorkspaceSources(partner: PrefixSegment | undefined): SourceExposureRef[] | null {
+      if (!partner) return null;
+      const covered = new Uint8Array(partner.text.length);
+      const sources = new Map<string, SourceExposureRef>();
+      for (const span of partner.sourceMapSpans ?? []) {
+        if (!Number.isInteger(span.start) || !Number.isInteger(span.end) || span.start < 0
+          || span.end <= span.start || span.end > partner.text.length
+          || span.digest !== sha256(partner.text.slice(span.start, span.end))) return null;
+        if (span.origin === 'unknown-derived' || span.origin === 'user-input') return null;
+        if (span.origin === 'hindsight-source' || span.origin === 'generation-derived') {
+          if (!span.exposedSources?.length) return null;
+          for (const source of span.exposedSources) {
+            const key = JSON.stringify([source.bankId, source.endpoint, source.documentId]);
+            const previous = sources.get(key);
+            if (previous && (previous.contentDigest !== source.contentDigest
+              || previous.validatedEpoch !== source.validatedEpoch)) return null;
+            sources.set(key, source);
+          }
+        }
+        for (let at = span.start; at < span.end; at++) covered[at] = 1;
+      }
+      if (sources.size === 0) return null;
+      for (let at = 0; at < partner.text.length; at++) {
+        if (!/\s/u.test(partner.text[at]!) && covered[at] !== 1) return null;
+      }
+      return [...sources.values()];
+    }
+
+    private workspaceListingSourceMap(
+      text: string,
+      seedConstitution: boolean,
+      partnerSources: readonly SourceExposureRef[] | null,
+    ): SourceMapSpan[] {
+      const heading = 'Files in your workspace:';
+      if (!text.startsWith(`${heading}\n`)) return [];
+      const spans: SourceMapSpan[] = [{ start: 0, end: heading.length, digest: sha256(heading), origin: 'core-generated' }];
+      let start = heading.length + 1;
+      for (const line of text.slice(start).split('\n')) {
+        if (seedConstitution && line === `- ${CONSTITUTION_FILE}`) {
+          spans.push({ start, end: start + line.length, digest: sha256(line), origin: 'core-generated' });
+        } else if (partnerSources?.length && line === `- ${PARTNER_FILE}`) {
+          spans.push({ start, end: start + line.length, digest: sha256(line), origin: 'hindsight-source',
+            exposedSources: [...partnerSources] });
+        }
+        start += line.length + 1;
+      }
+      return spans;
     }
 
     private async partnerPrefixSourceMap(text: string): Promise<SourceMapSpan[]> {
