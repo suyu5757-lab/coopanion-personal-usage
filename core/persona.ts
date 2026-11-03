@@ -1762,7 +1762,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         const finalPath = resolve(root, artifact.target);
         if (!insidePath(root, finalPath)) continue;
         const stagePath = join(stagingPath, owner.stagedName);
-        let stageMatches = handoffFileMatches(stagePath, owner, artifact.bodyDigest);
+        const stageMatches = handoffFileMatches(stagePath, owner, artifact.bodyDigest);
         let finalMatches = handoffFileMatches(finalPath, owner, artifact.bodyDigest);
 
         if (artifact.lifecycleState === 'pending') {
@@ -1770,27 +1770,30 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             memory.withdrawDerivedArtifact(artifact.artifactId, 'handoff-candidate-file-unavailable');
             continue;
           }
-          if (!await memory.verifyPendingHandoffArtifact(artifact.artifactId, artifact.creatorOperationId!,
-            readFileSync(finalMatches ? finalPath : stagePath, 'utf8'))) continue;
-          if (!finalMatches && stageMatches) {
+          let content: string;
+          try {
+            content = readFileSync(finalMatches ? finalPath : stagePath, 'utf8');
+          } catch {
+            continue;
+          }
+          if (!await memory.verifyPendingHandoffArtifact(artifact.artifactId, artifact.creatorOperationId!, content)) continue;
+          finalMatches = handoffFileMatches(finalPath, owner, artifact.bodyDigest);
+          if (!finalMatches) {
             if (existsSync(finalPath)) {
               memory.withdrawDerivedArtifact(artifact.artifactId, 'handoff-target-owned-elsewhere');
               this.removeOwnedHandoffFile(stagePath, owner, artifact.bodyDigest);
               continue;
             }
+            if (!handoffFileMatches(stagePath, owner, artifact.bodyDigest)) continue;
             try {
               linkSync(stagePath, finalPath);
-              syncDirectory(handoffPath);
-              finalMatches = handoffFileMatches(finalPath, owner, artifact.bodyDigest);
             } catch {
-              memory.withdrawDerivedArtifact(artifact.artifactId, 'handoff-publication-recovery-failed');
-              this.removeOwnedHandoffFile(stagePath, owner, artifact.bodyDigest);
               continue;
             }
           }
-          if (!finalMatches) {
-            memory.withdrawDerivedArtifact(artifact.artifactId, 'handoff-published-file-unverified');
-            this.removeOwnedHandoffFile(stagePath, owner, artifact.bodyDigest);
+          try {
+            syncDirectory(handoffPath);
+          } catch {
             continue;
           }
           if (!handoffFileMatches(finalPath, owner, artifact.bodyDigest)) {
@@ -1959,6 +1962,8 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         fd = null;
         closeSync(closingFd);
         syncDirectory(stagingPath);
+        if (ownsStagingDirectory) syncDirectory(handoffPath);
+        if (ownsHandoffDirectory) syncDirectory(dirname(handoffPath));
       } catch (error) {
         if (fd !== null) {
           const closingFd = fd;

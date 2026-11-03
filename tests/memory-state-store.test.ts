@@ -554,7 +554,9 @@ describe('the memory transaction database', () => {
     memory.stateStore = store;
     memory.ledger = ledger;
 
-    expect(await memory.forgetDocument('doc-a')).toMatchObject({ acceptance: 'not-accepted', failed: 1 });
+    expect(await memory.forgetDocument('doc-a')).toMatchObject({
+      acceptance: 'not-accepted', local: 0, deleted: 0, pending: 0, failed: 1,
+    });
     expect(ledger.damaged()).toBe(true);
     expect(memory.sourceVisible('doc-a')).toBe(false);
 
@@ -571,6 +573,7 @@ describe('the memory transaction database', () => {
       outbox: MemoryOutbox;
       stateStore: ReturnType<typeof openMemoryStateStore>;
       ledger: ForgetLedger;
+      forgetDocument(documentId: string): Promise<{ acceptance: string }>;
       sourceVisible(documentId: string): boolean;
     };
     restartedMemory.config = memory.config;
@@ -581,6 +584,12 @@ describe('the memory transaction database', () => {
     expect(restartedLedger.damaged()).toBe(false);
     expect(restartedLedger.forgotten('bank-a', 'http://hindsight.test', 'doc-a')).toBe(false);
     expect(restartedMemory.sourceVisible('doc-a')).toBe(true);
+
+    expect(await restartedMemory.forgetDocument('doc-a')).toMatchObject({ acceptance: 'accepted', deleted: 0 });
+    expect(restartedMemory.sourceVisible('doc-a')).toBe(false);
+    closeMemoryStateStores();
+    const retryLedger = new ForgetLedger(openMemoryStateStore(path));
+    expect(retryLedger.forgotten('bank-a', 'http://hindsight.test', 'doc-a')).toBe(true);
   });
 
   it('rolls back fence and epoch when derived invalidation fails, then recovers the intent', () => {

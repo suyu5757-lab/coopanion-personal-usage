@@ -1,11 +1,11 @@
 import { createServer, type Server } from 'node:http';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, fstatSync, fsyncSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { HindsightClient } from '@vectorize-io/hindsight-client';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CoreApi, ToolDef, World, WorldHost } from 'cortico/core/types.ts';
 import { inspectContextEvidence } from 'cortico/core/evidence.ts';
 import { message } from 'cortico/protocol/open-responses/context.ts';
@@ -31,7 +31,21 @@ const roots: string[] = [];
 const servers: Server[] = [];
 const activeCores: Core[] = [];
 
+vi.mock('node:fs', async (importOriginal) => {
+  const fs = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...fs,
+    fsyncSync: vi.fn(fs.fsyncSync),
+    linkSync: vi.fn(fs.linkSync),
+    unlinkSync: vi.fn(fs.unlinkSync),
+  };
+});
+
 afterEach(async () => {
+  const fs = await vi.importActual<typeof import('node:fs')>('node:fs');
+  vi.mocked(fsyncSync).mockReset().mockImplementation(fs.fsyncSync);
+  vi.mocked(linkSync).mockReset().mockImplementation(fs.linkSync);
+  vi.mocked(unlinkSync).mockReset().mockImplementation(fs.unlinkSync);
   for (const core of activeCores.splice(0)) await core.stop();
   closeMemoryStateStores();
   await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
@@ -879,7 +893,7 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(readdirSync(join(handoffDir, '.staging'))).toEqual([]);
   });
 
-  it('publishes a staged Handoff after restart when its pending SQLite owner matches', async () => {
+  it('retries Handoff link, directory sync and stage cleanup failures after reopening SQLite', async () => {
     const rig = await buildRig(true);
     const generation = rig.api().sessionInfo('main').generation;
     if (!generation) throw new Error('Core did not provide a generation token');
@@ -933,10 +947,56 @@ describe('Memory source evidence through the real Core consumer', () => {
     const restartedPersona = new Persona({ memoryDir: rig.memoryDir });
     const readFile = (restartedPersona as unknown as { tools(): ToolDef[] }).tools().find((tool) => tool.name === 'read_file');
     if (!readFile) throw new Error('Persona did not declare read_file');
-    await expect(readFile.handler({ path: target }, { role: 'main', callId: 'read-recovered-handoff' } as never))
+    const read = () => expect(readFile.handler({ path: target }, { role: 'main', callId: 'read-recovered-handoff' } as never))
       .resolves.toBe('[read failed] This workspace area is withheld until its content has provenance sidecar entries.');
+    const originalLink = vi.mocked(linkSync).getMockImplementation()!;
+    const originalSync = vi.mocked(fsyncSync).getMockImplementation()!;
+    const originalUnlink = vi.mocked(unlinkSync).getMockImplementation()!;
+    const finalPath = join(rig.memoryDir, target);
+    const stagePath = join(stagingPath, stagedName);
+    const owner = statSync(stagePath);
+    const directory = statSync(handoffDir);
+    const foreignPath = join(stagingPath, 'unregistered.md');
+    writeFileSync(foreignPath, 'preserve');
+
+    vi.mocked(linkSync).mockImplementation((from, to) => {
+      if (from === stagePath && to === finalPath) throw new Error('synthetic link failure');
+      originalLink(from, to);
+    });
+    await read();
+    expect(reopenedStore.getDerivedArtifact(artifactId)).toMatchObject({ lifecycleState: 'pending' });
+    expect(existsSync(finalPath)).toBe(false);
+    expect(statSync(stagePath).ino).toBe(owner.ino);
+    vi.mocked(linkSync).mockImplementation(originalLink);
+
+    vi.mocked(fsyncSync).mockImplementation((fd) => {
+      const stat = fstatSync(fd);
+      if (stat.dev === directory.dev && stat.ino === directory.ino) throw new Error('synthetic directory sync failure');
+      originalSync(fd);
+    });
+    for (let retry = 0; retry < 2; retry++) {
+      await read();
+      expect(reopenedStore.getDerivedArtifact(artifactId)).toMatchObject({ lifecycleState: 'pending' });
+      expect(statSync(finalPath).ino).toBe(owner.ino);
+      expect(statSync(stagePath).ino).toBe(owner.ino);
+    }
+    vi.mocked(fsyncSync).mockImplementation(originalSync);
+
+    vi.mocked(unlinkSync).mockImplementation((path) => {
+      if (path === stagePath) throw new Error('synthetic stage cleanup failure');
+      originalUnlink(path);
+    });
+    await read();
     expect(reopenedStore.getDerivedArtifact(artifactId)).toMatchObject({ lifecycleState: 'active' });
-    expect(readdirSync(join(handoffDir, '.staging'))).toEqual([]);
+    expect(statSync(stagePath).ino).toBe(owner.ino);
+    vi.mocked(unlinkSync).mockImplementation(originalUnlink);
+
+    await read();
+    await read();
+    expect(reopenedStore.getDerivedArtifact(artifactId)).toMatchObject({ lifecycleState: 'active' });
+    expect(statSync(finalPath).ino).toBe(owner.ino);
+    expect(readdirSync(stagingPath)).toEqual(['unregistered.md']);
+    expect(readFileSync(foreignPath, 'utf8')).toBe('preserve');
     expect(readdirSync(handoffDir).filter((name) => name.endsWith('.md'))).toEqual([target.slice('handoffs/'.length)]);
   });
 
