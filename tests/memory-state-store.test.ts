@@ -7,7 +7,8 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { MemoryOutbox, readLegacyOutbox, requestHashFor, type RetainItem } from '../core/memory/outbox.ts';
 import { ForgetLedger, readLegacyForget } from '../core/memory/forget-ledger.ts';
-import { closeMemoryStateStores, openMemoryStateStore, type ForgetStateSnapshot } from '../core/memory/state-store.ts';
+import { OutboxDelivery } from '../core/memory/delivery.ts';
+import { closeMemoryStateStores, memoryArtifactScope, openMemoryStateStore, type ForgetStateSnapshot } from '../core/memory/state-store.ts';
 import { HindsightMemory } from '../core/memory/hindsight.ts';
 import { createLegacyMemoryStateDatabase, openLegacyMemoryStateDatabase, snapshotLegacyDurableRows } from './fixtures/memory-state-legacy.ts';
 
@@ -281,7 +282,7 @@ describe('the memory transaction database', () => {
     database.close();
   });
 
-  it('keeps activation intact when the source fence transaction fails', () => {
+  it('keeps stored activation inaccessible when the source fence transaction fails', () => {
     const store = openMemoryStateStore(join(root(), 'memory-state.sqlite'));
     store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
     const outbox = new MemoryOutbox(store);
@@ -299,9 +300,12 @@ describe('the memory transaction database', () => {
 
     expect(ledger.add({ bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: userDocumentId, reason: 'user forgot source' })).toBeNull();
     expect(ledger.forgotten('bank-a', 'http://hindsight.test', userDocumentId)).toBe(false);
-    expect(store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:kept')).not.toBeNull();
+    expect(ledger.damaged()).toBe(true);
+    expect(store.loadActivationState('bank-a', 'http://hindsight.test', 'fact:kept')).toBeNull();
     const after = new DatabaseSync(store.path);
     expect((after.prepare('SELECT COUNT(*) AS count FROM memory_mention_events').get() as { count: number }).count).toBe(1);
+    expect((after.prepare('SELECT COUNT(*) AS count FROM memory_activation WHERE bank_id = ? AND endpoint = ? AND document_id = ?')
+      .get('bank-a', 'http://hindsight.test', 'fact:kept') as { count: number }).count).toBe(1);
     after.close();
   });
 
@@ -457,7 +461,7 @@ describe('the memory transaction database', () => {
     expect(outbox.status()).toMatchObject({ completed: 0, unverified: 0, verified: 1, active: 0 });
   });
 
-  it('keeps source visibility closed when the source fence cannot commit, then accepts a durable retry', async () => {
+  it('recovers a durable Forget intent after the fence transaction fails', async () => {
     const dir = root();
     const path = join(dir, 'memory-state.sqlite');
     const store = openMemoryStateStore(path);
@@ -476,7 +480,7 @@ describe('the memory transaction database', () => {
       outbox: MemoryOutbox;
       stateStore: ReturnType<typeof openMemoryStateStore>;
       ledger: ForgetLedger;
-      forgetDocument(documentId: string): Promise<{ local: number; deleted: number; pending: number; failed: number }>;
+      forgetDocument(documentId: string): Promise<{ acceptance: string; local: number; deleted: number; pending: number; failed: number }>;
       sourceVisible(documentId: string): boolean;
     };
     memory.config = { enabled: true, bankId: 'bank-a', apiUrl: 'http://hindsight.test' };
@@ -486,7 +490,7 @@ describe('the memory transaction database', () => {
     memory.ledger = ledger;
     expect(memory.sourceVisible('doc-a')).toBe(true);
 
-    expect(await memory.forgetDocument('doc-a')).toMatchObject({ local: 0, failed: 1 });
+    expect(await memory.forgetDocument('doc-a')).toMatchObject({ acceptance: 'accepted', local: 0, pending: 1, failed: 0 });
     expect(outbox.get(queued.id)?.state).toBe('pending');
     expect(ledger.forgotten('bank-a', 'http://hindsight.test', 'doc-a')).toBe(false);
     expect(ledger.damaged()).toBe(true);
@@ -512,12 +516,323 @@ describe('the memory transaction database', () => {
     restartedMemory.outbox = restartedOutbox;
     restartedMemory.stateStore = restartedStore;
     restartedMemory.ledger = restartedLedger;
-    expect(restartedLedger.damaged()).toBe(true);
-    expect(restartedMemory.sourceVisible('doc-a')).toBe(false);
-
-    expect(restartedLedger.add({ bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: 'doc-a', reason: 'retry after database recovery' })).not.toBeNull();
     expect(restartedLedger.damaged()).toBe(false);
+    expect(restartedLedger.forgotten('bank-a', 'http://hindsight.test', 'doc-a')).toBe(true);
+    expect(restartedLedger.status()).toMatchObject({ pending: 1, tombstones: 1 });
     expect(restartedMemory.sourceVisible('doc-a')).toBe(false);
+  });
+
+  it('reports an unaccepted Forget when the initial intent and fallback block cannot persist', async () => {
+    const dir = root();
+    const path = join(dir, 'memory-state.sqlite');
+    const store = openMemoryStateStore(path);
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    const outbox = new MemoryOutbox(store);
+    const ledger = new ForgetLedger(store);
+    outbox.add(retainItem());
+    const database = new DatabaseSync(path);
+    database.exec(`
+      CREATE TRIGGER reject_intent BEFORE INSERT ON memory_deletions WHEN new.state = 'intent'
+        BEGIN SELECT RAISE(ABORT, 'synthetic intent failure'); END;
+      CREATE TRIGGER reject_forget_block BEFORE UPDATE ON memory_metadata WHEN new.key = 'forget:write-blocked'
+        BEGIN SELECT RAISE(ABORT, 'synthetic block marker failure'); END;
+    `);
+    database.close();
+
+    const memory = new HindsightMemory() as unknown as {
+      config: { enabled: boolean; bankId: string; apiUrl: string };
+      client: object | null;
+      outbox: MemoryOutbox;
+      stateStore: ReturnType<typeof openMemoryStateStore>;
+      ledger: ForgetLedger;
+      forgetDocument(documentId: string): Promise<{ acceptance: string; failed: number }>;
+      sourceVisible(documentId: string): boolean;
+    };
+    memory.config = { enabled: true, bankId: 'bank-a', apiUrl: 'http://hindsight.test' };
+    memory.client = {};
+    memory.outbox = outbox;
+    memory.stateStore = store;
+    memory.ledger = ledger;
+
+    expect(await memory.forgetDocument('doc-a')).toMatchObject({ acceptance: 'not-accepted', failed: 1 });
+    expect(ledger.damaged()).toBe(true);
+    expect(memory.sourceVisible('doc-a')).toBe(false);
+
+    closeMemoryStateStores();
+    const repair = new DatabaseSync(path);
+    repair.exec('DROP TRIGGER reject_intent; DROP TRIGGER reject_forget_block;');
+    repair.close();
+    const restartedStore = openMemoryStateStore(path);
+    const restartedOutbox = new MemoryOutbox(restartedStore);
+    const restartedLedger = new ForgetLedger(restartedStore);
+    const restartedMemory = new HindsightMemory() as unknown as {
+      config: { enabled: boolean; bankId: string; apiUrl: string };
+      client: object | null;
+      outbox: MemoryOutbox;
+      stateStore: ReturnType<typeof openMemoryStateStore>;
+      ledger: ForgetLedger;
+      sourceVisible(documentId: string): boolean;
+    };
+    restartedMemory.config = memory.config;
+    restartedMemory.client = {};
+    restartedMemory.outbox = restartedOutbox;
+    restartedMemory.stateStore = restartedStore;
+    restartedMemory.ledger = restartedLedger;
+    expect(restartedLedger.damaged()).toBe(false);
+    expect(restartedLedger.forgotten('bank-a', 'http://hindsight.test', 'doc-a')).toBe(false);
+    expect(restartedMemory.sourceVisible('doc-a')).toBe(true);
+  });
+
+  it('rolls back fence and epoch when derived invalidation fails, then recovers the intent', () => {
+    const path = join(root(), 'memory-state.sqlite');
+    const store = openMemoryStateStore(path);
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    const ledger = new ForgetLedger(store);
+    const at = new Date().toISOString();
+    store.saveDerivedArtifact({
+      artifactId: 'growth-proposal:synthetic',
+      kind: 'growth-proposal',
+      target: 'growth-proposals/synthetic.json',
+      scope: memoryArtifactScope('bank-a', 'http://hindsight.test'),
+      creatorSessionId: null,
+      creatorGenerationId: null,
+      creatorOperationId: 'call-1',
+      bodyDigest: 'a'.repeat(64),
+      origin: 'model-derived',
+      reviewState: 'unreviewed',
+      lifecycleState: 'active',
+      lineageState: 'complete',
+      lineageReceiptDigest: 'b'.repeat(64),
+      lineageValidatedAt: at,
+      statusReason: null,
+      createdAt: at,
+      updatedAt: at,
+      sources: [{
+        bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: 'doc-a',
+        validatedEpoch: 1, validatedFence: 'fence-1', revision: 'revision-1',
+        contentDigest: 'c'.repeat(64), segmentDigest: 'd'.repeat(64),
+        validationState: 'validated', correlationId: 'memory-search-1',
+      }],
+    });
+    const database = new DatabaseSync(path);
+    database.exec(`CREATE TRIGGER reject_derived_invalidation BEFORE UPDATE OF lifecycle_state ON derived_artifact
+      WHEN new.lifecycle_state = 'stale' BEGIN SELECT RAISE(ABORT, 'synthetic derived update failure'); END;`);
+    database.close();
+
+    const intent = ledger.beginIntents([{
+      bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: 'doc-a', reason: 'user asked to forget',
+    }], 'user asked to forget');
+    expect(intent.acceptance).toBe('accepted');
+    expect(store.activationForRetrieval('bank-a', 'http://hindsight.test', 'fact:blocked', at)).toBeNull();
+    expect(store.recordUserMention({
+      bankId: 'bank-a', endpoint: 'http://hindsight.test', targetDocumentId: 'fact:blocked',
+      userEventDocumentId: 'user:main:blocked', targetCreatedAt: at, semanticMatch: 1, intensity: 0.2,
+    }).status).toBe('forget-unavailable');
+    expect(ledger.finalizeIntents()).toBe(false);
+    expect(ledger.damaged()).toBe(true);
+    expect(store.loadForgetState().state).toMatchObject({ tasks: [{ state: 'intent' }], tombstones: [], epochs: {} });
+    expect(store.getDerivedArtifact('growth-proposal:synthetic')?.lifecycleState).toBe('active');
+
+    closeMemoryStateStores();
+    const repair = new DatabaseSync(path);
+    repair.exec('DROP TRIGGER reject_derived_invalidation');
+    repair.close();
+    const reopenedStore = openMemoryStateStore(path);
+    const reopenedLedger = new ForgetLedger(reopenedStore);
+    expect(reopenedLedger.damaged()).toBe(false);
+    expect(reopenedLedger.forgotten('bank-a', 'http://hindsight.test', 'doc-a')).toBe(true);
+    expect(reopenedLedger.epoch('bank-a', 'http://hindsight.test')).toBe(1);
+    expect(reopenedStore.getDerivedArtifact('growth-proposal:synthetic')).toMatchObject({
+      lifecycleState: 'stale', statusReason: 'source-forgotten',
+    });
+  });
+
+  it('retries a failed remote deletion after reopening SQLite', async () => {
+    const path = join(root(), 'memory-state.sqlite');
+    const store = openMemoryStateStore(path);
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    const outbox = new MemoryOutbox(store);
+    const ledger = new ForgetLedger(store, { now: () => new Date(0) });
+    let deleteCalls = 0;
+    const makeMemory = (stateStore: ReturnType<typeof openMemoryStateStore>, queue: MemoryOutbox, forgetLedger: ForgetLedger, deleteDocument: () => Promise<void>) => {
+      const memory = new HindsightMemory() as unknown as {
+        config: Record<string, unknown>;
+        client: Record<string, unknown>;
+        outbox: MemoryOutbox;
+        stateStore: ReturnType<typeof openMemoryStateStore>;
+        ledger: ForgetLedger;
+        ready: boolean;
+        unavailableUntil: number;
+        forgetDocument(documentId: string): Promise<{ acceptance: string; deleted: number; pending: number; failed: number }>;
+        drainDeletions(): Promise<void>;
+      };
+      memory.config = { enabled: true, bankId: 'bank-a', apiUrl: 'http://hindsight.test', recall: { maxTokens: 900, budget: 'low', timeoutMs: 800, types: ['observation'] } };
+      memory.client = {
+        deleteDocument,
+        clearMentalModel: async () => ({}),
+        refreshMentalModel: async () => ({ operation_id: 'refresh-1' }),
+      };
+      memory.outbox = queue;
+      memory.stateStore = stateStore;
+      memory.ledger = forgetLedger;
+      memory.ready = true;
+      memory.unavailableUntil = 0;
+      return memory;
+    };
+    const first = makeMemory(store, outbox, ledger, async () => {
+      deleteCalls += 1;
+      throw new Error('synthetic service outage');
+    });
+
+    expect(await first.forgetDocument('doc-a')).toMatchObject({ acceptance: 'accepted', deleted: 0, pending: 0, failed: 1 });
+    expect(deleteCalls).toBe(1);
+    expect(ledger.forgotten('bank-a', 'http://hindsight.test', 'doc-a')).toBe(true);
+    expect(ledger.status()).toMatchObject({ failed: 1, pending: 0 });
+
+    closeMemoryStateStores();
+    const reopenedStore = openMemoryStateStore(path);
+    const reopenedOutbox = new MemoryOutbox(reopenedStore);
+    const reopenedLedger = new ForgetLedger(reopenedStore, { now: () => new Date(0) });
+    const restarted = makeMemory(reopenedStore, reopenedOutbox, reopenedLedger, async () => { deleteCalls += 1; });
+    await restarted.drainDeletions();
+
+    expect(deleteCalls).toBe(2);
+    expect(reopenedLedger.status()).toMatchObject({ done: 1, pending: 0, failed: 0 });
+    expect(reopenedLedger.forgotten('bank-a', 'http://hindsight.test', 'doc-a')).toBe(true);
+  });
+
+  it('recovers a durable intent after the process exits before fence promotion', () => {
+    const path = join(root(), 'memory-state.sqlite');
+    const store = openMemoryStateStore(path);
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    closeMemoryStateStores();
+    const stateStoreModule = pathToFileURL(join(process.cwd(), 'core/memory/state-store.ts')).href;
+    const ledgerModule = pathToFileURL(join(process.cwd(), 'core/memory/forget-ledger.ts')).href;
+    const childSource = `
+      import { openMemoryStateStore } from ${JSON.stringify(stateStoreModule)};
+      import { ForgetLedger } from ${JSON.stringify(ledgerModule)};
+      const store = openMemoryStateStore(process.env.COO_TEST_MEMORY_STATE_PATH);
+      const ledger = new ForgetLedger(store);
+      const result = ledger.beginIntents([{
+        bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: 'doc-a', reason: 'synthetic process stop',
+      }], 'synthetic process stop');
+      if (result.acceptance !== 'accepted') process.exit(2);
+      process.exit(0);
+    `;
+    const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', childSource], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      timeout: 10_000,
+      env: { ...process.env, COO_TEST_MEMORY_STATE_PATH: path },
+    });
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+
+    const reopenedStore = openMemoryStateStore(path);
+    const reopenedLedger = new ForgetLedger(reopenedStore);
+    expect(reopenedLedger.damaged()).toBe(false);
+    expect(reopenedLedger.forgotten('bank-a', 'http://hindsight.test', 'doc-a')).toBe(true);
+    expect(reopenedLedger.status()).toMatchObject({ pending: 1, tombstones: 1 });
+    expect(reopenedLedger.epoch('bank-a', 'http://hindsight.test')).toBe(1);
+  });
+
+  it('blocks a late retain callback while a durable intent awaits fence recovery', async () => {
+    const path = join(root(), 'memory-state.sqlite');
+    const store = openMemoryStateStore(path);
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    const outbox = new MemoryOutbox(store);
+    outbox.add(retainItem('doc-late'));
+    const item = outbox.due(new Date(), 1)[0]!;
+    const ledger = new ForgetLedger(store);
+    let resolveRetain!: (value: { async: boolean; operationId: string | null }) => void;
+    let beginRetain!: () => void;
+    const retainStarted = new Promise<void>((resolve) => { beginRetain = resolve; });
+    const cancelled: string[] = [];
+    const delivery = new OutboxDelivery(outbox, {
+      retain: async () => {
+        beginRetain();
+        return await new Promise((resolve) => { resolveRetain = resolve; });
+      },
+      status: async () => 'processing',
+      verify: async () => true,
+      retry: async () => {},
+      cancel: async (entry) => { if (entry.operationId) cancelled.push(entry.operationId); },
+    }, {
+      target: () => ({ bankId: 'bank-a', endpoint: 'http://hindsight.test' }),
+      forgotten: (entry) => ledger.damaged() || ledger.forgotten(entry.bankId ?? 'bank-a', entry.endpoint ?? 'http://hindsight.test', entry.documentId),
+    });
+    const running = delivery.drain();
+    await retainStarted;
+    expect(ledger.beginIntents([{
+      bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: item.documentId, reason: 'late callback race',
+    }], 'late callback race').acceptance).toBe('accepted');
+
+    resolveRetain({ async: true, operationId: 'late-operation' });
+    await running;
+    expect(cancelled).toContain('late-operation');
+    expect(outbox.get(item.id)?.state).toBe('cancelled');
+    expect(ledger.damaged()).toBe(true);
+
+    closeMemoryStateStores();
+    const reopenedStore = openMemoryStateStore(path);
+    const reopenedLedger = new ForgetLedger(reopenedStore);
+    expect(reopenedLedger.damaged()).toBe(false);
+    expect(reopenedLedger.forgotten('bank-a', 'http://hindsight.test', item.documentId)).toBe(true);
+    expect(reopenedLedger.status()).toMatchObject({ pending: 1, tombstones: 1 });
+  });
+
+  it('keeps bank clear fences inside one namespace when document IDs overlap', () => {
+    const store = openMemoryStateStore(join(root(), 'memory-state.sqlite'));
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    const ledger = new ForgetLedger(store);
+    ledger.add({ bankId: 'bank-a', endpoint: 'http://a', documentId: 'same-id', reason: 'forget one namespace' });
+
+    expect(ledger.beginClearTarget('bank-a', 'http://a')).toBe(true);
+    expect(ledger.forgotten('bank-a', 'http://a', 'same-id')).toBe(true);
+    expect(ledger.forgotten('bank-b', 'http://b', 'same-id')).toBe(false);
+    expect(ledger.epoch('bank-a', 'http://a')).toBe(2);
+    expect(ledger.epoch('bank-b', 'http://b')).toBe(0);
+  });
+
+  it('keeps the wildcard fence after remote bank clear fails and retries only on a later clear call', async () => {
+    const path = join(root(), 'memory-state.sqlite');
+    const store = openMemoryStateStore(path);
+    store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
+    const outbox = new MemoryOutbox(store);
+    const ledger = new ForgetLedger(store);
+    const makeMemory = (stateStore: ReturnType<typeof openMemoryStateStore>, queue: MemoryOutbox, forgetLedger: ForgetLedger, deleteBank: () => Promise<void>) => {
+      const memory = new HindsightMemory() as unknown as {
+        config: Record<string, unknown>;
+        client: Record<string, unknown>;
+        outbox: MemoryOutbox;
+        stateStore: ReturnType<typeof openMemoryStateStore>;
+        ledger: ForgetLedger;
+        clear(): Promise<string>;
+      };
+      memory.config = { enabled: true, bankId: 'bank-a', apiUrl: 'http://a', recall: { maxTokens: 900, budget: 'low', timeoutMs: 800, types: ['observation'] } };
+      memory.client = { deleteBank };
+      memory.outbox = queue;
+      memory.stateStore = stateStore;
+      memory.ledger = forgetLedger;
+      return memory;
+    };
+    const first = makeMemory(store, outbox, ledger, async () => { throw new Error('synthetic clear outage'); });
+
+    await expect(first.clear()).rejects.toThrow('synthetic clear outage');
+    expect(ledger.bankClearPending('bank-a', 'http://a')).toBe(true);
+    expect(ledger.forgotten('bank-a', 'http://a', 'source-a')).toBe(true);
+    expect(ledger.forgotten('bank-b', 'http://b', 'source-a')).toBe(false);
+
+    closeMemoryStateStores();
+    const reopenedStore = openMemoryStateStore(path);
+    const reopenedOutbox = new MemoryOutbox(reopenedStore);
+    const reopenedLedger = new ForgetLedger(reopenedStore);
+    expect(reopenedLedger.damaged()).toBe(false);
+    expect(reopenedLedger.bankClearPending('bank-a', 'http://a')).toBe(true);
+    const restarted = makeMemory(reopenedStore, reopenedOutbox, reopenedLedger, async () => {});
+    expect(await restarted.clear()).toBe('long-term memory cleared');
+    expect(reopenedLedger.bankClearPending('bank-a', 'http://a')).toBe(false);
+    expect(reopenedLedger.forgotten('bank-a', 'http://a', 'source-a')).toBe(false);
   });
 
   it('quarantines a queued request whose content no longer matches its committed hash', () => {

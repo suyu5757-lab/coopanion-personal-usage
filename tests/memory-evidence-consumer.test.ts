@@ -11,11 +11,15 @@ import { inspectContextEvidence } from 'cortico/core/evidence.ts';
 import { message } from 'cortico/protocol/open-responses/context.ts';
 import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
+import { WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
 import { Core } from '../vendor/cortico/tests/core/fixture-core.ts';
 import { FakeLLM, makeCfg, makeFakeIO, makeLoaded, makeTool, textReply, toolReply } from '../vendor/cortico/tests/core/helpers.ts';
 import { coopanionPersona, PARTNER_FILE } from '../core/persona.ts';
 import { ExperienceCards, experienceCardArtifactText } from '../core/growth/experience-cards.ts';
+import { GrowthProposals, growthProposalArtifactText } from '../core/growth/proposals.ts';
+import { GrowthReview } from '../core/growth/review.ts';
 import { HindsightMemory } from '../core/memory/hindsight.ts';
+import { MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE } from '../core/memory/model-text.ts';
 import { loadHindsightConfig } from '../core/memory/config.ts';
 import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import { MemoryOutbox } from '../core/memory/outbox.ts';
@@ -102,7 +106,7 @@ async function hindsightServer(
         res.end();
         return;
       }
-      await beforeDocumentRead?.();
+      if (req.method === 'GET') await beforeDocumentRead?.();
       send({
         id: documentId, bank_id: 'fixture-bank', original_text: document.text,
         content_hash: createHash('sha256').update(document.text, 'utf8').digest('hex'), created_at: '2024-05-01T10:00:00.000Z',
@@ -131,6 +135,7 @@ async function buildRig(
     additionalSources?: Array<{ documentId: string; text: string }>;
     tools?: ToolDef[];
     worldPrompt?: string;
+    growthEnabled?: boolean;
     llmSetup?: (llm: FakeLLM) => void;
   } = {},
 ) {
@@ -158,7 +163,7 @@ async function buildRig(
     ...(options.partnerAdditionalDerived ?? []),
   ];
   const hasPartnerDocument = derivedPartnerParagraphs.length > 0 || !!options.partnerUserNote;
-  const growthStateFile = hasPartnerDocument ? join(root, 'growth', 'state.json') : undefined;
+  const growthStateFile = hasPartnerDocument || options.growthEnabled ? join(root, 'growth', 'state.json') : undefined;
   if (growthStateFile) mkdirSync(join(root, 'growth'), { recursive: true });
   const Persona = coopanionPersona(Cormini, { memory, ...(growthStateFile ? { growthStateFile } : {}) });
   const persona = new Persona({ memoryDir });
@@ -375,6 +380,176 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(handoffMemoryItem).toBeDefined();
   });
 
+  it('attaches exact Growth source spans and rejects a proposal when formatted output has unmapped text', async () => {
+    const rig = await buildRig(true, SOURCE_TEXT, undefined, {
+      growthEnabled: true,
+      llmSetup: (llm) => llm.script(
+        toolReply([{ name: 'memory_search', args: { query: 'jasmine tea preference' }, id: 'growth-search-1' }]),
+        toolReply([{ name: 'propose_growth', id: 'growth-proposal-1', args: {
+          title: 'Protect focus time',
+          summary: 'Pause routine interruptions while the person is programming.',
+          evidence: ['The person prefers jasmine tea.'],
+          sourceIds: ['doc-1'],
+          risk: 'low',
+          changes: [{ file: 'CONSTITUTION.md', from: 'Ask before routine interruptions.', to: 'During focused work, wait before routine interruptions.', reason: 'The person asked for focus time.' }],
+        } }]),
+        toolReply([{ name: 'finish_review', id: 'growth-finish-1', args: { note: 'no complete source map' } }]),
+      ),
+    });
+    const proposalsDir = join(rig.root, 'growth', 'growth-proposals');
+    const coreApi = rig.api();
+    const evidenceSessionIds = new Set<string>();
+    const readGenerationEvidence = coreApi.generationEvidence.bind(coreApi);
+    coreApi.generationEvidence = (sessionId) => {
+      evidenceSessionIds.add(sessionId);
+      return readGenerationEvidence(sessionId);
+    };
+    const review = new GrowthReview({
+      core: () => coreApi,
+      snapshot: () => [message('system', 'Synthetic Growth review system prefix.')],
+      tools: () => [],
+      memory: () => rig.memory,
+      proposalsDir,
+      modelLanguage: () => 'en',
+      timezone: () => 'UTC',
+    });
+
+    expect(await review.run()).toMatchObject({ proposals: 0, cancelled: false });
+    const toolOutput = rig.llm.calls[1]?.messages.find((entry) => entry.role === 'tool');
+    expect(toolOutput?.content).toContain(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE);
+    const growthSessionId = [...evidenceSessionIds].find((sessionId) => sessionId.startsWith('growth-'));
+    expect(growthSessionId).toBeDefined();
+    const proposalEnvelope = readGenerationEvidence(growthSessionId!).find((envelope) =>
+      envelope.outputToolCalls.some((call) => call.toolCallId === 'growth-proposal-1'));
+    expect(proposalEnvelope, JSON.stringify(readGenerationEvidence(growthSessionId!))).toMatchObject({ mappingState: 'missing', actualEvidenceUsed: 'unknown' });
+    expect(proposalEnvelope?.exposedSources.map((source) => source.documentId)).toContain('doc-1');
+    const mappedSpan = proposalEnvelope?.items.flatMap((item) => item.spans).find((span) =>
+      span.origin === 'hindsight-source' && span.exposedSources.some((source) => source.documentId === 'doc-1'));
+    expect(mappedSpan).toBeDefined();
+    expect(toolOutput?.content.slice(mappedSpan!.start, mappedSpan!.end)).toBe(SOURCE_TEXT);
+    const proposalOutput = rig.llm.calls.flatMap((call) => call.messages).find((entry) => entry.role === 'tool'
+      && typeof entry.content === 'string' && entry.content.startsWith('[proposal rejected]'));
+    expect(proposalOutput?.content).toContain('[proposal rejected] The proposal generation has no complete joined source evidence.');
+    expect(new GrowthProposals(proposalsDir).list()).toEqual([]);
+    expect(rig.memory.derivedArtifact('growth-proposal-1')).toBeNull();
+  });
+
+  it('rejects Growth approval when Forget wins during source verification', async () => {
+    let pauseRead = false;
+    let readHeld = false;
+    let signalRead!: () => void;
+    let releaseRead!: () => void;
+    const readStarted = new Promise<void>((resolve) => { signalRead = resolve; });
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const rig = await buildRig(true, SOURCE_TEXT, async () => {
+      if (!pauseRead || readHeld) return;
+      readHeld = true;
+      signalRead();
+      await readGate;
+    }, { growthEnabled: true });
+    const store = new GrowthProposals(join(rig.root, 'growth', 'growth-proposals'));
+    const written = store.write({
+      title: 'Protect focus time',
+      summary: 'Pause routine interruptions while the person is programming.',
+      evidence: [SOURCE_TEXT],
+      sourceIds: ['doc-1'],
+      risk: 'low',
+      changes: [{ file: 'CONSTITUTION.md', from: 'Ask before routine interruptions.', to: 'During focused work, wait before routine interruptions.', reason: 'The person asked for focus time.' }],
+    });
+    if (!written.ok) throw new Error(written.errors.join('; '));
+    const expectedEpoch = rig.memory.evidenceEpoch();
+    if (!expectedEpoch) throw new Error('Memory evidence epoch is unavailable');
+    const artifactText = growthProposalArtifactText(written.proposal);
+    const artifact = await rig.memory.registerDerivedArtifactFromSources({
+      artifactId: written.proposal.id,
+      kind: 'growth-proposal',
+      target: `growth-proposals/${written.proposal.id}.json`,
+      content: artifactText,
+      origin: 'model-derived',
+      reviewState: 'unreviewed',
+      creatorOperationId: `test-growth:${written.proposal.id}`,
+      sourceIds: written.proposal.sourceIds,
+      expectedEpoch,
+    });
+    expect(artifact).toMatchObject({ lifecycleState: 'active', reviewState: 'unreviewed' });
+
+    const invoke = rig.persona.webUi('en').invoke;
+    if (!invoke) throw new Error('Growth review route is unavailable');
+    pauseRead = true;
+    const review = invoke('hindsight', 'growth-proposal-review', [written.proposal.id, 'approved']);
+    await readStarted;
+    const forgotten = await rig.memory.forgetDocument('doc-1');
+    expect(forgotten.acceptance).toBe('accepted');
+    releaseRead();
+
+    await expect(review).rejects.toThrow('The proposal sources cannot be verified.');
+    expect(store.get(written.proposal.id)?.state).toBe('candidate');
+    expect(rig.memory.derivedArtifact(written.proposal.id)).toMatchObject({ lifecycleState: 'stale', reviewState: 'unreviewed' });
+    expect(rig.memory.sourceVisible('doc-1')).toBe(false);
+  });
+
+  it('stops a controlled Growth apply when Forget changes the source epoch during read-back', async () => {
+    let signalValidatedSource!: () => void;
+    let releaseValidatedSource!: () => void;
+    const validatedSource = new Promise<void>((resolve) => { signalValidatedSource = resolve; });
+    const sourceGate = new Promise<void>((resolve) => { releaseValidatedSource = resolve; });
+    const rig = await buildRig(true, SOURCE_TEXT, undefined, { growthEnabled: true });
+    const store = new GrowthProposals(join(rig.root, 'growth', 'growth-proposals'));
+    const written = store.write({
+      title: 'Protect focus time',
+      summary: 'Pause routine interruptions while the person is programming.',
+      evidence: [SOURCE_TEXT],
+      sourceIds: ['doc-1'],
+      risk: 'low',
+      changes: [{ file: 'CONSTITUTION.md', from: 'Ask before routine interruptions.', to: 'During focused work, wait before routine interruptions.', reason: 'The person asked for focus time.' }],
+    });
+    if (!written.ok) throw new Error(written.errors.join('; '));
+    const expectedEpoch = rig.memory.evidenceEpoch();
+    if (!expectedEpoch) throw new Error('Memory evidence epoch is unavailable');
+    const artifactText = growthProposalArtifactText(written.proposal);
+    const artifact = await rig.memory.registerDerivedArtifactFromSources({
+      artifactId: written.proposal.id,
+      kind: 'growth-proposal',
+      target: `growth-proposals/${written.proposal.id}.json`,
+      content: artifactText,
+      origin: 'model-derived',
+      reviewState: 'approved',
+      creatorOperationId: `test-growth:${written.proposal.id}`,
+      sourceIds: written.proposal.sourceIds,
+      expectedEpoch,
+    });
+    expect(artifact).toMatchObject({ lifecycleState: 'active', reviewState: 'approved' });
+    expect(store.transition(written.proposal.id, 'approved')?.state).toBe('approved');
+
+    writeFileSync(join(rig.memoryDir, 'CONSTITUTION.md'), 'Ask before routine interruptions.\n');
+    const git = new WorkspaceGit(rig.memoryDir);
+    git.ensureRepo();
+    expect(git.status().dirty).toBe(false);
+
+    const memory = rig.memory as HindsightMemory & { hasSource(documentId: string): Promise<boolean> };
+    const hasSource = memory.hasSource.bind(memory);
+    memory.hasSource = async (documentId) => {
+      const present = await hasSource(documentId);
+      signalValidatedSource();
+      await sourceGate;
+      return present;
+    };
+    const applyGrowth = (rig.persona as unknown as { applyGrowthProposal(id: string): Promise<unknown> }).applyGrowthProposal
+      .bind(rig.persona);
+    const apply = applyGrowth(written.proposal.id);
+    await validatedSource;
+    const forgotten = await rig.memory.forgetDocument('doc-1');
+    expect(forgotten.acceptance).toBe('accepted');
+    releaseValidatedSource();
+
+    await expect(apply).rejects.toThrow('The proposal sources changed during review. It was not applied.');
+    expect(readFileSync(join(rig.memoryDir, 'CONSTITUTION.md'), 'utf8')).toBe('Ask before routine interruptions.\n');
+    expect(git.status().dirty).toBe(false);
+    expect(store.get(written.proposal.id)?.state).toBe('approved');
+    expect(rig.memory.derivedArtifact(written.proposal.id)).toMatchObject({ lifecycleState: 'stale', reviewState: 'approved' });
+    expect(rig.memory.sourceVisible('doc-1')).toBe(false);
+  });
+
   it('blocks a rebuilt source span when Forget fences it before provider dispatch', async () => {
     const rig = await buildRig(true, undefined, undefined, { partnerSummary: 'Coo saved the note: jasmine tea 🌿' });
     const validate = rig.persona.validateEvidenceForRequest.bind(rig.persona);
@@ -404,6 +579,29 @@ describe('Memory source evidence through the real Core consumer', () => {
       && item.spans.some((span) => span.origin === 'hindsight-source' && span.mappingState === 'stale'
         && span.exposedSources.length === 0 && span.serializedRanges.length === 0))).toBe(true);
     expect(rig.memory.sourceVisible('doc-1')).toBe(false);
+  });
+
+  it('discards a source read that returns after the whole bank was cleared', async () => {
+    let beginRead!: () => void;
+    let releaseRead!: () => void;
+    let held = false;
+    const readStarted = new Promise<void>((resolve) => { beginRead = resolve; });
+    const gate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const rig = await buildRig(true, undefined, async () => {
+      if (held) return;
+      held = true;
+      beginRead();
+      await gate;
+    });
+    const client = (rig.memory as unknown as { client: Record<string, unknown> }).client;
+    client.deleteBank = async () => {};
+
+    const pendingRead = rig.memory.evidenceForSegments(SOURCE_TEXT, [{ documentId: 'doc-1', start: 0, end: SOURCE_TEXT.length }]);
+    await readStarted;
+    expect(await rig.memory.clear()).toBe('long-term memory cleared');
+    releaseRead();
+
+    expect(await pendingRead).toEqual([]);
   });
 
   it('blocks a rebuilt source span when a verified local revision supersedes it before dispatch', async () => {
@@ -615,7 +813,7 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(readFileSync(otherFile, 'utf8')).toBe('preserve');
   });
 
-  it('keeps a handoff published before a failed SQLite commit out of later workspace reads', async () => {
+  it('recovers a published Handoff after activation commit fails and the SQLite owner matches', async () => {
     const rig = await buildRig(true);
     const generation = rig.api().sessionInfo('main').generation;
     if (!generation) throw new Error('Core did not provide a generation token');
@@ -652,7 +850,7 @@ describe('Memory source evidence through the real Core consumer', () => {
     if (!published) throw new Error('the commit failure did not leave the published candidate available for review');
     const artifactId = `handoff:${createHash('sha256')
       .update(JSON.stringify(['main', 'commit-crash-window', published]), 'utf8').digest('hex')}`;
-    expect(rig.memory.derivedArtifact(artifactId)).toBeNull();
+    expect(rig.memory.derivedArtifact(artifactId)).toMatchObject({ lifecycleState: 'pending', kind: 'handoff-note' });
     expect(rig.core.session.records).toHaveLength(recordsBefore);
 
     await rig.core.stop();
@@ -667,7 +865,7 @@ describe('Memory source evidence through the real Core consumer', () => {
     persistentMemory.stateStore = reopenedStore;
     persistentMemory.outbox = new MemoryOutbox(reopenedStore);
     persistentMemory.ledger = new ForgetLedger(reopenedStore);
-    expect(reopenedStore.getDerivedArtifact(artifactId)).toBeNull();
+    expect(reopenedStore.getDerivedArtifact(artifactId)).toMatchObject({ lifecycleState: 'pending' });
 
     const Persona = coopanionPersona(Cormini, { memory: rig.memory });
     const restartedPersona = new Persona({ memoryDir: rig.memoryDir });
@@ -675,8 +873,229 @@ describe('Memory source evidence through the real Core consumer', () => {
     if (!readFile) throw new Error('Persona did not declare read_file');
     await expect(readFile.handler({ path: `handoffs/${published}` }, { role: 'main', callId: 'read-orphan' } as never))
       .resolves.toBe('[read failed] This workspace area is withheld until its content has provenance sidecar entries.');
-    prepared.discard?.();
-    expect(existsSync(handoffDir)).toBe(false);
+    expect(reopenedStore.getDerivedArtifact(artifactId)).toMatchObject({ lifecycleState: 'active' });
+    const content = readFileSync(join(handoffDir, published), 'utf8');
+    expect(rig.memory.derivedArtifactIsCurrent(artifactId, content)).toBe(true);
+    expect(readdirSync(join(handoffDir, '.staging'))).toEqual([]);
+  });
+
+  it('publishes a staged Handoff after restart when its pending SQLite owner matches', async () => {
+    const rig = await buildRig(true);
+    const generation = rig.api().sessionInfo('main').generation;
+    if (!generation) throw new Error('Core did not provide a generation token');
+    const text = 'Continue the synthetic task.';
+    const snapshot = [message('user', text, { sourceIndependentSpans: [{
+      start: 0, end: text.length, digest: createHash('sha256').update(text, 'utf8').digest('hex'), origin: 'user-input',
+    }] })];
+    const prepared = await rig.persona.prepareHandoff(snapshot, {
+      hardTokens: null, sessionId: 'main', expectedGeneration: generation.token, candidateSnapshotId: 'pending-before-publish',
+      sourceEvidence: inspectContextEvidence(snapshot), inspectCandidate: (records) => inspectContextEvidence(records),
+    });
+    expect(prepared.commitGuard?.()).toEqual({ status: 'allow' });
+    const handoffDir = join(rig.memoryDir, 'handoffs');
+    const stagingPath = join(handoffDir, '.staging');
+    const stagedName = readdirSync(stagingPath)[0]!;
+    const target = prepared.injections?.map((injection) => injection.text.match(/handoffs\/[A-Za-z0-9._-]+\.md/)?.[0])
+      .find((value): value is string => !!value);
+    if (!target) throw new Error('Handoff target was not present in its staged injection');
+
+    const memory = rig.memory as unknown as {
+      commitHandoffArtifact: (...args: never[]) => unknown;
+      derivedArtifact(artifactId: string): { lifecycleState: string } | null;
+      stateStore: ReturnType<typeof openMemoryStateStore>;
+      outbox: MemoryOutbox;
+      ledger: ForgetLedger;
+    };
+    const originalCommit = memory.commitHandoffArtifact.bind(memory);
+    let artifactId = '';
+    memory.commitHandoffArtifact = ((input: { artifactId: string }) => {
+      artifactId = input.artifactId;
+      const pending = (originalCommit as unknown as (value: unknown) => unknown)(input);
+      if (pending) throw new Error('synthetic process stop after pending commit');
+      return pending;
+    }) as never;
+    expect(() => prepared.commit?.()).toThrow('synthetic process stop after pending commit');
+    memory.commitHandoffArtifact = originalCommit as never;
+    expect(artifactId).not.toBe('');
+    expect(memory.derivedArtifact(artifactId)).toMatchObject({ lifecycleState: 'pending' });
+    expect(existsSync(join(rig.memoryDir, target))).toBe(false);
+    expect(readdirSync(join(stagingPath))).toEqual([stagedName]);
+    expect(readdirSync(handoffDir).filter((name) => name.endsWith('.md'))).toEqual([]);
+
+    await rig.core.stop();
+    activeCores.splice(activeCores.indexOf(rig.core), 1);
+    closeMemoryStateStores();
+    const reopenedStore = openMemoryStateStore(join(rig.root, 'memory-state.sqlite'));
+    memory.stateStore = reopenedStore;
+    memory.outbox = new MemoryOutbox(reopenedStore);
+    memory.ledger = new ForgetLedger(reopenedStore);
+    const Persona = coopanionPersona(Cormini, { memory: rig.memory });
+    const restartedPersona = new Persona({ memoryDir: rig.memoryDir });
+    const readFile = (restartedPersona as unknown as { tools(): ToolDef[] }).tools().find((tool) => tool.name === 'read_file');
+    if (!readFile) throw new Error('Persona did not declare read_file');
+    await expect(readFile.handler({ path: target }, { role: 'main', callId: 'read-recovered-handoff' } as never))
+      .resolves.toBe('[read failed] This workspace area is withheld until its content has provenance sidecar entries.');
+    expect(reopenedStore.getDerivedArtifact(artifactId)).toMatchObject({ lifecycleState: 'active' });
+    expect(readdirSync(join(handoffDir, '.staging'))).toEqual([]);
+    expect(readdirSync(handoffDir).filter((name) => name.endsWith('.md'))).toEqual([target.slice('handoffs/'.length)]);
+  });
+
+  it('removes an owned staging link after restart when SQLite activation already committed', async () => {
+    const rig = await buildRig(true);
+    const generation = rig.api().sessionInfo('main').generation;
+    if (!generation) throw new Error('Core did not provide a generation token');
+    const text = 'Continue the local synthetic task.';
+    const snapshot = [message('user', text, { sourceIndependentSpans: [{
+      start: 0, end: text.length, digest: createHash('sha256').update(text, 'utf8').digest('hex'), origin: 'user-input',
+    }] })];
+    const prepared = await rig.persona.prepareHandoff(snapshot, {
+      hardTokens: null, sessionId: 'main', expectedGeneration: generation.token, candidateSnapshotId: 'active-before-cleanup',
+      sourceEvidence: inspectContextEvidence(snapshot), inspectCandidate: (records) => inspectContextEvidence(records),
+    });
+    const target = prepared.injections?.map((injection) => injection.text.match(/handoffs\/[A-Za-z0-9._-]+\.md/)?.[0])
+      .find((value): value is string => !!value);
+    if (!target) throw new Error('Handoff target was not present in its staged injection');
+    const memory = rig.memory as unknown as {
+      activateHandoffArtifact(artifactId: string, ownerToken: string): unknown;
+      derivedArtifact(artifactId: string): { lifecycleState: string } | null;
+    };
+    const originalActivate = memory.activateHandoffArtifact.bind(memory);
+    let artifactId = '';
+    memory.activateHandoffArtifact = (id, ownerToken) => {
+      artifactId = id;
+      const active = originalActivate(id, ownerToken);
+      if (active) throw new Error('synthetic process stop after activation commit');
+      return active;
+    };
+
+    expect(() => prepared.commit?.()).toThrow('synthetic process stop after activation commit');
+    memory.activateHandoffArtifact = originalActivate;
+    expect(memory.derivedArtifact(artifactId)).toMatchObject({ lifecycleState: 'active' });
+    const handoffDir = join(rig.memoryDir, 'handoffs');
+    const filename = target.slice('handoffs/'.length);
+    expect(existsSync(join(handoffDir, filename))).toBe(true);
+    expect(readdirSync(join(handoffDir, '.staging'))).toHaveLength(1);
+
+    await rig.core.stop();
+    activeCores.splice(activeCores.indexOf(rig.core), 1);
+    closeMemoryStateStores();
+    const memoryState = rig.memory as unknown as {
+      stateStore: ReturnType<typeof openMemoryStateStore>;
+      outbox: MemoryOutbox;
+      ledger: ForgetLedger;
+    };
+    const reopenedStore = openMemoryStateStore(join(rig.root, 'memory-state.sqlite'));
+    memoryState.stateStore = reopenedStore;
+    memoryState.outbox = new MemoryOutbox(reopenedStore);
+    memoryState.ledger = new ForgetLedger(reopenedStore);
+    const Persona = coopanionPersona(Cormini, { memory: rig.memory });
+    const restartedPersona = new Persona({ memoryDir: rig.memoryDir });
+    const readFile = (restartedPersona as unknown as { tools(): ToolDef[] }).tools().find((tool) => tool.name === 'read_file');
+    if (!readFile) throw new Error('Persona did not declare read_file');
+    await readFile.handler({ path: target }, { role: 'main', callId: 'read-active-handoff' } as never);
+
+    expect(reopenedStore.getDerivedArtifact(artifactId)).toMatchObject({ lifecycleState: 'active' });
+    expect(readdirSync(join(handoffDir, '.staging'))).toEqual([]);
+    expect(readdirSync(handoffDir).filter((name) => name.endsWith('.md'))).toEqual([filename]);
+  });
+
+  it('keeps a published Handoff stale when Forget wins before SQLite activation', async () => {
+    const rig = await buildRig(true);
+    const generation = rig.api().sessionInfo('main').generation;
+    if (!generation) throw new Error('Core did not provide a generation token');
+    const attachment = (await rig.memory.evidenceForSegments(SOURCE_TEXT, [
+      { documentId: 'doc-1', start: 0, end: SOURCE_TEXT.length },
+    ]))[0];
+    if (!attachment) throw new Error('Synthetic source read-back did not produce an attachment');
+    const snapshot = [message('user', SOURCE_TEXT, { evidence: [attachment] })];
+    const handoffDir = join(rig.memoryDir, 'handoffs');
+    const prepared = await rig.persona.prepareHandoff(snapshot, {
+      hardTokens: null, sessionId: 'main', expectedGeneration: generation.token, candidateSnapshotId: 'forget-before-activation',
+      sourceEvidence: inspectContextEvidence(snapshot), inspectCandidate: (records) => inspectContextEvidence(records),
+    });
+    const memory = rig.memory as unknown as {
+      activateHandoffArtifact(artifactId: string, ownerToken: string): unknown;
+      derivedArtifact(artifactId: string): { lifecycleState: string } | null;
+      sourceVisible(documentId: string): boolean;
+      stateStore: ReturnType<typeof openMemoryStateStore>;
+      outbox: MemoryOutbox;
+      ledger: ForgetLedger;
+    };
+    const originalActivate = memory.activateHandoffArtifact.bind(memory);
+    const ledger = memory.ledger;
+    memory.activateHandoffArtifact = (artifactId, ownerToken) => {
+      expect(ledger.addMany([{
+        bankId: 'fixture-bank', endpoint: rig.baseUrl, documentId: 'doc-1', reason: 'synthetic R3 Forget race',
+      }], 'synthetic R3 Forget race').failed).toBe(0);
+      return originalActivate(artifactId, ownerToken);
+    };
+    expect(() => prepared.commit?.()).toThrow('Handoff provenance changed before file activation.');
+    memory.activateHandoffArtifact = originalActivate;
+
+    const published = readdirSync(handoffDir).find((name) => name.endsWith('.md'));
+    if (!published) throw new Error('the file was not published before the Forget fence');
+    const artifactId = `handoff:${createHash('sha256')
+      .update(JSON.stringify(['main', 'forget-before-activation', published]), 'utf8').digest('hex')}`;
+    expect(memory.derivedArtifact(artifactId)).toMatchObject({ lifecycleState: 'stale' });
+    expect(memory.sourceVisible('doc-1')).toBe(false);
+
+    await rig.core.stop();
+    activeCores.splice(activeCores.indexOf(rig.core), 1);
+    closeMemoryStateStores();
+    const reopenedStore = openMemoryStateStore(join(rig.root, 'memory-state.sqlite'));
+    memory.stateStore = reopenedStore;
+    memory.outbox = new MemoryOutbox(reopenedStore);
+    memory.ledger = new ForgetLedger(reopenedStore);
+    const Persona = coopanionPersona(Cormini, { memory: rig.memory });
+    const restartedPersona = new Persona({ memoryDir: rig.memoryDir });
+    const readFile = (restartedPersona as unknown as { tools(): ToolDef[] }).tools().find((tool) => tool.name === 'read_file');
+    if (!readFile) throw new Error('Persona did not declare read_file');
+    await expect(readFile.handler({ path: `handoffs/${published}` }, { role: 'main', callId: 'read-stale-handoff' } as never))
+      .resolves.toBe('[read failed] This workspace area is withheld until its content has provenance sidecar entries.');
+    expect(reopenedStore.getDerivedArtifact(artifactId)).toMatchObject({ lifecycleState: 'stale' });
+    expect(existsSync(join(handoffDir, published))).toBe(true);
+    expect(readdirSync(join(handoffDir, '.staging'))).toEqual([]);
+  });
+
+  it('withholds an unregistered Handoff stage after restart and keeps its unconfirmed owner', async () => {
+    const rig = await buildRig(true);
+    const generation = rig.api().sessionInfo('main').generation;
+    if (!generation) throw new Error('Core did not provide a generation token');
+    const attachment = (await rig.memory.evidenceForSegments(SOURCE_TEXT, [
+      { documentId: 'doc-1', start: 0, end: SOURCE_TEXT.length },
+    ]))[0];
+    if (!attachment) throw new Error('Synthetic source read-back did not produce an attachment');
+    const snapshot = [message('user', SOURCE_TEXT, { evidence: [attachment] })];
+    const prepared = await rig.persona.prepareHandoff(snapshot, {
+      hardTokens: null, sessionId: 'main', expectedGeneration: generation.token, candidateSnapshotId: 'stage-before-owner',
+      sourceEvidence: inspectContextEvidence(snapshot), inspectCandidate: (records) => inspectContextEvidence(records),
+    });
+    const handoffDir = join(rig.memoryDir, 'handoffs');
+    const stagingPath = join(handoffDir, '.staging');
+    const staged = readdirSync(stagingPath)[0]!;
+    expect(rig.memory.listHandoffArtifacts()).toEqual([]);
+
+    await rig.core.stop();
+    activeCores.splice(activeCores.indexOf(rig.core), 1);
+    closeMemoryStateStores();
+    const memory = rig.memory as unknown as {
+      stateStore: ReturnType<typeof openMemoryStateStore>;
+      outbox: MemoryOutbox;
+      ledger: ForgetLedger;
+    };
+    const reopenedStore = openMemoryStateStore(join(rig.root, 'memory-state.sqlite'));
+    memory.stateStore = reopenedStore;
+    memory.outbox = new MemoryOutbox(reopenedStore);
+    memory.ledger = new ForgetLedger(reopenedStore);
+    const Persona = coopanionPersona(Cormini, { memory: rig.memory });
+    const restartedPersona = new Persona({ memoryDir: rig.memoryDir });
+    const readFile = (restartedPersona as unknown as { tools(): ToolDef[] }).tools().find((tool) => tool.name === 'read_file');
+    if (!readFile) throw new Error('Persona did not declare read_file');
+    await expect(readFile.handler({ path: `handoffs/.staging/${staged}` }, { role: 'main', callId: 'read-unregistered-stage' } as never))
+      .resolves.toBe('[read failed] This workspace area is withheld until its content has provenance sidecar entries.');
+    expect(readdirSync(stagingPath)).toEqual([staged]);
+    expect(reopenedStore.listDerivedArtifacts('handoff-note')).toEqual([]);
+    expect(prepared.commitGuard?.()).toMatchObject({ status: 'stale', reason: 'generation-changed' });
   });
 
   it('attaches approved ExperienceCard text only after validating every stored source ID', async () => {

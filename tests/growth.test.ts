@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,7 +8,7 @@ import { message, type ContextRecord } from 'cortico/protocol/open-responses/con
 import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import { coopanionPersona } from '../core/persona.ts';
-import type { HindsightMemory } from '../core/memory/hindsight.ts';
+import type { HindsightMemory, MemoryTextRead } from '../core/memory/hindsight.ts';
 import { GROWTH_DEFAULTS, readGrowth } from '../core/growth/config.ts';
 import { SELF_REVIEW_TEXT } from '../core/growth/model-text.ts';
 import { ExperienceCards } from '../core/growth/experience-cards.ts';
@@ -64,9 +65,11 @@ function tempState(): string {
 function memoryRead(sourceIds: string[], text = '[memory] Synthetic dated event records.'): {
   text: string;
   status: 'found';
-  trace: { format: { includedSourceDocumentIds: string[] } };
+  sourceSegments: Array<{ documentId: string; start: number; end: number }>;
+  trace: { format: { includedSourceDocumentIds: string[]; sourceSegments: Array<{ documentId: string; start: number; end: number }> } };
 } {
-  return { text, status: 'found', trace: { format: { includedSourceDocumentIds: sourceIds } } };
+  const sourceSegments = sourceIds.map((documentId) => ({ documentId, start: 0, end: text.length }));
+  return { text, status: 'found', sourceSegments, trace: { format: { includedSourceDocumentIds: sourceIds, sourceSegments } } };
 }
 
 function generationEnvelope(toolCallId: string): GenerationEvidenceEnvelope {
@@ -105,6 +108,26 @@ function generationEnvelope(toolCallId: string): GenerationEvidenceEnvelope {
 function generationMemoryMethods() {
   return {
     evidenceEpoch: () => '0:0',
+    evidenceForRead: async (read: MemoryTextRead) => {
+      const sourceSegments = read.sourceSegments
+        ?? read.trace?.format.sourceSegments.map(({ documentId, start, end }) => ({ documentId, start, end }))
+        ?? [];
+      return sourceSegments.map((segment) => ({
+        bankId: 'bank-synthetic',
+        endpoint: 'https://bank.invalid',
+        documentId: segment.documentId,
+        validatedEpoch: '0:0',
+        revisionState: 'current' as const,
+        validationStatus: 'validated' as const,
+        validationReceipt: createHash('sha256').update(`receipt:${segment.documentId}`).digest('hex'),
+        contentDigest: createHash('sha256').update(`source:${segment.documentId}`).digest('hex'),
+        segment: {
+          start: segment.start,
+          end: segment.end,
+          digest: createHash('sha256').update(read.text.slice(segment.start, segment.end)).digest('hex'),
+        },
+      }));
+    },
     recordGenerationEvidenceEnvelope: () => true,
     registerDerivedArtifactFromSources: async (input: { artifactId: string }) => ({ artifactId: input.artifactId }),
   };

@@ -23,6 +23,14 @@ export interface ForgetStateSnapshot {
   stale: string[];
 }
 
+export interface ForgetIntentTarget {
+  bankId: string;
+  endpoint: string;
+  documentId: string;
+  operationId?: string;
+  reason: string;
+}
+
 export interface LegacyMemoryImport {
   outbox: object[];
   forget: ForgetStateSnapshot;
@@ -770,11 +778,25 @@ export class MemoryStateStore {
     return rows.map((row) => row.document_id);
   }
 
-  loadForgetState(): { state: ForgetStateSnapshot | null; damaged: boolean; blocked: boolean } {
+  loadForgetState(): { state: ForgetStateSnapshot | null; damaged: boolean; blocked: boolean; blockedTargets: ForgetIntentTarget[] | null } {
     this.assertOpen();
     const blocked = this.meta('forget:write-blocked') === '1';
-    if (this.meta('forget:present') !== '1') return { state: null, damaged: this.meta('forget:damaged') === '1', blocked };
-    if (this.meta('forget:damaged') === '1') return { state: null, damaged: true, blocked };
+    const encodedBlockedTargets = this.meta('forget:blocked-targets');
+    let blockedTargets: ForgetIntentTarget[] | null = null;
+    if (encodedBlockedTargets) {
+      try {
+        const parsed = JSON.parse(encodedBlockedTargets) as unknown;
+        if (Array.isArray(parsed) && parsed.every((entry) => entry && typeof entry === 'object'
+          && typeof (entry as Record<string, unknown>).bankId === 'string'
+          && typeof (entry as Record<string, unknown>).endpoint === 'string'
+          && typeof (entry as Record<string, unknown>).documentId === 'string'
+          && typeof (entry as Record<string, unknown>).reason === 'string')) {
+          blockedTargets = parsed as ForgetIntentTarget[];
+        }
+      } catch { /* The block remains closed when its retry target cannot be read. */ }
+    }
+    if (this.meta('forget:present') !== '1') return { state: null, damaged: this.meta('forget:damaged') === '1', blocked, blockedTargets };
+    if (this.meta('forget:damaged') === '1') return { state: null, damaged: true, blocked, blockedTargets };
     try {
       const tasks = (this.db.prepare('SELECT record_json FROM memory_deletions ORDER BY task_id').all() as Array<{ record_json: string }>)
         .map((row) => JSON.parse(row.record_json) as Record<string, unknown>);
@@ -799,14 +821,45 @@ export class MemoryStateStore {
         },
         damaged: false,
         blocked,
+        blockedTargets,
       };
     } catch {
-      return { state: null, damaged: true, blocked };
+      return { state: null, damaged: true, blocked, blockedTargets };
     }
   }
 
-  markForgetWriteBlocked(): void {
-    this.transaction(() => this.setMeta('forget:write-blocked', '1'));
+  markForgetWriteBlocked(targets?: readonly ForgetIntentTarget[]): void {
+    this.transaction(() => {
+      this.setMeta('forget:write-blocked', '1');
+      if (targets) this.setMeta('forget:blocked-targets', JSON.stringify(targets));
+    });
+  }
+
+  /** Commits a fail-closed intent before the source fence and deletion retry are finalized. */
+  saveForgetIntents(tasks: readonly object[]): void {
+    this.transaction(() => {
+      this.setMeta('forget:write-blocked', '1');
+      this.setMeta('forget:present', '1');
+      const insert = this.db.prepare(`
+        INSERT INTO memory_deletions(task_id, bank_id, endpoint, document_id, operation_id, state,
+          attempts, verifications, next_attempt_at, record_json)
+        VALUES(?, ?, ?, ?, ?, 'intent', ?, ?, ?, ?)
+      `);
+      for (const raw of tasks) {
+        const task = raw as Record<string, unknown>;
+        if (typeof task.id !== 'string' || typeof task.bankId !== 'string' || typeof task.endpoint !== 'string'
+          || typeof task.documentId !== 'string' || typeof task.reason !== 'string'
+          || typeof task.nextAttemptAt !== 'string' || typeof task.createdAt !== 'string' || typeof task.updatedAt !== 'string') {
+          throw new Error('invalid memory forget intent');
+        }
+        insert.run(task.id, task.bankId, task.endpoint, task.documentId,
+          typeof task.operationId === 'string' ? task.operationId : null,
+          typeof task.attempts === 'number' ? task.attempts : 0,
+          typeof task.verifications === 'number' ? task.verifications : 0,
+          task.nextAttemptAt, JSON.stringify({ ...task, state: 'intent' }));
+      }
+      this.db.prepare('DELETE FROM memory_metadata WHERE key = ?').run('forget:blocked-targets');
+    });
   }
 
   saveForgetState(state: ForgetStateSnapshot): void {
@@ -872,7 +925,9 @@ export class MemoryStateStore {
     reinforcement: ReinforcementParameters = DEFAULT_REINFORCEMENT_PARAMETERS,
   ): UserMentionResult {
     return this.transaction(() => {
-      if (this.meta('forget:damaged') === '1') return { status: 'forget-unavailable', activation: null };
+      if (this.meta('forget:damaged') === '1' || this.meta('forget:write-blocked') === '1') {
+        return { status: 'forget-unavailable', activation: null };
+      }
       if (this.isFenced(input.bankId, input.endpoint, input.targetDocumentId)
         || this.isFenced(input.bankId, input.endpoint, input.userEventDocumentId)) {
         return { status: 'forgotten', activation: null };
@@ -1118,6 +1173,17 @@ export class MemoryStateStore {
     return this.readDerivedArtifact(requiredText(artifactId, 'artifactId'));
   }
 
+  listDerivedArtifacts(kind: string): DerivedArtifact[] {
+    this.assertOpen();
+    const rows = this.db.prepare(`
+      SELECT artifact_id FROM derived_artifact WHERE kind = ? ORDER BY created_at, artifact_id
+    `).all(requiredText(kind, 'kind')) as Array<{ artifact_id: string }>;
+    return rows.flatMap(({ artifact_id }) => {
+      const artifact = this.readDerivedArtifact(artifact_id);
+      return artifact ? [artifact] : [];
+    });
+  }
+
   derivedArtifactsForSource(bankId: string, endpoint: string, documentId: string): DerivedArtifact[] {
     this.assertOpen();
     const rows = this.db.prepare(`
@@ -1147,6 +1213,18 @@ export class MemoryStateStore {
         UPDATE derived_artifact SET lifecycle_state = ?, status_reason = ?, updated_at = ?
         WHERE artifact_id = ?
       `).run(lifecycleState, requiredText(reason, 'reason'), validTimestamp(updatedAt, 'updatedAt'), current.artifactId);
+      return this.readDerivedArtifact(current.artifactId);
+    });
+  }
+
+  activateDerivedArtifact(artifactId: string, creatorOperationId: string, updatedAt: string): DerivedArtifact | null {
+    return this.transaction(() => {
+      const current = this.readDerivedArtifact(requiredText(artifactId, 'artifactId'));
+      if (!current || current.lifecycleState !== 'pending' || current.creatorOperationId !== creatorOperationId) return null;
+      this.db.prepare(`
+        UPDATE derived_artifact SET lifecycle_state = 'active', status_reason = NULL, updated_at = ?
+        WHERE artifact_id = ? AND lifecycle_state = 'pending' AND creator_operation_id = ?
+      `).run(validTimestamp(updatedAt, 'updatedAt'), current.artifactId, creatorOperationId);
       return this.readDerivedArtifact(current.artifactId);
     });
   }
@@ -1376,6 +1454,7 @@ export class MemoryStateStore {
   }
 
   private isFenced(bankId: string, endpoint: string, documentId: string): boolean {
+    if (this.meta('forget:write-blocked') === '1') return true;
     return !!this.db.prepare(`
       SELECT 1 AS fenced FROM memory_fences
       WHERE bank_id = ? AND endpoint = ? AND document_id IN (?, '*')
@@ -1548,6 +1627,7 @@ export class MemoryStateStore {
     this.setMeta('forget:present', '1');
     this.setMeta('forget:damaged', damaged ? '1' : '0');
     this.setMeta('forget:write-blocked', '0');
+    this.db.prepare('DELETE FROM memory_metadata WHERE key = ?').run('forget:blocked-targets');
   }
 
   private meta(key: string): string | null {

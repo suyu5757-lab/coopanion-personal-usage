@@ -35,13 +35,26 @@ describe('memory correction tool', () => {
   it('does not imply an active conversation was cleared by a forget request', async () => {
     const memory = {
       enabled: () => true,
-      forget: async () => ({ local: 0, deleted: 1, pending: 0, failed: 0, activeContextInvalidated: false }),
+      forget: async () => ({ acceptance: 'accepted', local: 0, deleted: 1, pending: 0, failed: 0, activeContextInvalidated: false }),
     } as unknown as HindsightMemory;
     const tool = memoryTools({ memory: () => memory }).find((entry) => entry.name === 'memory_forget')!;
     const result = await tool.handler({ query: 'the old route' }, {} as never);
 
+    expect(result).toContain('[forget accepted]');
     expect(result).toContain('active conversation may still contain this source');
     expect(result).toContain('Do not recover it from workspace files, Handoff notes or Git history.');
+  });
+
+  it('separates a failed Forget request from an accepted deletion retry', async () => {
+    const memory = {
+      enabled: () => true,
+      forget: async () => ({ acceptance: 'not-accepted', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false }),
+    } as unknown as HindsightMemory;
+    const tool = memoryTools({ memory: () => memory }).find((entry) => entry.name === 'memory_forget')!;
+    const result = await tool.handler({ query: 'the old route' }, {} as never);
+
+    expect(result).toContain('[forget not accepted]');
+    expect(result).toContain('retry is required');
   });
 });
 

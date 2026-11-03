@@ -1,15 +1,22 @@
 /**
- * The durable record of forgetting. A fenced source is kept out of every read, its removal from
- * the service is tracked to a terminal state, and portraits derived from it stay blocked until
- * they have been rebuilt without it. The fence, the tasks and the derived state share one atomic
- * write, so a restart cannot see a fence without the work it implies.
+ * The durable record of forgetting. A source stays out of reads while its remote deletion is
+ * tracked to a terminal state and dependent portraits are rebuilt. A durable intent blocks reads
+ * before the fence, retry task and derived invalidation commit together.
  */
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { openMemoryStateStore, type ForgetStateSnapshot, type MemoryStateStore } from './state-store.ts';
+import { openMemoryStateStore, type ForgetIntentTarget, type ForgetStateSnapshot, type MemoryStateStore } from './state-store.ts';
 import { readState } from '../state-file.ts';
 
-export type DeletionState = 'pending' | 'done' | 'failed';
+export type DeletionState = 'intent' | 'pending' | 'done' | 'failed';
+
+export type ForgetIntentAcceptance = 'accepted' | 'not-accepted' | 'unknown-blocked';
+
+export interface ForgetIntentResult {
+  acceptance: ForgetIntentAcceptance;
+  tasks: DeletionTask[];
+  failed: number;
+}
 
 export interface DeletionTask {
   id: string;
@@ -70,6 +77,14 @@ export interface LedgerFile extends ForgetStateSnapshot {
 export const VERIFY_DELAY_MS = 10 * 60_000;
 
 const key = (bankId: string, endpoint: string): string => JSON.stringify([bankId, endpoint]);
+const sourceKey = (target: Pick<ForgetIntentTarget, 'bankId' | 'endpoint' | 'documentId'>): string =>
+  JSON.stringify([target.bankId, target.endpoint, target.documentId]);
+
+function sameKeys(left: readonly string[] | null, right: readonly string[]): boolean {
+  if (!left || left.length !== right.length) return false;
+  const sortedRight = [...right].sort();
+  return [...left].sort().every((entry, index) => entry === sortedRight[index]);
+}
 
 function isTask(value: unknown): value is DeletionTask {
   if (!value || typeof value !== 'object') return false;
@@ -79,7 +94,7 @@ function isTask(value: unknown): value is DeletionTask {
     && typeof task.endpoint === 'string'
     && typeof task.documentId === 'string'
     && typeof task.state === 'string'
-    && (task.state === 'pending' || task.state === 'done' || task.state === 'failed')
+    && (task.state === 'intent' || task.state === 'pending' || task.state === 'done' || task.state === 'failed')
     && typeof task.createdAt === 'string'
     && typeof task.updatedAt === 'string';
 }
@@ -143,6 +158,8 @@ export class ForgetLedger {
   private persistenceBlocked = false;
   private persistenceError: string | null = null;
   private initializationError: string | null = null;
+  private blockedTargetKeys: string[] | null = null;
+  private retryableFailureTargetKeys: string[] | null = null;
   readonly stateStore: MemoryStateStore | null;
 
   constructor(
@@ -176,6 +193,8 @@ export class ForgetLedger {
       if (saved.state) this.file = saved.state as LedgerFile;
       this.damagedLedger = saved.damaged;
       this.persistenceBlocked ||= saved.blocked;
+      this.blockedTargetKeys = saved.blockedTargets?.map(sourceKey).sort() ?? null;
+      if (!this.damagedLedger && this.file.tasks.some((task) => task.state === 'intent')) this.promoteIntents();
     } catch (err) {
       this.damagedLedger = true;
       this.persistenceError = `could not read the memory database: ${err instanceof Error ? err.message : String(err)}`;
@@ -201,6 +220,47 @@ export class ForgetLedger {
     }
   }
 
+  private promoteIntents(): boolean {
+    if (this.damagedLedger || !this.stateStore) return false;
+    const intents = this.file.tasks.filter((task) => task.state === 'intent');
+    if (intents.length === 0) return !this.persistenceBlocked;
+    const before = this.file;
+    const tombstones = [...this.file.tombstones];
+    const epochs = { ...this.file.epochs };
+    const stale = new Set(this.file.stale);
+    const at = this.now().toISOString();
+    for (const task of intents) {
+      const exists = tombstones.some((entry) => entry.bankId === task.bankId
+        && entry.endpoint === task.endpoint && entry.documentId === task.documentId);
+      if (!exists) {
+        tombstones.push({ bankId: task.bankId, endpoint: task.endpoint, documentId: task.documentId, reason: task.reason.slice(0, 300), at });
+        const target = key(task.bankId, task.endpoint);
+        epochs[target] = (epochs[target] ?? 0) + 1;
+      }
+      stale.add(key(task.bankId, task.endpoint));
+    }
+    const intentIds = new Set(intents.map((task) => task.id));
+    this.file = {
+      ...this.file,
+      tasks: this.file.tasks.map((task) => intentIds.has(task.id)
+        ? { ...task, state: 'pending', updatedAt: at }
+        : task),
+      tombstones,
+      epochs,
+      stale: [...stale],
+    };
+    if (!this.persist()) {
+      this.file = before;
+      this.persistenceBlocked = true;
+      return false;
+    }
+    this.persistenceBlocked = false;
+    this.persistenceError = null;
+    this.blockedTargetKeys = null;
+    this.retryableFailureTargetKeys = null;
+    return true;
+  }
+
   private persistClearedTarget(bankId: string, endpoint: string): boolean {
     if (this.damagedLedger || !this.stateStore) {
       this.persistenceError ??= `could not write the memory database: ${this.initializationError ?? 'forget state is damaged'}`;
@@ -219,13 +279,102 @@ export class ForgetLedger {
     }
   }
 
+  /** Persist the acceptance record before cancelling the local queue or applying fences. */
+  beginIntents(inputs: readonly DeletionInput[], reason: string): ForgetIntentResult {
+    this.load();
+    const unique = [...new Map(inputs.filter((input) => input.bankId && input.endpoint && input.documentId)
+      .map((input) => [sourceKey(input), input])).values()];
+    const requestedKeys = unique.map(sourceKey).sort();
+    if (unique.length === 0) return { acceptance: 'not-accepted', tasks: [], failed: 0 };
+    if (this.damagedLedger || !this.stateStore) {
+      this.persistenceError ??= `could not write the memory database: ${this.initializationError ?? 'forget state is damaged'}`;
+      return { acceptance: this.persistenceBlocked ? 'unknown-blocked' : 'not-accepted', tasks: [], failed: unique.length };
+    }
+    if (this.persistenceBlocked
+      && !sameKeys(this.blockedTargetKeys, requestedKeys)
+      && !sameKeys(this.retryableFailureTargetKeys, requestedKeys)) {
+      return { acceptance: 'unknown-blocked', tasks: [], failed: unique.length };
+    }
+
+    const tasks: DeletionTask[] = [];
+    const fresh: DeletionTask[] = [];
+    const at = this.now().toISOString();
+    for (const input of unique) {
+      const fenced = this.file.tombstones.some((entry) => entry.bankId === input.bankId
+        && entry.endpoint === input.endpoint && entry.documentId === input.documentId);
+      const existing = fenced ? this.file.tasks.find((task) => task.bankId === input.bankId && task.endpoint === input.endpoint
+        && task.documentId === input.documentId && task.state !== 'done') : undefined;
+      if (existing) {
+        tasks.push(existing);
+        continue;
+      }
+      const acknowledged = fenced ? this.file.tasks.find((task) => task.bankId === input.bankId && task.endpoint === input.endpoint
+        && task.documentId === input.documentId && task.state === 'done') : undefined;
+      if (acknowledged) {
+        tasks.push(acknowledged);
+        continue;
+      }
+      const task: DeletionTask = {
+        ...input,
+        id: randomUUID(),
+        reason: reason.slice(0, 300),
+        state: 'intent',
+        attempts: 0,
+        verifications: 0,
+        nextAttemptAt: at,
+        createdAt: at,
+        updatedAt: at,
+      };
+      fresh.push(task);
+      tasks.push(task);
+    }
+    if (fresh.length === 0) return { acceptance: 'accepted', tasks, failed: 0 };
+
+    this.persistenceBlocked = true;
+    const retryTargets: ForgetIntentTarget[] = unique.map((input) => ({ ...input, reason: reason.slice(0, 300) }));
+    try {
+      this.stateStore.saveForgetIntents(fresh);
+      this.file = { ...this.file, tasks: [...this.file.tasks, ...fresh] };
+      this.blockedTargetKeys = null;
+      this.retryableFailureTargetKeys = null;
+      this.persistenceError = null;
+      return { acceptance: 'accepted', tasks, failed: 0 };
+    } catch (error) {
+      this.retryableFailureTargetKeys = requestedKeys;
+      this.persistenceError = `could not write the memory database: ${error instanceof Error ? error.message : String(error)}`;
+      try { this.stateStore.markForgetWriteBlocked(retryTargets); } catch { /* The process-local block still closes Memory. */ }
+      this.opts.log?.warn('[memory] could not persist the forget intent', { message: error instanceof Error ? error.message : String(error) });
+      try {
+        const saved = this.stateStore.loadForgetState();
+        const savedTasks = (saved.state?.tasks ?? []).filter(isTask);
+        const persisted = fresh.every((intent) => savedTasks.some((task) => task.id === intent.id && task.state === 'intent'));
+        if (persisted) {
+          this.file = saved.state as LedgerFile;
+          this.persistenceBlocked = true;
+          return { acceptance: 'accepted', tasks: fresh, failed: 0 };
+        }
+        this.blockedTargetKeys = saved.blockedTargets?.map(sourceKey).sort() ?? null;
+        return { acceptance: 'not-accepted', tasks: [], failed: Math.max(1, unique.length) };
+      } catch {
+        return { acceptance: 'unknown-blocked', tasks: [], failed: Math.max(1, unique.length) };
+      }
+    }
+  }
+
+  /** Apply persisted intents as fences and retry tasks in one SQLite transaction. */
+  finalizeIntents(): boolean {
+    this.load();
+    if (this.damagedLedger || !this.stateStore) return false;
+    return this.promoteIntents();
+  }
+
   /**
    * Fence every source and record the deletions in one write. A source already fenced keeps its
    * tombstone; an open task for it is reused so a repeated forget does not duplicate the work.
    */
   addMany(inputs: readonly DeletionInput[], reason: string): { tasks: DeletionTask[]; failed: number } {
     this.load();
-    if (this.damagedLedger || !this.stateStore) {
+    if (this.damagedLedger || this.persistenceBlocked || !this.stateStore) {
       this.persistenceError ??= `could not write the memory database: ${this.initializationError ?? 'forget state is damaged'}`;
       return { tasks: [], failed: Math.max(1, inputs.length) };
     }
@@ -340,6 +489,7 @@ export class ForgetLedger {
 
   markFresh(bankId: string, endpoint: string): boolean {
     this.load();
+    if (this.persistenceBlocked || this.damagedLedger) return false;
     const target = key(bankId, endpoint);
     if (!this.file.stale.includes(target)) return true;
     const before = this.file;
@@ -378,6 +528,7 @@ export class ForgetLedger {
    */
   markDone(id: string): boolean {
     this.load();
+    if (this.persistenceBlocked || this.damagedLedger) return false;
     const index = this.file.tasks.findIndex((task) => task.id === id);
     if (index < 0) return false;
     const before = this.file;
@@ -406,6 +557,7 @@ export class ForgetLedger {
 
   markFailed(id: string, error: string): boolean {
     this.load();
+    if (this.persistenceBlocked || this.damagedLedger) return false;
     const index = this.file.tasks.findIndex((task) => task.id === id);
     if (index < 0) return false;
     const before = this.file;
@@ -446,7 +598,8 @@ export class ForgetLedger {
     for (const task of this.file.tasks) {
       if (task.state === 'pending') status.pending += 1;
       else if (task.state === 'failed') status.failed += 1;
-      else status.done += 1;
+      else if (task.state === 'done') status.done += 1;
+      else status.pending += 1;
     }
     return status;
   }
@@ -454,7 +607,7 @@ export class ForgetLedger {
   /** Block every source in a bank before the remote clear begins. */
   beginClearTarget(bankId: string, endpoint: string): boolean {
     this.load();
-    if (this.damagedLedger || !this.stateStore) return false;
+    if (this.damagedLedger || this.persistenceBlocked || !this.stateStore) return false;
     const before = this.file;
     const at = this.now().toISOString();
     const target = key(bankId, endpoint);
@@ -483,7 +636,7 @@ export class ForgetLedger {
   /** The remote clear succeeded; release the wildcard only after its result is known. */
   finishClearTarget(bankId: string, endpoint: string): boolean {
     this.load();
-    if (this.damagedLedger || !this.stateStore) return false;
+    if (this.damagedLedger || this.persistenceBlocked || !this.stateStore) return false;
     const before = this.file;
     const at = this.now().toISOString();
     const target = key(bankId, endpoint);

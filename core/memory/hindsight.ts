@@ -16,7 +16,7 @@ import { sanitizeForMemory } from './policy.ts';
 import { loadHindsightConfig, type HindsightConfig, type HindsightFileConfig } from './config.ts';
 import { DeliveryError, OutboxDelivery, type DeliveryOps, type OperationState } from './delivery.ts';
 import { MemoryOutbox, readLegacyOutbox, type OutboxItem, type RetainItem } from './outbox.ts';
-import { ForgetLedger, readLegacyForget, type DeletionInput } from './forget-ledger.ts';
+import { ForgetLedger, readLegacyForget, type DeletionInput, type ForgetIntentAcceptance } from './forget-ledger.ts';
 import {
   memoryArtifactScope,
   openMemoryStateStore,
@@ -464,6 +464,8 @@ export interface ForgetSourceScanReceipt {
 }
 
 export interface ForgetResult {
+  /** Whether a durable intent or existing fence accepted the request. */
+  acceptance: ForgetIntentAcceptance | 'not-found' | 'partial';
   /** Writes removed from the local queue before sending. */
   local: number;
   /** Source documents confirmed deleted remotely. */
@@ -519,6 +521,7 @@ export interface DerivedArtifactRegistration {
 
 export interface HandoffArtifactCommit {
   artifactId: string;
+  ownerToken: string;
   target: string;
   content: string;
   expectedEpoch: string;
@@ -851,10 +854,10 @@ export class HindsightMemory {
     }
   }
 
-  commitHandoffArtifact(input: HandoffArtifactCommit, commit: () => void): DerivedArtifact | null {
+  commitHandoffArtifact(input: HandoffArtifactCommit): DerivedArtifact | null {
     const config = this.config;
     const store = this.stateStore;
-    if (!config || !store || !input.expectedEpoch || !this.sourceSetCurrent(input.sources, input.expectedEpoch)) return null;
+    if (!config || !store || !input.ownerToken || !input.expectedEpoch || !this.sourceSetCurrent(input.sources, input.expectedEpoch)) return null;
     if (input.mappingState === 'source-independent' && input.sources.length > 0) return null;
     if (input.mappingState === 'complete' && input.sources.length === 0) return null;
     const dependencies = input.sources.map((source) => this.dependencyFromExposure(
@@ -878,24 +881,87 @@ export class HindsightMemory {
       scope: memoryArtifactScope(config.bankId, config.apiUrl),
       creatorSessionId: null,
       creatorGenerationId: null,
-      creatorOperationId: input.artifactId,
+      creatorOperationId: input.ownerToken,
       bodyDigest,
       origin: 'model-derived',
       reviewState: 'unreviewed',
-      lifecycleState: 'active',
+      lifecycleState: 'pending',
       lineageState: input.mappingState,
       lineageReceiptDigest: receipt,
       lineageValidatedAt: at,
-      statusReason: null,
+      statusReason: 'handoff-awaiting-file-publication',
       createdAt: at,
       updatedAt: at,
       sources: dependencies,
     };
-    try {
-      return this.saveDerivedArtifactCurrent(record, input.expectedEpoch, input.sources, commit);
-    } catch (error) {
-      throw error;
+    return store.transaction(() => {
+      if (!this.sourceSetCurrent(input.sources, input.expectedEpoch)) return null;
+      const current = store.getDerivedArtifact(input.artifactId);
+      if (current) {
+        return current.kind === record.kind && current.target === record.target && current.scope === record.scope
+          && current.creatorOperationId === input.ownerToken && current.bodyDigest === bodyDigest
+          && (current.lifecycleState === 'pending' || current.lifecycleState === 'active') ? current : null;
+      }
+      return store.saveDerivedArtifact(record);
+    });
+  }
+
+  listHandoffArtifacts(): DerivedArtifact[] {
+    const config = this.config;
+    const store = this.stateStore;
+    if (!config || !store) return [];
+    const scope = memoryArtifactScope(config.bankId, config.apiUrl);
+    return store.listDerivedArtifacts('handoff-note').filter((artifact) => artifact.scope === scope);
+  }
+
+  private handoffArtifactDependenciesCurrent(artifact: DerivedArtifact): boolean {
+    const config = this.config;
+    const store = this.stateStore;
+    const ledger = this.ledger;
+    if (!config || !store || !ledger || ledger.damaged() || ledger.bankClearPending(config.bankId, config.apiUrl)
+      || artifact.scope !== memoryArtifactScope(config.bankId, config.apiUrl)) return false;
+    if (artifact.lineageState === 'source-independent') return artifact.sources.length === 0;
+    if (artifact.lineageState !== 'complete' || artifact.sources.length === 0) return false;
+    const epoch = ledger.epoch(config.bankId, config.apiUrl);
+    return artifact.sources.every((source) => source.validationState === 'validated'
+      && source.bankId === config.bankId && source.endpoint === config.apiUrl
+      && source.validatedEpoch === epoch && source.validatedFence === String(epoch)
+      && !!source.contentDigest && /^[a-f0-9]{64}$/.test(source.contentDigest)
+      && !!source.segmentDigest && /^[a-f0-9]{64}$/.test(source.segmentDigest)
+      && !ledger.forgotten(source.bankId, source.endpoint, source.documentId)
+      && !store.supersededSources(source.bankId, source.endpoint).has(source.documentId)
+      && this.sourceVisible(source.documentId) && this.sourceCurrentForContext(source.documentId));
+  }
+
+  async verifyPendingHandoffArtifact(artifactId: string, ownerToken: string, content: string): Promise<boolean> {
+    const store = this.stateStore;
+    const artifact = store?.getDerivedArtifact(artifactId);
+    if (!artifact || artifact.kind !== 'handoff-note' || artifact.lifecycleState !== 'pending'
+      || artifact.creatorOperationId !== ownerToken || artifact.bodyDigest !== sha256(content)
+      || !this.handoffArtifactDependenciesCurrent(artifact)) return false;
+    if (artifact.lineageState === 'source-independent') return true;
+    const expectedEpoch = this.evidenceEpoch();
+    if (!expectedEpoch) return false;
+    for (const source of artifact.sources) {
+      const exposure = await this.readSourceExposure(source.documentId, expectedEpoch);
+      if (!exposure || exposure.attachment.bankId !== source.bankId || exposure.attachment.endpoint !== source.endpoint
+        || exposure.attachment.contentDigest !== source.contentDigest || exposure.attachment.revisionState !== 'current'
+        || exposure.attachment.validationStatus !== 'validated' || !this.handoffArtifactDependenciesCurrent(artifact)) return false;
     }
+    return this.evidenceEpoch() === expectedEpoch && this.handoffArtifactDependenciesCurrent(artifact);
+  }
+
+  activateHandoffArtifact(artifactId: string, ownerToken: string): DerivedArtifact | null {
+    const store = this.stateStore;
+    if (!store) return null;
+    return store.transaction(() => {
+      const current = store.getDerivedArtifact(artifactId);
+      if (!current || current.kind !== 'handoff-note' || current.creatorOperationId !== ownerToken
+        || !this.handoffArtifactDependenciesCurrent(current)) return null;
+      if (current.lifecycleState === 'active') return current;
+      if (current.lifecycleState !== 'pending') return null;
+      return store.activateDerivedArtifact(artifactId, ownerToken, new Date().toISOString());
+    });
   }
 
   derivedArtifactIsCurrent(artifactId: string, content: string): boolean {
@@ -1109,6 +1175,7 @@ export class HindsightMemory {
       }
       this.outbox = new MemoryOutbox(this.stateStore, { log });
       this.ledger = new ForgetLedger(this.stateStore, { log });
+      this.ledger.damaged();
       this.client = new HindsightClient({
         baseUrl: this.config.apiUrl,
         ...(this.config.apiToken ? { apiKey: this.config.apiToken } : {}),
@@ -1129,11 +1196,11 @@ export class HindsightMemory {
     this.delivery = new OutboxDelivery(this.outbox, this.deliveryOps(), {
       log,
       target: () => ({ bankId: this.config!.bankId, endpoint: this.config!.apiUrl }),
-      forgotten: (item) => this.ledger?.forgotten(
+      forgotten: (item) => !!this.ledger?.damaged() || (this.ledger?.forgotten(
         item.bankId ?? this.config!.bankId,
         item.endpoint ?? this.config!.apiUrl,
         item.documentId,
-      ) ?? false,
+      ) ?? false),
     });
     this.booting = this.runBootstrap();
     this.startDelivery();
@@ -2754,7 +2821,7 @@ export class HindsightMemory {
 
   async forget(query: string): Promise<ForgetResult> {
     const asked = query.trim();
-    if (!asked) return { local: 0, deleted: 0, pending: 0, failed: 0, activeContextInvalidated: false };
+    if (!asked) return { acceptance: 'not-found', local: 0, deleted: 0, pending: 0, failed: 0, activeContextInvalidated: false };
     this.forgetScanDepth += 1;
     this.invalidateCache();
     try {
@@ -2839,74 +2906,90 @@ export class HindsightMemory {
   }
 
   private async forgetMatching(asked: string): Promise<ForgetResult> {
-    if (!this.config || !this.ledger) return { local: 0, deleted: 0, pending: 0, failed: 0, activeContextInvalidated: false };
+    if (!this.config || !this.ledger) return { acceptance: 'not-accepted', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
     const outbox = this.outbox;
     const ledger = this.ledger;
     const store = outbox?.stateStore;
-    if (!outbox || !store || store !== ledger.stateStore) return { local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
+    if (!outbox || !store || store !== ledger.stateStore) return { acceptance: 'not-accepted', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
     let candidates: OutboxItem[] = [];
     let cancelled: OutboxItem[] = [];
-    let fenced: ReturnType<ForgetLedger['addMany']> = { tasks: [], failed: 0 };
     const sourceIds = new Set<string>();
+    let belongsToTarget: (item: OutboxItem) => boolean = () => false;
+    let inputs: DeletionInput[] = [];
+    const reason = 'the person asked to forget this';
     try {
-      store.transaction(() => {
-        const matched = outbox.matching((item) => matchesForget(item, asked));
-        const targets = new Map<string, { bankId: string; endpoint: string; documents: Set<string> }>();
-        for (const item of matched) {
-          if (!item.bankId || !item.endpoint) continue;
-          const key = JSON.stringify([item.bankId, item.endpoint]);
-          const target = targets.get(key) ?? { bankId: item.bankId, endpoint: item.endpoint, documents: new Set<string>() };
-          target.documents.add(item.documentId);
-          targets.set(key, target);
+      const matched = outbox.matching((item) => matchesForget(item, asked));
+      const targets = new Map<string, { bankId: string; endpoint: string; documents: Set<string> }>();
+      for (const item of matched) {
+        if (!item.bankId || !item.endpoint) continue;
+        const targetKey = JSON.stringify([item.bankId, item.endpoint]);
+        const target = targets.get(targetKey) ?? { bankId: item.bankId, endpoint: item.endpoint, documents: new Set<string>() };
+        target.documents.add(item.documentId);
+        targets.set(targetKey, target);
+      }
+      for (const target of targets.values()) {
+        let frontier = [...target.documents];
+        while (frontier.length > 0) {
+          const revisionDependents = store.revisionDependents(target.bankId, target.endpoint, frontier)
+            .filter((id) => !target.documents.has(id));
+          const outputDependents = frontier.flatMap((sourceId) => store.derivedArtifactsForSource(
+            target.bankId, target.endpoint, sourceId,
+          )).filter((artifact) => artifact.kind === 'coo-output' && artifact.target.startsWith('coo:'))
+            .map((artifact) => artifact.target).filter((id) => !target.documents.has(id));
+          const dependents = [...new Set([...revisionDependents, ...outputDependents])];
+          for (const dependent of dependents) target.documents.add(dependent);
+          frontier = dependents;
         }
-        for (const target of targets.values()) {
-          let frontier = [...target.documents];
-          while (frontier.length > 0) {
-            const revisionDependents = store.revisionDependents(target.bankId, target.endpoint, frontier)
-              .filter((id) => !target.documents.has(id));
-            const outputDependents = frontier.flatMap((sourceId) => store.derivedArtifactsForSource(
-              target.bankId, target.endpoint, sourceId,
-            )).filter((artifact) => artifact.kind === 'coo-output' && artifact.target.startsWith('coo:'))
-              .map((artifact) => artifact.target).filter((id) => !target.documents.has(id));
-            const dependents = [...new Set([...revisionDependents, ...outputDependents])];
-            for (const dependent of dependents) target.documents.add(dependent);
-            frontier = dependents;
-          }
+      }
+      belongsToTarget = (item) => [...targets.values()].some((target) =>
+        item.bankId === target.bankId && item.endpoint === target.endpoint && target.documents.has(item.documentId));
+      candidates = outbox.matching(belongsToTarget);
+      for (const target of targets.values()) {
+        for (const documentId of target.documents) {
+          sourceIds.add(documentId);
+          const inFlight = candidates.find((entry) => entry.bankId === target.bankId
+            && entry.endpoint === target.endpoint && entry.documentId === documentId && entry.state !== 'pending');
+          inputs.push({
+            bankId: target.bankId,
+            endpoint: target.endpoint,
+            documentId,
+            ...(inFlight ? { operationId: inFlight.operationId } : {}),
+            reason,
+          });
         }
-        const belongsToTarget = (item: OutboxItem) => [...targets.values()].some((target) =>
-          item.bankId === target.bankId && item.endpoint === target.endpoint && target.documents.has(item.documentId));
-        candidates = outbox.matching(belongsToTarget);
-        cancelled = outbox.cancelMatching(belongsToTarget, 'the person asked to forget this');
-        const inputs: DeletionInput[] = [];
-        for (const target of targets.values()) {
-          for (const documentId of target.documents) {
-            sourceIds.add(documentId);
-            const inFlight = candidates.find((entry) => entry.bankId === target.bankId
-              && entry.endpoint === target.endpoint && entry.documentId === documentId && entry.state !== 'pending');
-            inputs.push({
-              bankId: target.bankId,
-              endpoint: target.endpoint,
-              documentId,
-              ...(inFlight ? { operationId: inFlight.operationId } : {}),
-              reason: 'the person asked to forget this',
-            });
-          }
-        }
-        // The source fences, revision dependents and local cancellations commit together.
-        fenced = ledger.addMany(inputs, 'the person asked to forget this');
-        if (fenced.failed > 0) throw new Error('the forget fence could not be committed');
-      });
+      }
     } catch (error) {
       outbox.reload();
       ledger.reload();
       ledger.markUnavailable('local forget transaction failed; source visibility remains blocked until a fence is committed');
       this.log?.warn('[memory] forget transaction was not committed', { message: error instanceof Error ? error.message : String(error) });
-      return { local: 0, deleted: 0, pending: 0, failed: Math.max(1, fenced.failed), activeContextInvalidated: false };
+      return { acceptance: 'unknown-blocked', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
+    }
+
+    const intent = inputs.length > 0 ? ledger.beginIntents(inputs, reason) : null;
+    if (intent && intent.acceptance !== 'accepted') {
+      return { acceptance: intent.acceptance, local: 0, deleted: 0, pending: 0, failed: intent.failed, activeContextInvalidated: false };
+    }
+    const fencedTasks = intent?.tasks ?? [];
+    if (intent) {
+      try {
+        store.transaction(() => {
+          cancelled = outbox.cancelMatching(belongsToTarget, reason);
+          if (!ledger.finalizeIntents()) throw new Error('the durable forget intent could not be fenced');
+        });
+      } catch (error) {
+        outbox.reload();
+        ledger.reload();
+        ledger.markUnavailable('durable forget intent awaits fence recovery; Memory remains blocked');
+        this.invalidateCache();
+        this.log?.warn('[memory] forget fence finalization failed', { message: error instanceof Error ? error.message : String(error) });
+        return { acceptance: 'accepted', local: 0, deleted: 0, pending: fencedTasks.length, failed: 0, activeContextInvalidated: false };
+      }
     }
     const cancelFailed = Math.max(0, candidates.length - cancelled.length);
     this.invalidateCache();
     this.forgetDerived([...sourceIds]);
-    const additional = { local: 0, deleted: 0, pending: 0, failed: 0 };
+    const additional = { local: 0, deleted: 0, pending: 0, failed: 0, accepted: false, unknownBlocked: false };
     if (this.delivery) await this.delivery.cancelForget(candidates);
     if (this.canTry() && await this.ensureStarted()) {
       const config = this.config;
@@ -2930,9 +3013,12 @@ export class HindsightMemory {
           additional.deleted += result.deleted;
           additional.pending += result.pending;
           additional.failed += result.failed;
+          additional.accepted ||= result.acceptance === 'accepted' || result.acceptance === 'partial';
+          additional.unknownBlocked ||= result.acceptance === 'unknown-blocked';
         }
       } catch (err) {
         this.noteFailure('forget', err);
+        additional.failed += 1;
       }
     }
     const literal = await this.literalSourceDocumentIds(asked);
@@ -2946,6 +3032,8 @@ export class HindsightMemory {
         additional.deleted += result.deleted;
         additional.pending += result.pending;
         additional.failed += result.failed;
+        additional.accepted ||= result.acceptance === 'accepted' || result.acceptance === 'partial';
+        additional.unknownBlocked ||= result.acceptance === 'unknown-blocked';
       }
     }
     if (this.canTry() && await this.ensureStarted()) {
@@ -2953,12 +3041,18 @@ export class HindsightMemory {
       await this.clearDerived();
     }
     this.forgetDerived([...sourceIds]);
-    const outcome = this.ledger.outcome(fenced.tasks.map((task) => task.id));
+    const outcome = ledger.outcome(fencedTasks.map((task) => task.id));
+    const accepted = !!intent || additional.accepted;
+    const acceptance = accepted
+      ? additional.failed > 0 || !literal.complete ? 'partial' : 'accepted'
+      : additional.unknownBlocked ? 'unknown-blocked'
+      : additional.failed > 0 || !literal.complete ? 'not-accepted' : 'not-found';
     return {
+      acceptance,
       local: cancelled.length + additional.local,
       deleted: outcome.done + additional.deleted,
       pending: outcome.pending + additional.pending,
-      failed: outcome.failed + fenced.failed + cancelFailed + additional.failed,
+      failed: outcome.failed + cancelFailed + additional.failed,
       activeContextInvalidated: false,
     };
   }
@@ -2993,57 +3087,72 @@ export class HindsightMemory {
 
   /** Forget exactly one source event; no unrelated recent item is touched. */
   async forgetDocument(documentId: string): Promise<ForgetResult> {
-    if (!documentId || !this.config || !this.ledger) return { local: 0, deleted: 0, pending: 0, failed: 0, activeContextInvalidated: false };
+    if (!documentId) return { acceptance: 'not-found', local: 0, deleted: 0, pending: 0, failed: 0, activeContextInvalidated: false };
+    if (!this.config || !this.ledger) return { acceptance: 'not-accepted', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
     const outbox = this.outbox;
     const ledger = this.ledger;
     const store = outbox?.stateStore;
-    if (!outbox || !store || store !== ledger.stateStore) return { local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
+    if (!outbox || !store || store !== ledger.stateStore) return { acceptance: 'not-accepted', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
     const config = this.config;
     let matched: OutboxItem[] = [];
     let cancelled: OutboxItem[] = [];
-    let fenced: ReturnType<ForgetLedger['addMany']> = { tasks: [], failed: 0 };
     let sourceIds = [documentId];
     let target = { bankId: config.bankId, endpoint: config.apiUrl };
+    let inputs: DeletionInput[] = [];
+    const reason = 'the person asked not to remember this';
     try {
-      store.transaction(() => {
-        const direct = outbox.matching((item) => item.documentId === documentId);
-        const origin = direct.find((item) => item.bankId && item.endpoint);
-        if (origin?.bankId && origin.endpoint) target = { bankId: origin.bankId, endpoint: origin.endpoint };
-        const seen = new Set(sourceIds);
-        let frontier = [...sourceIds];
-        while (frontier.length > 0) {
-          const revisionDependents = store.revisionDependents(target.bankId, target.endpoint, frontier)
-            .filter((id) => !seen.has(id));
-          const outputDependents = frontier.flatMap((sourceId) => store.derivedArtifactsForSource(
-            target.bankId, target.endpoint, sourceId,
-          )).filter((artifact) => artifact.kind === 'coo-output' && artifact.target.startsWith('coo:'))
-            .map((artifact) => artifact.target).filter((id) => !seen.has(id));
-          const dependents = [...new Set([...revisionDependents, ...outputDependents])];
-          for (const dependent of dependents) seen.add(dependent);
-          sourceIds = [...seen];
-          frontier = dependents;
-        }
-        matched = outbox.matching((item) => item.bankId === target.bankId && item.endpoint === target.endpoint && seen.has(item.documentId));
-        cancelled = outbox.cancelMatching((item) => item.bankId === target.bankId && item.endpoint === target.endpoint && seen.has(item.documentId), 'the person asked not to remember this');
-        const inputs = sourceIds.map((sourceId) => {
-          const inFlight = matched.find((entry) => entry.documentId === sourceId && entry.state !== 'pending');
-          return {
-            bankId: target.bankId,
-            endpoint: target.endpoint,
-            documentId: sourceId,
-            ...(inFlight ? { operationId: inFlight.operationId } : {}),
-            reason: 'the person asked not to remember this',
-          };
-        });
-        fenced = ledger.addMany(inputs, 'the person asked not to remember this');
-        if (fenced.failed > 0) throw new Error('the forget fence could not be committed');
+      const direct = outbox.matching((item) => item.documentId === documentId);
+      const origin = direct.find((item) => item.bankId && item.endpoint);
+      if (origin?.bankId && origin.endpoint) target = { bankId: origin.bankId, endpoint: origin.endpoint };
+      const seen = new Set(sourceIds);
+      let frontier = [...sourceIds];
+      while (frontier.length > 0) {
+        const revisionDependents = store.revisionDependents(target.bankId, target.endpoint, frontier)
+          .filter((id) => !seen.has(id));
+        const outputDependents = frontier.flatMap((sourceId) => store.derivedArtifactsForSource(
+          target.bankId, target.endpoint, sourceId,
+        )).filter((artifact) => artifact.kind === 'coo-output' && artifact.target.startsWith('coo:'))
+          .map((artifact) => artifact.target).filter((id) => !seen.has(id));
+        const dependents = [...new Set([...revisionDependents, ...outputDependents])];
+        for (const dependent of dependents) seen.add(dependent);
+        sourceIds = [...seen];
+        frontier = dependents;
+      }
+      matched = outbox.matching((item) => item.bankId === target.bankId && item.endpoint === target.endpoint && seen.has(item.documentId));
+      inputs = sourceIds.map((sourceId) => {
+        const inFlight = matched.find((entry) => entry.documentId === sourceId && entry.state !== 'pending');
+        return {
+          bankId: target.bankId,
+          endpoint: target.endpoint,
+          documentId: sourceId,
+          ...(inFlight ? { operationId: inFlight.operationId } : {}),
+          reason,
+        };
       });
     } catch (error) {
       outbox.reload();
       ledger.reload();
       ledger.markUnavailable('local forget transaction failed; source visibility remains blocked until a fence is committed');
       this.log?.warn('[memory] source forget transaction was not committed', { message: error instanceof Error ? error.message : String(error) });
-      return { local: 0, deleted: 0, pending: 0, failed: Math.max(1, fenced.failed), activeContextInvalidated: false };
+      return { acceptance: 'unknown-blocked', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
+    }
+    const intent = ledger.beginIntents(inputs, reason);
+    if (intent.acceptance !== 'accepted') {
+      return { acceptance: intent.acceptance, local: 0, deleted: 0, pending: 0, failed: intent.failed, activeContextInvalidated: false };
+    }
+    try {
+      store.transaction(() => {
+        cancelled = outbox.cancelMatching((item) => item.bankId === target.bankId
+          && item.endpoint === target.endpoint && sourceIds.includes(item.documentId), reason);
+        if (!ledger.finalizeIntents()) throw new Error('the durable forget intent could not be fenced');
+      });
+    } catch (error) {
+      outbox.reload();
+      ledger.reload();
+      ledger.markUnavailable('durable forget intent awaits fence recovery; Memory remains blocked');
+      this.invalidateCache();
+      this.log?.warn('[memory] source forget fence finalization failed', { message: error instanceof Error ? error.message : String(error) });
+      return { acceptance: 'accepted', local: 0, deleted: 0, pending: intent.tasks.length, failed: 0, activeContextInvalidated: false };
     }
     const cancelFailed = Math.max(0, matched.length - cancelled.length);
     this.invalidateCache();
@@ -3053,12 +3162,13 @@ export class HindsightMemory {
       await this.drainDeletions();
       await this.clearDerived();
     }
-    const outcome = this.ledger.outcome(fenced.tasks.map((task) => task.id));
+    const outcome = ledger.outcome(intent.tasks.map((task) => task.id));
     return {
+      acceptance: 'accepted',
       local: cancelled.length,
       deleted: outcome.done,
       pending: outcome.pending,
-      failed: outcome.failed + fenced.failed + cancelFailed,
+      failed: outcome.failed + cancelFailed,
       activeContextInvalidated: false,
     };
   }

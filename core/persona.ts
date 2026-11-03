@@ -18,9 +18,9 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, closeSync, existsSync, fstatSync, lstatSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, statfsSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, fstatSync, fsyncSync, lstatSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, statfsSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { freemem, totalmem } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { LOG_SCHEME, blobScheme } from 'cortico/core/blobs.ts';
 import type { CoreApi, ContextEvidenceInspection, ContextHandoffPrepareContext, ContextHandoffSourceExcerpt, EvidenceAttachment, EventEnvelope, HandoffCommitCheck, PersonaWebUiDecl, PreparedContextHandoff, PrefixSegment, SessionDecl, SessionOpeningReason, SourceExposureRef, SourceMapSpan, StoragePart, SystemPrefixContext, ToolCallContext, ToolDef, ToolOutcome, WorldLifecycleEvent } from 'cortico/core/types.ts';
 import { message, withText, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
@@ -30,6 +30,7 @@ import { HANDOFF_DIR, type Cormini } from '../vendor/cortico/bots/cormini/person
 import type { GitAuthor, WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
 import { memoryTools } from './memory/tools.ts';
 import type { HindsightMemory, MemoryEvidenceSegment } from './memory/hindsight.ts';
+import type { DerivedArtifact } from './memory/state-store.ts';
 import { evidenceCoversText } from './memory/source-evidence.ts';
 import { isMemoryForgetRequest } from './memory/router.ts';
 import { memoryStorageText } from './memory/strings.ts';
@@ -143,6 +144,48 @@ const WRITES: Record<string, { ok: string; verb: string }> = {
 };
 
 const sha256 = (value: string | Uint8Array): string => createHash('sha256').update(value).digest('hex');
+const HANDOFF_OWNER_PREFIX = 'handoff-owner-v1:';
+
+interface HandoffFileOwner {
+  artifactId: string;
+  device: number;
+  inode: number;
+  stagedName: string;
+}
+
+function handoffOwnerToken(artifactId: string, identity: { dev: number; ino: number }, stagedName: string): string {
+  return `${HANDOFF_OWNER_PREFIX}${JSON.stringify([artifactId, identity.dev, identity.ino, stagedName])}`;
+}
+
+function handoffOwner(artifact: DerivedArtifact): HandoffFileOwner | null {
+  const token = artifact.creatorOperationId;
+  if (!token?.startsWith(HANDOFF_OWNER_PREFIX)) return null;
+  try {
+    const value = JSON.parse(token.slice(HANDOFF_OWNER_PREFIX.length)) as unknown;
+    if (!Array.isArray(value) || value.length !== 4 || value[0] !== artifact.artifactId
+      || !Number.isSafeInteger(value[1]) || !Number.isSafeInteger(value[2])
+      || typeof value[3] !== 'string' || !/^[0-9a-f-]{36}\.md$/i.test(value[3]) || basename(value[3]) !== value[3]) return null;
+    return { artifactId: value[0], device: value[1], inode: value[2], stagedName: value[3] };
+  } catch {
+    return null;
+  }
+}
+
+function handoffFileMatches(path: string, owner: HandoffFileOwner, digest: string): boolean {
+  try {
+    const stat = lstatSync(path);
+    return stat.isFile() && stat.dev === owner.device && stat.ino === owner.inode
+      && sha256(readFileSync(path)) === digest;
+  } catch {
+    return false;
+  }
+}
+
+function syncDirectory(path: string): void {
+  const fd = openSync(path, 'r');
+  try { fsyncSync(fd); }
+  finally { closeSync(fd); }
+}
 
 function insidePath(root: string, target: string): boolean {
   const rel = relative(root, target);
@@ -879,8 +922,12 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
               await this.ensurePartnerArtifacts();
               return this.partnerDocumentForRead();
             }
+            if (tool.name === 'read_file' && path?.startsWith(HANDOFF_DIR)) {
+              await this.recoverHandoffFiles();
+              return '[read failed] This workspace area is withheld until its content has provenance sidecar entries.';
+            }
             if (tool.name === 'read_file' && path
-              && (path.startsWith(`${PARTNER_DIR}/`) || path.startsWith('handoffs/'))) {
+              && path.startsWith(`${PARTNER_DIR}/`)) {
               return '[read failed] This workspace area is withheld until its content has provenance sidecar entries.';
             }
             if (tool.name === 'grep_files' && this.searchMayIncludeProvenance(path)) {
@@ -1689,7 +1736,100 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return { records, sourceExcerpts };
     }
 
+    private removeOwnedHandoffFile(path: string, owner: HandoffFileOwner, digest: string): boolean {
+      if (!handoffFileMatches(path, owner, digest)) return false;
+      try {
+        unlinkSync(path);
+        try { syncDirectory(dirname(path)); } catch { /* The removed name is still withheld if the directory could not be synced. */ }
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    /** Reconciles only Handoff files whose SQLite row, inode owner and body digest match. */
+    private async recoverHandoffFiles(): Promise<void> {
+      const memory = this.longTerm;
+      if (!memory) return;
+      const root = resolve(this.memoryDir);
+      const handoffPath = join(root, HANDOFF_DIR);
+      const stagingPath = join(handoffPath, '.staging');
+      for (const artifact of memory.listHandoffArtifacts()) {
+        const owner = handoffOwner(artifact);
+        if (!owner || !artifact.target.startsWith(HANDOFF_DIR)) continue;
+        const filename = basename(artifact.target);
+        if (artifact.target !== `${HANDOFF_DIR}${filename}` || !filename.endsWith('.md')) continue;
+        const finalPath = resolve(root, artifact.target);
+        if (!insidePath(root, finalPath)) continue;
+        const stagePath = join(stagingPath, owner.stagedName);
+        let stageMatches = handoffFileMatches(stagePath, owner, artifact.bodyDigest);
+        let finalMatches = handoffFileMatches(finalPath, owner, artifact.bodyDigest);
+
+        if (artifact.lifecycleState === 'pending') {
+          if (!stageMatches && !finalMatches) {
+            memory.withdrawDerivedArtifact(artifact.artifactId, 'handoff-candidate-file-unavailable');
+            continue;
+          }
+          if (!await memory.verifyPendingHandoffArtifact(artifact.artifactId, artifact.creatorOperationId!,
+            readFileSync(finalMatches ? finalPath : stagePath, 'utf8'))) continue;
+          if (!finalMatches && stageMatches) {
+            if (existsSync(finalPath)) {
+              memory.withdrawDerivedArtifact(artifact.artifactId, 'handoff-target-owned-elsewhere');
+              this.removeOwnedHandoffFile(stagePath, owner, artifact.bodyDigest);
+              continue;
+            }
+            try {
+              linkSync(stagePath, finalPath);
+              syncDirectory(handoffPath);
+              finalMatches = handoffFileMatches(finalPath, owner, artifact.bodyDigest);
+            } catch {
+              memory.withdrawDerivedArtifact(artifact.artifactId, 'handoff-publication-recovery-failed');
+              this.removeOwnedHandoffFile(stagePath, owner, artifact.bodyDigest);
+              continue;
+            }
+          }
+          if (!finalMatches) {
+            memory.withdrawDerivedArtifact(artifact.artifactId, 'handoff-published-file-unverified');
+            this.removeOwnedHandoffFile(stagePath, owner, artifact.bodyDigest);
+            continue;
+          }
+          if (!handoffFileMatches(finalPath, owner, artifact.bodyDigest)) {
+            memory.withdrawDerivedArtifact(artifact.artifactId, 'handoff-file-changed-during-recovery');
+            this.removeOwnedHandoffFile(stagePath, owner, artifact.bodyDigest);
+            continue;
+          }
+          const activated = memory.activateHandoffArtifact(artifact.artifactId, artifact.creatorOperationId!);
+          if (activated) {
+            if (!handoffFileMatches(finalPath, owner, artifact.bodyDigest)) {
+              memory.withdrawDerivedArtifact(artifact.artifactId, 'handoff-file-changed-during-activation');
+              this.removeOwnedHandoffFile(stagePath, owner, artifact.bodyDigest);
+              continue;
+            }
+            this.lastHandoffFile = artifact.target;
+            this.removeOwnedHandoffFile(stagePath, owner, artifact.bodyDigest);
+          } else if (memory.derivedArtifact(artifact.artifactId)?.lifecycleState !== 'pending') {
+            this.removeOwnedHandoffFile(stagePath, owner, artifact.bodyDigest);
+          }
+          continue;
+        }
+
+        if (artifact.lifecycleState === 'active') {
+          if (finalMatches) {
+            this.lastHandoffFile = artifact.target;
+            if (stageMatches) this.removeOwnedHandoffFile(stagePath, owner, artifact.bodyDigest);
+          } else {
+            memory.withdrawDerivedArtifact(artifact.artifactId, 'handoff-active-file-changed-or-missing');
+            if (stageMatches) this.removeOwnedHandoffFile(stagePath, owner, artifact.bodyDigest);
+          }
+          continue;
+        }
+
+        if (stageMatches) this.removeOwnedHandoffFile(stagePath, owner, artifact.bodyDigest);
+      }
+    }
+
     async prepareHandoff(snapshot: ContextRecord[], ctx: ContextHandoffPrepareContext): Promise<PreparedContextHandoff> {
+      await this.recoverHandoffFiles();
       const memory = this.longTerm;
       const protectedSnapshot = this.handoffIsProtected(snapshot);
       const expectedMemoryEpoch = memory?.evidenceEpoch() ?? null;
@@ -1733,6 +1873,8 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       let finalPath: string | null = null;
       let finalIdentity: { dev: number; ino: number } | null = null;
       let committedFile: string | null = null;
+      let fileOwner: HandoffFileOwner | null = null;
+      const noteDigest = sha256(note.text);
       const stem = handoffNoteStamp(now);
       let plannedFilename: string | null = null;
       for (let suffix = 0; suffix < 100; suffix++) {
@@ -1761,6 +1903,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       const previousPressureSplitAt = this.pressureSplitAt;
       const previousMemoryContextBlocks = [...this.memoryContextBlocks];
       const stagePath = join(stagingPath, `${randomUUID()}.md`);
+      const stageName = basename(stagePath);
       const makeDirectory = (path: string): boolean => {
         try {
           mkdirSync(path, { mode: 0o700 });
@@ -1770,16 +1913,22 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           return false;
         }
       };
-      const removeOwnedFile = (path: string | null, identity: { dev: number; ino: number } | null): void => {
-        if (!path || !identity || !existsSync(path)) return;
+      const removeOwnedFile = (path: string | null, identity: { dev: number; ino: number } | null): boolean => {
+        if (!path || !identity || !fileOwner || !handoffFileMatches(path, fileOwner, noteDigest)) return false;
         try {
-          const current = statSync(path);
-          if (current.dev === identity.dev && current.ino === identity.ino) unlinkSync(path);
-        } catch { /* Keep a file whose ownership cannot be confirmed. */ }
+          unlinkSync(path);
+          try { syncDirectory(dirname(path)); } catch { /* The removed name stays withheld if its directory could not be synced. */ }
+          return true;
+        } catch {
+          return false;
+        }
       };
       const cleanupStage = (): void => {
-        removeOwnedFile(stagePath, stageIdentity);
+        const removed = removeOwnedFile(stagePath, stageIdentity);
         stageIdentity = null;
+        if (removed) {
+          try { syncDirectory(stagingPath); } catch { /* Recovery can remove the owned name on the next run. */ }
+        }
         if (ownsStagingDirectory) {
           try { rmdirSync(stagingPath); } catch { /* Keep a directory that now contains another entry. */ }
           ownsStagingDirectory = false;
@@ -1803,10 +1952,13 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         fd = openSync(stagePath, 'wx', 0o600);
         const opened = fstatSync(fd);
         stageIdentity = { dev: opened.dev, ino: opened.ino };
+        fileOwner = { artifactId: handoffArtifactId, device: opened.dev, inode: opened.ino, stagedName: stageName };
         writeFileSync(fd, note.text, { encoding: 'utf8' });
+        fsyncSync(fd);
         const closingFd = fd;
         fd = null;
         closeSync(closingFd);
+        syncDirectory(stagingPath);
       } catch (error) {
         if (fd !== null) {
           const closingFd = fd;
@@ -1823,9 +1975,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         if (!generation || generation.status !== 'current' || generation.token !== ctx.expectedGeneration) {
           return { status: 'stale', reason: 'generation-changed' };
         }
-        if (!stageIdentity || !existsSync(stagePath) || readFileSync(stagePath, 'utf8') !== note.text) {
+        if (!stageIdentity || !fileOwner || !handoffFileMatches(stagePath, fileOwner, noteDigest)) {
           return { status: 'blocked', reason: 'staged-candidate-changed' };
         }
+        if (existsSync(join(handoffPath, plannedFilename!))) return { status: 'blocked', reason: 'handoff-target-owned-elsewhere' };
         if (candidateEvidence.mappingState !== 'complete') {
           return { status: 'blocked', reason: 'candidate-source-mapping-incomplete' };
         }
@@ -1849,34 +2002,43 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         finalPath = candidate;
         const linkedIdentity = { ...stageIdentity };
         finalIdentity = linkedIdentity;
-        const stat = statSync(candidate);
-        if (stat.dev !== linkedIdentity.dev || stat.ino !== linkedIdentity.ino) throw new Error('published handoff identity changed');
+        if (!fileOwner || !handoffFileMatches(candidate, fileOwner, noteDigest)) throw new Error('published handoff identity changed');
+        syncDirectory(handoffPath);
         committedFile = plannedFile;
-        unlinkSync(stagePath);
-        stageIdentity = null;
         this.lastHandoffFile = committedFile;
         this.pressureWarned = false;
         this.pressureSplitAt = null;
         this.memoryContextBlocks.clear();
-        cleanupStage();
       };
       const commit = (): void => {
+        if (committedFile) throw new Error('handoff candidate was already committed');
         if (!memory || !memory.enabled()) {
           if (!sourceFree || candidateEvidence.exposedSources.length > 0) throw new Error('Memory provenance is unavailable for this handoff');
           publish();
+          cleanupStage();
           return;
         }
-        if (!expectedMemoryEpoch) throw new Error('Memory epoch is unavailable for this handoff');
+        if (!expectedMemoryEpoch || !stageIdentity || !fileOwner) throw new Error('Memory epoch or staged owner is unavailable for this handoff');
+        const ownerToken = handoffOwnerToken(handoffArtifactId, stageIdentity, stageName);
         const stored = memory.commitHandoffArtifact({
           artifactId: handoffArtifactId,
+          ownerToken,
           target: plannedFile,
           content: note.text,
           expectedEpoch: expectedMemoryEpoch,
           mappingState: sourceFree ? 'source-independent' : 'complete',
           sources: candidateEvidence.exposedSources,
           segmentDigests: handoffSegmentDigests,
-        }, publish);
+        });
         if (!stored) throw new Error('Handoff provenance could not be committed with the candidate.');
+        publish();
+        const active = memory.activateHandoffArtifact(handoffArtifactId, ownerToken);
+        if (!active) throw new Error('Handoff provenance changed before file activation.');
+        if (!fileOwner || !handoffFileMatches(finalPath!, fileOwner, noteDigest)) {
+          memory.withdrawDerivedArtifact(handoffArtifactId, 'handoff-file-changed-during-activation');
+          throw new Error('Handoff file changed before provenance activation completed.');
+        }
+        cleanupStage();
       };
       const discard = (): void => {
         removeOwnedFile(finalPath, finalIdentity);

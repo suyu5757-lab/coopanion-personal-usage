@@ -6,10 +6,11 @@
 import { hasRole, textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import { message, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import { join } from 'node:path';
-import type { CoreApi, ForkOutcome, ToolDef } from 'cortico/core/types.ts';
+import type { CoreApi, EvidenceAttachment, ForkOutcome, ToolDef } from 'cortico/core/types.ts';
 import type { ModelLanguage } from '../language.ts';
-import type { HindsightMemory } from '../memory/hindsight.ts';
-import { memoryReadNotice } from '../memory/model-text.ts';
+import type { HindsightMemory, MemoryTextRead } from '../memory/hindsight.ts';
+import { evidenceCoversText } from '../memory/source-evidence.ts';
+import { MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, memoryReadNotice } from '../memory/model-text.ts';
 import { ExperienceCards, experienceCardArtifactText, readExperienceCardInput } from './experience-cards.ts';
 import { SELF_REVIEW_TEXT } from './model-text.ts';
 import { GrowthProposals, growthProposalArtifactText, readProposalInput } from './proposals.ts';
@@ -30,6 +31,39 @@ export const GROWTH_TOOL_NAMES = [
 
 export const PROPOSE_GROWTH_TOOL = 'propose_growth';
 export const PROPOSE_EXPERIENCE_TOOL = 'propose_experience';
+
+function completeGrowthEvidence(read: MemoryTextRead, evidence: readonly EvidenceAttachment[], expectedEpoch: string): boolean {
+  const segments = read.sourceSegments
+    ?? read.trace?.format.sourceSegments.map(({ documentId, start, end }) => ({ documentId, start, end }))
+    ?? [];
+  if (read.status !== 'found' || !read.text || read.sourceFactsTruncated || !expectedEpoch
+    || segments.length === 0 || evidence.length !== segments.length) return false;
+  const remaining = [...evidence];
+  for (const segment of segments) {
+    const index = remaining.findIndex((attachment) => attachment.documentId === segment.documentId
+      && attachment.segment.start === segment.start && attachment.segment.end === segment.end
+      && attachment.validatedEpoch === expectedEpoch && attachment.validationStatus === 'validated'
+      && attachment.revisionState === 'current');
+    if (index < 0) return false;
+    remaining.splice(index, 1);
+  }
+  return remaining.length === 0 && evidenceCoversText(read.text, evidence);
+}
+
+function validatedGrowthSourceIds(text: string, evidence: readonly EvidenceAttachment[], expectedEpoch: string): string[] {
+  const sourceIds = evidence.filter((attachment) => {
+    const { start, end, digest } = attachment.segment;
+    if (attachment.validatedEpoch !== expectedEpoch || attachment.validationStatus !== 'validated'
+      || attachment.revisionState !== 'current' || !Number.isInteger(start) || !Number.isInteger(end)
+      || start < 0 || end <= start || end > text.length) return false;
+    const excerpt = text.slice(start, end);
+    return evidenceCoversText(excerpt, [{
+      ...attachment,
+      segment: { start: 0, end: excerpt.length, digest },
+    }]);
+  }).map((attachment) => attachment.documentId);
+  return [...new Set(sourceIds)];
+}
 
 /** Growth reads include the exact source document id that a proposal must carry. */
 export function growthMemorySearchTool(memory: () => HindsightMemory | null, observedSourceIds?: Set<string>): ToolDef {
@@ -54,10 +88,20 @@ export function growthMemorySearchTool(memory: () => HindsightMemory | null, obs
       const maxTokens = typeof args.max_tokens === 'number' && Number.isFinite(args.max_tokens)
         ? Math.min(2000, Math.max(400, Math.round(args.max_tokens)))
         : 900;
+      const expectedEpoch = store.evidenceEpoch();
       const read = await store.recallBlockDetailed(query, { budget: 'low', maxTokens, timeoutMs: 5000, maxItems: 8, captureTrace: true });
-      for (const sourceId of read.trace?.format.includedSourceDocumentIds ?? []) observedSourceIds?.add(sourceId);
       if (read.status !== 'found') return memoryReadNotice(read.status);
-      return read.text || memoryReadNotice('fenced');
+      if (!read.text) return memoryReadNotice('fenced');
+      const evidence = expectedEpoch ? await store.evidenceForRead(read) : [];
+      const current = !!expectedEpoch && store.evidenceEpoch() === expectedEpoch;
+      if (expectedEpoch && current) {
+        for (const sourceId of validatedGrowthSourceIds(read.text, evidence, expectedEpoch)) observedSourceIds?.add(sourceId);
+      }
+      if (expectedEpoch && current && completeGrowthEvidence(read, evidence, expectedEpoch)) {
+        return { text: read.text, evidence };
+      }
+      const output = [read.text, MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE].join('\n');
+      return current && evidence.length > 0 ? { text: output, evidence } : output;
     },
   };
 }
@@ -230,8 +274,9 @@ function proposeGrowthTool(
       if (unseen) return `[proposal rejected] Source ${unseen} was not returned by memory_search.`;
       const source = memory();
       if (!source?.enabled()) return '[proposal rejected] Long-term memory is unavailable for source verification.';
+      const sessionId = ctx.sessionId ?? ctx.role;
       const envelopeMatches = ctx.callId
-        ? core.generationEvidence(ctx.role).filter((envelope) => envelope.sessionId === ctx.role
+        ? core.generationEvidence(sessionId).filter((envelope) => envelope.sessionId === sessionId
             && envelope.outputToolCalls.some((output) => output.toolCallId === ctx.callId))
         : [];
       const envelope = envelopeMatches.length === 1 ? envelopeMatches[0] : null;
@@ -312,8 +357,9 @@ function proposeExperienceTool(
       }
       const source = memory();
       if (!source?.enabled()) return '[candidate rejected] Long-term memory is unavailable for source verification.';
+      const sessionId = ctx.sessionId ?? ctx.role;
       const envelopeMatches = ctx.callId
-        ? core.generationEvidence(ctx.role).filter((envelope) => envelope.sessionId === ctx.role
+        ? core.generationEvidence(sessionId).filter((envelope) => envelope.sessionId === sessionId
             && envelope.outputToolCalls.some((output) => output.toolCallId === ctx.callId))
         : [];
       const envelope = envelopeMatches.length === 1 ? envelopeMatches[0] : null;

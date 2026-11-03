@@ -43,6 +43,7 @@ function memoryFor(overrides: Record<string, unknown> = {}): HindsightMemory {
   const memory = {
   enabled: () => true,
   settled: () => true,
+  listHandoffArtifacts: () => [],
   markRecallInjected: () => {},
   sourceVisible: () => true,
   hasSource: async () => true,

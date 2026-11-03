@@ -1,4 +1,5 @@
 import { createServer, type Server } from 'node:http';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,7 +23,7 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-async function hindsightServer(response: unknown): Promise<{ baseUrl: string; requests: Array<Record<string, unknown>> }> {
+async function hindsightServer(response: unknown, includeSourceDocuments = false): Promise<{ baseUrl: string; requests: Array<Record<string, unknown>> }> {
   const requests: Array<Record<string, unknown>> = [];
   const server = createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -37,6 +38,30 @@ async function hindsightServer(response: unknown): Promise<{ baseUrl: string; re
       } else if (url.pathname.endsWith('/documents') && req.method === 'GET') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ items: [], total: 0, limit: Number(url.searchParams.get('limit') ?? 0), offset: Number(url.searchParams.get('offset') ?? 0) }));
+      } else if (includeSourceDocuments && req.method === 'GET' && url.pathname.includes('/documents/')) {
+        const documentId = decodeURIComponent(url.pathname.split('/').at(-1) ?? '');
+        const facts = response && typeof response === 'object'
+          ? (response as { source_facts?: Record<string, { text?: unknown; document_id?: unknown; metadata?: unknown }> }).source_facts ?? {}
+          : {};
+        const source = Object.values(facts).find((candidate) => candidate.document_id === documentId && typeof candidate.text === 'string');
+        if (!source || typeof source.text !== 'string') {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        const metadata = source.metadata && typeof source.metadata === 'object'
+          ? source.metadata as Record<string, unknown>
+          : {};
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          id: documentId,
+          bank_id: 'bank-test',
+          original_text: source.text,
+          content_hash: createHash('sha256').update(source.text, 'utf8').digest('hex'),
+          created_at: '2024-05-01T10:00:00.000Z',
+          updated_at: '2024-05-01T10:00:00.000Z',
+          document_metadata: { ...metadata, status: metadata.status ?? 'current' },
+        }));
       } else {
         res.writeHead(404);
         res.end();
@@ -539,7 +564,7 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
   return { memory, ledger };
 }
 
-  it('uses the shared source-fact formatter in the Growth memory search', async () => {
+  it('attaches source-fact spans only after reading back the matching documents', async () => {
     const api = await hindsightServer({
       results: [{
         id: 'observation-growth',
@@ -553,20 +578,24 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
         'fact-two': { id: 'fact-two', text: 'Wei reviewed the plan.', type: 'experience', document_id: 'doc-two', metadata: { source_actor: 'user', kind: 'event' } },
       },
       source_facts_truncated: false,
-    });
+    }, true);
     const root = mkdtempSync(join(tmpdir(), 'coo-growth-memory-search-'));
     roots.push(root);
     const { memory } = await configuredMemory(api.baseUrl, root);
     const observedSourceIds = new Set<string>();
     const tool = growthMemorySearchTool(() => memory as unknown as HindsightMemory, observedSourceIds);
     const result = await tool.handler!({ query: 'What shared work was recorded?', max_tokens: 600 }, {} as never);
+    if (!result || typeof result !== 'object' || !('text' in result)) throw new Error('Growth search did not return a source-bearing tool outcome');
 
-    expect(result).toContain('source_id:doc-one');
-    expect(result).toContain('source_id:doc-two');
-    expect(result).not.toContain('source_id:doc-observation');
+    expect(result.text).toContain('source_id:doc-one');
+    expect(result.text).toContain('source_id:doc-two');
+    expect(result.text).not.toContain('source_id:doc-observation');
+    expect(result.text).toContain('Supporting source evidence is incomplete');
+    expect(result.evidence?.map((attachment) => attachment.documentId)).toEqual(['doc-one', 'doc-two']);
+    expect(result.evidence?.every((attachment) => attachment.validationStatus === 'validated')).toBe(true);
     expect(observedSourceIds).toEqual(new Set(['doc-one', 'doc-two']));
-    expect(result).toContain('Lin coordinated the materials.');
-    expect(result).toContain('Wei reviewed the plan.');
+    expect(result.text).toContain('Lin coordinated the materials.');
+    expect(result.text).toContain('Wei reviewed the plan.');
     expect(api.requests).toHaveLength(1);
   });
 
