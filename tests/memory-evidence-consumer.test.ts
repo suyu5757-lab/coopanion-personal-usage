@@ -200,7 +200,7 @@ async function buildRig(
   };
 }
 
-async function buildSourceFreeRig() {
+async function buildSourceFreeRig(reply = 'Ready.') {
   const root = mkdtempSync(join(tmpdir(), 'coo-source-free-handoff-'));
   roots.push(root);
   const memoryDir = join(root, 'persona');
@@ -218,7 +218,7 @@ async function buildSourceFreeRig() {
   const startWorld = world.start?.bind(world);
   world.start = async (currentHost) => { host = currentHost; await startWorld?.(currentHost); };
   const llm = new FakeLLM();
-  llm.script(textReply('Ready.'));
+  llm.script(textReply(reply));
   const core = new Core(makeLoaded({ config, rootDir: root, memoryDir, dataDir: join(root, 'data') }), {
     persona,
     worlds: [world],
@@ -612,6 +612,30 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(prepared.commitGuard?.()).toMatchObject({ status: 'blocked' });
     prepared.discard?.();
     expect(existsSync(join(rig.memoryDir, 'handoffs'))).toBe(false);
+  });
+
+  it('answers an ordinary no-history question through a FakeLLM request and response', async () => {
+    const question = 'What is two plus two?';
+    const answer = 'Two plus two is four.';
+    const rig = await buildSourceFreeRig(answer);
+    expect(rig.llm.calls).toHaveLength(0);
+    expect(rig.core.session.records.some((record) => textOf(record).includes(question))).toBe(false);
+
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(),
+      text: question, meta: { text: question },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.llm.calls.length === 1);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+
+    expect(JSON.stringify(rig.llm.calls[0]?.messages)).toContain(question);
+    expect(rig.llm.queue).toHaveLength(0);
+    const replies = rig.core.session.records.filter((record) => record.item.type === 'message'
+      && record.item.role === 'assistant' && textOf(record).includes(answer));
+    expect(replies).toHaveLength(1);
+    expect(rig.api().generationEvidence('main')).toMatchObject([
+      { requestState: 'sent', exposedSources: [], actualEvidenceUsed: 'unknown' },
+    ]);
   });
 
   it('stages, publishes and injects a source-free handoff after the guard allows it', async () => {

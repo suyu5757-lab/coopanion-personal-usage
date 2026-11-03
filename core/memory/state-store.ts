@@ -113,7 +113,7 @@ export type DerivedArtifactInput = Omit<DerivedArtifact, 'sources'> & {
   sources: readonly MemorySourceDependency[];
 };
 
-type MemoryStateMigrationCheckpoint = 'after-v4-ddl';
+type MemoryStateMigrationCheckpoint = 'after-v4-ddl' | 'after-v4-version';
 type MemoryStateMigrationOptions = { onCheckpoint?: (checkpoint: MemoryStateMigrationCheckpoint) => void };
 
 interface ActivationRow {
@@ -466,6 +466,7 @@ function migrateStateSchema(db: StateDatabase, options: MemoryStateMigrationOpti
       assertStateSchema(db, 4);
       options.onCheckpoint?.('after-v4-ddl');
       db.exec('PRAGMA user_version = 4');
+      options.onCheckpoint?.('after-v4-version');
     }
     assertStateSchema(db, 4);
     const integrity = db.prepare('PRAGMA quick_check').all() as Array<{ quick_check?: string }>;

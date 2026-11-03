@@ -180,6 +180,36 @@ describe('SQLite v4 migration (B01-B06)', () => {
     expectIntegrity(path);
   });
 
+  it('B05 rolls user_version=4 back when commit fails after the version write', () => {
+    const path = databasePath();
+    createLegacyMemoryStateDatabase(path, 3);
+    const old = openLegacyMemoryStateDatabase(path);
+    const before = snapshotLegacyDurableRows(old, 3);
+    old.close();
+
+    expect(() => new MemoryStateStore(path, {
+      onCheckpoint: (checkpoint) => {
+        if (checkpoint === 'after-v4-version') throw new Error('injected pre-commit failure');
+      },
+    })).toThrow('injected pre-commit failure');
+    expect(versionOf(path)).toBe(3);
+    expectLegacyRowsUnchanged(path, 3, before);
+    const afterRollback = openLegacyMemoryStateDatabase(path);
+    try {
+      const tables = (afterRollback.prepare(`
+        SELECT name FROM sqlite_schema WHERE type = 'table'
+          AND name IN ('generation_evidence', 'generation_source_dependency', 'derived_artifact', 'derived_artifact_source')
+        ORDER BY name
+      `).all() as Array<{ name: string }>).map((row) => row.name);
+      expect(tables).toEqual([]);
+    } finally { afterRollback.close(); }
+
+    openMemoryStateStore(path);
+    expect(versionOf(path)).toBe(4);
+    expectLegacyRowsUnchanged(path, 3, before);
+    expectIntegrity(path);
+  });
+
   it('B06 keeps repeated opens and deterministic writes free of duplicate rows and indexes', () => {
     const path = databasePath();
     let store = openMemoryStateStore(path);
