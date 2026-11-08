@@ -21,7 +21,7 @@ const root = () => {
 };
 const workspaceDigest = 'a'.repeat(64);
 const scopeDigest = 'b'.repeat(64);
-const entry = (id: string, text: string, origin: 'user-authored' | 'derived', sourceIds: string[] = [], state: 'current' | 'stale' = 'current'): PartnerProvenanceEntry => ({
+const entry = (id: string, text: string, origin: 'user-authored' | 'derived', sourceIds: string[] = [], state: 'current' | 'pending' | 'stale' = 'current'): PartnerProvenanceEntry => ({
   id: id.repeat(32).slice(0, 32),
   segmentDigest: partnerSegmentDigest(text),
   origin,
@@ -156,6 +156,21 @@ describe('PARTNER provenance sidecar', () => {
     if (result.status !== 'ok') return;
     expect(result.file.entries.map((item) => item.state)).toEqual(['stale', 'current', 'current', 'stale']);
     expect(markPartnerDerivedStale(file, workspaceDigest, scopeDigest)).toBe(false);
+  });
+
+  it('keeps a pending registration out of current text and fences it on Forget', () => {
+    const text = 'A paragraph whose source is not verified yet.';
+    const file = join(root(), 'partner-provenance.json');
+    writePartnerProvenance(file, manifest([entry('1', text, 'derived', ['source-a'], 'pending')]));
+
+    expect(filterPartnerMarkdown(text, readPartnerProvenance(file, workspaceDigest), scopeDigest, () => true))
+      .toMatchObject({ text: '', includedSegments: 0, withheldSegments: 1 });
+
+    expect(markPartnerSourcesStale(file, workspaceDigest, scopeDigest, ['source-a'])).toBe(true);
+    const result = readPartnerProvenance(file, workspaceDigest);
+    expect(result.status).toBe('ok');
+    if (result.status !== 'ok') return;
+    expect(result.file.entries[0]?.state).toBe('stale');
   });
 
   it('stores no paragraph text and keeps the sidecar private', () => {

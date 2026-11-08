@@ -426,7 +426,7 @@ describe('experience policy cards', () => {
       .toEqual(['verified']);
   });
 
-  it('tells the current session which approved policy was revoked', async () => {
+  it('removes a revoked policy from the approved context and withdraws its artifact', async () => {
     const root = temp();
     const workspace = join(root, 'workspace');
     const deploy = join(root, 'deploy');
@@ -437,20 +437,21 @@ describe('experience policy cards', () => {
     });
     const Persona = coopanionPersona(Cormini, { growthStateFile: join(deploy, 'growth.json'), memory });
     const persona = new Persona({ memoryDir: workspace });
-    const injected: Array<{ text: string; evidence?: EvidenceAttachment[] }> = [];
-    persona['core'] = { injectInternal: (text: string, _kind?: string, evidence?: EvidenceAttachment[]) => injected.push({ text, evidence }) } as never;
     const invoke = persona.webUi('en').invoke!;
     const card = await invoke('hindsight', 'experience-create', [{
       title: 'Quiet coding time', situation: 'The person is coding.', lesson: 'Wait before routine interruptions.', scope: 'proactive_speech', sourceIds: ['user:focus'],
     }]) as { id: string };
 
     await invoke('hindsight', 'experience-review', [card.id, 'approved']);
+    const approved = await (persona as unknown as { experienceContext(): Promise<{ text: string; evidence: EvidenceAttachment[] }> })
+      .experienceContext();
+    expect(approved.text).toContain('The person is coding.');
+    expect(approved.evidence.map((attachment) => attachment.documentId)).toEqual(['user:focus']);
+
     await invoke('hindsight', 'experience-review', [card.id, 'deprecated']);
-    expect(injected[0]?.text).toContain('The person is coding.');
-    expect(injected[0]?.evidence?.map((attachment) => attachment.documentId)).toEqual(['user:focus']);
-    expect(injected.at(-1)?.text).toContain('Quiet coding time');
-    expect(injected.at(-1)?.text).toContain('Do not follow it anymore');
-    expect(injected.at(-1)?.text).toContain('No approved experience strategies remain active.');
+    const revoked = await (persona as unknown as { experienceContext(): Promise<{ text: string }> }).experienceContext();
+    expect(revoked.text).toBe('');
+    expect(memory.derivedArtifact(card.id)).toMatchObject({ lifecycleState: 'withdrawn', reviewState: 'rejected' });
   });
 
   it('rejects experience cards and proposal approval when a source is gone', async () => {

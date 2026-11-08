@@ -587,10 +587,11 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
     const result = await tool.handler!({ query: 'What shared work was recorded?', max_tokens: 600 }, {} as never);
     if (!result || typeof result !== 'object' || !('text' in result)) throw new Error('Growth search did not return a source-bearing tool outcome');
 
-    expect(result.text).toContain('source_id:doc-one');
-    expect(result.text).toContain('source_id:doc-two');
+    expect(result.text).toContain('source_id: "doc-one"');
+    expect(result.text).toContain('source_id: "doc-two"');
     expect(result.text).not.toContain('source_id:doc-observation');
-    expect(result.text).toContain('Supporting source evidence is incomplete');
+    expect(result.text).not.toContain('Supporting source evidence is incomplete');
+    expect(result.text).not.toContain('Two verified events describe the shared work.');
     expect(result.evidence?.map((attachment) => attachment.documentId)).toEqual(['doc-one', 'doc-two']);
     expect(result.evidence?.every((attachment) => attachment.validationStatus === 'validated')).toBe(true);
     expect(observedSourceIds).toEqual(new Set(['doc-one', 'doc-two']));

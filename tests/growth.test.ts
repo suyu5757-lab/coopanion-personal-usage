@@ -411,7 +411,9 @@ const tool = (name: string): ToolDef => ({
 });
 
 function prefix(): ContextRecord[] {
-  return [message('system', 'CONSTITUTION'), message('user', 'hello')];
+  return [message('system', 'CONSTITUTION'), message('user', 'hello', {
+    sourceIndependentSpans: [{ start: 0, end: 5, digest: createHash('sha256').update('hello').digest('hex'), origin: 'user-input' }],
+  })];
 }
 
 describe('the growth review session', () => {
@@ -449,6 +451,7 @@ describe('the growth review session', () => {
     const spawnFork = vi.fn(async (opts: ForkOptions) => { captured.push(opts); return ''; });
     const core = {
       sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
+      generationEvidence: () => [],
       spawnFork,
       spawnForkWithOutcome: vi.fn(async (opts: ForkOptions) => ({ status: 'completed' as const, text: await spawnFork(opts) })),
     } as unknown as CoreApi;
@@ -483,6 +486,7 @@ describe('the growth review session', () => {
   it('reports an unknown Core cancellation instead of treating an empty fork as a completed review', async () => {
     const core = {
       sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
+      generationEvidence: () => [],
       spawnFork: vi.fn(async () => ''),
       spawnForkWithOutcome: vi.fn(async () => ({ status: 'cancelled' as const, invalidationStatus: 'unknown' as const })),
     } as unknown as CoreApi;
@@ -506,6 +510,7 @@ describe('the growth review session', () => {
   it('does not run a review when Core cannot report fork outcomes', async () => {
     const core = {
       sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
+      generationEvidence: () => [],
       spawnFork: vi.fn(async () => ''),
     } as unknown as CoreApi;
     const review = new GrowthReview({
@@ -556,7 +561,7 @@ describe('the growth review session', () => {
         risk: 'low',
         changes: [{ file: 'CONSTITUTION.md', from: 'old line', to: 'new line', reason: 'the person asked for quiet' }],
       }, { role: GROWTH_SESSION, callId: 'growth-proposal-call' } as never);
-      expect(result).toContain('[proposal saved]');
+      expect(typeof result === 'string' ? result : result.text).toBe('[proposal saved]');
       await finish.handler({ note: 'proposed focus mode' }, {} as never);
       return '';
     });
@@ -608,7 +613,7 @@ describe('the growth review session', () => {
         scope: 'proactive_speech',
         sourceIds: ['user:focus-1', 'user:focus-2'],
       }, { role: GROWTH_SESSION, callId: 'experience-proposal-call' } as never);
-      expect(saved).toContain('[experience candidate saved]');
+      expect(typeof saved === 'string' ? saved : saved.text).toBe('[experience candidate saved]');
       expect(await propose.handler({
         title: 'Unsearched source', situation: 'A situation.', lesson: 'A lesson.', scope: 'conversation',
         sourceIds: ['user:not-returned-1', 'user:not-returned-2'],
@@ -693,6 +698,7 @@ describe('the growth review session', () => {
     const never = new Promise<string>(() => {});
     const core = {
       sessionInfo: () => ({ snapshot: prefix(), running: 0 }),
+      generationEvidence: () => [],
       spawnFork: vi.fn((opts: ForkOptions) => {
         captured.push(opts);
         return never;

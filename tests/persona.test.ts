@@ -82,7 +82,7 @@ describe.skipIf(!gitInstalled())('Coo’s workspace history', () => {
 });
 
 describe('PARTNER.md', () => {
-  it('includes a user-authored paragraph only when its private sidecar matches', async () => {
+  it('withholds a self-declared user-authored paragraph without a registered Memory source', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'coo-persona-app-state-'));
     const stateFile = join(stateDir, 'app-state', 'growth.json');
     const { dir: workspace, p, run } = persona(stateFile);
@@ -102,12 +102,12 @@ describe('PARTNER.md', () => {
         }],
       });
       const prefix = (await p.systemSegments({ now: new Date(), timezone: 'UTC', worlds: [] })).map((s) => s.text).join('\n');
-      expect(prefix).toContain(`${PARTNER_NOTE}
-
-[workspace note; user-authored; no original event source is recorded]
-Likes cats. Works late.`);
-      expect(String(await run('read_file', { path: PARTNER_FILE }))).toContain('[workspace note; user-authored; no original event source is recorded]');
-      expect(String(await run('read_file', { path: PARTNER_FILE }))).toContain('Likes cats. Works late.');
+      expect(prefix).not.toContain('Likes cats. Works late.');
+      expect(prefix).toContain('Some PARTNER.md paragraphs are withheld');
+      const read = await run('read_file', { path: PARTNER_FILE });
+      const readText = typeof read === 'string' ? read : (read as { text?: string }).text ?? '';
+      expect(readText).toContain('[read failed] PARTNER.md paragraphs are withheld');
+      expect(readText).not.toContain('Likes cats. Works late.');
       const grep = String(await run('grep_files', { pattern: 'cats', path: '.' }));
       expect(grep).toContain('[search failed]');
       expect(grep).not.toContain('Likes cats.');

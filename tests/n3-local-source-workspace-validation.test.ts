@@ -707,7 +707,7 @@ describe('N3 local source and workspace validation', () => {
 
       const memoryTool = await project.run('memory_search', { query: 'confirmed option B', sources: true });
       const oldDraft = String(await project.run('read_file', { path: 'agenda/now.md' }));
-      const linkedPartnerSummary = String(await project.run('read_file', { path: PARTNER_FILE }));
+      const linkedPartnerSummary = toolText(await project.run('read_file', { path: PARTNER_FILE }));
       expect(toolText(memoryTool)).toContain('source_id:source-option-b');
       expect(toolText(memoryTool)).toContain(sourceText);
       expect(oldDraft).toContain('historicalEvidence=unverified');
@@ -722,7 +722,7 @@ describe('N3 local source and workspace validation', () => {
         reason: 'Synthetic forget fence',
       }], 'Synthetic forget fence');
       const fencedSearch = await project.run('memory_search', { query: 'confirmed option B', sources: true });
-      const staleDerivedSummary = String(await project.run('read_file', { path: PARTNER_FILE }));
+      const staleDerivedSummary = toolText(await project.run('read_file', { path: PARTNER_FILE }));
       const oldDraftAfterFence = String(await project.run('read_file', { path: 'agenda/now.md' }));
       expect(String(fencedSearch)).toContain('Historical memory is restricted');
       expect(staleDerivedSummary).not.toContain('chose option B');

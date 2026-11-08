@@ -1,9 +1,9 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryOutbox, type RetainItem } from '../core/memory/outbox.ts';
-import { closeMemoryStateStores } from '../core/memory/state-store.ts';
+import { closeMemoryStateStores, openMemoryStateStore } from '../core/memory/state-store.ts';
 import { OutboxDelivery, DeliveryError, type DeliveryOps } from '../core/memory/delivery.ts';
 import { isForgetRequest, isMemoryForgetRequest, planRecall } from '../core/memory/router.ts';
 
@@ -137,7 +137,7 @@ describe('the retain outbox', () => {
     expect(outbox.status().active).toBe(1);
   });
 
-  it('skips a malformed log line and keeps the readable items', () => {
+  it('refuses a legacy import with a malformed item and leaves it available for review', () => {
     const path = file();
     const at = new Date().toISOString();
     const legacy = {
@@ -145,9 +145,14 @@ describe('the retain outbox', () => {
       id: 'legacy-event', operationId: 'legacy-operation', state: 'pending', attempts: 0,
       nextAttemptAt: at, createdAt: at, updatedAt: at,
     };
-    writeFileSync(path, `${JSON.stringify({ v: 1, item: legacy })}\n{"v":1,"item":{"broken":true}}\n`);
+    const legacyLog = `${JSON.stringify({ v: 1, item: legacy })}\n{"v":1,"item":{"broken":true}}\n`;
+    writeFileSync(path, legacyLog);
     const reopened = new MemoryOutbox(path);
-    expect(reopened.due(new Date(), 10).map((entry) => entry.documentId)).toEqual(['kept']);
+
+    expect(reopened.readable()).toBe(false);
+    expect(reopened.status().persistenceError).toContain('invalid legacy retain outbox at line 2');
+    expect(openMemoryStateStore(path).imported('outbox-v1')).toBe(false);
+    expect(readFileSync(path, 'utf8')).toBe(legacyLog);
   });
 
   it('reports the oldest pending item and the last error', () => {
