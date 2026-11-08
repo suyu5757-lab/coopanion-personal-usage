@@ -6,6 +6,7 @@
  * retries are off so each attempt is recorded. Images are limited to the newest delivered batch
  * (`sinceLastDelivery`).
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import Anthropic from '@anthropic-ai/sdk';
 import type { Logger } from 'cortico/core/types.ts';
 import { nullLogger } from 'cortico/core/util.ts';
@@ -45,10 +46,19 @@ export interface ClaudeProviderOptions {
   log?: Logger;
 }
 
+interface DispatchContext {
+  generationId: string;
+  attemptId: string;
+  request: Request;
+  options: GenerateOptions;
+  blocked: boolean;
+}
+
 export class ClaudeProvider extends BaseProvider {
   private readonly opts: ClaudeProviderOptions;
   private readonly log: Logger;
   private sdk: Anthropic | null = null;
+  private readonly dispatchContext = new AsyncLocalStorage<DispatchContext>();
 
   constructor(opts: ClaudeProviderOptions) {
     super();
@@ -60,8 +70,34 @@ export class ClaudeProvider extends BaseProvider {
   client(): Anthropic {
     if (!this.opts.apiKey) throw new LLMError('Claude 缺密钥(端点的密钥变量未设置)', 401, '');
     // a redirect fails the request: the x-api-key header would follow it to the new address
-    this.sdk ??= new Anthropic({ apiKey: this.opts.apiKey, baseURL: this.opts.baseUrl || DEFAULT_BASE_URL, maxRetries: 0, fetch: (url, init) => fetch(url, { ...init, redirect: 'error' }) });
+    this.sdk ??= new Anthropic({ apiKey: this.opts.apiKey, baseURL: this.opts.baseUrl || DEFAULT_BASE_URL, maxRetries: 0, fetch: (url, init) => this.fetchChecked(url, init) });
     return this.sdk;
+  }
+
+  private async fetchChecked(input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]): ReturnType<typeof fetch> {
+    const context = this.dispatchContext.getStore();
+    if (context && (context.options.onRequestReady || context.options.onRequestSent)) {
+      const body = typeof init?.body === 'string' ? init.body
+        : input instanceof globalThis.Request ? await input.clone().text() : null;
+      if (body === null) {
+        context.blocked = true;
+        throw new Error('Provider request body could not be inspected');
+      }
+      const info = { generationId: context.generationId, attemptId: context.attemptId, request: context.request, body };
+      let allowed: boolean;
+      try { allowed = context.options.onRequestReady?.(info) ?? true; }
+      catch (error) { context.blocked = true; throw error; }
+      if (!allowed) {
+        context.blocked = true;
+        throw new Error('Provider request was blocked by current evidence state');
+      }
+      try {
+        if (!context.options.diagnostic) context.options.onRequestSent?.(info);
+      } catch (error) {
+        this.log.warn('Outbound request observer failed', { err: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    return fetch(input, { ...init, redirect: 'error' });
   }
 
   async respond(request: Request, options: GenerateOptions = {}): Promise<Generation> {
@@ -90,6 +126,7 @@ export class ClaudeProvider extends BaseProvider {
         purpose: options.diagnostic ? 'diagnostic' : 'generation', meters: unknownMeters(), charges: [],
       };
       const started = Date.now();
+      const dispatch: DispatchContext = { generationId, attemptId: attempt.id, request, options, blocked: false };
       const quotes: readonly PriceSnapshot[] = structuredClone(options.quote?.({ startedAt: attempt.startedAt, requestedServiceTier: null }) ?? []);
       const controller = new AbortController();
       const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
@@ -117,7 +154,8 @@ export class ClaudeProvider extends BaseProvider {
         const body = { ...params, ...(betas.length ? { betas } : {}) };
         const requestOptions = { signal, timeout: streaming ? HEADERS_TIMEOUT_MS.streaming : HEADERS_TIMEOUT_MS.unary };
         if (streaming) {
-          const { data: stream, response, request_id } = await this.client().beta.messages.create({ ...body, stream: true as const }, requestOptions).withResponse();
+          const { data: stream, response, request_id } = await this.dispatchContext.run(dispatch, () =>
+            this.client().beta.messages.create({ ...body, stream: true as const }, requestOptions).withResponse());
           attempt.status = response.status;
           attempt.requestId = request_id ?? null;
           touch();
@@ -129,7 +167,8 @@ export class ClaudeProvider extends BaseProvider {
           attempt.meters = assembly.meters();
           attempt.serviceTier = assembly.serviceTier();
         } else {
-          const { data: message, response, request_id } = await this.client().beta.messages.create({ ...body, stream: false as const }, requestOptions).withResponse();
+          const { data: message, response, request_id } = await this.dispatchContext.run(dispatch, () =>
+            this.client().beta.messages.create({ ...body, stream: false as const }, requestOptions).withResponse());
           attempt.status = response.status;
           attempt.requestId = request_id ?? null;
           const parsed = parseClaudeMessage(message, request);
@@ -164,7 +203,7 @@ export class ClaudeProvider extends BaseProvider {
         }
         lastError = error;
         const status = error instanceof LLMError ? error.status : 0;
-        if (committed || runaway || error instanceof ResponseProtocolError || !retryable(status)) break;
+        if (dispatch.blocked || committed || runaway || error instanceof ResponseProtocolError || !retryable(status)) break;
         this.log.warn('Claude attempt failed; retrying', { ordinal, err: String(error) });
       } finally {
         if (idle) clearTimeout(idle);
