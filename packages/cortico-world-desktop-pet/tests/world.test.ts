@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dryMountWorld, fakeWorldContext } from 'cortico/extensions/dry-mount.ts';
-import { renderTemplate } from 'cortico/core/template.ts';
+import { renderTemplateWithSourceMap } from 'cortico/core/template.ts';
 import { DESKTOP_PET, desktopPetDefinition } from '../src/definition.ts';
 import { DESKTOP_PET_DEFAULTS, SELF_DEFAULT, type DesktopPetConfigSection } from '../src/config.ts';
 import { DesktopPetWorld, type DesktopPetWorldOptions, type PetBotControls } from '../src/world.ts';
@@ -86,7 +86,7 @@ describe('English model text', () => {
   it('gives the bot no Chinese of its own: environment prompt, tool declarations, events', async () => {
     const { world, host } = await mounted((c) => { c.user = 'Sam'; }, { modelLanguage: () => 'en', replyLanguage: () => 'Japanese', controls: { openChat: () => {} } });
     const doc = world.webUi().promptDocs![0]!;
-    const prompt = renderTemplate(readFileSync(doc.path, 'utf8'), await world.envPromptVars());
+    const { text: prompt } = renderTemplateWithSourceMap(readFileSync(doc.path, 'utf8'), await world.envPromptVars());
     expect(prompt).not.toMatch(HAN);
     // every placeholder of the English template is one the World fills
     expect(prompt).not.toMatch(/\{\{/);
@@ -267,7 +267,7 @@ describe('with a pet page', () => {
     const { world } = await mounted((c) => { c.skin.figure = 'robot'; }, { packRoots: () => [root] });
     const page = await FakePage.open(origin(world));
     cleanup.push(() => page.close());
-    expect((await world.envPromptVars())['pet.moves']).toContain('| shelf(书架顶) | 跳上书架 | height:0–1,跳多高 |');
+    expect((await world.envPromptVars())['pet.moves']).toMatchObject({ text: expect.stringContaining('| shelf(书架顶) | 跳上书架 | height:0–1,跳多高 |') });
     const move = tool(world, 'pet_move_to').handler;
     expect(await move({ to: 'shelf', params: [2] }, ctx)).toMatchObject({ failed: true });
     expect(await move({ to: 'left', params: [1] }, ctx)).toMatchObject({ failed: true });
@@ -444,6 +444,47 @@ describe('with a pet page', () => {
     // a run that crosses midnight between the two dates the second one too
     expect(host.stamps[0]).toMatch(/^\[\d\d-\d\d 周. \d\d:\d\d\] $/);
     expect(host.stamps[1]).toMatch(/^\[\d\d:\d\d\] $/);
+  });
+
+  it('does not label a generated question or option as user input', async () => {
+    const { world, host } = await mounted();
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+    await tool(world, 'pet_ask').handler({ question: 'Generated question?', options: ['Generated option'] }, ctx);
+    const ask = await page.next((item) => item.t === 'ask');
+    page.send({ t: 'answer', askId: ask.id, index: 0 });
+    await expect.poll(() => host.events.length).toBe(1);
+    expect(host.events[0].text).toContain('Generated question?');
+    expect(host.events[0].text).toContain('Generated option');
+    expect(host.events[0].dependencyOrigin).toBeUndefined();
+  });
+
+  it('labels a custom display name as the person, not as an untrusted origin', async () => {
+    const { world, host } = await mounted((cfg) => { cfg.user = 'TestUser'; });
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+    page.send({ t: 'text', text: 'hello' });
+    await expect.poll(() => host.events.length).toBe(1);
+    expect(host.events[0].text).toContain('TestUser');
+    expect(host.events[0]).toMatchObject({ type: 'desktop-pet.message', dependencyOrigin: 'user-input' });
+  });
+
+  it('labels a direct touch as user input with a custom display name', async () => {
+    const { world, host } = await mounted((cfg) => { cfg.user = 'TestUser'; });
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+    page.send({ t: 'touch', kind: 'poke' });
+    await expect.poll(() => host.events.length, { timeout: 6000 }).toBe(1);
+    expect(host.events[0]).toMatchObject({ type: 'desktop-pet.touch', dependencyOrigin: 'user-input' });
+  });
+
+  it('maps the enabled CUA prompt as core-generated World text', async () => {
+    const { world } = await mounted((cfg) => { cfg.cua.enabled = true; });
+    const cua = (world as unknown as { cua: { envPrompt: () => Promise<string> } }).cua;
+    cua.envPrompt = async () => 'CUA prompt';
+    const vars = await world.envPromptVars();
+    expect(vars['pet.cua']).toMatchObject({ text: 'CUA prompt' });
+    expect((vars['pet.cua'] as { sourceMapSpans?: unknown[] }).sourceMapSpans).toHaveLength(1);
   });
 
   it('a watching tab still sends typed text and a theme switch, which reaches the pet window', async () => {

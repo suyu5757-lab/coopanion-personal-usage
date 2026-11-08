@@ -23,8 +23,9 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import type {
   BlobInput, EventEnvelope, Logger, OutputTap, RunPhase, ToolCallContext, ToolDef, ToolOutcome, TriggerMode, World, WorldWebUiDecl,
-  WorldHost, WorldLamp, WorldPanelDecl, WorldStreamSocket,
+  WorldEnvPromptValue, WorldEnvPromptVars, WorldHost, WorldLamp, WorldPanelDecl, WorldStreamSocket,
 } from 'cortico/core/types.ts';
+import { digestText } from 'cortico/core/evidence.ts';
 import { nowIso, shortTime } from 'cortico/core/util.ts';
 import type { Language } from 'cortico/core/language.ts';
 import type { DeepPartial } from 'cortico/world.ts';
@@ -80,6 +81,23 @@ const ENV_PROMPT_FILES: Record<ModelLanguage, string> = {
   zh: fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url)),
   en: fileURLToPath(new URL('./ENV_PROMPT.en.md', import.meta.url)),
 };
+
+const ENV_PROMPT_DIGESTS: Record<ModelLanguage, string> = {
+  zh: 'c80f4ca22a0696255bdb7a484236a8689a94782287ef2a5772ae81e5d51cb414',
+  en: '4613c67b5c89e65439dbd47386b6647937fe4253205e24b9e38e5c57707e85a2',
+};
+
+export const DESKTOP_PET_TRUSTED_TEMPLATE_DIGESTS: readonly string[] = Object.values(ENV_PROMPT_DIGESTS);
+
+const PACK_PROMPT_DIGESTS = new Set([
+  '5a957ce5fe90f29fa0c026031f5980a157ac8cfcb050a004cbebf7ad355c6133',
+  'a697de3bc0f85e5e87032970d823f165533c41ff170251006ce16d53104cb246',
+  '1886ee017df8548461e67f022dece8c3e2db717061383f2d64a5d3ed953a8782',
+]);
+
+function promptValue(text: string, verified: boolean): WorldEnvPromptValue {
+  return { text, ...(verified && text ? { sourceMapSpans: [{ start: 0, end: text.length, digest: digestText(text), origin: 'core-generated' }] } : {}) };
+}
 
 /** Longest `pet_quiet`: a quiet that outlasts a day is a setting, which `pet_set` changes. */
 const QUIET_MAX_MIN = 24 * 60;
@@ -492,13 +510,12 @@ export class DesktopPetWorld implements World {
   }
 
   /** The pack of the figure the skin asks for (Coo for one that is not installed); null only when even Coo's would not load. */
-  private currentPack(): FigurePack | null {
+  private currentPack(packs = this.packs()): FigurePack | null {
     const figure = this.cfg.skin.figure ?? COO;
-    return packFor(this.packs(), figure === this.figureFailed ? COO : figure);
+    return packFor(packs, figure === this.figureFailed ? COO : figure);
   }
   /** The words the body on screen does: its pack's vocabulary, less the words its body said it does not know. */
-  private vocab(): VocabWord[] {
-    const pack = this.currentPack();
+  private vocab(pack = this.currentPack()): VocabWord[] {
     if (!pack) return [];
     const known = this.bodyWords.get(pack.id);
     return known ? pack.manifest.vocab.filter((w) => known.has(w.id)) : pack.manifest.vocab;
@@ -1298,8 +1315,7 @@ export class DesktopPetWorld implements World {
     const host = this.host;
     if (!host) return null;
     try {
-      const directUserInput = type === 'desktop-pet.message' || type === 'desktop-pet.speech' || type === 'desktop-pet.touch'
-        || (type === 'desktop-pet.answer' && extra.meta?.dismissed !== true);
+      const directUserInput = type === 'desktop-pet.message' || type === 'desktop-pet.speech' || type === 'desktop-pet.touch';
       const e = await host.pushEvent({ type, source: this.id, senderKey, ts: nowIso(this.opts.timezone), text: this.stamp() + text,
         ...(directUserInput ? { dependencyOrigin: 'user-input' as const } : {}), ...extra }, { trigger });
       const item = chatItem(e);
@@ -1899,21 +1915,27 @@ export class DesktopPetWorld implements World {
 
   /* ---------- prompt ---------- */
 
-  async envPromptVars(): Promise<Record<string, string>> {
+  async envPromptVars(): Promise<WorldEnvPromptVars> {
     const { language, t } = this;
     const user = this.userName;
     const reply = this.opts.replyLanguage?.() ?? null;
+    const packs = this.packs();
+    const pack = this.currentPack(packs);
+    const verifiedPack = pack === null || PACK_PROMPT_DIGESTS.has(pack.manifestDigest ?? '');
+    const cua = this.cuaOn
+      ? promptValue(await this.cua.envPrompt(), true)
+      : promptValue(this.cua.unsupported() === null ? t.cuaOff(user, this.cuaCanOpen) : '', true);
     return {
-      'pet.cua': this.cuaOn ? await this.cua.envPrompt() : this.cua.unsupported() === null ? t.cuaOff(user, this.cuaCanOpen) : '',
-      'pet.user': user,
-      'pet.vocab': vocabTable(this.vocab(), language),
-      'pet.moves': moveTable(this.moves(), language),
-      'pet.voice': this.cfg.asr.enabled ? t.on : t.off,
-      'pet.body': this.bodyText(this.currentPack()),
-      'pet.dress': dressTable(this.packs(), language),
-      'pet.self': this.selfText(),
-      'pet.chat': this.opts.controls?.openChat ? t.chatPage(user) : '',
-      'pet.reply': reply ? t.reply(user, reply) : '',
+      'pet.cua': cua,
+      'pet.user': promptValue(user, true),
+      'pet.vocab': promptValue(vocabTable(this.vocab(pack), language), verifiedPack),
+      'pet.moves': promptValue(moveTable(pack?.manifest.moves ?? [], language), verifiedPack),
+      'pet.voice': promptValue(this.cfg.asr.enabled ? t.on : t.off, true),
+      'pet.body': promptValue(this.bodyText(pack), verifiedPack),
+      'pet.dress': promptValue(dressTable(packs, language), packs.every((entry) => PACK_PROMPT_DIGESTS.has(entry.manifestDigest ?? ''))),
+      'pet.self': promptValue(this.selfText(), true),
+      'pet.chat': promptValue(this.opts.controls?.openChat ? t.chatPage(user) : '', true),
+      'pet.reply': promptValue(reply ? t.reply(user, reply) : '', true),
     };
   }
 
@@ -1968,6 +1990,7 @@ export class DesktopPetWorld implements World {
         key: `worlds.${DESKTOP_PET_ID}.envPrompt`,
         ...c.envPrompt,
         path: this.envPromptFile(),
+        sourceDigest: this.envPromptFile() === ENV_PROMPT_FILES.en ? ENV_PROMPT_DIGESTS.en : ENV_PROMPT_DIGESTS.zh,
         role: 'envPrompt',
         vars: ['pet.user', 'pet.vocab', 'pet.moves', 'pet.voice', 'pet.body', 'pet.dress', 'pet.self', 'pet.chat', 'pet.reply', 'pet.cua']
           .map((name) => ({ name, description: c.vars[name] ?? name, ...(name === 'pet.vocab' || name === 'pet.moves' || name === 'pet.dress' || name === 'pet.cua' ? { multiline: true } : {}) })),

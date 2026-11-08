@@ -17,6 +17,7 @@
  * manifest's axis order (one axis: the option id), or a preset id. Coo keeps its picks in the skin's
  * own fields, one per axis (`lookOf`, `lookPatch`).
  */
+import { digestText } from 'cortico/core/evidence.ts';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { extname, join, normalize, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -139,6 +140,7 @@ export interface FigurePack {
   /** URL path the pages load the pack's files from, ending in `/`. */
   base: string;
   builtin: boolean;
+  manifestDigest?: string;
   manifest: FigureManifest;
 }
 
@@ -252,10 +254,24 @@ function readNeeds(raw: unknown, skipped: string[], t: PackText): FigureManifest
  * there; the pack loads without it. Unknown fields are not read at all. What is wrong is said in the words of `t`.
  */
 export function readManifest(dir: string, builtin = false, skipped: string[] = [], t: PackText = petText().packs): FigureManifest | string {
+  return loadManifest(dir, builtin, skipped, t).manifest;
+}
+
+function loadManifest(dir: string, builtin: boolean, skipped: string[], t: PackText): { manifest: FigureManifest | string; manifestDigest?: string } {
   const file = join(dir, MANIFEST_FILE);
-  if (!existsSync(file)) return t.noManifest(MANIFEST_FILE);
+  if (!existsSync(file)) return { manifest: t.noManifest(MANIFEST_FILE) };
+  let text: string;
   let raw: Record<string, unknown>;
-  try { raw = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>; } catch (err) { return t.badJson(MANIFEST_FILE, (err as Error).message); }
+  try {
+    text = readFileSync(file, 'utf8');
+    raw = JSON.parse(text) as Record<string, unknown>;
+  } catch (err) {
+    return { manifest: t.badJson(MANIFEST_FILE, (err as Error).message) };
+  }
+  return { manifest: parseManifest(raw, dir, builtin, skipped, t), ...(builtin ? { manifestDigest: digestText(text) } : {}) };
+}
+
+function parseManifest(raw: Record<string, unknown>, dir: string, builtin: boolean, skipped: string[], t: PackText): FigureManifest | string {
   for (const [key, oldest, now] of [['manifest', MANIFEST_OLDEST, MANIFEST_VERSION], ['api', FIGURE_API_OLDEST, FIGURE_API]] as const) {
     const v = raw[key];
     if (typeof v !== 'number' || !Number.isInteger(v)) return t.notInteger(key, JSON.stringify(v));
@@ -340,12 +356,12 @@ export function scanPacks(builtin: ReadonlyArray<{ dir: string; base: string }>,
   const problems: PackProblem[] = [];
   const add = (dir: string, base: (id: string) => string, isBuiltin: boolean) => {
     const skipped: string[] = [];
-    const m = readManifest(dir, isBuiltin, skipped, t);
+    const { manifest: m, manifestDigest } = loadManifest(dir, isBuiltin, skipped, t);
     if (typeof m === 'string') { problems.push({ dir, reason: m, loaded: false }); return; }
     const taken = packs.find((p) => p.id === m.id);
     if (taken) { problems.push({ dir, reason: t.idTaken(m.id, taken.builtin), loaded: false }); return; }
     for (const reason of skipped) problems.push({ dir, reason, loaded: true });
-    packs.push({ id: m.id, dir, base: base(m.id), builtin: isBuiltin, manifest: m });
+    packs.push({ id: m.id, dir, base: base(m.id), builtin: isBuiltin, manifestDigest, manifest: m });
   };
   for (const b of builtin) if (existsSync(b.dir)) add(b.dir, () => b.base, true);
   for (const root of roots) {
