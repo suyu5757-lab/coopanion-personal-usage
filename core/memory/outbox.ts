@@ -135,26 +135,55 @@ export function readLegacyOutbox(file: string, log?: OutboxLog): OutboxItem[] {
   if (!existsSync(file)) return [];
   const text = readFileSync(file, 'utf8');
   const items = new Map<string, OutboxItem>();
-  let bad = 0;
-  for (const line of text.split('\n')) {
+  const operationOwners = new Map<string, string>();
+  const documentOwners = new Map<string, string>();
+  const refuse = (line: number, reason: string): never => {
+    log?.warn('[memory] refusing legacy retain outbox import', { line, reason });
+    throw new Error(`invalid legacy retain outbox at line ${line}`);
+  };
+  const lines = text.split('\n');
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
     if (!line.trim()) continue;
+    let record: { v?: unknown; item?: unknown };
     try {
-      const record = JSON.parse(line) as { v?: unknown; item?: unknown };
-      if (record.v !== 1) throw new Error('unknown outbox record');
-      const item = parseItem(record.item);
-      if (!item) throw new Error('invalid outbox item');
-      if (!item.bankId || !item.endpoint) {
-        if (item.state === 'pending' || item.state === 'sending' || item.state === 'sent' || item.state === 'done' || item.state === 'failed') {
-          item.state = 'orphaned';
-          item.lastError = 'this item predates bank/endpoint binding; choose a target before sending it';
-        }
+      const parsed = JSON.parse(line) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return refuse(index + 1, 'record is not an object');
+      record = parsed as { v?: unknown; item?: unknown };
+    } catch (error) {
+      if (error instanceof SyntaxError) return refuse(index + 1, 'invalid JSON');
+      throw error;
+    }
+    if (record.v !== 1) return refuse(index + 1, 'unsupported record version');
+    const item = parseItem(record.item);
+    if (!item) return refuse(index + 1, 'invalid item');
+    if (item.requestHash !== requestHashFor(item)) return refuse(index + 1, 'request hash does not match its payload');
+
+    const previous = items.get(item.id);
+    if (previous) {
+      if (previous.operationId !== item.operationId || previous.requestHash !== item.requestHash) {
+        return refuse(index + 1, 'event id was reused with a different operation or payload');
       }
       items.set(item.id, item);
-    } catch {
-      bad += 1;
+      continue;
     }
+
+    const operationOwner = operationOwners.get(item.operationId);
+    if (operationOwner && operationOwner !== item.id) return refuse(index + 1, 'operation id is duplicated');
+    const documentKey = JSON.stringify([item.bankId ?? null, item.endpoint ?? null, item.documentId]);
+    const documentOwner = documentOwners.get(documentKey);
+    if (documentOwner && documentOwner !== item.id) return refuse(index + 1, 'document id is duplicated for the same target');
+    operationOwners.set(item.operationId, item.id);
+    documentOwners.set(documentKey, item.id);
+
+    if (!item.bankId || !item.endpoint) {
+      if (item.state === 'pending' || item.state === 'sending' || item.state === 'sent' || item.state === 'done' || item.state === 'failed') {
+        item.state = 'orphaned';
+        item.lastError = 'this item predates bank/endpoint binding; choose a target before sending it';
+      }
+    }
+    items.set(item.id, item);
   }
-  if (bad > 0) log?.warn('[memory] skipped unreadable retain outbox lines', { bad, file });
   return [...items.values()];
 }
 

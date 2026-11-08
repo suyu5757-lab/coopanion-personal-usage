@@ -3,7 +3,7 @@ import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readF
 import { dirname, join, resolve } from 'node:path';
 
 export type PartnerEntryOrigin = 'user-authored' | 'derived';
-export type PartnerEntryState = 'current' | 'stale';
+export type PartnerEntryState = 'current' | 'pending' | 'stale';
 
 export interface PartnerProvenanceEntry {
   id: string;
@@ -57,6 +57,12 @@ export function partnerSegmentDigest(segment: string): string {
   return digest(normalized);
 }
 
+/** Stable Memory document id for a paragraph the person saved into PARTNER.md. */
+export function partnerUserNoteDocumentId(workspaceDigest: string, segment: string, version?: string): string {
+  const base = `partner-user:${workspaceDigest}:${partnerSegmentDigest(segment)}`;
+  return version ? `${base}:${version}` : base;
+}
+
 export function partnerSegments(markdown: string): Array<{ text: string; digest: string }> {
   const normalized = markdown.replace(/\r\n?/g, '\n').trim();
   if (!normalized) return [];
@@ -72,7 +78,7 @@ function validEntry(value: unknown): value is PartnerProvenanceEntry {
   if (!isRecord(value) || typeof value.id !== 'string' || !ID.test(value.id)
     || typeof value.segmentDigest !== 'string' || !SHA256.test(value.segmentDigest)
     || (value.origin !== 'user-authored' && value.origin !== 'derived')
-    || (value.state !== 'current' && value.state !== 'stale')
+    || (value.state !== 'current' && value.state !== 'pending' && value.state !== 'stale')
     || (value.sourceScopeDigest !== null && (typeof value.sourceScopeDigest !== 'string' || !SHA256.test(value.sourceScopeDigest)))
     || !Array.isArray(value.sourceIds) || !value.sourceIds.every((id) => typeof id === 'string' && !!id.trim() && !/[\r\n\0]/.test(id))) return false;
   if (value.origin === 'user-authored') return value.sourceIds.length === 0 && value.sourceScopeDigest === null;
@@ -186,7 +192,8 @@ export function markPartnerSourcesStale(
   const forgotten = new Set(sourceIds.filter(Boolean));
   if (forgotten.size === 0) return false;
   return updateEntries(file, workspaceDigest, (entry) => entry.origin === 'derived'
-    && entry.sourceScopeDigest === sourceScopeDigest && entry.state === 'current' && entry.sourceIds.some((id) => forgotten.has(id))
+    && entry.sourceScopeDigest === sourceScopeDigest && (entry.state === 'current' || entry.state === 'pending')
+    && entry.sourceIds.some((id) => forgotten.has(id))
     ? { ...entry, state: 'stale' } : entry);
 }
 
@@ -195,7 +202,8 @@ export function markPartnerDerivedStale(
   workspaceDigest: string,
   sourceScopeDigest: string | null,
 ): boolean {
-  return updateEntries(file, workspaceDigest, (entry) => entry.origin === 'derived' && entry.state === 'current'
+  return updateEntries(file, workspaceDigest, (entry) => entry.origin === 'derived'
+    && (entry.state === 'current' || entry.state === 'pending')
     && (!sourceScopeDigest || entry.sourceScopeDigest === sourceScopeDigest)
     ? { ...entry, state: 'stale' } : entry);
 }

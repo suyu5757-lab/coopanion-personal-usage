@@ -58,6 +58,8 @@ import { loadDeployment } from 'cortico/deploy.ts';
 import { loadExtensions, readInstalled, type ExtensionSet } from 'cortico/extensions.ts';
 import { deploymentRoot, providersRoot, repoRoot } from 'cortico/paths.ts';
 import { providerModules, registerProviderModules } from 'cortico/providers/registry.ts';
+import LLAMACPP_PROVIDER from 'cortico/providers/llamacpp/index.ts';
+import RESPONSES_PROVIDER from 'cortico/providers/openai-responses-compat/index.ts';
 import { withWorlds, type WorldDefinition, type WorldSection } from 'cortico/world.ts';
 import { ActionGate } from './action-gate.ts';
 import { authorizeFileSystemAction, type FileSystemActionAuthorizationRequest } from './action-authorization.ts';
@@ -65,7 +67,7 @@ import { actionReceiptDuplicateKey } from './action-receipts.ts';
 import { isWorkspaceAppendPreapproved, parseWorkspaceAppendPaths } from './workspace-append-approval.ts';
 import { InstanceLockedError } from 'cortico/core/instance-lock.ts';
 import { CONSOLE } from 'cortico/worlds/console/definition.ts';
-import { desktopPetDefinition, figurePacks, isSupportedCuaTarget, type DesktopPetWorld } from 'cortico-world-desktop-pet';
+import { desktopPetDefinition, figurePacks, isSupportedCuaTarget, DESKTOP_PET_TRUSTED_TEMPLATE_DIGESTS, type DesktopPetWorld } from 'cortico-world-desktop-pet';
 import CODEX from 'cortico-world-codex';
 import { insideRoot, opencodeDefinition, OPENCODE_DEFAULTS, readConfig as readOpencodeConfig, workRoots as opencodeWorkRoots, type OpencodeConfigSection } from 'cortico-world-opencode';
 import COO, { CHATGPT, CHATGPT_PROVIDER, signedIn, usageLimited, vendorOf } from 'cortico-provider-coo';
@@ -80,12 +82,14 @@ import { hashContent } from './browser/actions.ts';
 import { readSelfTime, SELF_TIME_DEFAULTS } from './browser/config.ts';
 import { readResourcePressure, selfTimeScheduleNeedsRearm, selfTimeTickDelayMs } from './resource-pressure.ts';
 import { GROWTH_DEFAULTS, migrateLegacyGrowthConfig, readGrowth } from './growth/config.ts';
+import { isTrustedGrowthToolText } from './growth/review.ts';
 import { videoConfigGroup, videoDefinition, VIDEO_ID } from './video/definition.ts';
 import { coreText } from './i18n/index.ts';
 import { petToolDescriber } from './pet-status.ts';
 import { appLanguage, modelLanguage, replyLanguage } from './language.ts';
 import { CONSOLE_PORT, DEPLOYMENT, DISPLAY_NAME, followLanguage as followPersonaLanguage, personaOf, seed } from './seed.ts';
-import { coopanionPersona, type CoopanionPersona, type MemoryDeps } from './persona.ts';
+import { coopanionPersona, isTrustedPartnerReadText, type CoopanionPersona, type MemoryDeps } from './persona.ts';
+import { COOPANION_TOOL_SCHEMA_DIGESTS } from './tool-schema-roots.ts';
 import { HindsightMemory } from './memory/hindsight.ts';
 import { RelationshipJournal } from './memory/journal.ts';
 import { AffinitySync } from './memory/affinity-sync.ts';
@@ -675,6 +679,8 @@ export async function main(): Promise<void> {
   };
   const base = await cormini({
     memory: longTerm,
+    reloadPrefix: async () => { await core?.loop.reloadSystemPrefix(); },
+    sourceSafeToolResults: true,
     selfTime: () => readSelfTime(config),
     modelLanguage: () => modelLanguage(config?.language),
     growth: () => readGrowth(config),
@@ -752,6 +758,15 @@ export async function main(): Promise<void> {
       coo = persona;
       return {
         persona,
+        requireCompleteEvidence: true,
+        trustedToolSchemaDigests: COOPANION_TOOL_SCHEMA_DIGESTS,
+        trustedProviderModules: [LLAMACPP_PROVIDER, RESPONSES_PROVIDER, COO, CHATGPT_PROVIDER],
+        worldPromptTrust: (world) => world === pet
+          ? { templateDigests: DESKTOP_PET_TRUSTED_TEMPLATE_DIGESTS, independentVariables: true } : undefined,
+        worldEventTrust: (world, event) => world === pet
+          && ['desktop-pet.message', 'desktop-pet.speech', 'desktop-pet.touch'].includes(event.type),
+        toolTextTrust: (tool, text) => isTrustedGrowthToolText(tool, text)
+          || (tool === 'read_file' && isTrustedPartnerReadText(text)),
         onStart: () => persona.startRhythm(),
         onStop: () => { persona.stopRhythm(); persona.stopGrowth(); },
         webUi: {

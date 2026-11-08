@@ -1430,8 +1430,19 @@ export class MemoryStateStore {
     const revisionState = item.state === 'verified' ? 'active'
       : item.state === 'done' ? 'completed'
       : item.state === 'dead' || item.state === 'cancelled' ? 'failed' : 'pending';
-    if (sourceIds.length > 0) this.db.prepare('DELETE FROM memory_revisions WHERE event_id = ?').run(item.id);
-    else this.db.prepare('UPDATE memory_revisions SET state = ? WHERE event_id = ?').run(revisionState, item.id);
+    if (sourceIds.length === 0) {
+      const linked = this.db.prepare(`
+        UPDATE memory_revisions SET state = ? WHERE event_id = ?
+        RETURNING bank_id, endpoint, supersedes_document_id
+      `).all(revisionState, item.id) as Array<{ bank_id: string; endpoint: string; supersedes_document_id: string }>;
+      if (revisionState === 'active') {
+        for (const source of linked) {
+          this.markDerivedArtifactsForSource(source.bank_id, source.endpoint, source.supersedes_document_id, 'source-revised', item.updatedAt);
+        }
+      }
+      return;
+    }
+    this.db.prepare('DELETE FROM memory_revisions WHERE event_id = ?').run(item.id);
     const revision = this.db.prepare(`
       INSERT INTO memory_revisions(event_id, bank_id, endpoint, document_id, supersedes_document_id, state, created_at)
       VALUES(?, ?, ?, ?, ?, ?, ?)

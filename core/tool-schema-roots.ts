@@ -1,0 +1,30 @@
+/** Canonical digests of the built-in model-visible tool schemas. */
+export const COOPANION_TOOL_SCHEMA_DIGESTS: readonly string[] = [
+  'e33daf7b21b5d302bce41f1942b6904dfc999e47803a849124f432b7b0ab6f8a', // read_file
+  '903be00fe2e681346f907fa894cc385564c917ca0b2f3592aa3105a7b3d784a5', // write_file
+  '149c8a3c772fd0559613186775841bfba96976f67fe50aca8a46b747ba606cc6', // edit_file
+  '111f9fc12b20cbe1bdda0ae6e628912999373f4e8370e1cdf7ec6dd7c76f5a78', // append_file
+  '498122a0e72f921398557255700113f2826bba85924a53ef5ef23ecf6c8a071d', // delete_file
+  'bc1963b567d5472389e30d411cd15b1566f2a5a33fe56aa47e9005f7f66bd18d', // list_files
+  '32549242097a1af730743fa9e771146f9f90ebad8e8a0ad743781787412f3e4e', // glob_files
+  '587657c63ff45e2bfa0279b1e9b3998fc19c2f2b63fe7532b26347b2e5860e4a', // grep_files
+  '78503c97dcfba4d24d6e9e721bec320819e027585d3525e3f4322edda25d2149', // save_blob
+  'bdc16088fc975f35668be9244544f3958199806396e28f08de4f6716875663c5', // memory_search
+  'f85aafb3dedfd00fb0fb5244f739b3644b5bf604ad09bab389d8ae9d7e363d09', // memory_remember
+  'e27485ac542c932f000ce8e8ac1c54ffd427f9061a9bdd13f2e964d4b443aea5', // memory_correct
+  'f5a215126a939bac6ab6e561819233795746b3e4432d210bda8714d3a3c65b96', // memory_forget
+  'dd586e99185efe80abbc937c4680a2d11a4345abbe113cb11ac506ca297e18f8', // memory_reflect
+  '5960eecb3ba2d35745a487262873f9cde887a6f086a6be07e8edf20d90fc2fd5', // pet_say
+  'f8c9991d7e6e017d30f2799f091305b28a414f665bf49550bf8f5c0b7f5469f2', // pet_ask
+  '61a627c0b7d300e3bb3028719aaf85eac7c8a6dde20dbe59d9220d800d3a6078', // pet_ask (non-CJK cap)
+  '2ba24c39c25a543772cc246951749466e8afb898ecb881f3e90134556504d8cd', // pet_move_to
+  'd7b6ecae6b46512872fed34127429d59309a3190dc72601a35cc6ed9c699bd17', // pet_set
+  '24b25b3834e9d74ec23e1f013a7bad0104ab4ed4d17a1a73e4d169decbd15380', // pet_set (non-CJK cap)
+  '2955bc466d6fb919269674acab46827391968e233ddea5fdc3d7041f036b564f', // pet_quiet
+  'c28017cfd3dd08e8e362240b6118b740614f6d690782041168388cb8d713f226', // pet_act
+  'a66ef84bfa0d5ef28fd1fd08b295e57a053e3cd9e03cc39d1744a4a7877da715', // end_turn
+  '2cd825f3c61e7e4a8b4db5588c4309e6cc8b2e3e04159dcb10cb8449e9bda44d', // Growth memory_search
+  '76a31e0da8737c59895b274173c57f72537176285ca16e17db132d1de3c59f20', // propose_growth
+  'c9ccf69ea604aa774820a5b2bd65a07433e2751735d1c9ea011916a9a6489dbb', // propose_experience
+  'ab444af0aaa48bda6de9936b36d843b4af600ff03442ee2fc89a6716bfa34908', // finish_review
+];

@@ -1,5 +1,6 @@
-import type { ToolDef, ToolOutcome } from 'cortico/core/types.ts';
-import type { HindsightMemory } from './hindsight.ts';
+import { createHash } from 'node:crypto';
+import type { ToolDef, ToolOutcome, SourceMapSpan } from 'cortico/core/types.ts';
+import type { HindsightMemory, MemoryTextRead } from './hindsight.ts';
 import { evidenceCoversText } from './source-evidence.ts';
 import { MEMORY_SEARCH_DESCRIPTION, MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, WORKSPACE_HISTORY_EVIDENCE_DESCRIPTION, memoryReadNotice } from './model-text.ts';
 
@@ -7,6 +8,7 @@ export interface MemoryToolDeps {
   memory: () => HindsightMemory | null;
   currentUserSource?: (session: string) => string | null;
   currentReadSource?: (session: string) => string | null;
+  sourceSafeToolResults?: boolean;
 }
 
 function evidenceComplete(
@@ -19,6 +21,44 @@ function evidenceComplete(
   if (segments.length === 0 || evidence?.length !== segments.length
     || evidence.some((attachment) => attachment.validationStatus !== 'validated' || attachment.revisionState !== 'current')) return false;
   return !requireFullTextCoverage || evidenceCoversText(read.text, evidence);
+}
+
+function verifiedSourceText(output: string, evidence: ToolOutcome['evidence']): ToolOutcome {
+  let text = '';
+  const attachments: NonNullable<ToolOutcome['evidence']> = [];
+  const sourceMapSpans: SourceMapSpan[] = [];
+  for (const attachment of evidence ?? []) {
+    const segment = attachment.segment;
+    if (attachment.validationStatus !== 'validated' || attachment.revisionState !== 'current'
+      || !segment.sourceProof || !Number.isInteger(segment.start) || !Number.isInteger(segment.end)
+      || segment.start < 0 || segment.end <= segment.start || segment.end > output.length) continue;
+    const excerpt = output.slice(segment.start, segment.end);
+    if (createHash('sha256').update(excerpt).digest('hex') !== segment.digest) continue;
+    const { segment: _segment, ...source } = attachment;
+    const id = JSON.stringify(source.documentId);
+    if (text) text += '\n';
+    const idStart = text.length;
+    text += id;
+    sourceMapSpans.push({ start: idStart, end: text.length, digest: createHash('sha256').update(id).digest('hex'),
+      origin: 'source-identity', exposedSources: [source] });
+    text += '\n';
+    const start = text.length;
+    text += excerpt;
+    attachments.push({ ...attachment, segment: { ...segment, start, end: text.length } });
+  }
+  if (!text || attachments.length !== (evidence?.length ?? 0)) return { text: MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, failed: true };
+  return { text, evidence: attachments, sourceMapSpans };
+}
+
+function safeSearchResult(read: MemoryTextRead, output: string, evidence: ToolOutcome['evidence']): ToolOutcome {
+  const format = read.trace?.format;
+  if (read.status !== 'found' || read.sourceFactsTruncated || read.rejectedSourceDocumentIds?.length
+    || !evidenceComplete(read, evidence, false) || format?.sourceFactsTruncated
+    || format?.incompleteResultIds.length || format?.omittedSourceDocumentIds.length || format?.clippedResultIds.length
+    || format?.clippedContextResultIds.length || format?.clippedSourceFactIds.length) {
+    return { text: MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, failed: true };
+  }
+  return verifiedSourceText(output, evidence);
 }
 
 function withIncompleteEvidence(text: string): string {
@@ -34,7 +74,8 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
   return [
     {
       name: 'memory_search',
-      description: `${MEMORY_SEARCH_DESCRIPTION} ${WORKSPACE_HISTORY_EVIDENCE_DESCRIPTION}`,
+      description: `${deps.sourceSafeToolResults ? MEMORY_SEARCH_DESCRIPTION.replace('Returns dated memories;',
+        'Returns verified original source excerpts, each preceded by its quoted source ID;') : MEMORY_SEARCH_DESCRIPTION} ${WORKSPACE_HISTORY_EVIDENCE_DESCRIPTION}`,
       tags: ['read'],
       barrierAfter: true,
       parameters: {
@@ -55,6 +96,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
           if (!read.text) return memoryReadNotice(read.status);
           const evidence = await memory.evidenceForRead(read);
           const output = evidenceComplete(read, evidence, false) ? read.text : withIncompleteEvidence(read.text);
+          if (deps.sourceSafeToolResults) return safeSearchResult(read, output, evidence);
           return evidence.length ? { text: output, evidence } satisfies ToolOutcome : output;
         }
         const maxTokens = typeof args.max_tokens === 'number' && Number.isFinite(args.max_tokens)
@@ -69,6 +111,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         if (!read.text) return output;
         const evidence = await memory.evidenceForRead(read);
         if (!evidenceComplete(read, evidence, true)) output = withIncompleteEvidence(output);
+        if (deps.sourceSafeToolResults) return safeSearchResult(read, output, evidence);
         return evidence.length ? { text: output, evidence } satisfies ToolOutcome : output;
       },
     },

@@ -22,14 +22,14 @@ import { appendFileSync, closeSync, existsSync, fstatSync, fsyncSync, lstatSync,
 import { freemem, totalmem } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { LOG_SCHEME, blobScheme } from 'cortico/core/blobs.ts';
-import type { CoreApi, ContextEvidenceInspection, ContextHandoffPrepareContext, ContextHandoffSourceExcerpt, EvidenceAttachment, EventEnvelope, HandoffCommitCheck, PersonaWebUiDecl, PreparedContextHandoff, PrefixSegment, SessionDecl, SessionOpeningReason, SourceExposureRef, SourceMapSpan, StoragePart, SystemPrefixContext, ToolCallContext, ToolDef, ToolOutcome, WorldLifecycleEvent } from 'cortico/core/types.ts';
+import type { CoreApi, ContextEvidenceInspection, ContextHandoffPrepareContext, ContextHandoffSourceExcerpt, EvidenceAttachment, EventEnvelope, HandoffCommitCheck, PersonaWebUiDecl, PreparedContextHandoff, PrefixSegment, SessionDecl, SessionOpeningReason, SourceDependencyRecovery, SourceExposureRef, SourceMapSpan, StoragePart, SystemPrefixContext, ToolCallContext, ToolDef, ToolOutcome, WorldLifecycleEvent } from 'cortico/core/types.ts';
 import { message, withText, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import type { Language } from 'cortico/core/language.ts';
 import { HANDOFF_DIR, type Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import type { GitAuthor, WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
 import { memoryTools } from './memory/tools.ts';
-import type { HindsightMemory, MemoryEvidenceSegment } from './memory/hindsight.ts';
+import type { HindsightMemory, MemoryEvidenceSegment, PartnerSourceStatus } from './memory/hindsight.ts';
 import type { DerivedArtifact } from './memory/state-store.ts';
 import { evidenceCoversText } from './memory/source-evidence.ts';
 import { isMemoryForgetRequest } from './memory/router.ts';
@@ -43,13 +43,15 @@ import {
   partnerSegments,
   partnerWorkspaceDigest,
   readPartnerProvenance,
+  writePartnerProvenance,
+  type PartnerProvenanceEntry,
   type PartnerTextResult,
 } from './memory/partner-provenance.ts';
 import { SESSION_MAX_CALLS, type SelfTimeConfig } from './browser/config.ts';
 import { selfTimeLine } from './browser/model-text.ts';
 import { GROWTH_DEFAULTS, type GrowthConfig } from './growth/config.ts';
 import { GROWTH_SESSION, GROWTH_TOOL_NAMES, GrowthReview, growthMemorySearchTool } from './growth/review.ts';
-import { EXPERIENCE_CONTEXT_HEADER, ExperienceCards, experienceCardArtifactText, readExperienceCardInput } from './growth/experience-cards.ts';
+import { EXPERIENCE_CONTEXT_HEADER, ExperienceCards, experienceCardArtifactText, readExperienceCardInput, type ExperienceCard } from './growth/experience-cards.ts';
 import { GrowthProposals, growthProposalArtifactText, type GrowthProposal } from './growth/proposals.ts';
 import { GROWTH_CHECK_MS, GrowthSchedule } from './growth/schedule.ts';
 import { readResourcePressure } from './resource-pressure.ts';
@@ -80,6 +82,9 @@ export const SNAPSHOT_TAG = (version: string) => `start-${version}`;
 /** How long after a line a "don't remember that" still refers to it. */
 const FORGET_WINDOW_MS = 10 * 60_000;
 const MEMORY_TOOL_NAMES = new Set(['memory_search', 'memory_remember', 'memory_correct', 'memory_forget', 'memory_reflect']);
+const HANDOFF_DISCOVERY = 'Use list_files with dir handoffs to find handoff notes; verify a note and its current sources before using it.';
+/** Core's reserved synthetic call that carries an external event frame; mirrored read-only. */
+const EXTERNAL_EVENT_FRAME = 'external_event_frame';
 const WORKSPACE_READ_PATHS: Record<string, string> = {
   read_file: 'path',
   list_files: 'dir',
@@ -87,11 +92,42 @@ const WORKSPACE_READ_PATHS: Record<string, string> = {
   grep_files: 'path',
 };
 
+const PARTNER_USER_LABEL = '[workspace note; user-authored; no original event source is recorded]';
+const PARTNER_DERIVED_LABEL_PREFIX = '[workspace summary; source_ids=';
+const PARTNER_DERIVED_LABEL_SUFFIX = '; source references passed the local provenance and forget-fence checks; verify original Memory sources before citing history]';
+const PARTNER_READ_WITHHELD = '[read failed] PARTNER.md paragraphs are withheld because their provenance is not current.';
+const PARTNER_READ_WITHHELD_NOTICE = '[system] Some PARTNER.md paragraphs are withheld because their provenance is missing, stale, edited or ambiguous. The omitted statements are unknown, not false.';
+
+type PartnerSyncStatus = 'registered' | 'pending' | 'failed' | 'unavailable' | 'ignored';
+interface PartnerSyncResult {
+  status: PartnerSyncStatus;
+  current: number;
+  pending: number;
+  stale: number;
+  failed: number;
+}
+
+/** Fixed labels a PARTNER read may carry; anything else in a tool result needs a source. */
+export function isTrustedPartnerReadText(text: string): boolean {
+  if (text === PARTNER_USER_LABEL || text === PARTNER_READ_WITHHELD || text === PARTNER_READ_WITHHELD_NOTICE) return true;
+  if (!text.startsWith(PARTNER_DERIVED_LABEL_PREFIX) || !text.endsWith(PARTNER_DERIVED_LABEL_SUFFIX)) return false;
+  try {
+    const ids = JSON.parse(text.slice(PARTNER_DERIVED_LABEL_PREFIX.length, text.length - PARTNER_DERIVED_LABEL_SUFFIX.length));
+    return Array.isArray(ids) && ids.length > 0
+      && ids.every((id) => typeof id === 'string' && !!id && !/[\r\n\0]/u.test(id));
+  } catch {
+    return false;
+  }
+}
+
+function partnerSegmentLabel(segment: { origin: 'user-authored' | 'derived'; sourceIds: string[] }): string {
+  return segment.origin === 'derived'
+    ? `${PARTNER_DERIVED_LABEL_PREFIX}${JSON.stringify(segment.sourceIds)}${PARTNER_DERIVED_LABEL_SUFFIX}`
+    : PARTNER_USER_LABEL;
+}
+
 function partnerSegmentContextText(segment: { text: string; origin: 'user-authored' | 'derived'; sourceIds: string[] }): string {
-  const label = segment.origin === 'derived'
-    ? `[workspace summary; source_ids=${JSON.stringify(segment.sourceIds)}; source references passed the local provenance and forget-fence checks; verify original Memory sources before citing history]`
-    : '[workspace note; user-authored; no original event source is recorded]';
-  return `${label}\n${segment.text}`;
+  return `${partnerSegmentLabel(segment)}\n${segment.text}`;
 }
 
 function partnerEvidenceText(result: PartnerTextResult): string {
@@ -145,6 +181,17 @@ const WRITES: Record<string, { ok: string; verb: string }> = {
 
 const sha256 = (value: string | Uint8Array): string => createHash('sha256').update(value).digest('hex');
 const HANDOFF_OWNER_PREFIX = 'handoff-owner-v1:';
+
+/** True when the span is one whole part of a rendered handoff note, not an arbitrary substring. */
+function handoffNotePartOf(body: string, segment: string): boolean {
+  if (!segment.startsWith('# 交接笔记 · ') || !segment.endsWith('\n')) return false;
+  if (body === segment) return true;
+  const nextPart = (at: number): boolean => body.startsWith('# 交接笔记 · ', at);
+  if (body.startsWith(`${segment}\n`)) return nextPart(segment.length + 1);
+  if (body.endsWith(`\n${segment}`)) return true;
+  const at = body.indexOf(`\n${segment}\n`);
+  return at >= 0 && nextPart(at + segment.length + 2);
+}
 
 interface HandoffFileOwner {
   artifactId: string;
@@ -268,6 +315,9 @@ ${readFileSync(join(dir, name), 'utf8')}`, 'utf8');
 /** Coo's Persona class on `Base`, Cormini as the staged Cortico has it. */
 export interface MemoryDeps {
   memory?: HindsightMemory;
+  /** Rebuild the live system prefix after a user save changed PARTNER provenance. */
+  reloadPrefix?: () => Promise<void>;
+  sourceSafeToolResults?: boolean;
   /** The live `companion.selfTime`; null when the app does not have it. */
   selfTime?: () => SelfTimeConfig | null;
   modelLanguage?: () => ModelLanguage;
@@ -289,6 +339,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     /** Commits wait for the one before: Git's index takes one writer, and a turn often writes several files. */
     private commits: Promise<unknown> = Promise.resolve();
     private readonly longTerm = deps.memory ?? null;
+    private readonly reloadPrefixNow = deps.reloadPrefix ?? (() => Promise.resolve());
     private readonly selfTimeNow = deps.selfTime ?? (() => null);
     private readonly modelLang = deps.modelLanguage ?? (() => 'zh' as ModelLanguage);
     private readonly growthNow = deps.growth ?? (() => GROWTH_DEFAULTS);
@@ -303,11 +354,23 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     private readonly memoryContextBlocks = new Set<string>();
     private readonly partnerArtifacts = new Set<string>();
     private partnerArtifactEpoch: string | null = null;
+    private partnerSourceStates = new Map<string, PartnerSourceStatus>();
+    private partnerSourceStatesKey: string | null = null;
+    private partnerRecoveryAt = 0;
     private attachedCore: CoreApi | null = null;
+    private pendingOpening: string | null = null;
 
     override attach(core: CoreApi): void {
       this.attachedCore = core;
       super.attach(core);
+      if (typeof this.longTerm?.setPartnerSourceStatus === 'function') {
+        this.longTerm.setPartnerSourceStatus((documentId) => this.partnerSourceStatus(documentId));
+      }
+      void this.syncPartnerUserDocument(false).catch((error) => {
+        core.log.warn('PARTNER.md pending registrations could not be recovered', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
       this.longTerm?.setLifecycleHooks({
         forgetSources: (ids) => {
           let sidecarError: unknown;
@@ -316,6 +379,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           if (sidecar && scope) {
             try { markPartnerSourcesStale(sidecar, partnerWorkspaceDigest(this.memoryDir), scope, ids); }
             catch (error) { sidecarError = error; }
+            this.partnerSourceStatesKey = null;
           }
           const forgotten = new Set(ids);
           const proposals = this.growthProposals()?.list().filter((proposal) => proposal.sourceIds.some((id) => forgotten.has(id))) ?? [];
@@ -326,6 +390,9 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             const detail = [...proposalTitles, ...titles].length ? ` Withdraw these proposals or policies: ${[...proposalTitles, ...titles].join('; ')}.` : '';
             this.injectMemoryContext(`[memory] A source was forgotten. Do not use any linked proposal or experience policy.${detail}`);
           }
+          try { this.requestHandoffAfterDeliveredNoteForget(ids); }
+          catch { /* The source fence remains authoritative; handoff maintenance must not block Forget. */ }
+          if (this.hasApprovedExperienceCards()) void this.reloadSystemPrefixSafely();
           if (sidecarError) throw sidecarError;
         },
         clearDerived: () => {
@@ -334,6 +401,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           if (sidecar) {
             try { markPartnerDerivedStale(sidecar, partnerWorkspaceDigest(this.memoryDir), this.longTerm?.sourceScopeDigest() ?? null); }
             catch (error) { sidecarError = error; }
+            this.partnerSourceStatesKey = null;
           }
           const proposals = this.growthProposals()?.list().filter((proposal) => proposal.state === 'approved') ?? [];
           const cards = this.experienceCards()?.list('approved') ?? [];
@@ -341,6 +409,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             this.injectMemoryContext('[memory] Long-term memory was cleared. Do not use the retained Growth proposals or Experience cards; their source records are unavailable.');
           }
           this.injectMemoryContext('[memory] Long-term memory was cleared. Do not rely on Hindsight-derived context from before the clear.');
+          if (this.hasApprovedExperienceCards()) void this.reloadSystemPrefixSafely();
           if (sidecarError) throw sidecarError;
         },
       });
@@ -392,8 +461,8 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       this.growthCheck = null;
     }
 
-    override validateEvidenceForRequest(sources: readonly SourceExposureRef[]): boolean {
-      return sources.length === 0 || this.longTerm?.sourceExposureCurrent(sources) === true;
+    override validateEvidenceForRequest(sources: readonly SourceExposureRef[], inspection?: ContextEvidenceInspection): boolean {
+      return sources.length === 0 || (!!inspection && this.longTerm?.sourceEvidenceCurrent(inspection) === true);
     }
 
     private growthSnapshot(): ContextRecord[] {
@@ -418,6 +487,14 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     private experienceCards(): ExperienceCards | null {
       const dir = this.growthDirectory();
       return dir ? new ExperienceCards(join(dir, 'experience-cards')) : null;
+    }
+
+    /** Cheap check for the prefix hook; no directory scan when no card directory exists. */
+    private hasApprovedExperienceCards(): boolean {
+      const dir = this.growthDirectory();
+      if (!dir) return false;
+      const cardsDir = join(dir, 'experience-cards');
+      return existsSync(cardsDir) && (this.experienceCards()?.list('approved').length ?? 0) > 0;
     }
 
     private injectMemoryContext(text: string, evidence?: EvidenceAttachment[]): void {
@@ -465,10 +542,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         && sourceIds.every((id) => memory.sourceVisible(id));
     }
 
-    private async experienceContext(): Promise<{ text: string; evidence: EvidenceAttachment[] }> {
+    private async experienceEntries(): Promise<Array<{ card: ExperienceCard; text: string; evidence: EvidenceAttachment[] }>> {
       const cards = this.experienceCards();
       const memory = this.longTerm;
-      if (!cards || !memory?.enabled() || !memory.settled()) return { text: '', evidence: [] };
+      if (!cards || !memory?.enabled() || !memory.settled()) return [];
       const valid = new Set<string>();
       for (const card of cards.list('approved').slice(0, 8)) {
         const body = experienceCardArtifactText(card);
@@ -480,9 +557,9 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           : await this.verifiedRepeatedUserEventSources(card.sourceIds);
         if (sourcesValid) valid.add(card.id);
       }
-      if (!memory.enabled() || !memory.settled()) return { text: '', evidence: [] };
+      if (!memory.enabled() || !memory.settled()) return [];
       const entries = cards.approvedContextEntries(8, 3200, (card) => valid.has(card.id));
-      const included: Array<{ text: string; evidence: EvidenceAttachment[] }> = [];
+      const included: Array<{ card: ExperienceCard; text: string; evidence: EvidenceAttachment[] }> = [];
       for (const entry of entries) {
         const sourceIds = [...new Set(entry.card.sourceIds)];
         const segments: MemoryEvidenceSegment[] = sourceIds.map((documentId) => ({
@@ -490,21 +567,113 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         }));
         const evidence = await memory.evidenceForSegments(entry.text, segments);
         if (evidence.length !== segments.length || !evidenceCoversText(entry.text, evidence)) continue;
-        included.push({ text: entry.text, evidence });
+        included.push({ card: entry.card, text: entry.text, evidence });
       }
-      if (!memory.enabled() || !memory.settled() || included.length === 0) return { text: '', evidence: [] };
-      const text = `${EXPERIENCE_CONTEXT_HEADER}\n${included.map((entry) => entry.text).join('\n')}`;
+      return memory.enabled() && memory.settled() ? included : [];
+    }
+
+    private async experienceContext(): Promise<{ text: string; evidence: EvidenceAttachment[] }> {
+      const entries = await this.experienceEntries();
+      const text = entries.map((entry) => entry.text).join('\n');
       const evidence: EvidenceAttachment[] = [];
-      let offset = EXPERIENCE_CONTEXT_HEADER.length + 1;
-      for (let index = 0; index < included.length; index++) {
-        const entry = included[index]!;
+      let offset = 0;
+      for (let index = 0; index < entries.length; index++) {
+        const entry = entries[index]!;
         evidence.push(...entry.evidence.map((attachment) => ({
           ...attachment,
           segment: { ...attachment.segment, start: attachment.segment.start + offset, end: attachment.segment.end + offset },
         })));
-        offset += entry.text.length + (index + 1 < included.length ? 1 : 0);
+        offset += entry.text.length + (index + 1 < entries.length ? 1 : 0);
       }
       return { text, evidence };
+    }
+
+    private async reloadSystemPrefixSafely(): Promise<boolean> {
+      const core = this.core;
+      const reload = core?.reloadSystemPrefix;
+      if (!core || !reload) return false;
+      try {
+        await reload.call(core);
+        return true;
+      } catch {
+        try {
+          await reload.call(core);
+          return true;
+        } catch {
+          return false;
+        }
+      }
+    }
+
+    private withdrawExperienceContextArtifacts(cardId: string, reason: string): void {
+      const memory = this.longTerm;
+      if (!memory) return;
+      const list = (memory as unknown as { listDerivedArtifacts?: (kind: string) => DerivedArtifact[] })
+        .listDerivedArtifacts;
+      if (!list) return;
+      const prefix = `experience-context:${cardId}:`;
+      for (const artifact of list.call(memory, 'experience-context')) {
+        if (artifact.artifactId.startsWith(prefix) && artifact.lifecycleState === 'active') {
+          memory.withdrawDerivedArtifact(artifact.artifactId, reason);
+        }
+      }
+    }
+
+    /**
+     * A user-approved Experience entry is rendered as its own derived artifact. The system-prefix
+     * span then points at that artifact's exact body digest and current sources, so Core can accept
+     * the text without pretending it is a literal slice of an external document.
+     */
+    private async experiencePrefixSegment(): Promise<PrefixSegment | null> {
+      const entries = await this.experienceEntries();
+      const memory = this.longTerm;
+      if (!memory || entries.length === 0) return null;
+      const expectedEpoch = memory.evidenceEpoch();
+      if (!expectedEpoch) return null;
+      const included: Array<{ text: string; digest: string; sources: SourceExposureRef[] }> = [];
+      for (const entry of entries) {
+        const digest = sha256(entry.text);
+        const artifactId = `experience-context:${entry.card.id}:${digest.slice(0, 16)}`;
+        if (!memory.derivedArtifact(artifactId)) {
+          await memory.registerDerivedArtifactFromSources({
+            artifactId,
+            kind: 'experience-context',
+            target: `experience-context/${entry.card.id}.txt`,
+            content: entry.text,
+            origin: entry.card.userExplicit ? 'user-authored' : 'model-derived',
+            reviewState: 'approved',
+            creatorOperationId: `experience-context:${entry.card.id}`,
+            sourceIds: entry.card.sourceIds,
+            expectedEpoch,
+          });
+        }
+        const artifact = memory.derivedArtifact(artifactId);
+        if (!artifact || artifact.lifecycleState !== 'active' || artifact.reviewState !== 'approved'
+          || artifact.bodyDigest !== digest || !await memory.verifyDerivedArtifact(artifactId, entry.text)) continue;
+        for (const old of memory.listDerivedArtifacts('experience-context')) {
+          if (old.artifactId.startsWith(`experience-context:${entry.card.id}:`) && old.artifactId !== artifactId
+            && old.lifecycleState === 'active') {
+            memory.withdrawDerivedArtifact(old.artifactId, 'experience-context-replaced');
+          }
+        }
+        const sources = entry.evidence.map(({ segment: _segment, ...source }) => source);
+        included.push({ text: entry.text, digest, sources });
+      }
+      if (included.length === 0) return null;
+      const text = `${EXPERIENCE_CONTEXT_HEADER}\n${included.map((entry) => entry.text).join('\n')}`;
+      const sourceMapSpans: SourceMapSpan[] = [{
+        start: 0, end: EXPERIENCE_CONTEXT_HEADER.length,
+        digest: sha256(EXPERIENCE_CONTEXT_HEADER), origin: 'core-generated',
+      }];
+      let offset = EXPERIENCE_CONTEXT_HEADER.length + 1;
+      for (const entry of included) {
+        sourceMapSpans.push({
+          start: offset, end: offset + entry.text.length, digest: entry.digest,
+          origin: 'artifact-derived', exposedSources: entry.sources,
+        });
+        offset += entry.text.length + 1;
+      }
+      return { title: 'EXPERIENCE', text, sourceMapSpans };
     }
 
     private systemHealth(): Record<string, unknown> {
@@ -674,7 +843,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       const entries = new Map(provenance.file.entries.map((entry) => [entry.segmentDigest, entry]));
       const epochCurrent = !!this.longTerm && this.partnerArtifactEpoch === this.longTerm.evidenceEpoch();
       const segments = filtered.segments.filter((segment) => {
-        if (segment.origin === 'user-authored') return true;
+        if (segment.origin === 'user-authored') return false;
         const entry = entries.get(partnerSegmentDigest(segment.text));
         return !!entry && epochCurrent && this.partnerArtifacts.has(entry.id)
           && this.longTerm?.derivedArtifactIsCurrent(`partner:${entry.id}`, partnerSegmentContextText(segment)) === true;
@@ -691,7 +860,276 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
 
     private partnerDocumentForRead(): string {
       const result = this.partnerProvenanceResult();
-      return partnerEvidenceText(result) || '[read failed] PARTNER.md paragraphs are withheld because their provenance is not current.';
+      return partnerEvidenceText(result) || PARTNER_READ_WITHHELD;
+    }
+
+    private partnerSyncEmpty(status: PartnerSyncStatus): PartnerSyncResult {
+      return { status, current: 0, pending: 0, stale: 0, failed: 0 };
+    }
+
+    /** A pending source is current only after its exact read-back succeeds. */
+    private async partnerNoteReadback(text: string, documentId: string): Promise<boolean> {
+      try {
+        const evidence = await this.longTerm?.evidenceForSegments(text,
+          [{ documentId, start: 0, end: text.length, derived: true }], { allowedPendingPartnerId: documentId }) ?? [];
+        return evidence.length === 1
+          && evidence[0]!.validationStatus === 'validated'
+          && evidence[0]!.revisionState === 'current';
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * Recall asks this map, not the sidecar field alone. A source is current only while its
+     * paragraph is still in the saved PARTNER.md, its entry is current, and every source ref is
+     * still visible and unsuperseded.
+     */
+    private loadPartnerSourceStates(): void {
+      const sidecar = this.partnerProvenanceFile();
+      const file = this.partnerDocFile();
+      let sidecarText = '';
+      let partnerText = '';
+      try {
+        if (sidecar && existsSync(sidecar)) sidecarText = readFileSync(sidecar, 'utf8');
+        if (existsSync(file) && statSync(file).isFile()) partnerText = readFileSync(file, 'utf8');
+      } catch {
+        this.partnerSourceStates = new Map();
+        this.partnerSourceStatesKey = null;
+        return;
+      }
+      const key = sha256(`${sidecarText}\0${partnerText}`);
+      if (key === this.partnerSourceStatesKey) return;
+      const states = new Map<string, PartnerSourceStatus>();
+      try {
+        if (sidecar) {
+          const read = readPartnerProvenance(sidecar, partnerWorkspaceDigest(this.memoryDir));
+          if (read.status === 'ok') {
+            const counts = new Map<string, number>();
+            for (const segment of partnerSegments(partnerText)) counts.set(segment.digest, (counts.get(segment.digest) ?? 0) + 1);
+            for (const entry of read.file.entries) {
+              const visible = entry.state === 'current'
+                && (counts.get(entry.segmentDigest) ?? 0) === 1
+                && (entry.origin !== 'derived' || (!!this.longTerm
+                  && typeof this.longTerm.sourceScopeDigest === 'function'
+                  && typeof this.longTerm.sourceCurrentForContext === 'function'
+                  && entry.sourceScopeDigest === this.longTerm.sourceScopeDigest()
+                  && entry.sourceIds.every((id) => this.longTerm?.sourceCurrentForContext(id) === true)));
+              for (const id of entry.sourceIds) states.set(id, visible ? 'current' : 'superseded');
+            }
+          }
+        }
+      } catch {
+        states.clear();
+      }
+      this.partnerSourceStates = states;
+      this.partnerSourceStatesKey = key;
+    }
+
+    private partnerSourceStatus(documentId: string): PartnerSourceStatus | null {
+      if (!documentId.startsWith('partner-user:')) return null;
+      this.loadPartnerSourceStates();
+      return this.partnerSourceStates.get(documentId) ?? 'superseded';
+    }
+
+    /**
+     * Reconcile the saved PARTNER.md with its sidecar. A panel save may register new paragraphs;
+     * recovery only retries entries already marked pending. Removed or edited paragraphs become
+     * stale history. An incidental re-save does not revive them; an explicit panel save creates a
+     * new version unless its old source ID is Forget-fenced.
+     */
+    private async syncPartnerUserDocument(registerNew: boolean, retireMissing = false, forceRecovery = false): Promise<PartnerSyncResult> {
+      const memory = this.longTerm;
+      const sidecar = this.partnerProvenanceFile();
+      if (!memory || !sidecar || typeof memory.sourceScopeDigest !== 'function'
+        || typeof memory.retainPartnerNote !== 'function') return this.partnerSyncEmpty('unavailable');
+      const file = this.partnerDocFile();
+      const fileExists = existsSync(file);
+      if (!fileExists && !retireMissing) return this.partnerSyncEmpty('ignored');
+      let source = '';
+      try {
+        if (fileExists) {
+          if (!statSync(file).isFile() || !insidePath(realpathSync(this.memoryDir), realpathSync(file))) {
+            return this.partnerSyncEmpty('failed');
+          }
+          source = readFileSync(file, 'utf8');
+        }
+      } catch {
+        return this.partnerSyncEmpty('failed');
+      }
+      const scope = memory.sourceScopeDigest();
+      if (!scope) return this.partnerSyncEmpty('unavailable');
+      const workspaceDigest = partnerWorkspaceDigest(this.memoryDir);
+      const stored = readPartnerProvenance(sidecar, workspaceDigest);
+      if (stored.status !== 'ok' && stored.status !== 'missing') return this.partnerSyncEmpty('failed');
+      const entries = stored.status === 'ok' ? [...stored.file.entries] : [];
+      const byDigest = new Map(entries.map((entry) => [entry.segmentDigest, entry]));
+      const segments = partnerSegments(source);
+      const counts = new Map<string, number>();
+      for (const segment of segments) counts.set(segment.digest, (counts.get(segment.digest) ?? 0) + 1);
+      const currentDigests = new Set([...counts.entries()]
+        .filter(([, count]) => count === 1)
+        .map(([digest]) => digest));
+      let changed = false;
+      let recovered = false;
+      const mark = (entry: PartnerProvenanceEntry, state: PartnerProvenanceEntry['state']): void => {
+        if (entry.state === state) return;
+        entry.state = state;
+        changed = true;
+      };
+
+      // Anything no longer uniquely present in the saved file is history, not a current fact.
+      for (const entry of entries) {
+        if (entry.state !== 'stale' && !currentDigests.has(entry.segmentDigest)) mark(entry, 'stale');
+      }
+
+      for (const segment of segments) {
+        if ((counts.get(segment.digest) ?? 0) !== 1) continue;
+        const entry = byDigest.get(segment.digest);
+        const scopeMismatch = !!entry && entry.origin === 'derived' && entry.sourceScopeDigest !== scope;
+        if (entry?.state === 'stale') {
+          if (!registerNew) continue;
+          const forgotten = typeof memory.sourceFenced === 'function'
+            && entry.sourceIds.some((sourceId) => memory.sourceFenced!(sourceId));
+          if (forgotten) continue;
+          const retention = memory.retainPartnerNote(segment.text, workspaceDigest, { reviveDead: true, version: randomUUID() });
+          if (!retention) continue;
+          const next: PartnerProvenanceEntry = {
+            id: segment.digest,
+            segmentDigest: segment.digest,
+            origin: 'derived',
+            sourceIds: [retention.documentId],
+            sourceScopeDigest: scope,
+            state: retention.status === 'forgotten' || retention.status === 'blocked'
+              ? 'stale'
+              : await this.partnerNoteReadback(segment.text, retention.documentId) ? 'current' : 'pending',
+          };
+          entries[entries.indexOf(entry)] = next;
+          byDigest.set(segment.digest, next);
+          changed = true;
+          continue;
+        }
+        if (entry?.state === 'current' && entry.origin === 'derived' && !scopeMismatch) continue;
+        if (entry?.state === 'pending') {
+          if (!registerNew && !forceRecovery && Date.now() < this.partnerRecoveryAt) continue;
+          if (entry.sourceIds.length !== 1) {
+            mark(entry, 'stale');
+            continue;
+          }
+          const storedId = entry.sourceIds[0]!;
+          const retention = memory.retainPartnerNote(segment.text, workspaceDigest,
+            { documentId: storedId, reviveDead: registerNew });
+          if (!retention || retention.documentId !== storedId) continue;
+          if (retention.status === 'forgotten' || retention.status === 'blocked') {
+            mark(entry, 'stale');
+            continue;
+          }
+          if (await this.partnerNoteReadback(segment.text, storedId)) {
+            mark(entry, 'current');
+            recovered = true;
+          }
+          continue;
+        }
+        if (!registerNew) continue;
+        if (!entry || entry.origin === 'user-authored' || scopeMismatch) {
+          const retention = memory.retainPartnerNote(segment.text, workspaceDigest, { reviveDead: registerNew });
+          if (!retention) continue;
+          const next: PartnerProvenanceEntry = {
+            id: segment.digest,
+            segmentDigest: segment.digest,
+            origin: 'derived',
+            sourceIds: [retention.documentId],
+            sourceScopeDigest: scope,
+            state: retention.status === 'forgotten' || retention.status === 'blocked'
+              ? 'stale'
+              : await this.partnerNoteReadback(segment.text, retention.documentId) ? 'current' : 'pending',
+          };
+          if (entry) entries[entries.indexOf(entry)] = next;
+          else entries.push(next);
+          byDigest.set(segment.digest, next);
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        try {
+          writePartnerProvenance(sidecar, { v: 1, workspaceDigest, entries });
+        } catch {
+          return this.partnerSyncEmpty('failed');
+        }
+        this.partnerArtifacts.clear();
+        this.partnerArtifactEpoch = null;
+        this.partnerSourceStatesKey = null;
+        if (registerNew || recovered) {
+          void this.reloadPrefixNow().catch((error) => {
+            this.core?.log.warn('PARTNER.md prefix reload failed', {
+              message: error instanceof Error ? error.message : String(error),
+            });
+          });
+        }
+      }
+
+      this.loadPartnerSourceStates();
+      const current = entries.filter((entry) => entry.state === 'current').length;
+      const pending = entries.filter((entry) => entry.state === 'pending').length;
+      const stale = entries.filter((entry) => entry.state === 'stale').length;
+      let failed = 0;
+      for (const digest of currentDigests) {
+        const entry = byDigest.get(digest);
+        if (!entry || entry.state === 'stale' || entry.origin === 'user-authored'
+          || (entry.origin === 'derived' && entry.sourceScopeDigest !== scope)) failed += 1;
+      }
+      for (const count of counts.values()) if (count > 1) failed += count;
+      const status: PartnerSyncStatus = failed > 0 ? 'failed' : pending > 0 ? 'pending' : 'registered';
+      this.partnerRecoveryAt = registerNew || pending === 0 ? 0 : Date.now() + 60_000;
+      return { status, current, pending, stale, failed };
+    }
+
+    private async registerPartnerUserDocument(): Promise<PartnerSyncResult> {
+      return this.syncPartnerUserDocument(true, true);
+    }
+
+    /** A read result whose paragraphs each carry the same verified derived-artifact proof as the system prefix. */
+    private async partnerReadOutcome(): Promise<string | ToolOutcome> {
+      const result = this.partnerProvenanceResult();
+      if (result.status !== 'ok') return this.partnerStaticRead(PARTNER_READ_WITHHELD);
+      const segments = result.segments.filter((segment) => segment.origin === 'derived');
+      if (!segments.length) return this.partnerStaticRead(PARTNER_READ_WITHHELD);
+      const memory = this.longTerm;
+      if (!memory) return this.partnerStaticRead(PARTNER_READ_WITHHELD);
+      const sidecar = this.partnerProvenanceFile();
+      const provenance = sidecar ? readPartnerProvenance(sidecar, partnerWorkspaceDigest(this.memoryDir)) : { status: 'missing' as const };
+      const entries = provenance.status === 'ok'
+        ? new Map(provenance.file.entries.map((entry) => [entry.segmentDigest, entry]))
+        : new Map();
+      const parts = segments.map((segment) => partnerSegmentContextText(segment));
+      const body = parts.join('\n\n');
+      const notice = result.withheldSegments > 0 ? PARTNER_READ_WITHHELD_NOTICE : '';
+      const text = notice ? `${body}\n\n${notice}` : body;
+      const sourceMapSpans: SourceMapSpan[] = [];
+      let offset = 0;
+      for (const [index, segment] of segments.entries()) {
+        const content = parts[index]!;
+        const entry = entries.get(partnerSegmentDigest(segment.text));
+        if (!entry || this.partnerArtifactEpoch !== memory.evidenceEpoch() || !this.partnerArtifacts.has(entry.id)
+          || !await memory.verifyDerivedArtifact(`partner:${entry.id}`, content)) {
+          return this.partnerStaticRead(PARTNER_READ_WITHHELD);
+        }
+        const evidence = await memory.evidenceForSegments(content,
+          segment.sourceIds.map((documentId) => ({ documentId, start: 0, end: content.length, derived: true })));
+        const exposedSources = evidence.map(({ segment: _segment, ...source }) => source);
+        if (exposedSources.length !== segment.sourceIds.length
+          || !exposedSources.every((source) => segment.sourceIds.includes(source.documentId))
+          || !evidenceCoversText(content, evidence)) return this.partnerStaticRead(PARTNER_READ_WITHHELD);
+        sourceMapSpans.push({ start: offset, end: offset + content.length, digest: sha256(content), origin: 'artifact-derived', exposedSources });
+        offset += content.length + 2;
+      }
+      if (notice) sourceMapSpans.push({ start: body.length + 2, end: text.length, digest: sha256(notice), origin: 'core-generated' });
+      return { text, sourceMapSpans };
+    }
+
+    private partnerStaticRead(text: string): ToolOutcome {
+      return { text, sourceMapSpans: [{ start: 0, end: text.length, digest: sha256(text), origin: 'core-generated' }] };
     }
 
     protected override writeGuard(op: 'write' | 'append' | 'rename' | 'delete', path: string, role: string): string | null {
@@ -723,6 +1161,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     }
 
     override async systemSegments(ctx: SystemPrefixContext): Promise<PrefixSegment[]> {
+      await this.syncPartnerUserDocument(false);
       await this.ensurePartnerArtifacts();
       const segments = await super.systemSegments(ctx);
       const partner = segments.find((segment) => segment.title === 'PARTNER');
@@ -743,47 +1182,128 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         const seedConstitution = !!constitution?.sourceMapSpans?.some((span) => span.start === 0
           && span.end === constitution.text.length && span.origin === 'core-generated'
           && span.digest === sha256(constitution.text));
-        const partnerSources = this.partnerWorkspaceSources(segments.find((segment) => segment.title === 'PARTNER'));
         if (unique) {
-          workspace.sourceMapSpans = this.workspaceListingSourceMap(listing, seedConstitution, partnerSources)
+          workspace.sourceMapSpans = this.workspaceListingSourceMap(listing, seedConstitution)
             .map((span) => ({ ...span, start: span.start + start, end: span.end + start }));
         }
+      }
+      // Reviewed Experience text is a Persona rendering, not a user event. Its exact text,
+      // boundaries and digests travel through the system-prefix source map. Skip the async
+      // render entirely when no card is approved, so unrelated prefix builds keep their timing.
+      if (this.longTerm?.enabled() && this.hasApprovedExperienceCards()) {
+        const experience = await this.experiencePrefixSegment();
+        if (experience) segments.push(experience);
       }
       return segments;
     }
 
-    private partnerWorkspaceSources(partner: PrefixSegment | undefined): SourceExposureRef[] | null {
-      if (!partner) return null;
-      const covered = new Uint8Array(partner.text.length);
-      const sources = new Map<string, SourceExposureRef>();
-      for (const span of partner.sourceMapSpans ?? []) {
-        if (!Number.isInteger(span.start) || !Number.isInteger(span.end) || span.start < 0
-          || span.end <= span.start || span.end > partner.text.length
-          || span.digest !== sha256(partner.text.slice(span.start, span.end))) return null;
-        if (span.origin === 'unknown-derived' || span.origin === 'user-input') return null;
-        if (span.origin === 'hindsight-source' || span.origin === 'generation-derived') {
-          if (!span.exposedSources?.length) return null;
-          for (const source of span.exposedSources) {
-            const key = JSON.stringify([source.bankId, source.endpoint, source.documentId]);
-            const previous = sources.get(key);
-            if (previous && (previous.contentDigest !== source.contentDigest
-              || previous.validatedEpoch !== source.validatedEpoch)) return null;
-            sources.set(key, source);
+    async revalidateGenerationProofSources(sources: readonly SourceExposureRef[]): Promise<readonly SourceExposureRef[] | null> {
+      return this.longTerm?.revalidateSourceExposures(sources) ?? null;
+    }
+
+    async revalidateSourceDependencies(records: readonly ContextRecord[], events: readonly EventEnvelope[] = []): Promise<SourceDependencyRecovery[]> {
+      const memory = this.longTerm;
+      if (!memory) return [];
+      await this.recoverHandoffFiles();
+      const handoffFiles = memory.listHandoffArtifacts().flatMap((artifact) => {
+        // A forgotten source marks the mixed note stale. Its still-current parts may be
+        // re-read from the bodyDigest-bound file, but only for per-part recovery; the stale
+        // artifact is never admitted as a whole note.
+        const recoverable = artifact.lifecycleState === 'active'
+          || (artifact.lifecycleState === 'stale' && artifact.lineageState === 'complete' && artifact.sources.length > 0);
+        if (!recoverable || !artifact.target.startsWith(HANDOFF_DIR)) return [];
+        const owner = handoffOwner(artifact);
+        if (!owner) return [];
+        const path = resolve(this.memoryDir, artifact.target);
+        if (!insidePath(resolve(this.memoryDir), path) || !handoffFileMatches(path, owner, artifact.bodyDigest)) return [];
+        try {
+          return [{
+            target: artifact.target,
+            text: readFileSync(path, 'utf8'),
+            sources: artifact.sources,
+            sourceFree: artifact.lineageState === 'source-independent' && artifact.sources.length === 0,
+          }];
+        } catch { return []; }
+      });
+      const inputs: Array<{ text: string; digest: string; exposedSources: readonly SourceExposureRef[] }> = [];
+      const spans: Array<{ proofId: string; digest: string; exposedSources: SourceExposureRef[] }> = [];
+      const sourceFree: SourceDependencyRecovery[] = [];
+      for (const record of records) {
+        const text = textOf(record);
+        for (const span of record.context.sourceDependencySpans ?? []) {
+          if (!span || !Array.isArray(span.exposedSources)
+            || typeof span.proofId !== 'string' || !span.proofId.trim()
+            || !Number.isInteger(span.start) || !Number.isInteger(span.end)
+            || span.start < 0 || span.end <= span.start || span.end > text.length
+            || !/^[a-f0-9]{64}$/.test(span.digest)) continue;
+          const segment = text.slice(span.start, span.end);
+          if (sha256(segment) !== span.digest) continue;
+          if (span.exposedSources.length === 0) {
+            // The handoff notice itself is a fixed instruction, not historical content. It must
+            // remain usable after its note file is withdrawn, otherwise the stale note takes the
+            // whole new conversation down with it. The delivery count is cosmetic, and a
+            // source-free note part is accepted only while its active note file still contains
+            // that exact part. A mixed note keeps its parts on the source-bearing path.
+            const staticNotice = (file: string): boolean => segment === this.handoffNoteAt(file);
+            const fileInText = /saved in (handoffs\/[^\s]+\.md):/.exec(segment)?.[1];
+            const noticeRecord = record.item.type === 'message' && record.item.role === 'user'
+              && !record.context.frame?.events?.length && !record.context.evidence?.length
+              && !record.context.sourceIndependentSpans?.length && !record.context.sourceMapSpans?.length;
+            const deliveryNotice = noticeRecord && /^\[system\] \d+ new events?\.$/.test(segment);
+            const belongsToHandoff = (record.context.frame?.events ?? []).some((event) =>
+              event.type === HANDOFF_NOTE_TYPE && event.start < span.end && event.start + event.chars > span.start);
+            const notePart = belongsToHandoff && handoffFiles.some((file) =>
+              file.sourceFree && handoffNotePartOf(file.text, segment));
+            if (staticNotice('handoffs/') || (this.lastHandoffFile && staticNotice(this.lastHandoffFile))
+              || (fileInText && staticNotice(fileInText)) || deliveryNotice || notePart) {
+              sourceFree.push({ proofId: span.proofId, digest: span.digest, persistedSources: [], currentSources: [] });
+            }
+            continue;
           }
+          const belongsToHandoff = (record.context.frame?.events ?? []).some((event) =>
+            event.type === HANDOFF_NOTE_TYPE && event.start < span.end && event.start + event.chars > span.start);
+          if (belongsToHandoff && !handoffFiles.some((file) => file.text.includes(segment)
+            && span.exposedSources.every((source) => file.sources.some((dependency) => dependency.bankId === source.bankId
+              && dependency.endpoint === source.endpoint && dependency.documentId === source.documentId
+              && dependency.contentDigest === source.contentDigest)))) continue;
+          inputs.push({ text: segment, digest: span.digest, exposedSources: span.exposedSources });
+          spans.push({ proofId: span.proofId, digest: span.digest, exposedSources: span.exposedSources });
         }
-        for (let at = span.start; at < span.end; at++) covered[at] = 1;
       }
-      if (sources.size === 0) return null;
-      for (let at = 0; at < partner.text.length; at++) {
-        if (!/\s/u.test(partner.text[at]!) && covered[at] !== 1) return null;
+      for (const event of events) {
+        const dependency = event.sourceDependencies;
+        if (!dependency?.proofId || !Array.isArray(dependency.exposedSources)
+          || dependency.contentDigest !== sha256(event.text)) continue;
+        if (dependency.exposedSources.length === 0) {
+          const deliveryNotice = event.origin === 'internal'
+            && /^\[system\] \d+ new events?\.$/.test(event.text);
+          const notePart = event.type === HANDOFF_NOTE_TYPE && handoffFiles.some((file) =>
+            file.sourceFree && handoffNotePartOf(file.text, event.text));
+          if (deliveryNotice || notePart) {
+            sourceFree.push({ proofId: dependency.proofId, digest: dependency.contentDigest,
+              persistedSources: [], currentSources: [] });
+          }
+          continue;
+        }
+        if (event.type === HANDOFF_NOTE_TYPE && !handoffFiles.some((file) => file.text.includes(event.text)
+          && dependency.exposedSources.every((source) => file.sources.some((entry) => entry.bankId === source.bankId
+            && entry.endpoint === source.endpoint && entry.documentId === source.documentId
+            && entry.contentDigest === source.contentDigest)))) continue;
+        inputs.push({ text: event.text, digest: dependency.contentDigest, exposedSources: dependency.exposedSources });
+        spans.push({ proofId: dependency.proofId, digest: dependency.contentDigest, exposedSources: dependency.exposedSources });
       }
-      return [...sources.values()];
+      const current = await memory.revalidateSourceDependencies(inputs);
+      return [...sourceFree, ...spans.flatMap((span, index) => current[index] ? [{
+        proofId: span.proofId,
+        digest: span.digest,
+        persistedSources: span.exposedSources,
+        currentSources: current[index]!,
+      }] : [])];
     }
 
     private workspaceListingSourceMap(
       text: string,
       seedConstitution: boolean,
-      partnerSources: readonly SourceExposureRef[] | null,
     ): SourceMapSpan[] {
       const heading = 'Files in your workspace:';
       if (!text.startsWith(`${heading}\n`)) return [];
@@ -792,9 +1312,11 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       for (const line of text.slice(start).split('\n')) {
         if (seedConstitution && line === `- ${CONSTITUTION_FILE}`) {
           spans.push({ start, end: start + line.length, digest: sha256(line), origin: 'core-generated' });
-        } else if (partnerSources?.length && line === `- ${PARTNER_FILE}`) {
-          spans.push({ start, end: start + line.length, digest: sha256(line), origin: 'hindsight-source',
-            exposedSources: [...partnerSources] });
+        } else if (line === `- ${HANDOFF_DISCOVERY}` && start + line.length === text.length) {
+          spans.push({ start, end: start + line.length, digest: sha256(line), origin: 'core-generated' });
+        } else if (line === `- ${PARTNER_FILE}`) {
+          spans.push({ start, end: start + 2, digest: sha256('- '), origin: 'core-generated' });
+          spans.push({ start: start + 2, end: start + line.length, digest: sha256(PARTNER_FILE), origin: 'core-generated' });
         }
         start += line.length + 1;
       }
@@ -870,7 +1392,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
               && exposedSources.every((sourceRef) => sourceIds.has(sourceRef.documentId))
               && evidenceCoversText(entry.text, evidence);
             spans.push(complete
-              ? { start, end, digest: sha256(entry.text), origin: 'hindsight-source', exposedSources }
+              ? { start, end, digest: sha256(entry.text), origin: 'artifact-derived', exposedSources }
               : { start, end, digest: sha256(entry.text), origin: 'unknown-derived' });
           } else {
             spans.push({ start, end, digest: sha256(entry.text), origin: 'unknown-derived' });
@@ -945,8 +1467,9 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
               return '[workspace read failed] The resolved path is unavailable through workspace tools.';
             }
             if (tool.name === 'read_file' && (path === PARTNER_FILE || resolved === PARTNER_FILE)) {
+              await this.syncPartnerUserDocument(false, false, true);
               await this.ensurePartnerArtifacts();
-              return this.partnerDocumentForRead();
+              return this.partnerReadOutcome();
             }
             if (tool.name === 'read_file' && (path?.startsWith(HANDOFF_DIR) || resolved?.startsWith(HANDOFF_DIR))) {
               await this.recoverHandoffFiles();
@@ -968,6 +1491,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       });
       return [...base, ...memoryTools({
         memory: () => this.longTerm,
+        sourceSafeToolResults: deps.sourceSafeToolResults,
         currentReadSource: (session) => session === 'main' ? this.lastUserMemory?.documentId ?? null : null,
         currentUserSource: (session) => session === 'main' && Date.now() - (this.lastUserMemory?.at ?? 0) < FORGET_WINDOW_MS
           ? this.lastUserMemory?.documentId ?? null
@@ -1257,7 +1781,39 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         if (panel === 'hindsight') return this.hindsightInvoke(method, args);
         if (panel === 'action-receipts') return this.actionReceiptsInvoke(method, args);
         if (!baseInvoke) throw new Error(`No handler for panel ${panel}`);
-        return baseInvoke(panel, method, args);
+        const result = await baseInvoke(panel, method, args) as { ok?: boolean; revision?: string } | null;
+        const from = args[0];
+        const to = method === 'rename' ? args[1] : args[0];
+        const touchesPartner = panel === 'workspace'
+          && (method === 'write' || method === 'rename' || method === 'remove')
+          && (this.workspaceRelativePath(from) === PARTNER_FILE || this.workspaceRelativePath(to) === PARTNER_FILE);
+        if (touchesPartner && result?.ok === true) {
+          let verified = method !== 'write';
+          if (method === 'write') {
+            try {
+              verified = typeof result.revision === 'string' && result.revision.length > 0
+                && sha256(readFileSync(this.partnerDocFile(), 'utf8')) === result.revision;
+            } catch {
+              verified = false;
+            }
+          }
+          if (!verified) return { ...result, memoryRegistration: 'failed' };
+          try {
+            const registration = await this.registerPartnerUserDocument();
+            return {
+              ...result,
+              memoryRegistration: registration.status,
+              memoryRegistrationPending: registration.pending,
+              memoryRegistrationFailed: registration.failed,
+            };
+          } catch (error) {
+            this.core?.log.warn('PARTNER.md user provenance could not be registered', {
+              message: error instanceof Error ? error.message : String(error),
+            });
+            return { ...result, memoryRegistration: 'failed' };
+          }
+        }
+        return result;
       };
       return {
         ...decl,
@@ -1337,13 +1893,17 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           if (!await memory.verifyDerivedArtifact(current.id, growthProposalArtifactText(current))) {
             throw new Error('The proposal provenance is missing, stale or no longer matches its sources.');
           }
-          if (!memory.setDerivedArtifactReviewState(current.id, 'approved')) {
-            throw new Error('The proposal artifact could not be approved in the provenance store.');
-          }
+          if (current.state !== 'candidate') throw new Error('The proposal is no longer a candidate. Refresh the list.');
         }
         const proposal = store?.transition(id, action, String(args[2] ?? ''));
         if (!proposal) throw new Error('The proposal is no longer a candidate. Refresh the list.');
-        if (action === 'rejected') this.longTerm?.setDerivedArtifactReviewState(id, 'rejected');
+        if (action === 'approved') {
+          if (!this.longTerm?.setDerivedArtifactReviewState(id, 'approved')) {
+            throw new Error('The proposal artifact could not be approved in the provenance store.');
+          }
+        } else {
+          this.longTerm?.setDerivedArtifactReviewState(id, 'rejected');
+        }
         return proposal;
       }
       if (method === 'growth-proposal-apply') throw new Error('Growth proposal application is not enabled.');
@@ -1453,19 +2013,9 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           this.longTerm?.setDerivedArtifactReviewState(id, 'rejected');
           this.longTerm?.withdrawDerivedArtifact(id, 'experience-policy-deprecated');
         }
-        if (action === 'approved') {
-          const context = await this.experienceContext();
-          if (context.text) this.injectMemoryContext(context.text, context.evidence);
-        } else if (action === 'deprecated') {
-          const context = await this.experienceContext();
-          const notice = `[memory] The user revoked the experience strategy “${before?.title ?? id}”. Do not follow it anymore.`;
-          const text = context.text ? `${notice} ${context.text}` : `${notice} No approved experience strategies remain active.`;
-          const offset = notice.length + 1;
-          const evidence = context.evidence.map((attachment) => ({
-            ...attachment,
-            segment: { ...attachment.segment, start: attachment.segment.start + offset, end: attachment.segment.end + offset },
-          }));
-          this.injectMemoryContext(text, evidence);
+        if (action === 'rejected' || action === 'deprecated') this.withdrawExperienceContextArtifacts(id, 'experience-policy-revoked');
+        if (action === 'approved' || action === 'deprecated') {
+          await this.reloadSystemPrefixSafely();
         }
         return card;
       }
@@ -1572,14 +2122,12 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     }
 
     override onOpening(ctx: { reason: SessionOpeningReason }): void {
-      this.core?.injectInternal(ctx.reason === 'restarted' ? '[system] The app restarted; the session carries on.' : '[system] The session has started.', 'opening');
+      this.pendingOpening = ctx.reason === 'restarted' ? '[system] The app restarted; the session carries on.' : '[system] The session has started.';
       if (!this.longTerm?.enabled() && !this.experienceCards()?.list('approved').length) return;
       this.core?.injectDeferred('memory', async () => {
         const briefing = this.longTerm?.enabled() ? await this.longTerm.sessionBriefing().catch(() => null) : null;
         const portrait = briefing?.text?.trim() ?? '';
-        const strategies = await this.experienceContext();
         if (portrait && briefing?.evidence?.length) this.injectMemoryContext(portrait, briefing.evidence);
-        if (strategies.text) this.injectMemoryContext(strategies.text, strategies.evidence);
         return null;
       });
     }
@@ -1590,7 +2138,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         ? this.attachedCore?.generationEvidence(session).filter((envelope) => envelope.sessionId === session
             && envelope.outputToolCalls.some((output) => output.toolCallId === meta.callId)) ?? []
         : [];
-      this.longTerm?.retainCoo(text, meta, envelopes.length === 1 ? envelopes[0] : undefined);
+      const envelope = envelopes.length === 1 ? envelopes[0] : undefined;
+      const generation = this.attachedCore?.sessionInfo(session).generation;
+      if (envelope && (generation?.status !== 'current' || generation.token !== envelope.sessionGenerationToken)) return;
+      this.longTerm?.retainCoo(text, meta, envelope);
     }
 
     override onWorldLifecycle(event: WorldLifecycleEvent): void {
@@ -1600,8 +2151,70 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       this.core?.injectInternal(`[system] The World "${event.label}" ${what}.`, 'notice');
     }
 
+    /**
+     * A handoff note already present in the Core session is a frozen record. When a source it
+     * depends on is forgotten, request the existing safe context-handoff maintenance so the next
+     * batch waits for a rebuilt working context; the EventStore and the old artifact stay intact.
+     */
+    private requestHandoffAfterDeliveredNoteForget(forgottenIds: readonly string[]): void {
+      const forgotten = new Set(forgottenIds);
+      const bankId = this.longTerm?.bankId();
+      if (forgotten.size === 0) return;
+      const snapshot = this.attachedCore?.sessionInfo('main').snapshot;
+      if (!snapshot?.length) return;
+      const affected = snapshot.some((record) =>
+        (record.context.frame?.events ?? []).some((event) => event.type === HANDOFF_NOTE_TYPE)
+        && (record.context.sourceDependencySpans ?? []).some((span) =>
+          span.exposedSources.some((source) => (!bankId || source.bankId === bankId)
+            && forgotten.has(source.documentId))));
+      if (affected) this.attachedCore?.requestContextHandoff();
+    }
+
+    /**
+     * A historical handoff note can carry only the union of its sources. If any of those
+     * sources is gone, the note cannot be split by guessing text boundaries. Empty only the
+     * delivered event body; the static handoff notice remains the fixed, fact-free diagnostic.
+     * The stored note and artifact stay in place for audit. Never mark the historical body
+     * as core-generated.
+     */
+    private async isolateInvalidHandoffNotes(events: readonly EventEnvelope[]): Promise<number> {
+      const memory = this.longTerm;
+      let isolated = 0;
+      for (const event of events) {
+        if (event.type !== HANDOFF_NOTE_TYPE || event.origin !== 'external') continue;
+        const dependency = event.sourceDependencies;
+        if (!dependency || dependency.exposedSources.length === 0) continue;
+        let current: SourceExposureRef[] | null = null;
+        if (memory?.enabled()) {
+          try {
+            const [validated] = await memory.revalidateSourceDependencies([{
+              text: event.text,
+              digest: dependency.contentDigest,
+              exposedSources: dependency.exposedSources,
+            }]);
+            current = validated ?? null;
+          } catch {
+            current = null;
+          }
+        }
+        if (current) continue;
+        event.text = '';
+        event.sourceDependencies = undefined;
+        delete event.evidence;
+        delete event.blobs;
+        isolated += 1;
+      }
+      return isolated;
+    }
+
     /** Cormini's delivery: the heartbeat's quiet time starts over, and one line counts the events. */
     override async onDelivery(ctx: { events: EventEnvelope[] }): Promise<void> {
+      const isolatedHandoffs = await this.isolateInvalidHandoffNotes(ctx.events);
+      await this.syncPartnerUserDocument(false);
+      if (this.pendingOpening) {
+        this.core?.injectInternal(this.pendingOpening, 'opening');
+        this.pendingOpening = null;
+      }
       if (ctx.events.some((event) => event.origin === 'external')) this.growthSchedule?.noteActivity();
       for (const event of ctx.events) {
         if (event.type !== 'affinity.changed') continue;
@@ -1613,11 +2226,24 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       if (n === 0) return;
       // Cormini keeps its heartbeat private; the bracket access is TypeScript's way in for a subclass
       this['heartbeat'].noteActivity();
-      this.core?.injectInternal(`[system] ${n} new event${n === 1 ? '' : 's'}.`, 'notice');
+      // A count notice injected during delivery inherits the batch's source dependencies.
+      // When a mixed handoff note was isolated, those dependencies include the forgotten
+      // source; skip the cosmetic count instead of poisoning the new request.
+      // A source-free handoff batch has no dependency proof for the notice to inherit; the event
+      // frame header already counts it, and an uncovered notice would block the next request
+      // after a restart. Source-free ordinary batches keep the notice for provider mapping.
+      const carriesSourceDependencies = ctx.events.some((event) =>
+        (event.sourceDependencies?.exposedSources.length ?? 0) > 0);
+      const sourceFreeHandoff = !carriesSourceDependencies
+        && ctx.events.some((event) => event.type === HANDOFF_NOTE_TYPE);
+      if (isolatedHandoffs === 0 && !sourceFreeHandoff) {
+        this.core?.injectInternal(`[system] ${n} new event${n === 1 ? '' : 's'}.`, 'notice');
+      }
 
       let latest: string | null = null;
       let latestUserDocumentId: string | null = null;
       for (const event of external) {
+        if (event.source !== 'desktop-pet') continue;
         if (event.type === 'desktop-pet.touch') {
           const touch = event.meta?.touch as { kind?: unknown; count?: unknown; crashed?: unknown } | undefined;
           if (touch) this.longTerm?.retainTouch(touch, { session: 'main', cursor: event.cursor, at: event.ts });
@@ -1625,8 +2251,11 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           continue;
         }
         if (event.type !== 'desktop-pet.message' && event.type !== 'desktop-pet.speech' && event.type !== 'desktop-pet.answer') continue;
-        const said = typeof event.meta?.text === 'string' ? event.meta.text.trim() : event.text.trim();
-        if (!said) continue;
+        const said = typeof event.meta?.text === 'string' ? event.meta.text.trim() : '';
+        if (!said) {
+          this.lastUserMemory = null;
+          continue;
+        }
         if (isMemoryForgetRequest(said)) {
           const previous = this.lastUserMemory;
           if (previous && Date.now() - previous.at < FORGET_WINDOW_MS) await this.longTerm?.forgetDocument(previous.documentId);
@@ -1707,6 +2336,9 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           && !((record.context.frame?.events ?? []).some((event) => fenced(event)
             && event.start < span.end && event.start + event.chars > span.start)));
         const dependencies = (record.context.sourceDependencySpans ?? []).filter((span) => validSpan(text, span)
+          && itemCoverage.spans.some((covered) => covered.start === span.start && covered.end === span.end
+            && covered.digest === span.digest && covered.origin === 'generation-derived' && covered.mappingState === 'complete'
+            && covered.generationEvidenceId === span.proofId)
           && span.exposedSources.every((source) => memory?.sourceVisible(source.documentId)
             && memory.sourceCurrentForContext(source.documentId)));
         const sourceMaps = (record.context.sourceMapSpans ?? []).filter((span) => validSpan(text, span)
@@ -1762,6 +2394,124 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           ? outputIds.has(record.item.call_id)
           : true);
       return { records, sourceExcerpts };
+    }
+
+    /**
+     * Exact source slices that stay independently verifiable after a sibling source is forgotten.
+     * Only whole candidate evidence spans and whole carried note parts qualify; each part keeps
+     * one source tuple so Core can re-read and verify it on its own.
+     */
+    private handoffExcerptParts(
+      records: readonly ContextRecord[],
+      sourceExcerpts: readonly ContextHandoffSourceExcerpt[],
+      evidence: ContextEvidenceInspection,
+      sourceById: ReadonlyMap<string, ContextRecord>,
+      includeEvidenceExcerpts: boolean,
+    ): Array<{ text: string; source: SourceExposureRef }> {
+      const candidates: Array<{ text: string; source: SourceExposureRef; order: number }> = [];
+      let order = 0;
+      const sourceKeyOf = (source: SourceExposureRef): string => JSON.stringify([
+        source.bankId, source.endpoint, source.documentId, source.contentDigest,
+      ]);
+      const currentSource = (source: SourceExposureRef): SourceExposureRef | null =>
+        evidence.exposedSources.find(candidate => sourceKeyOf(candidate) === sourceKeyOf(source)) ?? null;
+      const textByItemId = new Map<string, string>();
+      for (const record of records) if (record.item.id) textByItemId.set(record.item.id, textOf(record));
+
+      // A previously delivered raw excerpt is present as a note event whose dependency span
+      // covers exactly that event. Rendered note sections start with a header and are not
+      // carried this way; their still-current content is rebuilt from the current snapshot.
+      for (const record of records) {
+        for (const event of record.context.frame?.events ?? []) {
+          if (event.type !== HANDOFF_NOTE_TYPE) continue;
+          const text = textOf(record).slice(event.start, event.start + event.chars);
+          if (!text.trim() || text.startsWith('# ')) continue;
+          const span = (record.context.sourceDependencySpans ?? []).find(entry =>
+            entry.start === event.start && entry.end === event.start + event.chars
+            && entry.exposedSources.length === 1 && entry.digest === sha256(text));
+          if (!span) continue;
+          const source = currentSource(span.exposedSources[0]!);
+          if (!source) continue;
+          candidates.push({ text, source, order: order++ });
+        }
+      }
+
+      if (includeEvidenceExcerpts) {
+        // Tool receipts carry read-back attachments as Core-verified hindsight-source spans.
+        for (const item of evidence.items) {
+          const text = textByItemId.get(item.itemId);
+          if (!text) continue;
+          for (const span of item.spans) {
+            if (span.origin !== 'hindsight-source' || span.mappingState !== 'complete') continue;
+            if (span.exposedSources.length !== 1) continue;
+            if (span.start < 0 || span.end <= span.start || span.end > text.length) continue;
+            const part = text.slice(span.start, span.end);
+            if (!part.trim() || part.length > 4096 || sha256(part) !== span.digest) continue;
+            const source = currentSource(span.exposedSources[0]!);
+            if (!source) continue;
+            candidates.push({ text: part, source, order: order++ });
+          }
+        }
+
+        // An unpaired tool receipt is represented by its sourceExcerpts instead of a record.
+        for (const excerpt of sourceExcerpts) {
+          const sourceRecord = sourceById.get(excerpt.sourceRecordId);
+          if (!sourceRecord) continue;
+          const sourceText = textOf(sourceRecord);
+          const { start, end, digest } = excerpt.attachment.segment;
+          if (start < 0 || end <= start || end > sourceText.length) continue;
+          const part = sourceText.slice(start, end);
+          if (!part.trim() || part.length > 4096 || sha256(part) !== digest) continue;
+          const { segment: _segment, ...attachmentSource } = excerpt.attachment;
+          const source = currentSource(attachmentSource);
+          if (!source) continue;
+          candidates.push({ text: part, source, order: order++ });
+        }
+      }
+
+      const best = new Map<string, { text: string; source: SourceExposureRef; order: number }>();
+      for (const candidate of candidates.sort((left, right) => right.text.length - left.text.length || left.order - right.order)) {
+        const key = sourceKeyOf(candidate.source);
+        if (!best.has(key)) best.set(key, candidate);
+      }
+      return [...best.values()].slice(0, 4).map(({ text, source }) => ({ text, source }));
+    }
+
+    /**
+     * Keeps the newest Core-framed, source-independent user event pair across a handoff.
+     * The pair is the synthetic external_event_frame call and its output; Core's fixPairing
+     * drops an orphaned output, and reusing both records leaves the original cursor and
+     * user-input span intact without replaying the event.
+     */
+    protected override handoffTail(snapshot: ContextRecord[]): ContextRecord[] {
+      let latest: { call: ContextRecord; output: ContextRecord } | null = null;
+      for (let index = 0; index < snapshot.length; index++) {
+        const output = snapshot[index];
+        if (output.item.type !== 'function_call_output') continue;
+        const callId = output.item.call_id;
+        if (output.context.evidence?.length || output.context.sourceDependencySpans?.length
+          || output.context.sourceMapSpans?.length) continue;
+        const events = output.context.frame?.events;
+        if (!events || events.length !== 1) continue;
+        const event = events[0];
+        if (event.type !== 'desktop-pet.message' || event.source !== 'desktop-pet') continue;
+        if (!Number.isInteger(event.cursor) || event.cursor < 0
+          || !Number.isInteger(event.start) || event.start < 0
+          || !Number.isInteger(event.chars) || event.chars <= 0) continue;
+        const text = textOf(output);
+        const end = event.start + event.chars;
+        if (end > text.length) continue;
+        const digest = sha256(text.slice(event.start, end));
+        const independent = output.context.sourceIndependentSpans?.some((span) =>
+          span.origin === 'user-input' && span.start === event.start && span.end === end && span.digest === digest);
+        if (!independent) continue;
+        const call = snapshot.slice(0, index).reverse().find((record) =>
+          record.item.type === 'function_call' && record.item.call_id === callId);
+        if (!call || call.item.type !== 'function_call' || call.item.name !== EXTERNAL_EVENT_FRAME
+          || !call.context.sourceIndependentItemDigest) continue;
+        latest = { call, output };
+      }
+      return latest ? [latest.call, latest.output] : [];
     }
 
     private removeOwnedHandoffFile(path: string, owner: HandoffFileOwner, digest: string): boolean {
@@ -1869,6 +2619,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       const memorySourcesVerified = !!memory && !!expectedMemoryEpoch && candidateEvidence.mappingState === 'complete'
         && candidateEvidence.exposedSources.length > 0
         && await memory.verifyExposureSources(candidateEvidence.exposedSources, expectedMemoryEpoch);
+
       const sourceFree = filtered.records.length + filtered.sourceExcerpts.length > 0
         && candidateEvidence.mappingState === 'complete'
         && candidateEvidence.exposedSources.length === 0;
@@ -1884,7 +2635,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         if (!text) return [];
         return [message('user', text, {
           ...(source.context.ts ? { ts: source.context.ts } : {}),
-          evidence: [{ ...excerpt.attachment, segment: { start: 0, end: text.length, digest: excerpt.attachment.segment.digest } }],
+          evidence: [{ ...excerpt.attachment, segment: { ...excerpt.attachment.segment, start: 0, end: text.length, digest: excerpt.attachment.segment.digest } }],
         })];
       });
       const noteSnapshot = [...filtered.records, ...excerptRecords];
@@ -1896,6 +2647,17 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         budgetTokens: Math.floor(maxTokens * keepRatio),
         splitAtMs: this.pressureSplitAt,
       });
+      const excerptParts = this.handoffExcerptParts(filtered.records, filtered.sourceExcerpts, candidateEvidence, sourceById,
+        candidateEvidence.exposedSources.length > 1);
+      const noteParts: Array<{ text: string; sourceDependencies: SourceExposureRef[] }> = note.parts.map((part) => ({
+        text: part.text,
+        sourceDependencies: candidateEvidence.exposedSources,
+      }));
+      if (excerptParts.length > 0) {
+        noteParts.push({ text: '# 原文摘录（逐段来源）\n', sourceDependencies: candidateEvidence.exposedSources });
+        for (const excerpt of excerptParts) noteParts.push({ text: excerpt.text, sourceDependencies: [excerpt.source] });
+      }
+      const noteText = noteParts.map((part) => part.text).join('\n');
       const handoffPath = join(this.memoryDir, HANDOFF_DIR);
       const stagingPath = join(handoffPath, '.staging');
       let ownsHandoffDirectory = false;
@@ -1905,7 +2667,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       let finalIdentity: { dev: number; ino: number } | null = null;
       let committedFile: string | null = null;
       let fileOwner: HandoffFileOwner | null = null;
-      const noteDigest = sha256(note.text);
+      const noteDigest = sha256(noteText);
       const stem = handoffNoteStamp(now);
       let plannedFilename: string | null = null;
       for (let suffix = 0; suffix < 100; suffix++) {
@@ -1984,7 +2746,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         const opened = fstatSync(fd);
         stageIdentity = { dev: opened.dev, ino: opened.ino };
         fileOwner = { artifactId: handoffArtifactId, device: opened.dev, inode: opened.ino, stagedName: stageName };
-        writeFileSync(fd, note.text, { encoding: 'utf8' });
+        writeFileSync(fd, noteText, { encoding: 'utf8' });
         fsyncSync(fd);
         const closingFd = fd;
         fd = null;
@@ -2057,7 +2819,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           artifactId: handoffArtifactId,
           ownerToken,
           target: plannedFile,
-          content: note.text,
+          content: noteText,
           expectedEpoch: expectedMemoryEpoch,
           mappingState: sourceFree ? 'source-independent' : 'complete',
           sources: candidateEvidence.exposedSources,
@@ -2094,12 +2856,12 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           snapshotId: ctx.candidateSnapshotId,
           records: filtered.records,
           sourceExcerpts: filtered.sourceExcerpts,
-          content: note.text,
-          injections: note.parts.map((part) => ({
+          content: noteText,
+          injections: noteParts.map((part) => ({
             origin: 'external' as const,
             kind: HANDOFF_NOTE_TYPE,
             text: part.text,
-            sourceDependencies: candidateEvidence.exposedSources,
+            sourceDependencies: part.sourceDependencies,
           })),
         },
         ...(protectedHandoff ? { protected: true as const } : {}),
@@ -2108,8 +2870,8 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         discard,
         injections: [
           { origin: 'internal' as const, kind: 'handoff', text: persona.handoffNoteAt(plannedFile), sourceDependencies: [] },
-          ...note.parts.map((part) => ({ origin: 'external' as const, kind: HANDOFF_NOTE_TYPE,
-            text: part.text, sourceDependencies: candidateEvidence.exposedSources })),
+          ...noteParts.map((part) => ({ origin: 'external' as const, kind: HANDOFF_NOTE_TYPE,
+            text: part.text, sourceDependencies: part.sourceDependencies })),
         ],
       };
     }
@@ -2155,9 +2917,24 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return '[system] You have taken many steps in a row this turn. Finish what is in hand, then call end_turn.';
     }
 
+    protected override prefixWorkspaceFiles(): string[] {
+      const files: string[] = [];
+      for (const name of readdirSync(this.memoryDir).sort()) {
+        if (name.startsWith('.') || name === HANDOFF_DIR.slice(0, -1)) continue;
+        if (statSync(join(this.memoryDir, name)).isDirectory()) files.push(...this.memory.walkFiles(name));
+        else files.push(name);
+      }
+      return files;
+    }
+
+    protected override prefixWorkspaceListing(): string {
+      const listing = super.prefixWorkspaceListing();
+      const heading = listing === 'Your workspace is empty.' ? 'Files in your workspace:' : listing;
+      return `${heading}\n- ${HANDOFF_DISCOVERY}`;
+    }
+
     protected override prefixFolds(): Array<{ prefix: string; line: (n: number) => string }> {
       return [
-        { prefix: 'handoffs/', line: (n) => `handoffs/ (${n} handoff notes; list_files with dir handoffs lists them all)` },
         { prefix: 'blobs/', line: (n) => `blobs/ (${n} binary files; list_files with dir blobs lists them all, read_file shows an image)` },
       ];
     }

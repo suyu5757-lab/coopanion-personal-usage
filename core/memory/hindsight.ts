@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { closeSync, existsSync, openSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import type { EvidenceAttachment, GenerationEvidenceEnvelope, SourceExposureRef } from 'cortico/core/types.ts';
+import type { ContextEvidenceInspection, EvidenceAttachment, GenerationEvidenceEnvelope, SourceExposureRef } from 'cortico/core/types.ts';
 import { createClient, createConfig, HindsightClient, HindsightError, sdk } from '@vectorize-io/hindsight-client';
 import {
   activationAt,
@@ -34,7 +34,7 @@ import {
   type MemoryStateStore,
 } from './state-store.ts';
 import { planRecall, type RecallRoute } from './router.ts';
-import { partnerSourceScopeDigest } from './partner-provenance.ts';
+import { partnerSourceScopeDigest, partnerUserNoteDocumentId } from './partner-provenance.ts';
 import { sourceFactsTokenBudget as resolveSourceFactsTokenBudget, recallContextCharBudget } from './recall-limits.ts';
 import { summarizeSourceFacts, type SourceFactCounts } from './recall-evidence.ts';
 import { planRecallQueries, type SourceMatchType } from './recall-query.ts';
@@ -137,6 +137,16 @@ export interface MemorySearchRead {
   sourceFactsTruncated?: boolean;
   trace?: MemorySearchTrace;
 }
+
+/** Local, durable state of one PARTNER paragraph registration. */
+export type PartnerNoteRetentionStatus = 'queued' | 'deferred' | 'forgotten' | 'blocked';
+export interface PartnerNoteRetention {
+  documentId: string;
+  status: PartnerNoteRetentionStatus;
+}
+
+/** The Persona owns the sidecar and tells Recall whether a partner-user source is current. */
+export type PartnerSourceStatus = 'current' | 'superseded';
 
 export interface MemorySearchTraceItem {
   resultIndex: number;
@@ -517,6 +527,9 @@ export interface DerivedArtifactRegistration {
   creatorOperationId?: string;
   sourceIds: readonly string[];
   expectedEpoch?: string;
+  /** Source identities exposed by the generation that produced this artifact. */
+  generationSources?: readonly SourceExposureRef[];
+  canCommit?: () => boolean;
 }
 
 export interface HandoffArtifactCommit {
@@ -533,10 +546,6 @@ export interface HandoffArtifactCommit {
 interface MemorySourceExposure {
   attachment: Omit<EvidenceAttachment, 'segment'>;
   originalText: string;
-}
-
-function canonicalEvidenceText(value: string): string {
-  return value.normalize('NFC').replace(/\s+/gu, ' ').trim();
 }
 
 function sourceMetadata(meta: SourceMeta): Record<string, string> {
@@ -582,6 +591,8 @@ const hash = (text: string) => createHash('sha256').update(text).digest('hex').s
 const sha256 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
 const sourceTupleKey = (source: Pick<SourceExposureRef, 'bankId' | 'endpoint' | 'documentId'>): string =>
   JSON.stringify([source.bankId, source.endpoint, source.documentId]);
+const sourceProofKey = (source: SourceExposureRef): string =>
+  JSON.stringify([source.validatedEpoch, source.validationReceipt, source.contentDigest]);
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -645,6 +656,10 @@ export class HindsightMemory {
   private opsClient: ReturnType<typeof createClient> | null = null;
   private draining = false;
   private drainTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly readBackProofs = new Map<string, string>();
+  private readonly segmentProofs = new Map<string, { sourceTuple: string; sourceProof: string; sourceDigest: string;
+    startUtf16: number; endUtf16: number; text: string }>();
+  private readonly artifactProofs = new Map<string, Set<string>>();
   private recallCache = new Map<string, { at: number; value: string; trace?: MemoryRecallTrace }>();
   private lastRecall: TurnRecallReceipt | null = null;
   private lastSourceLookup: SourceLookupReceipt | null = null;
@@ -665,6 +680,17 @@ export class HindsightMemory {
   private modelRefreshAt = 0;
   private modelRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private lifecycleHooks: MemoryLifecycleHooks | null = null;
+  private partnerSourceStatusInspector: ((documentId: string) => PartnerSourceStatus | null) | null = null;
+
+  setPartnerSourceStatus(inspector: ((documentId: string) => PartnerSourceStatus | null) | null): void {
+    this.partnerSourceStatusInspector = inspector;
+  }
+
+  private partnerSourceStatusFor(documentId: string | null | undefined): PartnerSourceStatus | null {
+    if (!documentId || !documentId.startsWith('partner-user:')) return null;
+    try { return this.partnerSourceStatusInspector?.(documentId) ?? 'superseded'; }
+    catch { return 'superseded'; }
+  }
 
   setLifecycleHooks(hooks: MemoryLifecycleHooks): void {
     this.lifecycleHooks = hooks;
@@ -708,8 +734,16 @@ export class HindsightMemory {
   }
 
   private sameDerivedArtifact(current: DerivedArtifact, next: DerivedArtifactInput): boolean {
-    const sources = [...next.sources].sort((a, b) =>
-      a.bankId.localeCompare(b.bankId) || a.endpoint.localeCompare(b.endpoint) || a.documentId.localeCompare(b.documentId));
+    // A Forget or Revision bumps the validation epoch without changing which source a derived
+    // artifact depends on. The epoch and read-back receipt are refreshed by verification, so the
+    // artifact identity must ignore them; otherwise unrelated source changes would permanently
+    // strand an independent derived paragraph.
+    const identity = (source: { bankId: string; endpoint: string; documentId: string; contentDigest: string | null;
+      segmentDigest: string | null; validationState: string; correlationId: string | null }): string => JSON.stringify([
+      source.bankId, source.endpoint, source.documentId, source.contentDigest, source.segmentDigest,
+      source.validationState, source.correlationId,
+    ]);
+    const sources = next.sources.map(identity).sort();
     return current.lifecycleState === 'active'
       && current.kind === next.kind
       && current.target === next.target
@@ -720,7 +754,7 @@ export class HindsightMemory {
       && current.bodyDigest === next.bodyDigest
       && current.origin === next.origin
       && current.lineageState === next.lineageState
-      && JSON.stringify(current.sources) === JSON.stringify(sources);
+      && JSON.stringify(current.sources.map(identity).sort()) === JSON.stringify(sources);
   }
 
   private sameGenerationEvidence(current: GenerationEvidence, next: GenerationEvidenceInput): boolean {
@@ -772,6 +806,10 @@ export class HindsightMemory {
     }));
     const evidence = await this.evidenceForSegments(input.content, segments);
     if (evidence.length !== segments.length || this.evidenceEpoch() !== expectedEpoch) return null;
+    if (input.generationSources?.some((source) => !evidence.some((attachment) =>
+      sourceTupleKey(attachment) === sourceTupleKey(source) && attachment.contentDigest === source.contentDigest
+      && attachment.validationReceipt === source.validationReceipt))) return null;
+    if (input.canCommit && !input.canCommit()) return null;
     const dependencies = evidence.map((attachment) => this.dependencyFromExposure(
       attachment,
       attachment.segment.digest,
@@ -1002,7 +1040,15 @@ export class HindsightMemory {
         && exposure.contentDigest === source.contentDigest && exposure.segment.digest === source.segmentDigest
         && this.derivedArtifactIsCurrent(artifactId, content);
     });
-    return matches && this.evidenceEpoch() === expectedEpoch;
+    if (!matches || this.evidenceEpoch() !== expectedEpoch) return false;
+    for (const { segment, ...source } of evidence) {
+      const key = JSON.stringify([sourceTupleKey(source), sourceProofKey(source), segment.digest]);
+      const artifacts = this.artifactProofs.get(key) ?? new Set<string>();
+      artifacts.add(artifactId);
+      this.artifactProofs.set(key, artifacts);
+      if (this.artifactProofs.size > 4096) this.artifactProofs.delete(this.artifactProofs.keys().next().value!);
+    }
+    return true;
   }
 
   setDerivedArtifactReviewState(artifactId: string, reviewState: DerivedArtifactReviewState): DerivedArtifact | null {
@@ -1012,6 +1058,10 @@ export class HindsightMemory {
 
   derivedArtifact(artifactId: string): DerivedArtifact | null {
     return this.stateStore?.getDerivedArtifact(artifactId) ?? null;
+  }
+
+  listDerivedArtifacts(kind: string): DerivedArtifact[] {
+    return this.stateStore?.listDerivedArtifacts(kind) ?? [];
   }
 
   recordGenerationEvidenceEnvelope(envelope: GenerationEvidenceEnvelope, toolCallId: string): boolean {
@@ -1038,7 +1088,7 @@ export class HindsightMemory {
     const sourceBearing = envelope.exposedSources.length > 0 && envelope.mappingState === 'complete'
       && envelope.items.every((item) => item.mappingState === 'complete' && item.disposition !== 'unknown-derived-incomplete')
       && envelope.exposedSources.every((source) => segmentDigests.has(sourceTupleKey(source)))
-      && this.sourceExposureCurrent(envelope.exposedSources);
+      && this.sourceEvidenceCurrent(envelope);
     const mappingState: MemorySourceMappingState = joined && sourceBearing ? 'complete'
       : joined && independent ? 'source-independent'
         : envelope.mappingState === 'ambiguous' || output?.joinState === 'ambiguous' ? 'ambiguous'
@@ -1075,7 +1125,7 @@ export class HindsightMemory {
     };
     try {
       return store.transaction(() => {
-        if (this.evidenceEpoch() !== expectedEpoch) return false;
+        if (this.evidenceEpoch() !== expectedEpoch || (sourceBearing && !this.sourceEvidenceCurrent(envelope))) return false;
         const existing = store.getGenerationEvidence(record.sessionId, record.generationId);
         if (existing) {
           return this.sameGenerationEvidence(existing, record)
@@ -1678,7 +1728,9 @@ export class HindsightMemory {
         const retrievalScores = captureRetrievalScores(result.scores, resultIndex);
         const documentId = result.document_id ?? null;
         const metadata = result.metadata ? { ...result.metadata } : {};
-        if (documentId && currentRevisions.has(documentId)) metadata.status = 'current';
+        const partnerStatus = this.partnerSourceStatusFor(documentId);
+        if (partnerStatus) metadata.status = partnerStatus;
+        else if (documentId && currentRevisions.has(documentId)) metadata.status = 'current';
         else if (documentId && superseded.has(documentId)) metadata.status = 'superseded';
         const sourceFacts: MemorySearchSourceFact[] = [];
         const sourceFactIds = [...new Set(result.source_fact_ids ?? [])];
@@ -1719,7 +1771,9 @@ export class HindsightMemory {
             missingSourceFact = true;
             continue;
           }
-          if (currentRevisions.has(factDocumentId)) factMetadata.status = 'current';
+          const partnerFactStatus = this.partnerSourceStatusFor(factDocumentId);
+          if (partnerFactStatus) factMetadata.status = partnerFactStatus;
+          else if (currentRevisions.has(factDocumentId)) factMetadata.status = 'current';
           else if (superseded.has(factDocumentId)) factMetadata.status = 'superseded';
           sourceFacts.push({
             id: fact.id,
@@ -1974,8 +2028,10 @@ export class HindsightMemory {
         if (!semanticCandidate && matched.length === 0) return;
         const matchType: SourceMatchType = matched.some((needle) => needle.type === 'query_prefix') ? 'query_prefix'
           : matched.length > 0 ? 'literal_phrase' : 'semantic_candidate';
-        const state = currentRevisions.has(doc.id) ? 'current' : superseded.has(doc.id) ? 'superseded'
-          : typeof metadata.status === 'string' ? metadata.status : 'unknown';
+        const partnerState = this.partnerSourceStatusFor(doc.id);
+        const state = partnerState === 'current' ? 'current' : partnerState === 'superseded' ? 'superseded'
+          : currentRevisions.has(doc.id) ? 'current' : superseded.has(doc.id) ? 'superseded'
+            : typeof metadata.status === 'string' ? metadata.status : 'unknown';
         const recordedAt = typeof metadata.said_at === 'string' ? metadata.said_at : doc.created_at;
         if (matchType === 'semantic_candidate') semanticCandidates += 1;
         else if (matchType === 'query_prefix') queryPrefixMatches += 1;
@@ -2483,6 +2539,46 @@ export class HindsightMemory {
     return queued === 'queued' ? documentId : null;
   }
 
+  /**
+   * Queue one exact paragraph the person saved into PARTNER.md. The document id binds the
+   * paragraph to its workspace and normalized body digest, so the same words read back as one
+   * source and a later rewrite becomes a different source.
+   */
+  retainPartnerNote(text: string, workspaceDigest: string,
+    options: { reviveDead?: boolean; version?: string; documentId?: string } = {},
+  ): PartnerNoteRetention | null {
+    const safe = sanitizeForMemory(text);
+    if (!workspaceDigest) return null;
+    const base = partnerUserNoteDocumentId(workspaceDigest, text);
+    const documentId = options.documentId ?? partnerUserNoteDocumentId(workspaceDigest, text, options.version);
+    if (options.documentId && documentId !== base && !documentId.startsWith(`${base}:`)) return null;
+    if (!safe.text || safe.skip) return { documentId, status: 'blocked' };
+    if (!this.enabled() || !this.outbox || !this.config || !this.ledger || this.ledger.damaged()) {
+      return { documentId, status: 'deferred' };
+    }
+    const saidAt = new Date().toISOString();
+    const queued = this.enqueue({
+      content: safe.text,
+      documentId,
+      context: 'A note the person wrote about themselves in PARTNER.md. First-person "I" refers to the person.',
+      tags: ['scope:life', 'source:partner'],
+      timestamp: saidAt,
+      priority: 'normal',
+      metadata: sourceMetadata({ actor: 'user', kind: 'event', status: 'completed', saidAt }),
+    });
+    if (queued === 'queued') {
+      if (options.reviveDead === true) {
+        const dead = this.outbox.matching((item) => item.documentId === documentId
+          && item.bankId === this.config!.bankId && item.endpoint === this.config!.apiUrl
+          && (item.state === 'dead' || item.state === 'failed')).find(Boolean);
+        if (dead) this.outbox.retryDead(dead.id);
+      }
+      return { documentId, status: 'queued' };
+    }
+    if (queued === 'skipped') return { documentId, status: 'forgotten' };
+    return { documentId, status: 'deferred' };
+  }
+
   retainCoo(
     text: string,
     meta: { session?: string; callId?: string; timestamp?: string } = {},
@@ -2521,7 +2617,7 @@ export class HindsightMemory {
     }
     const sourceBearing = requestComplete && exposed.length > 0
       && exposed.every((source) => sourceSegmentDigests.has(sourceTupleKey(source)))
-      && this.sourceExposureCurrent(exposed);
+      && this.sourceEvidenceCurrent(envelope!);
     const mappingState: MemorySourceMappingState = sourceBearing ? 'complete'
       : sourceFree ? 'source-independent'
         : envelope?.mappingState === 'ambiguous' || output?.joinState === 'ambiguous' ? 'ambiguous'
@@ -2599,7 +2695,7 @@ export class HindsightMemory {
     };
     try {
       this.stateStore.transaction(() => {
-        if (sourceBearing && !this.sourceExposureCurrent(exposed)) throw new Error('Coo output sources changed before persistence');
+        if (sourceBearing && !this.sourceEvidenceCurrent(envelope!)) throw new Error('Coo output sources changed before persistence');
         const priorGeneration = this.stateStore!.getGenerationEvidence(generation.sessionId, generation.generationId);
         if (!priorGeneration) this.stateStore!.saveGenerationEvidence(generation);
         else if (!this.sameGenerationEvidence(priorGeneration, generation)) {
@@ -3090,11 +3186,16 @@ export class HindsightMemory {
   async forgetMostRecent(session: string, since: Date): Promise<ForgetResult | null> {
     const item = this.outbox?.recentDocument(`user:${session}:`, since);
     if (!item) return null;
-    return this.forgetDocument(item.documentId);
+    if (!item.bankId || !item.endpoint) return { acceptance: 'not-accepted', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
+    return this.forgetDocumentInNamespace(item.documentId, { bankId: item.bankId, endpoint: item.endpoint });
   }
 
   /** Forget exactly one source event; no unrelated recent item is touched. */
   async forgetDocument(documentId: string): Promise<ForgetResult> {
+    return this.forgetDocumentInNamespace(documentId);
+  }
+
+  private async forgetDocumentInNamespace(documentId: string, namespace?: { bankId: string; endpoint: string }): Promise<ForgetResult> {
     if (!documentId) return { acceptance: 'not-found', local: 0, deleted: 0, pending: 0, failed: 0, activeContextInvalidated: false };
     if (this.storageError) return { acceptance: 'unknown-blocked', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
     if (!this.config || !this.ledger) return { acceptance: 'not-accepted', local: 0, deleted: 0, pending: 0, failed: 1, activeContextInvalidated: false };
@@ -3106,13 +3207,10 @@ export class HindsightMemory {
     let matched: OutboxItem[] = [];
     let cancelled: OutboxItem[] = [];
     let sourceIds = [documentId];
-    let target = { bankId: config.bankId, endpoint: config.apiUrl };
+    const target = namespace ?? { bankId: config.bankId, endpoint: config.apiUrl };
     let inputs: DeletionInput[] = [];
     const reason = 'the person asked not to remember this';
     try {
-      const direct = outbox.matching((item) => item.documentId === documentId);
-      const origin = direct.find((item) => item.bankId && item.endpoint);
-      if (origin?.bankId && origin.endpoint) target = { bankId: origin.bankId, endpoint: origin.endpoint };
       const seen = new Set(sourceIds);
       let frontier = [...sourceIds];
       while (frontier.length > 0) {
@@ -3265,11 +3363,51 @@ export class HindsightMemory {
       && source.validatedEpoch === epoch
       && source.revisionState === 'current'
       && source.validationStatus === 'validated'
-      && /^[a-f0-9]{64}$/.test(source.validationReceipt)
-      && /^[a-f0-9]{64}$/.test(source.contentDigest)
+      && this.readBackProofs.get(sourceTupleKey(source)) === sourceProofKey(source)
       && this.sourceVisible(source.documentId)
       && this.sourceCurrentForContext(source.documentId));
     return current && this.evidenceEpoch() === epoch;
+  }
+
+  /** Rechecks direct excerpts, source identities and verified derived artifacts. */
+  sourceEvidenceCurrent(inspection: Pick<ContextEvidenceInspection, 'exposedSources' | 'items'>): boolean {
+    if (!this.sourceExposureCurrent(inspection.exposedSources)) return false;
+    for (const item of inspection.items) {
+      for (const span of item.spans) {
+        if (span.origin === 'generation-derived' && span.exposedSources.length > 0 && !span.generationEvidenceId) return false;
+        if (span.origin !== 'hindsight-source' && span.origin !== 'source-identity' && span.origin !== 'artifact-derived') continue;
+        if (span.mappingState !== 'complete' || !span.exposedSources.length) return false;
+        for (const source of span.exposedSources) {
+          if (!this.sourceExposureCurrent([source])) return false;
+          const key = JSON.stringify([sourceTupleKey(source), sourceProofKey(source), span.digest]);
+          if (span.origin === 'hindsight-source') {
+            const range = span.sourceProof;
+            const proof = range && this.segmentProofs.get(range.token);
+            if (!range || !proof || proof.sourceTuple !== sourceTupleKey(source) || proof.sourceProof !== sourceProofKey(source)
+              || proof.sourceDigest !== source.contentDigest || proof.endUtf16 - proof.startUtf16 !== proof.text.length
+              || !Number.isInteger(range.startUtf16) || !Number.isInteger(range.endUtf16)
+              || range.startUtf16 < 0 || range.endUtf16 <= range.startUtf16 || range.endUtf16 > proof.text.length
+              || range.endUtf16 - range.startUtf16 !== span.end - span.start
+              || sha256(proof.text.slice(range.startUtf16, range.endUtf16)) !== span.digest) return false;
+          } else if (span.origin === 'source-identity') {
+            if (span.digest !== sha256(JSON.stringify(source.documentId))) return false;
+          } else {
+            const artifacts = this.artifactProofs.get(key);
+            const current = [...artifacts ?? []].some((id) => {
+              const artifact = this.stateStore?.getDerivedArtifact(id);
+              return !!artifact && artifact.lifecycleState === 'active' && artifact.lineageState === 'complete'
+                && artifact.bodyDigest === span.digest && artifact.scope === memoryArtifactScope(source.bankId, source.endpoint)
+                && artifact.sources.length === span.exposedSources.length
+                && artifact.sources.every((dependency) => dependency.validationState === 'validated'
+                  && span.exposedSources.some((ref) => sourceTupleKey(ref) === sourceTupleKey(dependency)
+                    && ref.contentDigest === dependency.contentDigest && this.sourceExposureCurrent([ref])));
+            });
+            if (!current) return false;
+          }
+        }
+      }
+    }
+    return true;
   }
 
   /** A content-free identity for the configured source namespace used by the partner sidecar. */
@@ -3351,7 +3489,7 @@ export class HindsightMemory {
   }
 
   /** Re-reads one source before it is attached to context text. */
-  private async readSourceExposure(documentId: string, expectedEpoch: string): Promise<MemorySourceExposure | null> {
+  private async readSourceExposure(documentId: string, expectedEpoch: string, allowedPendingPartnerId?: string): Promise<MemorySourceExposure | null> {
     if (!documentId || !this.canTry() || !await this.ensureStarted()) return null;
     const config = this.config;
     const client = this.client;
@@ -3359,6 +3497,7 @@ export class HindsightMemory {
     const ledger = this.ledger;
     const epoch = this.evidenceEpoch();
     if (!config || !client || !store || !ledger || !epoch || epoch !== expectedEpoch || !this.sourceVisible(documentId)) return null;
+    if (allowedPendingPartnerId !== documentId && this.partnerSourceStatusFor(documentId) === 'superseded') return null;
     const fenceEpoch = this.visibilityEpoch();
     try {
       const document = await client.getDocument(config.bankId, documentId, { signal: AbortSignal.timeout(5_000) });
@@ -3366,6 +3505,10 @@ export class HindsightMemory {
         || typeof document.original_text !== 'string' || !document.original_text
         || this.evidenceEpoch() !== expectedEpoch || fenceEpoch !== this.visibilityEpoch()
         || ledger.damaged() || !this.sourceVisible(documentId)) return null;
+      // A PARTNER save or Forget can land while getDocument is in flight. Recheck the same
+      // sidecar-derived status at the consumption boundary; only the exact pending registration
+      // read-back may bypass it.
+      if (allowedPendingPartnerId !== documentId && this.partnerSourceStatusFor(documentId) === 'superseded') return null;
 
       const metadata = document.document_metadata && typeof document.document_metadata === 'object'
         ? document.document_metadata as Record<string, unknown>
@@ -3381,26 +3524,33 @@ export class HindsightMemory {
         config.bankId, config.apiUrl, document.id, document.updated_at, document.content_hash,
         contentDigest, expectedEpoch, localCurrent, revisionState, validationStatus,
       ])).digest('hex');
-      return {
-        attachment: {
-          bankId: config.bankId,
-          endpoint: config.apiUrl,
-          documentId,
-          validatedEpoch: expectedEpoch,
-          revisionState,
-          validationStatus,
-          validationReceipt,
-          contentDigest,
-        },
-        originalText: document.original_text,
+      const attachment = {
+        bankId: config.bankId,
+        endpoint: config.apiUrl,
+        documentId,
+        validatedEpoch: expectedEpoch,
+        revisionState,
+        validationStatus,
+        validationReceipt,
+        contentDigest,
       };
-    } catch {
+      const key = sourceTupleKey(attachment);
+      this.readBackProofs.delete(key);
+      if (validationStatus === 'validated') {
+        this.readBackProofs.set(key, sourceProofKey(attachment));
+        if (this.readBackProofs.size > 4096) this.readBackProofs.delete(this.readBackProofs.keys().next().value!);
+      }
+      return { attachment, originalText: document.original_text };
+    } catch (error) {
+      if (isMissing(error) && this.evidenceEpoch() === expectedEpoch) {
+        this.readBackProofs.delete(sourceTupleKey({ bankId: config.bankId, endpoint: config.apiUrl, documentId }));
+      }
       return null;
     }
   }
 
   /** Maps final formatted text ranges to current Hindsight source read-backs. */
-  async evidenceForSegments(text: string, segments: readonly MemoryEvidenceSegment[]): Promise<EvidenceAttachment[]> {
+  async evidenceForSegments(text: string, segments: readonly MemoryEvidenceSegment[], opts: { allowedPendingPartnerId?: string } = {}): Promise<EvidenceAttachment[]> {
     const expectedEpoch = this.evidenceEpoch();
     if (!expectedEpoch || !text || segments.length === 0) return [];
     const readbacks = new Map<string, Promise<MemorySourceExposure | null>>();
@@ -3410,16 +3560,25 @@ export class HindsightMemory {
         || segment.start < 0 || segment.end <= segment.start || segment.end > text.length || !segment.documentId) continue;
       let readback = readbacks.get(segment.documentId);
       if (!readback) {
-        readback = this.readSourceExposure(segment.documentId, expectedEpoch);
+        readback = this.readSourceExposure(segment.documentId, expectedEpoch, opts.allowedPendingPartnerId);
         readbacks.set(segment.documentId, readback);
       }
       const source = await readback;
       if (!source) continue;
       const segmentText = text.slice(segment.start, segment.end);
-      const sourceText = sanitizeForMemory(source.originalText).text;
-      const matched = segment.derived === true
-        || canonicalEvidenceText(sourceText).includes(canonicalEvidenceText(segmentText));
+      const startUtf16 = source.originalText.indexOf(segmentText);
+      const matched = segment.derived === true || startUtf16 >= 0;
       const attachment = source.attachment;
+      const segmentDigest = createHash('sha256').update(segmentText, 'utf8').digest('hex');
+      let sourceProof: EvidenceAttachment['segment']['sourceProof'];
+      if (segment.derived !== true && startUtf16 >= 0
+        && attachment.validationStatus === 'validated' && attachment.revisionState === 'current') {
+        const token = randomUUID();
+        this.segmentProofs.set(token, { sourceTuple: sourceTupleKey(attachment), sourceProof: sourceProofKey(attachment),
+          startUtf16, endUtf16: startUtf16 + segmentText.length, sourceDigest: attachment.contentDigest, text: segmentText });
+        sourceProof = { token, startUtf16: 0, endUtf16: segmentText.length };
+        if (this.segmentProofs.size > 4096) this.segmentProofs.delete(this.segmentProofs.keys().next().value!);
+      }
       evidence.push({
         ...attachment,
         ...(matched ? {} : {
@@ -3429,7 +3588,8 @@ export class HindsightMemory {
         segment: {
           start: segment.start,
           end: segment.end,
-          digest: createHash('sha256').update(segmentText, 'utf8').digest('hex'),
+          digest: segmentDigest,
+          ...(sourceProof ? { sourceProof } : {}),
         },
       });
     }
@@ -3451,6 +3611,100 @@ export class HindsightMemory {
         || readback.attachment.validationStatus !== 'validated') return false;
     }
     return this.evidenceEpoch() === expectedEpoch;
+  }
+
+  /**
+   * Re-reads a persisted source set by document id and returns the current refs.
+   * Used only for generation-proof recovery; the source text is not retained here.
+   */
+  async revalidateSourceExposures(sources: readonly SourceExposureRef[]): Promise<SourceExposureRef[] | null> {
+    const expectedEpoch = this.evidenceEpoch();
+    const config = this.config;
+    if (!expectedEpoch || !config || sources.length === 0) return null;
+    const tuples = new Set<string>();
+    const wellFormed = sources.every((source) => {
+      if (!source || source.bankId !== config.bankId || source.endpoint !== config.apiUrl
+        || ![source.documentId, source.validatedEpoch, source.validationReceipt]
+          .every((value) => typeof value === 'string' && value.trim())
+        || source.revisionState !== 'current' || source.validationStatus !== 'validated'
+        || !/^[a-f0-9]{64}$/.test(source.contentDigest)) return false;
+      const tuple = sourceTupleKey(source);
+      if (tuples.has(tuple)) return false;
+      tuples.add(tuple);
+      return true;
+    });
+    if (!wellFormed) return null;
+    const current: SourceExposureRef[] = [];
+    const readbacks = new Map<string, Promise<MemorySourceExposure | null>>();
+    for (const source of sources) {
+      let readback = readbacks.get(source.documentId);
+      if (!readback) {
+        readback = this.readSourceExposure(source.documentId, expectedEpoch);
+        readbacks.set(source.documentId, readback);
+      }
+      const result = await readback;
+      const attachment = result?.attachment;
+      if (!attachment || attachment.bankId !== source.bankId || attachment.endpoint !== source.endpoint
+        || attachment.documentId !== source.documentId || attachment.contentDigest !== source.contentDigest
+        || attachment.revisionState !== 'current' || attachment.validationStatus !== 'validated') return null;
+      current.push(attachment);
+    }
+    return this.evidenceEpoch() === expectedEpoch ? current : null;
+  }
+
+  /** Re-reads persisted dependency clues without retaining source text. */
+  async revalidateSourceDependencies(
+    dependencies: readonly { text: string; digest: string; exposedSources: readonly SourceExposureRef[] }[],
+  ): Promise<Array<SourceExposureRef[] | null>> {
+    const expectedEpoch = this.evidenceEpoch();
+    const config = this.config;
+    if (!expectedEpoch || !config || dependencies.length === 0) return dependencies.map(() => null);
+    const readbacks = new Map<string, Promise<MemorySourceExposure | null>>();
+    const recovered: Array<SourceExposureRef[] | null> = [];
+    for (const dependency of dependencies) {
+      const sources = dependency.exposedSources;
+      if (!dependency.text || !/^[a-f0-9]{64}$/.test(dependency.digest)
+        || sha256(dependency.text) !== dependency.digest || !Array.isArray(sources) || sources.length === 0) {
+        recovered.push(null);
+        continue;
+      }
+      const tuples = new Set<string>();
+      const wellFormed = sources.every((source) => {
+        if (!source || source.bankId !== config.bankId || source.endpoint !== config.apiUrl
+          || ![source.documentId, source.validatedEpoch, source.validationReceipt]
+            .every((value) => typeof value === 'string' && value.trim())
+          || source.revisionState !== 'current' || source.validationStatus !== 'validated'
+          || !/^[a-f0-9]{64}$/.test(source.contentDigest)) return false;
+        const tuple = sourceTupleKey(source);
+        if (tuples.has(tuple)) return false;
+        tuples.add(tuple);
+        return true;
+      });
+      if (!wellFormed) {
+        recovered.push(null);
+        continue;
+      }
+      const current: SourceExposureRef[] = [];
+      let valid = true;
+      for (const source of sources) {
+        let readback = readbacks.get(source.documentId);
+        if (!readback) {
+          readback = this.readSourceExposure(source.documentId, expectedEpoch);
+          readbacks.set(source.documentId, readback);
+        }
+        const result = await readback;
+        const attachment = result?.attachment;
+        if (!attachment || attachment.bankId !== source.bankId || attachment.endpoint !== source.endpoint
+          || attachment.documentId !== source.documentId || attachment.contentDigest !== source.contentDigest
+          || attachment.revisionState !== 'current' || attachment.validationStatus !== 'validated') {
+          valid = false;
+          break;
+        }
+        current.push(attachment);
+      }
+      recovered.push(valid && this.evidenceEpoch() === expectedEpoch ? current : null);
+    }
+    return this.evidenceEpoch() === expectedEpoch ? recovered : dependencies.map(() => null);
   }
 
   async recent(limit = 20): Promise<Array<{ id: string; text: string; date: string; type: string; documentId: string | null; status?: string }>> {

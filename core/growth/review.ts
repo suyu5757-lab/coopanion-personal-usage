@@ -4,9 +4,11 @@
  * a proposal becomes a change only after the person approves it.
  */
 import { hasRole, textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
-import { message, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
+import { inputItem, itemText, message, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import { join } from 'node:path';
-import type { CoreApi, EvidenceAttachment, ForkOutcome, ToolDef } from 'cortico/core/types.ts';
+import { digestText, inspectContextEvidence } from 'cortico/core/evidence.ts';
+import { renderTemplateWithSourceMap, type RenderedTemplate } from 'cortico/core/template.ts';
+import type { CoreApi, EvidenceAttachment, ForkOutcome, GenerationEvidenceEnvelope, SourceMapSpan, ToolCallContext, ToolDef, ToolOutcome } from 'cortico/core/types.ts';
 import type { ModelLanguage } from '../language.ts';
 import type { HindsightMemory, MemoryTextRead } from '../memory/hindsight.ts';
 import { evidenceCoversText } from '../memory/source-evidence.ts';
@@ -32,37 +34,69 @@ export const GROWTH_TOOL_NAMES = [
 export const PROPOSE_GROWTH_TOOL = 'propose_growth';
 export const PROPOSE_EXPERIENCE_TOOL = 'propose_experience';
 
-function completeGrowthEvidence(read: MemoryTextRead, evidence: readonly EvidenceAttachment[], expectedEpoch: string): boolean {
-  const segments = read.sourceSegments
-    ?? read.trace?.format.sourceSegments.map(({ documentId, start, end }) => ({ documentId, start, end }))
-    ?? [];
-  if (read.status !== 'found' || !read.text || read.sourceFactsTruncated || !expectedEpoch
-    || segments.length === 0 || evidence.length !== segments.length) return false;
-  const remaining = [...evidence];
-  for (const segment of segments) {
-    const index = remaining.findIndex((attachment) => attachment.documentId === segment.documentId
-      && attachment.segment.start === segment.start && attachment.segment.end === segment.end
-      && attachment.validatedEpoch === expectedEpoch && attachment.validationStatus === 'validated'
-      && attachment.revisionState === 'current');
-    if (index < 0) return false;
-    remaining.splice(index, 1);
-  }
-  return remaining.length === 0 && evidenceCoversText(read.text, evidence);
-}
-
-function validatedGrowthSourceIds(text: string, evidence: readonly EvidenceAttachment[], expectedEpoch: string): string[] {
-  const sourceIds = evidence.filter((attachment) => {
+function verifiedGrowthEvidence(text: string, evidence: readonly EvidenceAttachment[], expectedEpoch: string): EvidenceAttachment[] {
+  return evidence.filter((attachment) => {
     const { start, end, digest } = attachment.segment;
     if (attachment.validatedEpoch !== expectedEpoch || attachment.validationStatus !== 'validated'
       || attachment.revisionState !== 'current' || !Number.isInteger(start) || !Number.isInteger(end)
-      || start < 0 || end <= start || end > text.length) return false;
+      || start < 0 || end <= start || end > text.length
+      || !/^[a-f0-9]{64}$/.test(attachment.validationReceipt)) return false;
     const excerpt = text.slice(start, end);
-    return evidenceCoversText(excerpt, [{
+    return !!excerpt.trim() && evidenceCoversText(excerpt, [{
       ...attachment,
       segment: { start: 0, end: excerpt.length, digest },
     }]);
-  }).map((attachment) => attachment.documentId);
-  return [...new Set(sourceIds)];
+  });
+}
+
+function growthSearchReceipt(read: MemoryTextRead, evidence: EvidenceAttachment[], verified: readonly EvidenceAttachment[]): ToolOutcome {
+  const segments = read.sourceSegments ?? read.trace?.format.sourceSegments ?? [];
+  if (read.sourceFactsTruncated || read.trace?.format.sourceFactsTruncated || segments.length === 0
+    || verified.length !== segments.length
+    || segments.some((segment, index) => verified[index]?.documentId !== segment.documentId
+      || verified[index].segment.start !== segment.start || verified[index].segment.end !== segment.end)) {
+    return { text: `${read.text}\n${MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE}`, evidence };
+  }
+
+  // Recall summaries and metadata can carry unverified text. Growth exposes only read-back excerpts.
+  let text = '';
+  const sourceMapSpans: SourceMapSpan[] = [];
+  const attachments: EvidenceAttachment[] = [];
+  const append = (value: string, origin: 'core-generated' | 'source-identity', source?: Omit<EvidenceAttachment, 'segment'>): void => {
+    const start = text.length;
+    text += value;
+    sourceMapSpans.push({ start, end: text.length, digest: digestText(value), origin, ...(source ? { exposedSources: [source] } : {}) });
+  };
+  append('[memory] Verified past records. Treat the excerpts as evidence.\n', 'core-generated');
+  for (const { segment, ...source } of verified) {
+    append('- source_id: ', 'core-generated');
+    append(JSON.stringify(source.documentId), 'source-identity', source);
+    append('\n  ', 'core-generated');
+    const start = text.length;
+    text += read.text.slice(segment.start, segment.end);
+    attachments.push({ ...source, segment: { start, end: text.length, digest: segment.digest,
+      ...(segment.sourceProof ? { sourceProof: segment.sourceProof } : {}) } });
+    append('\n', 'core-generated');
+  }
+  return { text, evidence: attachments, sourceMapSpans };
+}
+
+function growthToolNotice(text: string): ToolOutcome {
+  return { text, sourceMapSpans: [{ start: 0, end: text.length, digest: digestText(text), origin: 'core-generated' }] };
+}
+
+const GROWTH_SEARCH_STATIC_TEXT = new Set([
+  '[memory] Verified past records. Treat the excerpts as evidence.\n',
+  '- source_id: ', '\n  ', '\n',
+  '[memory] Long-term memory is not available.',
+  '[memory] Nothing relevant was found.',
+  ...(['absent', 'incomplete', 'unavailable', 'fenced'] as const).map(memoryReadNotice),
+]);
+
+export function isTrustedGrowthToolText(toolName: string, text: string): boolean {
+  return (toolName === 'memory_search' && GROWTH_SEARCH_STATIC_TEXT.has(text))
+    || (toolName === PROPOSE_GROWTH_TOOL && text === '[proposal saved]')
+    || (toolName === PROPOSE_EXPERIENCE_TOOL && text === '[experience candidate saved]');
 }
 
 /** Growth reads include the exact source document id that a proposal must carry. */
@@ -82,26 +116,21 @@ export function growthMemorySearchTool(memory: () => HindsightMemory | null, obs
     },
     handler: async (args) => {
       const store = memory();
-      if (!store?.enabled()) return '[memory] Long-term memory is not available.';
+      if (!store?.enabled()) return growthToolNotice('[memory] Long-term memory is not available.');
       const query = typeof args.query === 'string' ? args.query.trim() : '';
-      if (!query) return '[memory] Nothing relevant was found.';
+      if (!query) return growthToolNotice('[memory] Nothing relevant was found.');
       const maxTokens = typeof args.max_tokens === 'number' && Number.isFinite(args.max_tokens)
         ? Math.min(2000, Math.max(400, Math.round(args.max_tokens)))
         : 900;
       const expectedEpoch = store.evidenceEpoch();
       const read = await store.recallBlockDetailed(query, { budget: 'low', maxTokens, timeoutMs: 5000, maxItems: 8, captureTrace: true });
-      if (read.status !== 'found') return memoryReadNotice(read.status);
-      if (!read.text) return memoryReadNotice('fenced');
-      const evidence = expectedEpoch ? await store.evidenceForRead(read) : [];
-      const current = !!expectedEpoch && store.evidenceEpoch() === expectedEpoch;
-      if (expectedEpoch && current) {
-        for (const sourceId of validatedGrowthSourceIds(read.text, evidence, expectedEpoch)) observedSourceIds?.add(sourceId);
-      }
-      if (expectedEpoch && current && completeGrowthEvidence(read, evidence, expectedEpoch)) {
-        return { text: read.text, evidence };
-      }
-      const output = [read.text, MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE].join('\n');
-      return current && evidence.length > 0 ? { text: output, evidence } : output;
+      if (read.status !== 'found') return growthToolNotice(memoryReadNotice(read.status));
+      if (!read.text || !expectedEpoch) return growthToolNotice(memoryReadNotice('fenced'));
+      const evidence = await store.evidenceForRead(read);
+      if (store.evidenceEpoch() !== expectedEpoch) return growthToolNotice(memoryReadNotice('fenced'));
+      const verified = verifiedGrowthEvidence(read.text, evidence, expectedEpoch);
+      for (const source of verified) observedSourceIds?.add(source.documentId);
+      return growthSearchReceipt(read, evidence, verified);
     },
   };
 }
@@ -194,28 +223,48 @@ export interface GrowthRunResult {
   cancellationStatus?: 'acknowledged' | 'unknown' | 'shutdown';
 }
 
-function recentConversation(records: ContextRecord[]): string {
-  const lines: string[] = [];
-  for (const record of records) {
+function recentConversation(records: readonly ContextRecord[], generationEvidence: readonly GenerationEvidenceEnvelope[]): RenderedTemplate {
+  const lines: RenderedTemplate[] = [];
+  let remaining = RECENT_MAX_CHARS;
+  for (const record of [...records].reverse()) {
     if (record.context.head) continue;
-    if (hasRole(record, 'user')) {
-      const text = textOf(record).trim();
-      if (text) lines.push(`Person: ${text}`);
-    } else if (hasRole(record, 'assistant')) {
-      const text = textOf(record).trim();
-      if (text) lines.push(`Coo: ${text}`);
+    const who = hasRole(record, 'user') ? 'Person' : hasRole(record, 'assistant') ? 'Coo' : null;
+    const original = who ? textOf(record) : '';
+    const text = original.trim();
+    if (!text) continue;
+    const coverage = inspectContextEvidence([record], { generationEvidence });
+    if (coverage.mappingState !== 'complete') continue;
+    const line = `${who}: ${text}`;
+    if (line.length > remaining && lines.length > 0) break;
+    const excerpt = line.slice(-remaining);
+    const lead = excerpt.length === line.length ? `${who}: ` : '';
+    const body = excerpt.slice(lead.length);
+    if (!text.endsWith(body)) continue;
+    const spans: SourceMapSpan[] = [];
+    if (lead) spans.push({ start: 0, end: lead.length, digest: digestText(lead), origin: 'core-generated' });
+    if (who === 'Person') {
+      if (coverage.exposedSources.length || coverage.items.some(item => item.spans.some(span =>
+        span.origin !== 'user-input' && span.origin !== 'core-generated'))) continue;
+      spans.push({ start: lead.length, end: excerpt.length, digest: digestText(body), origin: 'user-input' });
+    } else {
+      const evidenceId = record.context.generationEvidenceId;
+      const item = inputItem(record);
+      if (!evidenceId || itemText(item) !== original) continue;
+      const startUtf16 = original.length - original.trimStart().length + text.length - body.length;
+      spans.push({ start: lead.length, end: excerpt.length, digest: digestText(body), origin: 'generation-derived',
+        exposedSources: coverage.exposedSources, generationProof: { evidenceId, item, startUtf16, endUtf16: startUtf16 + body.length } });
     }
+    lines.unshift({ text: excerpt, sourceMapSpans: spans });
+    remaining -= excerpt.length + 1;
+    if (remaining <= 0) break;
   }
-  let out = '';
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const next = out ? `${lines[i]}\n${out}` : lines[i]!;
-    if (next.length > RECENT_MAX_CHARS) {
-      if (!out) out = next.slice(-RECENT_MAX_CHARS);
-      break;
-    }
-    out = next;
-  }
-  return out;
+  let offset = 0;
+  const sourceMapSpans = lines.flatMap((line) => {
+    const spans = line.sourceMapSpans.map((span) => ({ ...span, start: span.start + offset, end: span.end + offset }));
+    offset += line.text.length + 1;
+    return spans;
+  });
+  return { text: lines.map((line) => line.text).join('\n'), sourceMapSpans };
 }
 
 function localDate(timezone: string, date: Date): string {
@@ -255,6 +304,10 @@ function guardRead(tool: ToolDef, state: { cancelled: boolean; deadline: number 
   };
 }
 
+function reviewIsCurrent(state: { cancelled: boolean; deadline: number }, ctx: ToolCallContext): boolean {
+  return !state.cancelled && Date.now() < state.deadline && !ctx.generationSignal?.aborted && !ctx.shutdownSignal?.aborted;
+}
+
 function proposeGrowthTool(
   store: GrowthProposals,
   state: { cancelled: boolean; deadline: number },
@@ -266,7 +319,7 @@ function proposeGrowthTool(
   return {
     ...PROPOSE_GROWTH_DECL,
     handler: async (args, ctx) => {
-      if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] No proposal was written.';
+      if (!reviewIsCurrent(state, ctx)) return '[review cancelled] No proposal was written.';
       if (done.proposals >= 3) return '[proposal rejected] At most three proposals per review.';
       const parsed = readProposalInput(args);
       if ('errors' in parsed) return `[proposal rejected] ${parsed.errors.join('; ')}`;
@@ -280,18 +333,19 @@ function proposeGrowthTool(
             && envelope.outputToolCalls.some((output) => output.toolCallId === ctx.callId))
         : [];
       const envelope = envelopeMatches.length === 1 ? envelopeMatches[0] : null;
-      if (!envelope || !source.recordGenerationEvidenceEnvelope(envelope, ctx.callId!)) {
+      if (!envelope || (ctx.generationToken !== undefined && envelope.sessionGenerationToken !== ctx.generationToken)
+        || !source.recordGenerationEvidenceEnvelope(envelope, ctx.callId!)) {
         return '[proposal rejected] The proposal generation has no complete joined source evidence.';
       }
       const expectedEpoch = source.evidenceEpoch();
       if (!expectedEpoch) return '[proposal rejected] The source epoch is unavailable.';
       for (const sourceId of parsed.proposal.sourceIds) {
-        if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] No proposal was written.';
+        if (!reviewIsCurrent(state, ctx)) return '[review cancelled] No proposal was written.';
         if (!source.sourceVisible(sourceId) || !await source.hasSource(sourceId) || !source.sourceVisible(sourceId)) {
           return `[proposal rejected] Source ${sourceId} is missing or fenced.`;
         }
       }
-      if (state.cancelled || Date.now() >= state.deadline || source.evidenceEpoch() !== expectedEpoch) return '[review cancelled] No proposal was written.';
+      if (!reviewIsCurrent(state, ctx) || source.evidenceEpoch() !== expectedEpoch) return '[review cancelled] No proposal was written.';
       const result = store.write(args);
       if (!result.ok) return `[proposal rejected] ${result.errors.join('; ')}`;
       const registered = await source.registerDerivedArtifactFromSources({
@@ -306,13 +360,15 @@ function proposeGrowthTool(
         creatorGenerationId: envelope.id,
         sourceIds: [...new Set([...result.proposal.sourceIds, ...envelope.exposedSources.map((entry) => entry.documentId)])],
         expectedEpoch,
+        generationSources: envelope.exposedSources,
+        canCommit: () => reviewIsCurrent(state, ctx),
       });
       if (!registered) {
         store.remove(result.proposal.id);
         return '[proposal rejected] Source provenance changed before the candidate was committed.';
       }
       done.proposals += 1;
-      return `[proposal saved] ${result.proposal.id}`;
+      return growthToolNotice('[proposal saved]');
     },
   };
 }
@@ -346,7 +402,7 @@ function proposeExperienceTool(
   return {
     ...PROPOSE_EXPERIENCE_DECL,
     handler: async (args, ctx) => {
-      if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] No experience candidate was written.';
+      if (!reviewIsCurrent(state, ctx)) return '[review cancelled] No experience candidate was written.';
       if (done.proposals >= 3) return '[candidate rejected] At most three candidates per review.';
       const parsed = readExperienceCardInput(args);
       if ('errors' in parsed) return `[candidate rejected] ${parsed.errors.join('; ')}`;
@@ -363,14 +419,15 @@ function proposeExperienceTool(
             && envelope.outputToolCalls.some((output) => output.toolCallId === ctx.callId))
         : [];
       const envelope = envelopeMatches.length === 1 ? envelopeMatches[0] : null;
-      if (!envelope || !source.recordGenerationEvidenceEnvelope(envelope, ctx.callId!)) {
+      if (!envelope || (ctx.generationToken !== undefined && envelope.sessionGenerationToken !== ctx.generationToken)
+        || !source.recordGenerationEvidenceEnvelope(envelope, ctx.callId!)) {
         return '[candidate rejected] The experience generation has no complete joined source evidence.';
       }
       const expectedEpoch = source.evidenceEpoch();
       if (!expectedEpoch) return '[candidate rejected] The source epoch is unavailable.';
       const dates = new Set<string>();
       for (const sourceId of parsed.card.sourceIds) {
-        if (state.cancelled || Date.now() >= state.deadline) return '[review cancelled] No experience candidate was written.';
+        if (!reviewIsCurrent(state, ctx)) return '[review cancelled] No experience candidate was written.';
         const evidence = await source.sourceEvidence(sourceId);
         if (!evidence.present || !evidence.visible || evidence.actor !== 'user' || evidence.kind !== 'event'
           || (evidence.status !== 'completed' && evidence.status !== 'current') || !source.sourceVisible(sourceId)) {
@@ -382,7 +439,7 @@ function proposeExperienceTool(
         dates.add(new Date(evidence.occurredAt).toISOString().slice(0, 10));
       }
       if (dates.size < 2) return '[candidate rejected] User-event sources must span different dates.';
-      if (state.cancelled || Date.now() >= state.deadline || source.evidenceEpoch() !== expectedEpoch) return '[review cancelled] No experience candidate was written.';
+      if (!reviewIsCurrent(state, ctx) || source.evidenceEpoch() !== expectedEpoch) return '[review cancelled] No experience candidate was written.';
       if (!parsed.card.sourceIds.every((sourceId) => source.sourceVisible(sourceId))) {
         return '[candidate rejected] One or more sources are now fenced.';
       }
@@ -400,13 +457,15 @@ function proposeExperienceTool(
         creatorGenerationId: envelope.id,
         sourceIds: [...new Set([...result.card.sourceIds, ...envelope.exposedSources.map((entry) => entry.documentId)])],
         expectedEpoch,
+        generationSources: envelope.exposedSources,
+        canCommit: () => reviewIsCurrent(state, ctx),
       });
       if (!registered) {
         store.remove(result.card.id);
         return '[candidate rejected] Source provenance changed before the candidate was committed.';
       }
       done.proposals += 1;
-      return `[experience candidate saved] ${result.card.id}`;
+      return growthToolNotice('[experience candidate saved]');
     },
   };
 }
@@ -434,14 +493,13 @@ export class GrowthReview {
       this.d.experienceCardsDir ?? join(this.d.proposalsDir, 'experience-cards'),
       this.d.now ?? (() => new Date()),
     );
-    const messages = [
-      ...prefix,
-      message('user', SELF_REVIEW_TEXT[this.d.modelLanguage()]({
-        portrait,
-        recent: recentConversation(snapshot),
-        date: localDate(this.d.timezone(), now),
-      })),
-    ];
+    const recent = recentConversation(snapshot, core.generationEvidence('main'));
+    const prompt = renderTemplateWithSourceMap(SELF_REVIEW_TEXT[this.d.modelLanguage()]({
+      portrait: portrait.trim() ? '{{growth.portrait}}' : '',
+      recent: recent.text ? '{{growth.recent}}' : '',
+      date: localDate(this.d.timezone(), now),
+    }), { 'growth.portrait': portrait.trim(), 'growth.recent': recent }, 'core-generated');
+    const messages = [...prefix, message('user', prompt.text, { sourceMapSpans: prompt.sourceMapSpans })];
     const started = Date.now();
     let timer: ReturnType<typeof setTimeout> | null = null;
     const forkOptions = {
