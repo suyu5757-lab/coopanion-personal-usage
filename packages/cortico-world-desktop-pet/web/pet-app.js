@@ -555,9 +555,28 @@ function pollE12Clock() {
     .catch(() => { e12Clock.data = null; })
     .finally(() => { e12Clock.busy = false; });
 }
-/** One beat's voice-follow state: matched worker jobs and the text they cover. */
+/** What streamvoice's speakable() drops, plus all whitespace; map[i] is the display index of clean[i]. */
+const SPEECH_NOISE = /[\p{Extended_Pictographic}\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/u;
+function speechClean(text) {
+  const out = [], map = [];
+  let i = 0;
+  while (i < text.length) {
+    const rest = text.slice(i);
+    if (rest.startsWith('http://') || rest.startsWith('https://')) {
+      const m = /^https?:\/\/\S+/.exec(rest);
+      if (m) { i += m[0].length; continue; }
+    }
+    const ch = text[i];
+    if (/\s/.test(ch) || /[*_`~#>|]/.test(ch) || SPEECH_NOISE.test(ch)) { i++; continue; }
+    out.push(ch); map.push(i); i++;
+  }
+  return { clean: out.join(''), map };
+}
+/** One beat's voice-follow state: the cleaned text, the exact job cursor, and what has been shown. */
 function makeE12Sync(text, now) {
-  return { text, jobs: new Map(), jobEnd: 0, matched: false, active: false, lastProgressAt: now, lastShown: 0,
+  const { clean, map } = speechClean(text);
+  return { text, clean, map, jobs: new Map(), matchCursor: 0, doneCursor: 0,
+    matched: false, active: false, misaligned: false, lastProgressAt: now, lastShown: 0,
     epoch: e12Clock.data?.epoch ?? null, startedAt: now, off: false };
 }
 function paintBubble(it, text) {
@@ -571,11 +590,15 @@ function fireBeatAnchors(it, b) {
 }
 /**
  * Follow the worker's playback clock. Returns true while the voice drives the text;
- * false only when no matching job appeared in time, so the caller can use the old 20 chars/s.
+ * false only when the stream cannot be aligned, so the caller can use the old 20 chars/s.
+ *
+ * Jobs must continue at `matchCursor` exactly. This is deliberate: an indexOf() search can
+ * match a repeated phrase later in the bubble and show text out of order when chunks repeat.
  */
 function stepSayWithVoice(it, b, dt) {
   const s = it.sync;
   if (!s || s.off) return false;
+  if (!s.clean) { s.off = true; return false; }
   pollE12Clock();
   const fresh = e12Clock.data && performance.now() - e12Clock.gotAt < 1500 ? e12Clock.data : null;
   if (fresh && fresh.epoch !== undefined) {
@@ -587,7 +610,8 @@ function stepSayWithVoice(it, b, dt) {
       s.epoch = fresh.epoch;
     }
   }
-  let reveal = -1;
+  let revealClean = -1;
+  let currentSeen = false;
   if (fresh && fresh.ok !== false) {
     const jobs = [];
     if (fresh.current) jobs.push(fresh.current);
@@ -598,42 +622,74 @@ function stepSayWithVoice(it, b, dt) {
       seen.add(job.id);
       let rec = s.jobs.get(job.id);
       if (!rec) {
-        const idx = s.text.indexOf(job.text, s.jobEnd);
-        if (idx < 0) continue;
-        rec = { idx, len: job.text.length };
+        if (s.misaligned) break;
+        const jc = speechClean(job.text).clean;
+        if (!jc) continue;
+        let start = -1;
+        if (s.clean.startsWith(jc, s.matchCursor)) start = s.matchCursor;
+        // Only the very first job may skip leading formatting; afterwards the stream must be exact.
+        else if (!s.matched) start = s.clean.indexOf(jc);
+        if (start < 0) { s.misaligned = true; break; }
+        rec = { start, len: jc.length };
         s.jobs.set(job.id, rec);
+        s.matchCursor = Math.max(s.matchCursor, start + rec.len);
         if (fresh.current && fresh.current.id === job.id) { s.matched = true; s.active = true; }
-        s.jobEnd = Math.max(s.jobEnd, idx + rec.len);
       }
       const current = !!fresh.current && fresh.current.id === job.id;
-      if (current) { s.active = true; s.lastProgressAt = T; }
+      if (current) { s.active = true; currentSeen = true; s.lastProgressAt = T; }
       if (current && !job.done) {
         const cps = Number(fresh.cps) || 4.8;
         // Owner 2026-11-19: a touch ahead of the voice (6% + 1 char); the last char still waits for done
-        const shown = Math.floor((Number(job.elapsed) || 0) * cps * 1.06) + 1;
-        reveal = Math.max(reveal, rec.idx + Math.min(rec.len - 1, shown));
+        const shown = Math.min(rec.len - 1, Math.floor((Number(job.elapsed) || 0) * cps * 1.06) + 1);
+        revealClean = Math.max(revealClean, rec.start + shown);
         break;
       }
-      if (job.done) { reveal = Math.max(reveal, rec.idx + rec.len); continue; }
+      if (job.done) {
+        const end = rec.start + rec.len;
+        revealClean = Math.max(revealClean, end);
+        s.doneCursor = Math.max(s.doneCursor, end);
+        s.matchCursor = Math.max(s.matchCursor, end);
+        continue;
+      }
       break;
     }
-    // a matched job that left the clock has ended (or was cancelled): show its text and move on
-    for (const [id, rec] of s.jobs) if (!seen.has(id)) reveal = Math.max(reveal, rec.idx + rec.len);
+    for (const [id, rec] of s.jobs) {
+      if (seen.has(id)) continue;
+      const end = rec.start + rec.len;
+      revealClean = Math.max(revealClean, end);
+      s.doneCursor = Math.max(s.doneCursor, end);
+      s.matchCursor = Math.max(s.matchCursor, end);
+    }
   }
-  if (reveal > it.shown) {
-    it.shown = Math.min(b.text.length, reveal);
-    s.lastShown = it.shown;
-    s.lastProgressAt = T;
-    paintBubble(it, b.text);
-    fireBeatAnchors(it, b);
+  if (s.misaligned) { s.off = true; return false; }
+  if (revealClean > 0) {
+    const pos = Math.min(revealClean, s.clean.length);
+    const idx = s.map[pos - 1];
+    const shown = idx === undefined ? b.text.length : idx + 1;
+    if (shown > it.shown) {
+      it.shown = Math.min(b.text.length, shown);
+      s.lastShown = it.shown; s.lastProgressAt = T;
+      paintBubble(it, b.text);
+      fireBeatAnchors(it, b);
+    }
   }
-  if (it.shown >= b.text.length) {
+  if (s.clean.length > 0 && s.doneCursor >= s.clean.length) {
+    if (it.shown < b.text.length) { it.shown = b.text.length; paintBubble(it, b.text); fireBeatAnchors(it, b); }
     it.beatDone = true;
     it.holdUntil = T + .45;
     return true;
   }
   if (s.active && T - s.lastProgressAt > 2.5) { it.beatDone = true; it.holdUntil = T + .2; return true; }
-  if (s.matched) return true;
+  if (s.matched) {
+    // The last matched job ended but the bubble has trailing text no job covers (markup, a 600-char cut).
+    // Let it out after a quiet spell; a real next job normally appears well before this.
+    if (!currentSeen && !(fresh && fresh.queue && fresh.queue.length) && T - s.lastProgressAt > 2 && it.shown < b.text.length) {
+      it.shown = b.text.length; paintBubble(it, b.text); fireBeatAnchors(it, b);
+      it.beatDone = true; it.holdUntil = T + .2;
+      return true;
+    }
+    return true;
+  }
   // the worker has not reached this bubble yet: start at the voice's pace, then fall back if it never comes
   if (T - s.startedAt < 1.6) {
     it.acc += dt * 4.8;
