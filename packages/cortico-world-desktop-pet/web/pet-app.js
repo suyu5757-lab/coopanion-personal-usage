@@ -639,8 +639,11 @@ function stepSayWithVoice(it, b, dt) {
       if (current) { s.active = true; currentSeen = true; s.lastProgressAt = T; }
       if (current && !job.done) {
         const cps = Number(fresh.cps) || 4.8;
+        // Use the job's own final duration once generation is done; the global cps is only a bridge.
+        const final = job.generation_done && Number(job.duration) > 0 ? Number(job.duration) : rec.len / cps;
+        const rate = final > 0 ? rec.len / final : cps;
         // Owner 2026-11-19: a touch ahead of the voice (6% + 1 char); the last char still waits for done
-        const shown = Math.min(rec.len - 1, Math.floor((Number(job.elapsed) || 0) * cps * 1.06) + 1);
+        const shown = Math.min(rec.len - 1, Math.floor((Number(job.elapsed) || 0) * rate * 1.06) + 1);
         revealClean = Math.max(revealClean, rec.start + shown);
         break;
       }

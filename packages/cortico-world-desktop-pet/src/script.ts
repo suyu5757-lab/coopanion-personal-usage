@@ -111,7 +111,19 @@ export function parseScript(script: string, vocab: readonly VocabWord[]): Parsed
     b.text = b.text.trim();
     for (const a of b.anchors) a.at = Math.max(0, Math.min(b.text.length, a.at - lead));
   }
-  return { beats, dropped };
+  // A marker like 【look】 before the sentence's own 。 creates a second beat whose text is only
+  // punctuation. Merge that punctuation into the previous balloon instead of showing a lone 。 bubble.
+  const punctuationOnly = (text: string): boolean => !/[^\s，。！？；：、…—·,.!?;:]/u.test(text);
+  const merged: Beat[] = [];
+  for (const b of beats) {
+    if (b.text && punctuationOnly(b.text)) {
+      const prev = merged[merged.length - 1];
+      if (prev) prev.text += b.text;
+      continue;
+    }
+    merged.push(b);
+  }
+  return { beats: merged, dropped };
 }
 
 /**

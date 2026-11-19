@@ -848,7 +848,11 @@ export class DesktopPetWorld implements World {
       const spoken = new Set(this.spokenThisTurn);
       this.spokenThisTurn.clear();
       void this.closeActivity();
-      const visible = replies.filter((reply) => !spoken.has(reply.text.trim()));
+      const visible = replies.filter((reply) => {
+        const beats = parseScript(reply.text, this.vocab()).beats.map((b) => b.text.trim()).filter(Boolean);
+        // A reply that only repeats what a pet_say bubble already said (markers ignored) is not a second bubble.
+        return beats.length > 0 && !beats.every((text) => spoken.has(text));
+      });
       for (const reply of visible) void this.sendAssistantBubble(reply.text);
       if (visible.length > 0) this.assistantFlush = this.assistantFlush.then(async () => {
         for (const reply of visible) await this.record({ kind: 'assistant', responseId: reply.responseId }, reply.text);
@@ -871,11 +875,25 @@ export class DesktopPetWorld implements World {
         const clock = await res.json() as { playing?: boolean; current?: { text?: string } | null };
         const current = clock.current?.text ?? '';
         if (!clock.playing || !current) break;
-        if (current.includes(text) || text.includes(current)) break;
+        const clean = (value: string): string => value
+          .replace(/【[^】]*】/g, ' ')
+          .replace(/<[^<>\n]{1,32}>/g, ' ')
+          .replace(/https?:\/\/\S+/g, ' ')
+          .replace(/[\p{Extended_Pictographic}\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/gu, ' ')
+          .replace(/[*_`~#>|]+/g, ' ')
+          .replace(/\s+/g, '');
+        const want = clean(text), got = clean(current);
+        // Require a substantial boundary match. A short reply like 「。」 must not match the period
+        // at the end of an unrelated job, and a shared two-character greeting is not enough either.
+        const enough = want.length >= 8;
+        if (enough && got && (got === want
+          || (want.startsWith(got) && got.length >= 12)
+          || (got.startsWith(want) && want.length >= 12))) break;
       } catch { break; }
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
-    this.server.sendPet({ t: 'say', beats: [{ text, actions: [], anchors: [] }] });
+    const { beats } = parseScript(text, this.vocab());
+    if (beats.length) this.server.sendPet({ t: 'say', beats });
   }
 
   /**
