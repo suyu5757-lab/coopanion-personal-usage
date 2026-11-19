@@ -51,6 +51,11 @@ const DESCRIBE: WorldDescribe = {
       trigger: 'flush',
     },
     {
+      type: 'desktop-pet.guide-answer',
+      description: { zh: '使用者在使用向导中提交的回答。', en: 'An answer submitted in the introduction.' },
+      trigger: 'debounce',
+    },
+    {
       type: 'desktop-pet.answer',
       description: { zh: 'pet_ask 问题的回答,或问题没有回答就被关掉。', en: 'The answer to a pet_ask question, or the question closed unanswered.' },
     },

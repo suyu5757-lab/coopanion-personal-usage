@@ -1,4 +1,4 @@
-import { TaskGrantRegistry, type ActionRisk, type ActionTargetEvidence, type DesktopTargetEvidence, type FileSystemTargetEvidence, type StepRequest, type StepTicket, type TaskGrant, type TaskGrantRequest } from './task-grants.ts';
+import { TaskGrantRegistry, type ActionRisk, type ActionTargetEvidence, type ApprovalChannel, type CoreUiApproval, type CoreUiConfirmation, type DesktopTargetEvidence, type FileSystemTargetEvidence, type StepRequest, type StepTicket, type TaskGrant, type TaskGrantRequest } from './task-grants.ts';
 
 /**
  * The one place that decides whether a tool may change something outside Coo's own state.
@@ -33,6 +33,7 @@ export interface DesktopStepAuthorization {
   grantDigest: string;
   approvedAt: number;
   expiresAt: number;
+  approvalChannel: ApprovalChannel;
   /** Consumes one ticket only when the dispatch evidence still matches the approved snapshot. */
   consume(target: DesktopTargetEvidence | null, expectedChange: string): boolean;
   /** Revokes a grant when the caller cannot dispatch the approved step. */
@@ -47,6 +48,7 @@ export interface DesktopStepGrantRequest {
   target: DesktopTargetEvidence;
   expiresInMs: number;
   maxSteps: 1;
+  policyRuleId?: string;
 }
 
 export interface FileSystemStepGrantRequest {
@@ -59,12 +61,15 @@ export interface FileSystemStepGrantRequest {
   files: Array<{ path: string; digest: string; bytes: number; mime: string }>;
   expiresInMs: number;
   maxSteps: 1;
+  policyRuleId?: string;
 }
 
 export interface FileSystemStepAuthorization {
   grantDigest: string;
   approvedAt: number;
   expiresAt: number;
+  approvalChannel: ApprovalChannel;
+  policyRuleId?: string;
   consume(
     target: FileSystemTargetEvidence,
     expectedChange: string,
@@ -160,7 +165,7 @@ export class ActionGate {
   }
 
   /** Issues a short grant only after Core's own approval UI confirms the proposed task. */
-  async requestTaskGrant(request: TaskGrantRequest, confirmInCoreUi: () => Promise<boolean>, now = Date.now()): Promise<TaskGrant | null> {
+  async requestTaskGrant(request: TaskGrantRequest, confirmInCoreUi: CoreUiConfirmation, now = Date.now()): Promise<TaskGrant | null> {
     this.synchronizeGeneration();
     if (request.actions.some((action) => !this.capabilityAllows(request.target.surface, action as Impact, request.target))) return null;
     const generation = this.permissionGeneration();
@@ -174,7 +179,7 @@ export class ActionGate {
   /** Creates a one-step desktop grant and delays ticket consumption until the dispatch boundary. */
   async requestDesktopStep(
     request: DesktopStepGrantRequest,
-    confirmInCoreUi: () => Promise<boolean>,
+    confirmInCoreUi: CoreUiConfirmation,
   ): Promise<DesktopStepAuthorization | null> {
     const approvedEvidence = desktopEvidenceKey(request.target);
     const grant = await this.requestTaskGrant({
@@ -185,6 +190,7 @@ export class ActionGate {
       actions: ['computer-input'],
       expiresInMs: request.expiresInMs,
       maxSteps: request.maxSteps,
+      ...(request.policyRuleId ? { policyRuleId: request.policyRuleId } : {}),
     }, confirmInCoreUi);
     if (!grant) return null;
 
@@ -198,6 +204,7 @@ export class ActionGate {
       grantDigest: grant.digest,
       approvedAt: grant.approvedAt,
       expiresAt: grant.expiresAt,
+      approvalChannel: grant.approvalChannel,
       consume: (target, expectedChange) => {
         if (finished) return false;
         finished = true;
@@ -218,7 +225,7 @@ export class ActionGate {
   /** Creates a one-step grant for an operation inside an allowed workspace. */
   async requestFileSystemStep(
     request: FileSystemStepGrantRequest,
-    confirmInCoreUi: () => Promise<boolean>,
+    confirmInCoreUi: CoreUiConfirmation,
   ): Promise<FileSystemStepAuthorization | null> {
     const approvedEvidence = fileSystemEvidenceKey(request.target);
     const grant = await this.requestTaskGrant({
@@ -230,6 +237,7 @@ export class ActionGate {
       files: request.files,
       expiresInMs: request.expiresInMs,
       maxSteps: request.maxSteps,
+      ...(request.policyRuleId ? { policyRuleId: request.policyRuleId } : {}),
     }, confirmInCoreUi);
     if (!grant) return null;
 
@@ -243,6 +251,8 @@ export class ActionGate {
       grantDigest: grant.digest,
       approvedAt: grant.approvedAt,
       expiresAt: grant.expiresAt,
+      approvalChannel: grant.approvalChannel,
+      ...(grant.policyRuleId ? { policyRuleId: grant.policyRuleId } : {}),
       consume: (target, expectedChange, files) => {
         if (finished) return false;
         finished = true;

@@ -11,6 +11,13 @@ export interface Rect {
 
 export type ActionTargetEvidence = DesktopTargetEvidence | BrowserTargetEvidence | FileSystemTargetEvidence;
 export type ActionRisk = 'READ_ONLY' | 'REVERSIBLE_LOCAL' | 'EXTERNAL_MUTATION' | 'IRREVERSIBLE_OR_PUBLIC';
+export type ApprovalChannel = 'core-pet-bubble' | 'durable-rule' | 'permission-center';
+export interface CoreUiApproval {
+  approved: boolean;
+  channel?: ApprovalChannel;
+  ruleId?: string;
+}
+export type CoreUiConfirmation = () => Promise<boolean | CoreUiApproval>;
 const ACTION_RISKS = new Set<ActionRisk>(['READ_ONLY', 'REVERSIBLE_LOCAL', 'EXTERNAL_MUTATION', 'IRREVERSIBLE_OR_PUBLIC']);
 
 export interface DesktopTargetEvidence {
@@ -62,6 +69,8 @@ export interface TaskGrantRequest {
   files?: Array<{ path: string; digest: string; bytes: number; mime: string }>;
   expiresInMs: number;
   maxSteps: number;
+  /** The durable rule that made this grant automatic, when one did. */
+  policyRuleId?: string;
 }
 
 export interface TaskGrant {
@@ -80,6 +89,8 @@ export interface TaskGrant {
   stepsUsed: number;
   digest: string;
   revoked: boolean;
+  approvalChannel: ApprovalChannel;
+  policyRuleId?: string;
 }
 
 export interface StepRequest {
@@ -165,7 +176,7 @@ export class TaskGrantRegistry {
 
   async requestGrant(
     request: TaskGrantRequest,
-    confirmInCoreUi: () => Promise<boolean>,
+    confirmInCoreUi: CoreUiConfirmation,
     now = Date.now(),
     stillAllowed: () => boolean = () => true,
   ): Promise<TaskGrant | null> {
@@ -178,7 +189,9 @@ export class TaskGrantRegistry {
       || !Number.isSafeInteger(request.maxSteps) || request.maxSteps < 1 || request.maxSteps > 200) {
       throw new Error('task grant request is incomplete or outside its limits');
     }
-    if (!await confirmInCoreUi()) return null;
+    const confirmation = await confirmInCoreUi();
+    const approval: CoreUiApproval = typeof confirmation === 'boolean' ? { approved: confirmation } : confirmation;
+    if (!approval.approved) return null;
     if (!stillAllowed()) return null;
     const targetDigest = hash(targetIdentity(request.target));
     const grant: TaskGrant = {
@@ -195,8 +208,11 @@ export class TaskGrantRegistry {
       expiresAt: now + request.expiresInMs,
       maxSteps: request.maxSteps,
       stepsUsed: 0,
-      digest: hash([request.taskId, request.taskText, request.risk, targetDigest, actions, files, this.generation, now, request.expiresInMs, request.maxSteps]),
+      digest: hash([request.taskId, request.taskText, request.risk, targetDigest, actions, files, this.generation, now, request.expiresInMs, request.maxSteps,
+        approval.channel ?? 'core-pet-bubble', request.policyRuleId ?? approval.ruleId ?? '']),
       revoked: false,
+      approvalChannel: approval.channel ?? 'core-pet-bubble',
+      ...(request.policyRuleId ?? approval.ruleId ? { policyRuleId: request.policyRuleId ?? approval.ruleId } : {}),
     };
     this.grants.set(grant.id, grant);
     return structuredClone(grant);

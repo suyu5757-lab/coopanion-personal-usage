@@ -1,5 +1,5 @@
 import type { Disposable, WebUiPanel, WebUiPanelContext } from 'cortico/web/shared/client-panel.ts';
-import { get } from '../../../../base/api.ts';
+import { get, setConfig } from '../../../../base/api.ts';
 import { pick } from '../../../../base/language.ts';
 import { S } from './strings.ts';
 
@@ -85,7 +85,14 @@ interface GrowthTrialReceipt {
   createdAt: number;
 }
 
+interface PolicyApplication { candidateId: string; modelRisk: string; coreRisk: string; reviewState: string; state: string; reason: string; appliedAt?: string; updatedAt: string }
 interface GrowthStatus {
+  autonomous?: { running: boolean; lastRun?: { status: string; finishedAt?: string; startedAt: string; error?: string; candidateIds: string[] } } | null;
+  config?: { enabled: boolean; autoApply?: boolean };
+  autoApply?: boolean;
+  policies?: { enabled: boolean; focus: boolean; applications: PolicyApplication[]; effective: Array<{ kind: string }> } | null;
+  proposalAssessments?: Record<string, { modelRisk: string; coreRisk: string; reasons: string[] }>;
+
   schedule: { enabled: boolean; blocked: boolean; everyDays: number; paused: boolean; forkRunning: boolean; lastReviewAt: string | null; nextReviewAt: string | null; lastStatus: string | null; lastError: string | null; lastProposalCount: number | null; lastFinishedAt: string | null; activeRun: boolean } | null;
   proposals: GrowthProposal[];
   experiences: ExperienceCard[];
@@ -99,6 +106,32 @@ interface SystemHealth {
   memoryPressureFreePercent: number | null;
   backgroundPausedForMemory: boolean;
   diskAvailableBytes: number | null;
+}
+
+interface DomainSupplementDiagnostics {
+  available: boolean;
+  enabled: boolean;
+  receiptState: 'disabled' | 'unavailable' | 'no_receipt' | 'in_progress' | 'settled';
+  receiptPresent: boolean;
+  turnActive: boolean;
+  status: 'finalized' | 'fallback' | 'skipped' | null;
+  fallbackReason: string | null;
+  baselineStatus: string | null;
+  candidateCount: number | null;
+  verifiedCount: number | null;
+  consumedCount: number | null;
+  addedSourceCount: number | null;
+  withheldCount: number | null;
+  fallbackCount: number | null;
+  finalizedSegmentCount: number | null;
+  queryCalls: number | null;
+  readbackCalls: number | null;
+  finalReadbackCalls: number | null;
+  supplementalChars: number | null;
+  elapsedMs: number | null;
+  rssDeltaBytes: number | null;
+  receiptAgeMs: number | null;
+  core: { requestState: 'UNKNOWN'; actualEvidenceUsed: 'UNKNOWN'; evidenceObserved: false };
 }
 
 interface UsageSummary {
@@ -224,6 +257,22 @@ const panel: WebUiPanel = {
 
     const growth = ui.sheet({ title: t.growth });
     const growthStatus = ui.msgline(t.growthLoading);
+    let currentGrowth: GrowthStatus | null = null;
+    const controlRow = ui.rowbar();
+    const toggle = (label: string, run: (value: boolean) => Promise<void>) => {
+      const input = document.createElement('input'); input.type = 'checkbox';
+      const el = ui.h('label', 'home-note'); el.append(input, document.createTextNode(' ' + label));
+      input.addEventListener('change', () => { void run(input.checked).catch(error => ui.toast(String(error), 'bad')); });
+      controlRow.append(el); return input;
+    };
+    const growthEnabled = toggle(t.enabled, async value => { await setConfig('companion', { 'companion.growth.enabled': value }, { signal: ctx.signal }); await loadGrowth(); });
+    const autoApply = toggle(t.autoApply, async value => { await setConfig('companion', { 'companion.growth.autoApply': value }, { signal: ctx.signal }); await loadGrowth(); });
+    const focusContext = toggle(t.focusContext, async value => { await ctx.invoke('growth-policy-focus', [value]); await loadGrowth(); });
+    const pauseGrowth = ui.button(t.pauseGrowth, { onClick: async () => { await ctx.invoke('growth-auto-pause', [!currentGrowth?.schedule?.paused]); await loadGrowth(); } });
+    const runGrowth = ui.button(t.runNow, { onClick: async () => { runGrowth.disabled = true; try { await ctx.invoke('growth-auto-run', []); await loadGrowth(); } catch (error) { ui.toast(String(error), 'bad'); } finally { runGrowth.disabled = false; } } });
+    controlRow.append(pauseGrowth, runGrowth);
+    const policyList = ui.h('div', 'hindsight-list');
+    growth.body.append(controlRow, policyList);
     const proposalList = ui.h('div', 'hindsight-list');
     const experienceList = ui.h('div', 'hindsight-list');
     const proposalsSheet = ui.sheet({ title: t.proposals });
@@ -283,7 +332,12 @@ const panel: WebUiPanel = {
     const usageLine = ui.h('div', 'stloc', t.usageUnavailable);
     health.body.append(healthBody, usageLine);
 
-    root.append(header, statusLine, searchRow, results.el, rememberRow, recent.el, actions, growth.el, growthStatus, proposalsSheet.el, experiencesSheet.el, addCardSheet.el, health.el);
+    const supplement = ui.sheet({ title: t.supplementDiagnostics });
+    const supplementLine = ui.msgline(t.loading);
+    const supplementBody = ui.h('div', 'hindsight-list');
+    supplement.body.append(supplementLine, supplementBody);
+
+    root.append(header, statusLine, searchRow, results.el, rememberRow, recent.el, actions, growth.el, growthStatus, proposalsSheet.el, experiencesSheet.el, addCardSheet.el, health.el, supplement.el);
 
     async function runSearch(query: string): Promise<void> {
       statusLine.textContent = t.loading;
@@ -304,19 +358,30 @@ const panel: WebUiPanel = {
               : state === 'deprecated' ? t.deprecated : state;
     }
 
+    function riskLabel(risk: string): string { return risk === 'low' ? t.riskLow : risk === 'medium' ? t.riskMedium : t.riskHigh; }
+    function policyRow(policy: PolicyApplication): HTMLElement {
+      const row = ui.h('div', 'strow'), info = ui.h('div', 'stinfo');
+      const proposal = currentGrowth?.proposals.find(item => item.id === policy.candidateId);
+      info.append(ui.h('div', 'stlabel', proposal?.title ?? policy.candidateId), ui.h('div', 'stloc', `${t.coreRisk}: ${riskLabel(policy.coreRisk)} · ${t.modelRisk}: ${riskLabel(policy.modelRisk)}`), ui.h('div', 'stloc', `${t.approvalState}: ${policy.reviewState === 'approved_auto' ? t.autoApproved : policy.reviewState === 'pending_owner' ? t.ownerReview : policy.reviewState} · ${stateLabel(policy.state)} · ${policy.reason}`));
+      if (policy.state === 'approved_owner') info.append(ui.h('div', 'stloc', t.highAwaitingPermission));
+      const actions = ui.actions();
+      if (policy.state === 'applied') actions.append(ui.button(t.revokePolicy, { size: 'sm', onClick: async () => { await ctx.invoke('growth-policy-revoke', [policy.candidateId]); await loadGrowth(); } }));
+      row.append(info, actions); return row;
+    }
     function proposalRow(proposal: GrowthProposal): HTMLElement {
       const row = ui.h('div', 'strow');
       const info = ui.h('div', 'stinfo');
       info.append(
         ui.h('div', 'stlabel', proposal.title),
-        ui.h('div', 'stloc', `${stateLabel(proposal.state)} · ${proposal.risk} · ${when(proposal.createdAt)}`),
+        ui.h('div', 'stloc', `${stateLabel(proposal.state)} · ${t.coreRisk}: ${riskLabel(currentGrowth?.proposalAssessments?.[proposal.id]?.coreRisk ?? 'high')} · ${t.modelRisk}: ${riskLabel(proposal.risk)} · ${when(proposal.createdAt)}`),
         ui.h('p', 'home-note', proposal.summary),
         ui.h('div', 'stloc', `${t.proposalEvidence}: ${proposal.evidence.join(' · ')}`),
         ui.h('div', 'stloc', `${t.proposalSources}: ${proposal.sourceIds.join(', ')}`),
         ...proposal.changes.map((change) => ui.h('div', 'stloc', `${change.file}: ${change.from ? `${change.from} → ` : ''}${change.to} (${change.reason})`)),
       );
       const actions = ui.actions();
-      if (proposal.state === 'candidate') {
+      if (proposal.state === 'candidate' && !currentGrowth?.policies?.applications.some(item => item.candidateId === proposal.id && item.state === 'applied')) {
+        const note = document.createElement('input'); note.type = 'text'; note.placeholder = t.ownerNote; note.dataset.growthOwnerNote = proposal.id; actions.append(note);
         actions.append(ui.button(t.approve, { size: 'sm', onClick: () => void reviewProposal(proposal, 'approved') }));
         actions.append(ui.button(t.reject, { size: 'sm', variant: 'danger', onClick: () => void reviewProposal(proposal, 'rejected') }));
       } else if (proposal.state === 'approved') {
@@ -330,7 +395,7 @@ const panel: WebUiPanel = {
 
     async function reviewProposal(proposal: GrowthProposal, action: 'approved' | 'rejected'): Promise<void> {
       try {
-        await ctx.invoke('growth-proposal-review', [proposal.id, action]);
+        await ctx.invoke('growth-proposal-review', [proposal.id, action, root.querySelector<HTMLInputElement>(`input[data-growth-owner-note="${proposal.id}"]`)?.value ?? '']);
         if (ctx.signal.aborted) return;
         ui.toast(action === 'approved' ? t.approved : t.rejected, 'ok');
         await loadGrowth();
@@ -448,6 +513,12 @@ const panel: WebUiPanel = {
           ctx.invoke<SystemHealth>('system-health'),
         ]);
         if (ctx.signal.aborted) return;
+        currentGrowth = data;
+        growthEnabled.checked = data.config?.enabled ?? false; autoApply.checked = data.autoApply === true;
+        focusContext.checked = data.policies?.focus ?? false;
+        pauseGrowth.textContent = data.schedule?.paused ? t.resumeGrowth : t.pauseGrowth;
+        policyList.replaceChildren(...(data.policies?.applications ?? []).map(policyRow));
+        if (data.policies?.focus) policyList.prepend(ui.h('div', 'stloc', data.policies.effective.some(item => item.kind === 'focus_quiet') ? t.focusSuppressed : t.focusNormal));
         const schedule = data.schedule;
         const scheduleEnabled = schedule?.blocked ? t.reviewBlocked : schedule?.enabled ? t.enabled : t.off;
         const lastStatus = schedule?.lastStatus === 'ok' ? t.reviewOk
@@ -456,6 +527,8 @@ const panel: WebUiPanel = {
         growthStatus.textContent = schedule
           ? `${t.growthSchedule}: ${scheduleEnabled}${schedule.paused ? ` · ${t.paused}` : ''}${schedule.activeRun ? ` · ${t.running}` : ''} · ${t.nextReview}: ${schedule.nextReviewAt ? when(schedule.nextReviewAt) : t.notRun} · ${t.lastReview}: ${schedule.lastFinishedAt ? when(schedule.lastFinishedAt) : t.notRun} · ${lastStatus}${schedule.lastProposalCount !== null ? ` · ${t.proposalCount(schedule.lastProposalCount)}` : ''}${schedule.lastError ? ` · ${t.lastReviewError}: ${schedule.lastError}` : ''}`
           : `${t.growthSchedule}: ${t.statusOff}`;
+        const automatic = data.autonomous;
+        if (automatic?.lastRun) growthStatus.textContent += ` · ${t.lastReview}: ${when(automatic.lastRun.finishedAt ?? automatic.lastRun.startedAt)} · ${automatic.lastRun.status}${automatic.running ? ` · ${t.running}` : ''}${automatic.lastRun.error ? ` · ${automatic.lastRun.error}` : ''}`;
         proposalList.replaceChildren(...(data.proposals.length ? data.proposals.map(proposalRow) : [ui.placeholder(t.noProposals)]));
         experienceList.replaceChildren(...(data.experiences.length ? data.experiences.map(experienceRow) : [ui.placeholder(t.noExperienceCards)]));
         healthBody.replaceChildren(
@@ -484,10 +557,65 @@ const panel: WebUiPanel = {
       }
     }
 
+    async function loadSupplementDiagnostics(): Promise<void> {
+      supplementLine.textContent = t.loading;
+      supplementLine.className = 'msgline';
+      try {
+        const data = await ctx.invoke<DomainSupplementDiagnostics>('domain-supplement-diagnostics');
+        if (ctx.signal.aborted) return;
+        const coreLine = healthRow(t.supplementCore, t.supplementCoreUnknown);
+        if (!data.available) {
+          supplementLine.textContent = t.supplementUnavailable;
+          supplementLine.className = 'msgline bad';
+          supplementBody.replaceChildren(coreLine);
+          return;
+        }
+        if (!data.enabled) {
+          supplementLine.textContent = t.supplementDisabled;
+          supplementLine.className = 'msgline';
+          supplementBody.replaceChildren(coreLine);
+          return;
+        }
+        if (data.receiptState === 'in_progress') {
+          supplementLine.textContent = t.supplementInProgress;
+          supplementLine.className = 'msgline';
+          supplementBody.replaceChildren(coreLine);
+          return;
+        }
+        if (data.receiptState !== 'settled' || !data.receiptPresent) {
+          supplementLine.textContent = data.receiptState === 'no_receipt' ? t.supplementNoReceipt : t.supplementUnavailable;
+          supplementLine.className = 'msgline';
+          supplementBody.replaceChildren(coreLine);
+          return;
+        }
+        supplementLine.textContent = data.status === 'finalized' ? t.supplementFinalized
+          : data.status === 'fallback' ? `${t.supplementFallback}${data.fallbackReason ? `: ${data.fallbackReason}` : ''}`
+            : t.supplementSkipped;
+        supplementLine.className = 'msgline';
+        supplementBody.replaceChildren(
+          healthRow(t.supplementDiagnostics, t.supplementSummary({
+            candidates: data.candidateCount ?? 0,
+            verified: data.verifiedCount ?? 0,
+            consumed: data.consumedCount ?? 0,
+            added: data.addedSourceCount ?? 0,
+            withheld: data.withheldCount ?? 0,
+            elapsedMs: data.elapsedMs ?? 0,
+            fallbackReason: data.fallbackReason,
+          })),
+          coreLine,
+        );
+      } catch (error) {
+        if (ctx.signal.aborted) return;
+        supplementLine.textContent = error instanceof Error ? error.message : String(error);
+        supplementLine.className = 'msgline bad';
+        supplementBody.replaceChildren();
+      }
+    }
+
     async function load(): Promise<void> {
       statusLine.textContent = t.loading;
       statusLine.className = 'msgline';
-      await loadGrowth();
+      await Promise.all([loadGrowth(), loadSupplementDiagnostics()]);
       let status: HindsightStatus;
       try {
         status = await ctx.invoke<HindsightStatus>('status');

@@ -52,6 +52,11 @@ nsis:
 mac:
   # macOS locale folders use underscores and bare en.
   electronLanguages: [en, zh_CN, zh_TW, ja, ko, fr, de, es_419, pt_BR, it, ru]
+  # A monotonic integer build number, higher than 0.4.0's dotted value; the user-visible
+  # version stays CFBundleShortVersionString = 1.0.0. Rev29 voice revision 6: 10002/10003 exposed
+  # unspanned World receipts and Host markers, 10004/10005 exposed unspanned pet frame lines and pet
+  # tool receipts; the span fixes ship under a new build number.
+  bundleVersion: "10017"
   target:
     - target: dmg
     - target: zip
@@ -64,9 +69,9 @@ mac:
   extendInfo:
     LSUIElement: true
     # English for every language: electron-builder has no option for per-language InfoPlist.strings
-    NSMicrophoneUsageDescription: Coo listens to you through the microphone. Speech is recognized on this Mac; recordings are not uploaded.
-    NSAudioCaptureUsageDescription: Coo listens to video audio in her own browser. Speech is recognized on this Mac; recordings are not uploaded.
-    NSAppleEventsUsageDescription: While using the computer for you, Coo uses this to bring the app you name to the front.
+    NSMicrophoneUsageDescription: Xi listens to you through the microphone. Speech is recognized on this Mac; recordings are not uploaded.
+    NSAudioCaptureUsageDescription: Xi listens to video audio in her own browser. Speech is recognized on this Mac; recordings are not uploaded.
+    NSAppleEventsUsageDescription: While using the computer for you, Xi uses this to bring the app you name to the front.
 dmg:
   writeUpdateInfo: false
 # x64 only. Data goes to ~/.config/Coopanion. The app runs on X11 (XWayland under Wayland, see app/main.cjs);

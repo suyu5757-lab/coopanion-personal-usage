@@ -34,6 +34,7 @@ export type ActionReceiptCompletion =
   | (ActionReceiptCompletionDetails & { phase: 'cancelled'; dispatchState: 'not-dispatched'; outcome: 'cancelled' })
   | (ActionReceiptCompletionDetails & { phase: 'failed'; dispatchState: ActionDispatchState; outcome: 'failed' });
 export type ActionReceiptReviewDecision = 'verified' | 'review-pending' | 'failed';
+export type ActionApprovalChannel = 'core-pet-bubble' | 'durable-rule' | 'permission-center';
 
 export type ExperienceTrialOutcome = 'verified' | 'unknown' | 'failed';
 
@@ -65,7 +66,8 @@ export interface ActionReceipt {
   duplicateKey: string;
   createdAt: number;
   updatedAt: number;
-  approvalChannel?: 'core-pet-bubble';
+  approvalChannel?: ActionApprovalChannel;
+  policyRuleId?: string;
   grantDigest?: string;
   approvedAt?: number;
   expiresAt?: number;
@@ -167,6 +169,8 @@ function usable(value: unknown): value is BrowserTaskAction {
     && (record.dispatchState === undefined || DISPATCH_STATES.has(record.dispatchState as ActionDispatchState))
     && (evidence === undefined || (Array.isArray(evidence) && evidence.every(usableEvidence)))
     && (record.outcome === undefined || OUTCOMES.has(record.outcome as ActionReceiptOutcome))
+    && (record.approvalChannel === undefined || record.approvalChannel === 'core-pet-bubble' || record.approvalChannel === 'durable-rule' || record.approvalChannel === 'permission-center')
+    && (record.policyRuleId === undefined || (typeof record.policyRuleId === 'string' && record.policyRuleId.length > 0 && record.policyRuleId.length <= 64))
     && typeof record.duplicateKey === 'string'
     && Number.isFinite(record.createdAt) && Number.isFinite(record.updatedAt);
 }
@@ -311,12 +315,21 @@ export class ActionReceiptLedger {
     this.transition(id, 'planned', 'awaiting-approval', now);
   }
 
-  acting(id: string, grantDigest: string, approvedAt: number, expiresAt: number, now = Date.now()): void {
+  acting(
+    id: string,
+    grantDigest: string,
+    approvedAt: number,
+    expiresAt: number,
+    now = Date.now(),
+    approval: { channel?: ActionApprovalChannel; ruleId?: string } = {},
+  ): void {
     if (!/^[a-f0-9]{64}$/.test(grantDigest) || !Number.isFinite(approvedAt) || !Number.isFinite(expiresAt) || expiresAt <= now) {
       throw new Error('the action grant is invalid');
     }
     this.transition(id, 'awaiting-approval', 'acting', now, {
-      approvalChannel: 'core-pet-bubble', grantDigest, approvedAt, expiresAt,
+      approvalChannel: approval.channel ?? 'core-pet-bubble',
+      ...(approval.ruleId ? { policyRuleId: approval.ruleId.slice(0, 64) } : {}),
+      grantDigest, approvedAt, expiresAt,
     });
   }
 

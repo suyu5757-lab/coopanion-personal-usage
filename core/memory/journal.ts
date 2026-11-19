@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { writeState } from '../state-file.ts';
 import type { HindsightMemory } from './hindsight.ts';
 
 export interface JournalLog {
@@ -73,19 +74,17 @@ export class RelationshipJournal {
   private readLastDay(): string | null {
     const file = this.file();
     if (!file || !existsSync(file)) return null;
-    try {
-      const parsed = JSON.parse(readFileSync(file, 'utf8')) as { lastDay?: unknown };
-      return typeof parsed.lastDay === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(parsed.lastDay) ? parsed.lastDay : null;
-    } catch {
-      return null;
-    }
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as { lastDay?: unknown };
+    if (typeof parsed.lastDay !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(parsed.lastDay)
+      || !Number.isFinite(Date.parse(`${parsed.lastDay}T12:00:00Z`))) throw new Error('invalid journal day marker');
+    return parsed.lastDay;
   }
 
   private writeLastDay(day: string): void {
     const file = this.file();
     if (!file) return;
     try {
-      writeFileSync(file, `${JSON.stringify({ lastDay: day })}\n`, 'utf8');
+      writeState(file, `${JSON.stringify({ lastDay: day })}\n`);
     } catch (err) {
       this.log?.warn('[journal] could not save the journal marker', { message: err instanceof Error ? err.message : String(err) });
     }
@@ -105,22 +104,33 @@ export class RelationshipJournal {
         return;
       }
       let cursor = saved;
-      if (cursor < addDays(yesterday, -MAX_CATCH_UP_DAYS + 1)) cursor = addDays(yesterday, -MAX_CATCH_UP_DAYS + 1);
+      if (cursor < addDays(yesterday, -MAX_CATCH_UP_DAYS)) cursor = addDays(yesterday, -MAX_CATCH_UP_DAYS);
       let wrote = false;
       while (addDays(cursor, 1) <= yesterday) {
         const day = addDays(cursor, 1);
+        if (memory.journalDayRecorded(day)) {
+          this.writeLastDay(day);
+          cursor = day;
+          continue;
+        }
         const question = `Write Coo's private diary entry for ${day} about the relationship with the person. `
           + 'Use that day\'s affection events, affinity changes and long-term memories. '
-          + 'If nothing happened, say it was a quiet day. '
+          + 'Describe only what the dated sources support; distinguish feelings, plans and claims from verified actions. '
           + 'Two to four sentences, first person, warm and concrete. No diagnosis, no heading, no bullet list.';
         const expectedEpoch = memory.evidenceEpoch();
         if (!expectedEpoch) return;
-        const answer = await memory.reflect(question, { tags: ['scope:affection'], tagsMatch: 'any', timeoutMs: 120_000 });
+        const read = await memory.reflectDetailed(question, { tags: ['scope:affection'], tagsMatch: 'any', timeoutMs: 120_000, requireSources: true });
         // A forget during the reflection makes the answer unusable, and a journal entry would
         // carry the forgotten source into a new document.
         if (!memory.settled() || memory.evidenceEpoch() !== expectedEpoch) return;
-        const text = answer || 'A quiet day. Nothing much happened, and that was fine.';
-        memory.retainJournal(text, day);
+        if (read.status !== 'found' || !read.text || !read.sourceSegments?.length) return;
+        const retained = await memory.retainJournal(read.text, day, {
+          sourceIds: read.sourceSegments.map((source) => source.documentId), expectedEpoch,
+        });
+        if (retained !== 'queued' && retained !== 'verified' && retained !== 'exists') {
+          this.log?.warn(`[journal] generated journal was not queued for ${day}: ${retained}`);
+          return;
+        }
         this.writeLastDay(day);
         cursor = day;
         wrote = true;

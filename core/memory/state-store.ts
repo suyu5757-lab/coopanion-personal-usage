@@ -12,6 +12,20 @@ import {
   type ReinforcementParameters,
   type UserMentionEvidence,
 } from './activation.ts';
+import {
+  DOMAIN_IDS,
+  MEMORY_DOMAIN_TAXONOMY,
+  assertSourceDomainClassification,
+  normalizeDomains,
+  type CooGrowthCandidateSourceEvidence,
+  type DomainId,
+  type DomainSourcePage,
+  type SourceDomainClassification,
+  type SourceDomainClassificationInput,
+  type SourceDomainEvidenceProvider,
+  type SourceDomainLink,
+  type SourceDomainStats,
+} from './source-domains.ts';
 
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
 
@@ -121,8 +135,11 @@ export type DerivedArtifactInput = Omit<DerivedArtifact, 'sources'> & {
   sources: readonly MemorySourceDependency[];
 };
 
-type MemoryStateMigrationCheckpoint = 'after-v4-ddl' | 'after-v4-version';
+type MemoryStateMigrationCheckpoint = 'after-v4-ddl' | 'after-v4-version' | 'after-v5-ddl' | 'after-v5-version';
 type MemoryStateMigrationOptions = { onCheckpoint?: (checkpoint: MemoryStateMigrationCheckpoint) => void };
+export interface MemoryStateStoreOptions extends MemoryStateMigrationOptions {
+  sourceDomainEvidence?: SourceDomainEvidenceProvider;
+}
 
 interface ActivationRow {
   activation_anchor_weight: number;
@@ -164,6 +181,11 @@ const V4_TABLE_COLUMNS: Record<string, readonly string[]> = {
   derived_artifact_source: ['artifact_id', 'bank_id', 'endpoint', 'document_id', 'validated_epoch', 'validated_fence', 'source_revision', 'content_digest', 'segment_digest', 'validation_state', 'correlation_id'],
 };
 
+const V5_TABLE_COLUMNS: Record<string, readonly string[]> = {
+  source_domain_record: ['bank_id', 'endpoint', 'document_id', 'state', 'taxonomy_version', 'classifier_version', 'confidence', 'source_epoch', 'source_revision', 'classified_at', 'updated_at'],
+  source_domain_link: ['bank_id', 'endpoint', 'document_id', 'domain_id', 'link_state', 'taxonomy_version', 'classifier_version', 'confidence', 'rule_id', 'evidence_start', 'evidence_end', 'evidence_digest', 'claim_verification', 'created_at'],
+};
+
 const BASE_INDEXES = [
   'memory_operations_due', 'memory_operations_source', 'memory_revisions_current', 'memory_deletions_due',
 ];
@@ -172,6 +194,7 @@ const V4_INDEXES = [
   'generation_evidence_attempt', 'generation_source_dependency_namespace',
   'derived_artifact_lifecycle', 'derived_artifact_source_namespace',
 ];
+const V5_INDEXES = ['source_domain_record_state', 'source_domain_link_domain', 'source_domain_link_namespace'];
 
 const BASE_SCHEMA_SQL = `
   CREATE TABLE memory_metadata (
@@ -369,11 +392,66 @@ const V4_SCHEMA_SQL = `
     ON derived_artifact_source(bank_id, endpoint, document_id, artifact_id);
 `;
 
+const DOMAIN_ID_SQL = DOMAIN_IDS.map((domain) => `'${domain}'`).join(', ');
+
+export const V5_SCHEMA_SQL = `
+  CREATE TABLE source_domain_record (
+    bank_id TEXT NOT NULL CHECK(length(trim(bank_id)) > 0),
+    endpoint TEXT NOT NULL CHECK(length(trim(endpoint)) > 0),
+    document_id TEXT NOT NULL CHECK(length(trim(document_id)) > 0),
+    state TEXT NOT NULL CHECK(state IN ('assigned', 'unclassified', 'ambiguous', 'pending_review')),
+    taxonomy_version TEXT NOT NULL CHECK(length(trim(taxonomy_version)) > 0),
+    classifier_version TEXT NOT NULL CHECK(length(trim(classifier_version)) > 0),
+    confidence REAL CHECK(confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+    source_epoch INTEGER NOT NULL CHECK(source_epoch >= 0),
+    source_revision TEXT NOT NULL CHECK(length(source_revision) = 64 AND source_revision NOT GLOB '*[^0-9a-f]*'),
+    classified_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(bank_id, endpoint, document_id)
+  );
+  CREATE INDEX source_domain_record_state ON source_domain_record(state, updated_at);
+  CREATE TABLE source_domain_link (
+    bank_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    document_id TEXT NOT NULL,
+    domain_id TEXT NOT NULL CHECK(domain_id IN (${DOMAIN_ID_SQL})),
+    link_state TEXT NOT NULL CHECK(link_state IN ('confirmed', 'candidate')),
+    taxonomy_version TEXT NOT NULL CHECK(length(trim(taxonomy_version)) > 0),
+    classifier_version TEXT NOT NULL CHECK(length(trim(classifier_version)) > 0),
+    confidence REAL CHECK(confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+    rule_id TEXT,
+    evidence_start INTEGER CHECK(evidence_start IS NULL OR evidence_start >= 0),
+    evidence_end INTEGER CHECK(evidence_end IS NULL OR evidence_end > evidence_start),
+    evidence_digest TEXT CHECK(evidence_digest IS NULL OR (length(evidence_digest) = 64 AND evidence_digest NOT GLOB '*[^0-9a-f]*')),
+    claim_verification TEXT NOT NULL CHECK(claim_verification IN ('user_verified', 'external_unverified')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(bank_id, endpoint, document_id, domain_id),
+    FOREIGN KEY(bank_id, endpoint, document_id)
+      REFERENCES source_domain_record(bank_id, endpoint, document_id) ON DELETE CASCADE,
+    CHECK((evidence_start IS NULL) = (evidence_end IS NULL)),
+    CHECK((evidence_start IS NULL) = (evidence_digest IS NULL)),
+    CHECK(link_state = 'candidate'
+      OR (evidence_start IS NOT NULL AND evidence_end IS NOT NULL AND evidence_digest IS NOT NULL))
+  );
+  CREATE INDEX source_domain_link_domain
+    ON source_domain_link(domain_id, link_state, bank_id, endpoint, document_id);
+  CREATE INDEX source_domain_link_namespace
+    ON source_domain_link(bank_id, endpoint, document_id);
+`;
+
+/** Explicit maintenance fallback for a synthetic or separately approved database. Never run automatically. */
+export const V5_DOWN_SCHEMA_SQL = `
+  DROP TABLE IF EXISTS source_domain_link;
+  DROP TABLE IF EXISTS source_domain_record;
+  PRAGMA user_version = 4;
+`;
+
 function expectedTables(version: number): Record<string, readonly string[]> {
   return {
     ...BASE_TABLE_COLUMNS,
     ...(version >= 3 ? V3_TABLE_COLUMNS : {}),
     ...(version >= 4 ? V4_TABLE_COLUMNS : {}),
+    ...(version >= 5 ? V5_TABLE_COLUMNS : {}),
   };
 }
 
@@ -382,6 +460,7 @@ function expectedIndexes(version: number): string[] {
     ...BASE_INDEXES,
     ...(version >= 3 ? V3_INDEXES : []),
     ...(version >= 4 ? V4_INDEXES : []),
+    ...(version >= 5 ? V5_INDEXES : []),
   ].sort();
 }
 
@@ -406,6 +485,11 @@ function assertStateSchema(db: StateDatabase, version: number): void {
     if (JSON.stringify(actual) !== JSON.stringify([...columns].sort())) {
       throw new Error(`memory database schema ${version} has an unexpected ${table} layout`);
     }
+    const uniqueIndexes = (db.prepare(`PRAGMA index_list("${table}")`).all() as Array<{ origin: string }>)
+      .filter((index) => index.origin === 'u');
+    if (uniqueIndexes.length > 0 && table !== 'memory_mention_events') {
+      throw new Error(`memory database schema ${version} has an unexpected unique index on ${table}`);
+    }
   }
   const indexes = (db.prepare("SELECT name FROM sqlite_schema WHERE type = 'index' AND sql IS NOT NULL ORDER BY name")
     .all() as Array<{ name: string }>).map((row) => row.name);
@@ -423,6 +507,13 @@ function assertStateSchema(db: StateDatabase, version: number): void {
     assertForeignKey(db, 'derived_artifact', 'generation_evidence', 'creator_generation_id', 'generation_id');
     assertForeignKey(db, 'derived_artifact_source', 'derived_artifact', 'artifact_id', 'artifact_id');
   }
+  if (version >= 5) {
+    assertPrimaryKey(db, 'source_domain_record', ['bank_id', 'endpoint', 'document_id']);
+    assertPrimaryKey(db, 'source_domain_link', ['bank_id', 'endpoint', 'document_id', 'domain_id']);
+    assertForeignKey(db, 'source_domain_link', 'source_domain_record', 'bank_id', 'bank_id', 'CASCADE');
+    assertForeignKey(db, 'source_domain_link', 'source_domain_record', 'endpoint', 'endpoint', 'CASCADE');
+    assertForeignKey(db, 'source_domain_link', 'source_domain_record', 'document_id', 'document_id', 'CASCADE');
+  }
 }
 
 function assertPrimaryKey(db: StateDatabase, table: string, expected: readonly string[]): void {
@@ -431,19 +522,27 @@ function assertPrimaryKey(db: StateDatabase, table: string, expected: readonly s
   if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(`memory database has an invalid ${table} identity`);
 }
 
-function assertForeignKey(db: StateDatabase, table: string, target: string, from: string, to: string): void {
-  const rows = db.prepare(`PRAGMA foreign_key_list("${table}")`).all() as Array<{ table: string; from: string; to: string }>;
-  if (!rows.some((row) => row.table === target && row.from === from && row.to === to)) {
+function assertForeignKey(
+  db: StateDatabase,
+  table: string,
+  target: string,
+  from: string,
+  to: string,
+  onDelete?: string,
+): void {
+  const rows = db.prepare(`PRAGMA foreign_key_list("${table}")`).all() as Array<{ table: string; from: string; to: string; on_delete: string }>;
+  if (!rows.some((row) => row.table === target && row.from === from && row.to === to
+    && (onDelete === undefined || row.on_delete === onDelete))) {
     throw new Error(`memory database has an invalid ${table} relationship`);
   }
 }
 
 function migrateStateSchema(db: StateDatabase, options: MemoryStateMigrationOptions): void {
   const version = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
-  if (version > 4) throw new Error(`memory database schema ${version} is newer than this application`);
+  if (version > 5) throw new Error(`memory database schema ${version} is newer than this application`);
   if (version === 1) throw new Error('memory database schema 1 has no verified migration contract');
-  if (version === 4) {
-    assertStateSchema(db, 4);
+  if (version === 5) {
+    assertStateSchema(db, 5);
     return;
   }
   if (version === 0) {
@@ -474,9 +573,17 @@ function migrateStateSchema(db: StateDatabase, options: MemoryStateMigrationOpti
       assertStateSchema(db, 4);
       options.onCheckpoint?.('after-v4-ddl');
       db.exec('PRAGMA user_version = 4');
+      current = 4;
       options.onCheckpoint?.('after-v4-version');
     }
-    assertStateSchema(db, 4);
+    if (current < 5) {
+      db.exec(V5_SCHEMA_SQL);
+      assertStateSchema(db, 5);
+      options.onCheckpoint?.('after-v5-ddl');
+      db.exec('PRAGMA user_version = 5');
+      options.onCheckpoint?.('after-v5-version');
+    }
+    assertStateSchema(db, 5);
     const integrity = db.prepare('PRAGMA quick_check').all() as Array<{ quick_check?: string }>;
     if (integrity.length !== 1 || integrity[0]?.quick_check !== 'ok') {
       throw new Error(`memory database integrity check failed: ${integrity[0]?.quick_check ?? 'no result'}`);
@@ -619,17 +726,19 @@ export function closeMemoryStateStores(): void {
 /** Application-private SQLite state for memory delivery and source visibility. */
 export class MemoryStateStore {
   private readonly db: InstanceType<typeof DatabaseSync>;
+  private readonly sourceDomainEvidence?: SourceDomainEvidenceProvider;
   private transactionDepth = 0;
   private closed = false;
 
-  constructor(readonly path: string, migrationOptions: MemoryStateMigrationOptions = {}) {
+  constructor(readonly path: string, options: MemoryStateStoreOptions = {}) {
     mkdirSync(dirname(path), { recursive: true });
     const fd = openSync(path, 'a', 0o600);
     closeSync(fd);
     this.db = new DatabaseSync(path);
+    this.sourceDomainEvidence = options.sourceDomainEvidence;
     try {
       this.db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA synchronous = FULL;');
-      migrateStateSchema(this.db, migrationOptions);
+      migrateStateSchema(this.db, options);
       this.db.exec('PRAGMA journal_mode = WAL;');
       this.restrictFilePermissions();
       const check = this.db.prepare('PRAGMA quick_check').all() as Array<{ quick_check?: string }>;
@@ -696,6 +805,22 @@ export class MemoryStateStore {
     });
   }
 
+  /** Bounded, content-free identities for Growth; classifications are discovery hints only. */
+  listGrowthSourceIdentities(bankId: string, endpoint: string, limit = 64): string[] {
+    this.assertOpen();
+    if (!Number.isInteger(limit) || limit < 1 || limit > 128) throw new RangeError('Growth identity limit must be between 1 and 128');
+    const rows = this.db.prepare(`
+      SELECT document_id, MAX(updated_at) AS latest FROM (
+        SELECT document_id, updated_at FROM memory_operations
+        WHERE bank_id = ? AND endpoint = ? AND state = 'verified'
+        UNION ALL
+        SELECT document_id, updated_at FROM source_domain_record
+        WHERE bank_id = ? AND endpoint = ?
+      ) GROUP BY document_id ORDER BY latest DESC, document_id LIMIT ?
+    `).all(requiredText(bankId, 'bankId'), requiredText(endpoint, 'endpoint'), bankId, endpoint, limit) as Array<{ document_id: string }>;
+    return rows.map(row => row.document_id);
+  }
+
   loadOutbox(): Array<Record<string, unknown>> {
     this.assertOpen();
     const rows = this.db.prepare(`
@@ -716,10 +841,40 @@ export class MemoryStateStore {
     this.transaction(() => this.writeOutbox(item));
   }
 
+  /**
+   * Updates one existing outbox operation row without rewriting its event. Used by an authorized
+   * local reconciliation where the Bank delivery already happened and the event payload must stay
+   * untouched.
+   */
+  updateOutboxRecord(item: object): boolean {
+    this.assertOpen();
+    const raw = item as { id?: unknown; state?: unknown; updatedAt?: unknown };
+    if (typeof raw.id !== 'string' || typeof raw.state !== 'string' || typeof raw.updatedAt !== 'string') return false;
+    const result = this.db.prepare(`
+      UPDATE memory_operations
+      SET state = ?, updated_at = ?, next_poll_at = NULL, record_json = ?
+      WHERE event_id = ?
+    `).run(raw.state, raw.updatedAt, JSON.stringify(item), raw.id);
+    return result.changes === 1;
+  }
+
   replaceOutbox(items: readonly object[]): void {
     this.transaction(() => {
       this.db.exec('DELETE FROM memory_operations; DELETE FROM memory_events;');
       for (const item of items) this.writeOutbox(item);
+    });
+  }
+
+  /** Removes only the named retain operations and their own events, never unrelated events. */
+  removeOutbox(eventIds: readonly string[]): void {
+    if (eventIds.length === 0) return;
+    this.transaction(() => {
+      const deleteOperation = this.db.prepare('DELETE FROM memory_operations WHERE event_id = ?');
+      const deleteEvent = this.db.prepare('DELETE FROM memory_events WHERE event_id = ?');
+      for (const eventId of eventIds) {
+        deleteOperation.run(eventId);
+        deleteEvent.run(eventId);
+      }
     });
   }
 
@@ -1250,6 +1405,334 @@ export class MemoryStateStore {
     });
   }
 
+  putSourceDomainClassification(input: SourceDomainClassificationInput): SourceDomainClassification {
+    assertSourceDomainClassification(input);
+    this.assertSourceDomainWritable();
+    const provider = this.sourceDomainEvidence;
+    if (!provider) throw new Error('source domain evidence provider is not configured; classification writes are disabled');
+    const evidence = provider(input.bankId, input.endpoint, input.documentId);
+    if (!evidence) throw new Error('verified source evidence is unavailable');
+    if (evidence.bankId !== input.bankId || evidence.endpoint !== input.endpoint || evidence.documentId !== input.documentId) {
+      throw new Error('verified source evidence identity does not match the classification');
+    }
+    if (evidence.sourceActor !== 'user' || !['event', 'correction'].includes(evidence.sourceKind)) {
+      throw new Error('only verified user events and corrections can be classified');
+    }
+    if (evidence.sourceStatus === 'superseded' || evidence.sourceStatus === 'disputed') {
+      throw new Error('verified source is no longer current');
+    }
+    if (typeof evidence.content !== 'string' || evidence.content.length === 0) {
+      throw new Error('verified source content is empty');
+    }
+    const revision = createHash('sha256').update(evidence.content, 'utf8').digest('hex');
+    const evidenceEpoch = evidence.sourceEpoch;
+    if (input.sourceRevision !== revision) throw new Error('source revision does not match the verified source');
+    for (const link of input.links) {
+      if (link.evidenceStart === null) continue;
+      const end = link.evidenceEnd!;
+      if (end > evidence.content.length) throw new Error('evidence span is outside the verified source');
+      const digest = createHash('sha256').update(evidence.content.slice(link.evidenceStart, end), 'utf8').digest('hex');
+      if (digest !== link.evidenceDigest) throw new Error('evidence digest does not match the verified source span');
+    }
+
+    return this.transaction(() => {
+      this.assertSourceDomainWritable();
+      if (this.isFenced(input.bankId, input.endpoint, input.documentId)) {
+        throw new Error('source is fenced and cannot be classified');
+      }
+      const epoch = this.currentEpoch(input.bankId, input.endpoint);
+      if (evidenceEpoch !== epoch || input.sourceEpoch !== epoch) throw new Error('source epoch is stale');
+      if (this.supersededSources(input.bankId, input.endpoint).has(input.documentId)) {
+        throw new Error('source is superseded and cannot be classified');
+      }
+
+      this.db.prepare(`
+        DELETE FROM source_domain_link WHERE bank_id = ? AND endpoint = ? AND document_id = ?
+      `).run(input.bankId, input.endpoint, input.documentId);
+      this.db.prepare(`
+        DELETE FROM source_domain_record WHERE bank_id = ? AND endpoint = ? AND document_id = ?
+      `).run(input.bankId, input.endpoint, input.documentId);
+      this.db.prepare(`
+        INSERT INTO source_domain_record(bank_id, endpoint, document_id, state, taxonomy_version,
+          classifier_version, confidence, source_epoch, source_revision, classified_at, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        input.bankId, input.endpoint, input.documentId, input.state, input.taxonomyVersion,
+        input.classifierVersion, input.confidence, epoch, revision, input.classifiedAt, input.updatedAt,
+      );
+      const insert = this.db.prepare(`
+        INSERT INTO source_domain_link(bank_id, endpoint, document_id, domain_id, link_state,
+          taxonomy_version, classifier_version, confidence, rule_id, evidence_start, evidence_end,
+          evidence_digest, claim_verification, created_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const link of input.links) insert.run(
+        input.bankId, input.endpoint, input.documentId, link.domainId, link.linkState,
+        input.taxonomyVersion, input.classifierVersion, link.confidence, link.ruleId,
+        link.evidenceStart, link.evidenceEnd, link.evidenceDigest, link.claimVerification, input.updatedAt,
+      );
+      return this.readSourceDomainRecord(input.bankId, input.endpoint, input.documentId)!;
+    });
+  }
+
+  /** Persist an exact-read Coo candidate in the separate synthetic source-index path. */
+  putCooGrowthCandidateClassification(
+    input: SourceDomainClassificationInput,
+    evidence: CooGrowthCandidateSourceEvidence,
+  ): SourceDomainClassification {
+    assertSourceDomainClassification(input);
+    this.assertSourceDomainWritable();
+    this.assertCooGrowthCandidateClassification(input, evidence);
+    const revision = createHash('sha256').update(evidence.content, 'utf8').digest('hex');
+    if (input.sourceRevision !== revision) throw new Error('Coo candidate source revision does not match exact read-back');
+
+    return this.transaction(() => {
+      this.assertSourceDomainWritable();
+      if (this.isFenced(input.bankId, input.endpoint, input.documentId)) {
+        throw new Error('Coo candidate source is fenced');
+      }
+      const epoch = this.currentEpoch(input.bankId, input.endpoint);
+      if (evidence.sourceEpoch !== epoch || input.sourceEpoch !== epoch) {
+        throw new Error('Coo candidate source epoch is stale');
+      }
+      if (this.supersededSources(input.bankId, input.endpoint).has(input.documentId)) {
+        throw new Error('Coo candidate source is superseded');
+      }
+      const current = this.readSourceDomainRecord(input.bankId, input.endpoint, input.documentId);
+      if (current) {
+        const same = current.state === input.state
+          && current.taxonomyVersion === input.taxonomyVersion
+          && current.classifierVersion === input.classifierVersion
+          && current.sourceEpoch === epoch
+          && current.sourceRevision === revision
+          && JSON.stringify(current.links) === JSON.stringify(input.links);
+        if (!same) throw new Error('Coo candidate source index identity conflicts with its persisted classification');
+        return current;
+      }
+
+      this.db.prepare(`
+        INSERT INTO source_domain_record(bank_id, endpoint, document_id, state, taxonomy_version,
+          classifier_version, confidence, source_epoch, source_revision, classified_at, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        input.bankId, input.endpoint, input.documentId, input.state, input.taxonomyVersion,
+        input.classifierVersion, input.confidence, epoch, revision, input.classifiedAt, input.updatedAt,
+      );
+      const insert = this.db.prepare(`
+        INSERT INTO source_domain_link(bank_id, endpoint, document_id, domain_id, link_state,
+          taxonomy_version, classifier_version, confidence, rule_id, evidence_start, evidence_end,
+          evidence_digest, claim_verification, created_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const link of input.links) insert.run(
+        input.bankId, input.endpoint, input.documentId, link.domainId, link.linkState,
+        input.taxonomyVersion, input.classifierVersion, link.confidence, link.ruleId,
+        link.evidenceStart, link.evidenceEnd, link.evidenceDigest, link.claimVerification, input.updatedAt,
+      );
+      return this.readSourceDomainRecord(input.bankId, input.endpoint, input.documentId)!;
+    });
+  }
+
+  /** Read a Coo candidate index row only alongside its current configured-client exact read-back. */
+  getCooGrowthCandidateClassification(
+    bankId: string,
+    endpoint: string,
+    documentId: string,
+    evidence: CooGrowthCandidateSourceEvidence,
+  ): SourceDomainClassification | null {
+    this.assertOpen();
+    try {
+      const record = this.readSourceDomainRecord(
+        requiredText(bankId, 'bankId'), requiredText(endpoint, 'endpoint'), requiredText(documentId, 'documentId'),
+      );
+      if (!record || record.classifierVersion !== 'coo-growth-source/v1'
+        || record.documentId !== evidence.documentId || record.sourceRevision !== createHash('sha256').update(evidence.content, 'utf8').digest('hex')
+        || !this.sourceDomainRecordCurrent(record)) return null;
+      this.assertCooGrowthCandidateClassification({
+        bankId: record.bankId,
+        endpoint: record.endpoint,
+        documentId: record.documentId,
+        state: record.state,
+        taxonomyVersion: record.taxonomyVersion,
+        classifierVersion: record.classifierVersion,
+        confidence: record.confidence,
+        sourceEpoch: record.sourceEpoch,
+        sourceRevision: record.sourceRevision,
+        classifiedAt: record.classifiedAt,
+        updatedAt: record.updatedAt,
+        links: record.links,
+      }, evidence);
+      return this.sourceDomainRecordCurrent(record) ? record : null;
+    } catch {
+      return null;
+    }
+  }
+
+  getSourceDomainClassification(bankId: string, endpoint: string, documentId: string): SourceDomainClassification | null {
+    this.assertOpen();
+    const record = this.readSourceDomainRecord(
+      requiredText(bankId, 'bankId'), requiredText(endpoint, 'endpoint'), requiredText(documentId, 'documentId'),
+    );
+    return record && this.sourceDomainRecordReadable(record) ? record : null;
+  }
+
+  listDomainSources(
+    bankId: string,
+    endpoint: string,
+    domains: readonly DomainId[],
+    opts: { limit?: number; cursor?: string | null } = {},
+  ): DomainSourcePage {
+    this.assertOpen();
+    const bank = requiredText(bankId, 'bankId');
+    const target = requiredText(endpoint, 'endpoint');
+    const selected = normalizeDomains(domains);
+    const limit = opts.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error('domain source limit must be an integer between 1 and 200');
+    let cursor = opts.cursor ?? '';
+    if (typeof cursor !== 'string') throw new Error('domain source cursor must be a string');
+    if (this.meta('forget:damaged') === '1' || this.meta('forget:write-blocked') === '1') {
+      return { items: [], nextCursor: null, complete: false, filtered: 0, blocked: true };
+    }
+
+    const placeholders = selected.map(() => '?').join(', ');
+    const query = this.db.prepare(`
+      SELECT bank_id, endpoint, document_id
+      FROM source_domain_record
+      WHERE bank_id = ? AND endpoint = ? AND state = 'assigned' AND document_id > ?
+        AND EXISTS (
+          SELECT 1 FROM source_domain_link l
+          WHERE l.bank_id = source_domain_record.bank_id
+            AND l.endpoint = source_domain_record.endpoint
+            AND l.document_id = source_domain_record.document_id
+            AND l.link_state = 'confirmed'
+            AND l.domain_id IN (${placeholders})
+        )
+      ORDER BY document_id
+      LIMIT ?
+    `);
+    const items: SourceDomainClassification[] = [];
+    let filtered = 0;
+    let exhausted = false;
+    while (items.length < limit) {
+      const requested = limit - items.length + 1;
+      const rows = query.all(bank, target, cursor, ...selected, requested) as Array<{
+        bank_id: string; endpoint: string; document_id: string;
+      }>;
+      if (rows.length === 0) { exhausted = true; break; }
+      for (const row of rows) {
+        cursor = row.document_id;
+        const record = this.readSourceDomainRecord(row.bank_id, row.endpoint, row.document_id);
+        if (!record || !this.sourceDomainRecordReadable(record)) filtered += 1;
+        else items.push(record);
+        if (items.length === limit) break;
+      }
+      if (rows.length < requested) { exhausted = true; break; }
+    }
+    return {
+      items,
+      nextCursor: exhausted ? null : cursor,
+      complete: exhausted,
+      filtered,
+      blocked: false,
+    };
+  }
+
+  domainIndexStats(bankId: string, endpoint: string): SourceDomainStats {
+    this.assertOpen();
+    const bank = requiredText(bankId, 'bankId');
+    const target = requiredText(endpoint, 'endpoint');
+    const blocked = this.meta('forget:damaged') === '1' || this.meta('forget:write-blocked') === '1';
+    const epoch = this.currentEpoch(bank, target);
+    const rows = this.db.prepare(`
+      SELECT state, COUNT(*) AS count FROM source_domain_record
+      WHERE bank_id = ? AND endpoint = ? GROUP BY state
+    `).all(bank, target) as Array<{ state: string; count: number }>;
+    const counts: Record<string, number> = {};
+    for (const row of rows) counts[row.state] = row.count;
+    const verifiedSources = (this.db.prepare(`
+      WITH operation_sources AS (
+        SELECT DISTINCT o.document_id
+        FROM memory_operations o JOIN memory_events e USING(event_id)
+        WHERE o.bank_id = ? AND o.endpoint = ? AND o.state = 'verified' AND e.actor = 'user'
+          AND NOT EXISTS (
+            SELECT 1 FROM memory_fences f
+            WHERE f.bank_id = o.bank_id AND f.endpoint = o.endpoint AND f.document_id IN (o.document_id, '*')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM memory_revisions r
+            WHERE r.bank_id = o.bank_id AND r.endpoint = o.endpoint
+              AND r.supersedes_document_id = o.document_id AND r.state = 'active'
+          )
+      ), indexed_sources AS (
+        SELECT DISTINCT r.document_id
+        FROM source_domain_record r
+        WHERE r.bank_id = ? AND r.endpoint = ? AND r.source_epoch = ?
+          AND r.document_id NOT LIKE 'coo-growth:%'
+          AND NOT EXISTS (
+            SELECT 1 FROM memory_fences f
+            WHERE f.bank_id = r.bank_id AND f.endpoint = r.endpoint AND f.document_id IN (r.document_id, '*')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM memory_revisions rev
+            WHERE rev.bank_id = r.bank_id AND rev.endpoint = r.endpoint
+              AND rev.supersedes_document_id = r.document_id AND rev.state = 'active'
+          )
+      )
+      SELECT COUNT(*) AS count FROM (
+        SELECT document_id FROM operation_sources
+        UNION
+        SELECT document_id FROM indexed_sources
+      )
+    `).get(bank, target, bank, target, epoch) as { count: number }).count;
+    const notIndexed = (this.db.prepare(`
+      SELECT COUNT(DISTINCT o.document_id) AS count FROM memory_operations o JOIN memory_events e USING(event_id)
+      WHERE o.bank_id = ? AND o.endpoint = ? AND o.state = 'verified' AND e.actor = 'user'
+        AND NOT EXISTS (
+          SELECT 1 FROM memory_fences f
+          WHERE f.bank_id = o.bank_id AND f.endpoint = o.endpoint AND f.document_id IN (o.document_id, '*')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM memory_revisions r
+          WHERE r.bank_id = o.bank_id AND r.endpoint = o.endpoint
+            AND r.supersedes_document_id = o.document_id AND r.state = 'active'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM source_domain_record r
+          WHERE r.bank_id = o.bank_id AND r.endpoint = o.endpoint AND r.document_id = o.document_id
+            AND r.source_epoch = ? AND r.document_id NOT LIKE 'coo-growth:%'
+        )
+    `).get(bank, target, epoch) as { count: number }).count;
+    const unattributedSources = (this.db.prepare(`
+      SELECT COUNT(DISTINCT o.document_id) AS count FROM memory_operations o JOIN memory_events e USING(event_id)
+      WHERE o.bank_id = ? AND o.endpoint = ? AND o.state = 'verified' AND e.actor IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM memory_fences f
+          WHERE f.bank_id = o.bank_id AND f.endpoint = o.endpoint AND f.document_id IN (o.document_id, '*')
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM memory_revisions rev
+          WHERE rev.bank_id = o.bank_id AND rev.endpoint = o.endpoint
+            AND rev.supersedes_document_id = o.document_id AND rev.state = 'active'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM source_domain_record r
+          WHERE r.bank_id = o.bank_id AND r.endpoint = o.endpoint AND r.document_id = o.document_id
+            AND r.source_epoch = ? AND r.document_id NOT LIKE 'coo-growth:%'
+        )
+    `).get(bank, target, epoch) as { count: number }).count;
+    return {
+      records: rows.reduce((total, row) => total + row.count, 0),
+      assigned: counts.assigned ?? 0,
+      ambiguous: counts.ambiguous ?? 0,
+      pendingReview: counts.pending_review ?? 0,
+      unclassified: counts.unclassified ?? 0,
+      verifiedSources,
+      notIndexed,
+      unattributedSources,
+      blocked,
+    };
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -1359,6 +1842,141 @@ export class MemoryStateStore {
         correlationId: source.correlation_id,
       })),
     };
+  }
+
+  private readSourceDomainRecord(
+    bankId: string,
+    endpoint: string,
+    documentId: string,
+  ): SourceDomainClassification | null {
+    const row = this.db.prepare(`
+      SELECT bank_id, endpoint, document_id, state, taxonomy_version, classifier_version,
+        confidence, source_epoch, source_revision, classified_at, updated_at
+      FROM source_domain_record WHERE bank_id = ? AND endpoint = ? AND document_id = ?
+    `).get(bankId, endpoint, documentId) as {
+      bank_id: string; endpoint: string; document_id: string; state: string;
+      taxonomy_version: string; classifier_version: string; confidence: number | null;
+      source_epoch: number; source_revision: string; classified_at: string; updated_at: string;
+    } | undefined;
+    if (!row) return null;
+    const order = new Map(DOMAIN_IDS.map((domain, index) => [domain, index]));
+    const links = (this.db.prepare(`
+      SELECT domain_id, link_state, confidence, rule_id, evidence_start, evidence_end,
+        evidence_digest, claim_verification
+      FROM source_domain_link WHERE bank_id = ? AND endpoint = ? AND document_id = ?
+    `).all(bankId, endpoint, documentId) as Array<{
+      domain_id: string; link_state: string; confidence: number | null; rule_id: string | null;
+      evidence_start: number | null; evidence_end: number | null; evidence_digest: string | null;
+      claim_verification: string;
+    }>).map((link): SourceDomainLink => ({
+      domainId: link.domain_id as DomainId,
+      linkState: link.link_state as SourceDomainLink['linkState'],
+      confidence: link.confidence,
+      ruleId: link.rule_id,
+      evidenceStart: link.evidence_start,
+      evidenceEnd: link.evidence_end,
+      evidenceDigest: link.evidence_digest,
+      claimVerification: link.claim_verification as SourceDomainLink['claimVerification'],
+    })).sort((left, right) => order.get(left.domainId)! - order.get(right.domainId)!);
+    return {
+      bankId: row.bank_id,
+      endpoint: row.endpoint,
+      documentId: row.document_id,
+      state: row.state as SourceDomainClassification['state'],
+      taxonomyVersion: row.taxonomy_version,
+      classifierVersion: row.classifier_version,
+      confidence: row.confidence,
+      sourceEpoch: row.source_epoch,
+      sourceRevision: row.source_revision,
+      classifiedAt: row.classified_at,
+      updatedAt: row.updated_at,
+      links,
+    };
+  }
+
+  private sourceDomainRecordReadable(record: SourceDomainClassification): boolean {
+    if (record.documentId.startsWith('coo-growth:')) return false;
+    if (!this.sourceDomainRecordCurrent(record)) return false;
+    if (!this.sourceDomainEvidence) return true;
+    try {
+      const evidence = this.sourceDomainEvidence(record.bankId, record.endpoint, record.documentId);
+      if (!evidence || evidence.bankId !== record.bankId || evidence.endpoint !== record.endpoint
+        || evidence.documentId !== record.documentId || evidence.sourceEpoch !== record.sourceEpoch) return false;
+      if (evidence.sourceActor !== 'user' || !['event', 'correction'].includes(evidence.sourceKind)) return false;
+      if (evidence.sourceStatus === 'superseded' || evidence.sourceStatus === 'disputed') return false;
+      if (typeof evidence.content !== 'string' || evidence.content.length === 0) return false;
+      if (createHash('sha256').update(evidence.content, 'utf8').digest('hex') !== record.sourceRevision) return false;
+      return this.sourceDomainRecordCurrent(record);
+    } catch {
+      return false;
+    }
+  }
+
+  private assertCooGrowthCandidateClassification(
+    input: SourceDomainClassificationInput,
+    evidence: CooGrowthCandidateSourceEvidence,
+  ): void {
+    requiredText(evidence.bankId, 'Coo evidence bankId');
+    requiredText(evidence.endpoint, 'Coo evidence endpoint');
+    requiredText(evidence.documentId, 'Coo evidence documentId');
+    requiredText(evidence.candidateId, 'Coo evidence candidateId');
+    requiredText(evidence.generationId, 'Coo evidence generationId');
+    requiredText(evidence.responseId, 'Coo evidence responseId');
+    requiredText(evidence.creatorOperationId, 'Coo evidence creatorOperationId');
+    if (evidence.bankId !== input.bankId || evidence.endpoint !== input.endpoint
+      || evidence.documentId !== input.documentId || !evidence.documentId.startsWith(`coo-growth:${evidence.candidateId}:`)) {
+      throw new Error('Coo candidate source identity does not match its index row');
+    }
+    if (evidence.sourceActor !== 'coo' || evidence.sourceStatus !== 'candidate' || evidence.candidateState !== 'candidate'
+      || !['plan', 'reflection'].includes(evidence.sourceKind)
+      || (evidence.candidateType === 'growth_proposal_candidate' ? evidence.sourceKind !== 'plan'
+        : evidence.candidateType === 'experience_card_candidate' ? evidence.sourceKind !== 'reflection' : true)) {
+      throw new Error('Coo source does not preserve candidate authorship and status');
+    }
+    for (const [field, value] of [
+      ['candidateBodyDigest', evidence.candidateBodyDigest],
+      ['candidateSnapshotDigest', evidence.candidateSnapshotDigest],
+      ['sourceBodyDigest', evidence.sourceBodyDigest],
+      ['generationReceiptDigest', evidence.generationReceiptDigest],
+      ['parentSetDigest', evidence.parentSetDigest],
+    ] as const) requiredDigest(value, `Coo evidence ${field}`);
+    if (typeof evidence.content !== 'string' || !evidence.content
+      || evidence.sourceBodyDigest !== createHash('sha256').update(evidence.content, 'utf8').digest('hex')) {
+      throw new Error('Coo source body digest does not match exact read-back');
+    }
+    if (input.state !== 'assigned' || input.taxonomyVersion !== MEMORY_DOMAIN_TAXONOMY
+      || input.classifierVersion !== 'coo-growth-source/v1' || input.confidence !== null
+      || input.links.length !== 1 || input.links[0]?.domainId !== 'self-growth'
+      || input.links[0]?.linkState !== 'confirmed' || input.links[0]?.claimVerification !== 'external_unverified'
+      || input.links[0]?.ruleId !== 'coo-growth-candidate' || input.links[0]?.evidenceStart !== 0
+      || input.links[0]?.evidenceEnd !== evidence.content.length || input.links[0]?.evidenceDigest !== evidence.sourceBodyDigest) {
+      throw new Error('Coo candidate classification must remain an unverified self-growth candidate');
+    }
+    if (!Number.isInteger(evidence.sourceEpoch) || evidence.sourceEpoch < 0 || input.sourceEpoch !== evidence.sourceEpoch) {
+      throw new Error('Coo candidate source epoch is invalid');
+    }
+  }
+
+  /**
+   * The persisted row and Forget state still match the record. Re-run after a readback
+   * provider returns, because that call can commit a Forget, revision or row deletion.
+   */
+  private sourceDomainRecordCurrent(record: SourceDomainClassification): boolean {
+    if (this.meta('forget:damaged') === '1' || this.meta('forget:write-blocked') === '1') return false;
+    if (this.isFenced(record.bankId, record.endpoint, record.documentId)) return false;
+    if (record.sourceEpoch !== this.currentEpoch(record.bankId, record.endpoint)) return false;
+    if (this.supersededSources(record.bankId, record.endpoint).has(record.documentId)) return false;
+    const row = this.db.prepare(`
+      SELECT source_epoch, source_revision FROM source_domain_record
+      WHERE bank_id = ? AND endpoint = ? AND document_id = ?
+    `).get(record.bankId, record.endpoint, record.documentId) as
+      { source_epoch: number; source_revision: string } | undefined;
+    return !!row && row.source_epoch === record.sourceEpoch && row.source_revision === record.sourceRevision;
+  }
+
+  private assertSourceDomainWritable(): void {
+    if (this.meta('forget:damaged') === '1') throw new Error('forget ledger is damaged; source domains are read-only');
+    if (this.meta('forget:write-blocked') === '1') throw new Error('forget writes are blocked; source domains are read-only');
   }
 
   private writeOutbox(raw: object): void {
@@ -1607,6 +2225,18 @@ export class MemoryStateStore {
       DELETE FROM memory_mention_events
       WHERE bank_id = ? AND endpoint = ? AND (target_document_id = ? OR user_event_document_id = ?)
     `);
+    const deleteDomainLinks = this.db.prepare(`
+      DELETE FROM source_domain_link WHERE bank_id = ? AND endpoint = ? AND document_id = ?
+    `);
+    const deleteDomainRecord = this.db.prepare(`
+      DELETE FROM source_domain_record WHERE bank_id = ? AND endpoint = ? AND document_id = ?
+    `);
+    const deleteDomainNamespaceLinks = this.db.prepare(`
+      DELETE FROM source_domain_link WHERE bank_id = ? AND endpoint = ?
+    `);
+    const deleteDomainNamespaceRecords = this.db.prepare(`
+      DELETE FROM source_domain_record WHERE bank_id = ? AND endpoint = ?
+    `);
     for (const raw of state.tombstones) {
       const entry = raw as Record<string, unknown>;
       const bankId = entry.bankId as string;
@@ -1617,6 +2247,8 @@ export class MemoryStateStore {
         this.markDerivedArtifactsForNamespace(bankId, endpoint, 'bank-cleared', at);
         this.db.prepare('DELETE FROM memory_activation WHERE bank_id = ? AND endpoint = ?').run(bankId, endpoint);
         this.db.prepare('DELETE FROM memory_mention_events WHERE bank_id = ? AND endpoint = ?').run(bankId, endpoint);
+        deleteDomainNamespaceLinks.run(bankId, endpoint);
+        deleteDomainNamespaceRecords.run(bankId, endpoint);
         continue;
       }
       this.markDerivedArtifactsForSource(bankId, endpoint, documentId, 'source-forgotten', at);
@@ -1624,6 +2256,8 @@ export class MemoryStateStore {
       for (const dependent of dependents) deleteActivation.run(bankId, endpoint, dependent.target_document_id);
       deleteActivation.run(bankId, endpoint, documentId);
       deleteMentions.run(bankId, endpoint, documentId, documentId);
+      deleteDomainLinks.run(bankId, endpoint, documentId);
+      deleteDomainRecord.run(bankId, endpoint, documentId);
     }
     const bumpActivationEpoch = this.db.prepare(`
       UPDATE memory_activation SET source_epoch = ? WHERE bank_id = ? AND endpoint = ?

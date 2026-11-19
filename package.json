@@ -1,7 +1,7 @@
 {
   "name": "coopanion",
   "productName": "Coopanion",
-  "version": "0.4.0",
+  "version": "1.0.0",
   "private": true,
   "description": "A desktop companion built on Cortico: a pet on your screen that talks, listens and can operate the computer",
   "license": "AGPL-3.0-or-later",
@@ -20,6 +20,7 @@
     "console:test": "tsx scripts/console-test.ts",
     "build:installer": "tsx scripts/stage.ts && tsx scripts/pack.ts",
     "build:test-app": "tsx scripts/build-test-app.ts",
+    "build:acceptance-app": "tsx scripts/build-acceptance-app.ts",
     "build:icons": "electron scripts/make-icons.cjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
@@ -39,7 +40,8 @@
     "tsx": "^4.23.15",
     "undici": "7.29.1",
     "ws": "^8.21.3",
-    "cortico-world-codex": "workspace:*"
+    "cortico-world-codex": "workspace:*",
+    "tar-stream": "3.2.1"
   },
   "devDependencies": {
     "@codemirror/commands": "^6.11.1",
@@ -62,7 +64,6 @@
     "react-dom": "^19.3.0",
     "react-textarea-autosize": "^8.5.9",
     "tailwindcss": "^4.3.3",
-    "tar-stream": "3.2.1",
     "typescript": "^5.9.3",
     "vitest": "^2.1.9"
   }

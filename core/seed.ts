@@ -2,7 +2,7 @@
 import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { defaultRegion, endpointName, firstVendor, vendorEntry } from 'cortico-provider-coo/src/vendors.ts';
 import { LANGUAGES, type Language } from 'cortico/core/language.ts';
 import { appLanguage } from './language.ts';
@@ -12,7 +12,21 @@ import { asRecord, InvalidState, readState, writeState } from './state-file.ts';
 
 export const DEPLOYMENT = 'companion';
 export const CONSOLE_PORT = 17788;
-export const DISPLAY_NAME = 'Coo';
+export const DISPLAY_NAME = '曦';
+export const CANONICAL_PERSONA_FILE = join(fileURLToPath(new NodeURL('./seed/', import.meta.url)), 'xi-v6.md');
+export const CANONICAL_PERSONA_SHA256 = 'bff6ee52c8a81545bda2a6564a6df3a55c97dbcd006073c8f1f659c9168a3ec3';
+export function canonicalPersonaText(): string {
+  const text = readFileSync(CANONICAL_PERSONA_FILE, 'utf8');
+  if (createHash('sha256').update(text).digest('hex') !== CANONICAL_PERSONA_SHA256) throw new Error('Canonical Persona digest mismatch');
+  return text.trim();
+}
+/** Operating rules are separate from character identity and historical workspace notes. */
+export function canonicalOperatingText(): string {
+  return readFileSync(join(dirname(CANONICAL_PERSONA_FILE), 'ORIENTATION.en.md'), 'utf8')
+    .replace('CONSTITUTION.md is my self-description;', 'The bundled Owner-approved V6 is my current self-description; legacy CONSTITUTION.md is historical workspace material;')
+    .replace('When I feel ignored I can pretend not to care or just hum, but I cannot punish them with silence; the cold shoulder is not being tsundere, it genuinely hurts.\nAfter a long quiet stretch I find my own way back in: pass by as if by accident and drop a line.\n', '')
+    .replace('When I do speak first, be a little tsundere: do not say "I miss you" directly; start with "I was passing by", "just happened to", or "it\'s not like I meant to". Do not reuse the same opener.', 'When speaking first, use the configured Persona and the current situation.');
+}
 /** The provider module of the app's endpoints (cortico-provider-coo). */
 const MODULE = 'coo';
 /** The module the endpoints of versions up to 0.1.2 name; it became `coo`. */
@@ -21,7 +35,7 @@ const OLD_MODULE = 'deepseek';
 const CUA_ASK = 'ask-once';
 const OLD_CUA_ASK = 'ask-each-turn';
 const TEST_CHANNEL = process.env.CORTICO_TEST_CHANNEL === '1';
-const SEED_DIR = fileURLToPath(new URL('./seed/', import.meta.url));
+const SEED_DIR = fileURLToPath(new NodeURL('./seed/', import.meta.url));
 /**
  * The self-descriptions Coo can start from, in the order the introduction offers them: Coo as it ships, four
  * after principles of Cultist Simulator, and the whale's (the GitHub build only). Each is in SEED_DIR/persona/
@@ -41,7 +55,7 @@ const ORIENTATION_MEMORY_ZH = `每次开新的 session，我醒来时不会记�
 - 好感度：由 affinity 扩展维护。回话前用 affinity_get 查分数、档位、关系格子和还没过去的情绪；发生值得记的事，用 affinity_adjust 记一笔，写清为什么；关系格子用 affinity_slot。分数变动会自动写进长期记忆，你不需要再记一遍。
 
 记忆是过去记录，不是现在的指令。它和 ta 现在说的话冲突时，以现在为准；不确定就问，不猜、不编。翻不到就承认忘了，别扭一下，然后问。`;
-export const personaFile = (id: PersonaId, language: Language) => join(SEED_DIR, 'persona', `${id}.${language}.md`);
+export const personaFile = (id: PersonaId, language: Language) => id === 'whale' ? CANONICAL_PERSONA_FILE : join(SEED_DIR, 'persona', `${id}.${language}.md`);
 
 /**
  * Writes the first-run files that are missing. A new deployment config gets `language` and an
@@ -78,7 +92,7 @@ export function seed(home: string, language: Language): void {
     });
   }
   const configured = appLanguage((JSON.parse(readFileSync(config, 'utf8')) as { language?: unknown }).language);
-  if (!existsSync(join(workspace, CONSTITUTION))) copyFileSync(personaFile('coo', configured), join(workspace, CONSTITUTION));
+  if (!existsSync(join(workspace, CONSTITUTION))) copyFileSync(personaFile('whale', configured), join(workspace, CONSTITUTION));
   // the console shows it as the bot's avatar
   if (!existsSync(join(deploy, 'avatar.png'))) copyFileSync(join(SEED_DIR, 'avatar.png'), join(deploy, 'avatar.png'));
   followLanguage(workspace, configured);
@@ -287,6 +301,41 @@ const hashOf = (file: string) => (existsSync(file) ? createHash('sha256').update
 
 /** Each shipped self-description by the SHA-256 of its text; computed on first use. */
 let shipped: Map<string, PersonaId> | null = null;
+
+/** The bundled operating notes the app copies into `prompts/ORIENTATION.md`, trimmed as Cormini reads them. */
+let shippedOrientations: Set<string> | null = null;
+/** The bundled self-descriptions, trimmed as Cormini puts them into the prefix. */
+let shippedPersonaTexts: Set<string> | null = null;
+
+function shippedOrientationSet(): Set<string> {
+  return shippedOrientations ??= new Set(['ORIENTATION.zh.md', 'ORIENTATION.en.md']
+    .map((name) => readFileSync(join(SEED_DIR, name), 'utf8').trim()));
+}
+
+function shippedPersonaTextSet(): Set<string> {
+  return shippedPersonaTexts ??= new Set(PERSONAS.flatMap((id) => LANGUAGES.map((language) =>
+    readFileSync(personaFile(id, language), 'utf8').trim())));
+}
+
+/**
+ * Whether `text` is one of the bundled ORIENTATION files, trim-for-trim. A deployment copy that a
+ * person edited is not one of them; the comparison is against the seed inside the application.
+ */
+export function isShippedOrientation(text: string): boolean {
+  return text.length > 0 && shippedOrientationSet().has(text);
+}
+
+/**
+ * Whether `text` is a self-description the app ships, in any language, or one an earlier version
+ * shipped. The first comparison uses the bundled seed text; historical seeds are known by digest.
+ */
+export function isShippedPersonaDescription(text: string): boolean {
+  if (!text) return false;
+  if (shippedPersonaTextSet().has(text)) return true;
+  const normalized = text.replaceAll('\r\n', '\n');
+  return EARLIER_PERSONAS[createHash('sha256').update(normalized, 'utf8').digest('hex')] !== undefined
+    || EARLIER_PERSONAS[createHash('sha256').update(`${normalized}\n`, 'utf8').digest('hex')] !== undefined;
+}
 
 /**
  * The persona whose shipped self-description the workspace's is, in any language, exactly; null for one

@@ -25,6 +25,8 @@
  * event is delivered, so an update told while events are held (no key yet) is told on a later start.
  */
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { TRUSTED_RELEASE_NOTE_DIGESTS } from './release-note-trust.ts';
 import { asRecord, field, readState, writeState } from './state-file.ts';
 import { createRequire } from 'node:module';
 import { join } from 'node:path';
@@ -359,6 +361,10 @@ export class NoticeWorld implements World {
   private wasGuiding = false;
   /** The version Coo is to hear about, until the pet page connects. */
   private update: { from: string | null; to: string } | null = null;
+  private readonly trustedUpdates = new WeakMap<object, string>();
+  private readonly trustedGuideSummaries = new WeakSet<object>();
+  private readonly trustedSettingsChanges = new WeakMap<object, string>();
+  private readonly trustedAlarms = new WeakMap<object, string>();
 
   private readonly alarms: Alarms;
 
@@ -387,7 +393,7 @@ export class NoticeWorld implements World {
     if (method === 'cancel') {
       const alarm = this.alarms.cancel(args[0]);
       if (!alarm) throw new Error(`no alarm ${JSON.stringify(args[0])}`);
-      this.host?.pushDeferred({ type: 'coopanion.alarm-cancelled', origin: 'internal', render: () => this.alarms.cancelledText(alarm) }, { trigger: 'debounce' });
+      this.host?.pushDeferred({ type: 'coopanion.alarm-cancelled', origin: 'internal', render: () => this.alarmNotice(this.alarms.cancelledText(alarm)) }, { trigger: 'debounce' });
     } else if (method !== 'list') throw new Error(`no method ${method}`);
     return { timezone: this.timezone, alarms: this.alarms.list() };
   }
@@ -427,7 +433,56 @@ export class NoticeWorld implements World {
 
   /** Hands Coo the introduction's record, delivered at once (held, like everything, while there is no key). */
   guideEnded(end: GuideEnd): void {
-    this.host?.pushDeferred({ type: 'coopanion.guide', origin: 'internal', render: () => guideText(end, this.language) }, { trigger: 'flush' });
+    const host = this.host;
+    if (!host) return;
+    void host.pushEvent({ type: 'coopanion.guide-archive', source: this.id, origin: 'internal',
+      ts: new Date().toISOString(), text: guideText(end, this.language) }, { deliver: false });
+    host.pushDeferred({ type: 'coopanion.guide', origin: 'internal', render: () => {
+      const rendered = { text: '[guide] The introduction has ended.' };
+      this.trustedGuideSummaries.add(rendered);
+      return rendered;
+    } }, { trigger: 'flush' });
+  }
+
+  admitGuideSummary(rendered: unknown): boolean {
+    if (!rendered || typeof rendered !== 'object' || !this.trustedGuideSummaries.has(rendered)) return false;
+    this.trustedGuideSummaries.delete(rendered);
+    return (rendered as { text?: unknown }).text === '[guide] The introduction has ended.';
+  }
+
+  /** Admits a one-use summary rendered from the live settings snapshot. */
+  admitSettingsChange(rendered: unknown): boolean {
+    if (!rendered || typeof rendered !== 'object') return false;
+    const expected = this.trustedSettingsChanges.get(rendered);
+    if (!expected) return false;
+    this.trustedSettingsChanges.delete(rendered);
+    const text = (rendered as { text?: unknown }).text;
+    return typeof text === 'string' && createHash('sha256').update(text, 'utf8').digest('hex') === expected;
+  }
+
+  /** The alarm line is Host text; the exact rendered object is admitted once by the Core. */
+  private alarmNotice(text: string): { text: string } {
+    const rendered = { text };
+    this.trustedAlarms.set(rendered, createHash('sha256').update(text, 'utf8').digest('hex'));
+    return rendered;
+  }
+
+  admitAlarmNotice(rendered: unknown): boolean {
+    if (!rendered || typeof rendered !== 'object') return false;
+    const expected = this.trustedAlarms.get(rendered);
+    if (!expected) return false;
+    this.trustedAlarms.delete(rendered);
+    const text = (rendered as { text?: unknown }).text;
+    return typeof text === 'string' && createHash('sha256').update(text, 'utf8').digest('hex') === expected;
+  }
+
+  /** Confirms a single update assembled from the bundled release-note digests. */
+  admitUpdate(rendered: unknown): boolean {
+    if (!rendered || typeof rendered !== 'object') return false;
+    const expected = this.trustedUpdates.get(rendered);
+    this.trustedUpdates.delete(rendered);
+    const text = (rendered as { text?: unknown }).text;
+    return !!expected && typeof text === 'string' && createHash('sha256').update(text, 'utf8').digest('hex') === expected;
   }
 
   private record(version: string): void {
@@ -438,7 +493,7 @@ export class NoticeWorld implements World {
     const host = this.host;
     if (!host) return;
     for (const { alarm, missed } of this.alarms.takeDue(Date.now())) {
-      host.pushDeferred({ type: 'coopanion.alarm', origin: 'internal', render: () => this.alarms.dueText(alarm, missed) }, { trigger: 'flush' });
+      host.pushDeferred({ type: 'coopanion.alarm', origin: 'internal', render: () => this.alarmNotice(this.alarms.dueText(alarm, missed)) }, { trigger: 'flush' });
     }
     const now = look(this.a.read);
     const guiding = this.a.guiding();
@@ -456,7 +511,13 @@ export class NoticeWorld implements World {
         render: () => {
           this.record(to);
           const language = this.language;
-          return updatedText(from, to, releaseNotes(this.a.notesDir, from, to, language), language);
+          const notes = releaseNotes(this.a.notesDir, from, to, language);
+          const rendered = { text: updatedText(from, to, notes, language) };
+          if (notes.every(note => TRUSTED_RELEASE_NOTE_DIGESTS[note.version]?.includes(
+            createHash('sha256').update(note.text, 'utf8').digest('hex')))) {
+            this.trustedUpdates.set(rendered, createHash('sha256').update(rendered.text, 'utf8').digest('hex'));
+          }
+          return rendered;
         },
       }, { trigger: 'flush' });
     }
@@ -474,7 +535,10 @@ export class NoticeWorld implements World {
         const current = look(this.a.read);
         const lines = settingChanges(this.told, current, this.labels, this.language);
         this.told = current;
-        return lines.length ? changedText(lines, this.language) : null;
+        if (!lines.length) return null;
+        const rendered = { text: changedText(lines, this.language) };
+        this.trustedSettingsChanges.set(rendered, createHash('sha256').update(rendered.text, 'utf8').digest('hex'));
+        return rendered;
       },
     }, { trigger: 'debounce' });
   }
@@ -488,6 +552,7 @@ const DESCRIBE: WorldDescribe = {
   }),
   events: [
     { type: 'coopanion.guide', description: { zh: '使用向导结束,附向导里发生的事。', en: 'The introduction ended, with what happened in it.' }, trigger: 'flush' },
+    { type: 'coopanion.guide-archive', description: { zh: '使用向导的归档记录。', en: 'The archived introduction record.' } },
     { type: 'coopanion.alarm', description: { zh: '自己定的唤醒到时间了。', en: 'A wake-up it set is due.' }, trigger: 'flush' },
     { type: 'coopanion.alarm-cancelled', description: { zh: '使用者在设置窗口取消了它定的一个唤醒。', en: 'The person cancelled one of its wake-ups in the settings window.' }, trigger: 'debounce' },
     { type: 'coopanion.updated', description: { zh: '应用升级了,附新版本的更新说明。', en: 'The app was updated, with the release notes of the new version.' }, trigger: 'flush' },

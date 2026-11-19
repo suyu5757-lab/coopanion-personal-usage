@@ -64,19 +64,60 @@ const V3_SCHEMA = `
   CREATE INDEX memory_mention_events_source ON memory_mention_events(bank_id, endpoint, user_event_document_id);
 `;
 
+const V4_SCHEMA = `
+  CREATE TABLE generation_evidence (
+    session_id TEXT NOT NULL, generation_id TEXT NOT NULL, provider_attempt_id TEXT, response_id TEXT,
+    tool_correlation_id TEXT, origin TEXT NOT NULL, mapping_state TEXT NOT NULL,
+    validation_receipt_digest TEXT, validated_at TEXT, exception_reason TEXT,
+    actual_evidence_used TEXT NOT NULL DEFAULT 'unknown', created_at TEXT NOT NULL,
+    PRIMARY KEY(session_id, generation_id)
+  );
+  CREATE INDEX generation_evidence_attempt
+    ON generation_evidence(session_id, provider_attempt_id, response_id, tool_correlation_id);
+  CREATE TABLE generation_source_dependency (
+    session_id TEXT NOT NULL, generation_id TEXT NOT NULL, bank_id TEXT NOT NULL,
+    endpoint TEXT NOT NULL, document_id TEXT NOT NULL, validated_epoch INTEGER, validated_fence TEXT,
+    source_revision TEXT, content_digest TEXT, segment_digest TEXT, validation_state TEXT NOT NULL,
+    correlation_id TEXT, PRIMARY KEY(session_id, generation_id, bank_id, endpoint, document_id),
+    FOREIGN KEY(session_id, generation_id) REFERENCES generation_evidence(session_id, generation_id) ON DELETE CASCADE
+  );
+  CREATE INDEX generation_source_dependency_namespace
+    ON generation_source_dependency(bank_id, endpoint, document_id, session_id, generation_id);
+  CREATE TABLE derived_artifact (
+    artifact_id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL, scope TEXT NOT NULL,
+    creator_session_id TEXT, creator_generation_id TEXT, creator_operation_id TEXT,
+    body_digest TEXT NOT NULL, origin TEXT NOT NULL, review_state TEXT NOT NULL,
+    lifecycle_state TEXT NOT NULL, lineage_state TEXT NOT NULL, lineage_receipt_digest TEXT,
+    lineage_validated_at TEXT, status_reason TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    FOREIGN KEY(creator_session_id, creator_generation_id) REFERENCES generation_evidence(session_id, generation_id)
+  );
+  CREATE INDEX derived_artifact_lifecycle ON derived_artifact(scope, lifecycle_state, kind, target);
+  CREATE TABLE derived_artifact_source (
+    artifact_id TEXT NOT NULL, bank_id TEXT NOT NULL, endpoint TEXT NOT NULL, document_id TEXT NOT NULL,
+    validated_epoch INTEGER, validated_fence TEXT, source_revision TEXT, content_digest TEXT,
+    segment_digest TEXT, validation_state TEXT NOT NULL, correlation_id TEXT,
+    PRIMARY KEY(artifact_id, bank_id, endpoint, document_id),
+    FOREIGN KEY(artifact_id) REFERENCES derived_artifact(artifact_id) ON DELETE CASCADE
+  );
+  CREATE INDEX derived_artifact_source_namespace
+    ON derived_artifact_source(bank_id, endpoint, document_id, artifact_id);
+`;
+
 const LEGACY_TABLES = [
   'memory_metadata', 'memory_events', 'memory_operations', 'memory_revisions', 'memory_deletions',
   'memory_fences', 'memory_derived_state', 'memory_activation', 'memory_mention_events',
+  'generation_evidence', 'generation_source_dependency', 'derived_artifact', 'derived_artifact_source',
 ] as const;
 
-export type LegacyMemorySchemaVersion = 2 | 3;
+export type LegacyMemorySchemaVersion = 2 | 3 | 4;
 
 export function createLegacyMemoryStateDatabase(path: string, version: LegacyMemorySchemaVersion): void {
   const db = new DatabaseSync(path);
   try {
     db.exec('PRAGMA foreign_keys = ON');
     db.exec(BASE_SCHEMA);
-    if (version === 3) db.exec(V3_SCHEMA);
+    if (version >= 3) db.exec(V3_SCHEMA);
+    if (version === 4) db.exec(V4_SCHEMA);
     db.exec(`PRAGMA user_version = ${version}`);
     seedDurableRows(db, version);
   } finally {
@@ -89,7 +130,9 @@ export function openLegacyMemoryStateDatabase(path: string): FixtureDatabase {
 }
 
 export function snapshotLegacyDurableRows(db: FixtureDatabase, version: LegacyMemorySchemaVersion): string {
-  const tables = version === 3 ? LEGACY_TABLES : LEGACY_TABLES.slice(0, 7);
+  const tables = version === 4 ? LEGACY_TABLES
+    : version === 3 ? LEGACY_TABLES.slice(0, 9)
+      : LEGACY_TABLES.slice(0, 7);
   return JSON.stringify(tables.map((table) => [
     table,
     db.prepare(`SELECT * FROM "${table}" ORDER BY rowid`).all(),
@@ -141,4 +184,29 @@ function seedDurableRows(db: FixtureDatabase, version: LegacyMemorySchemaVersion
     applied_boost, source_epoch, params_version) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run('legacy-mention', 'legacy-bank', 'https://memory.test', 'legacy-fact', 'legacy-user-event',
       'legacy-user-event-id', '2026-11-01T09:00:00.000Z', 'initial', 0.9, 0.2, 'user_mention', 0.1, 3, 'activation-v1');
+  if (version < 4) return;
+
+  const digest = 'a'.repeat(64);
+  db.prepare(`INSERT INTO generation_evidence(session_id, generation_id, provider_attempt_id, response_id,
+    tool_correlation_id, origin, mapping_state, validation_receipt_digest, validated_at, exception_reason,
+    actual_evidence_used, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?)`)
+    .run('legacy-session', 'legacy-generation', null, null, null, 'unknown', 'unknown', null, null,
+      'legacy fixture', '2026-11-02T08:00:00.000Z');
+  db.prepare(`INSERT INTO generation_source_dependency(session_id, generation_id, bank_id, endpoint,
+    document_id, validated_epoch, validated_fence, source_revision, content_digest, segment_digest,
+    validation_state, correlation_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run('legacy-session', 'legacy-generation', 'legacy-bank', 'https://memory.test', 'legacy-doc',
+      3, null, 'legacy-revision', null, null, 'unknown', null);
+  db.prepare(`INSERT INTO derived_artifact(artifact_id, kind, target, scope, creator_session_id,
+    creator_generation_id, creator_operation_id, body_digest, origin, review_state, lifecycle_state,
+    lineage_state, lineage_receipt_digest, lineage_validated_at, status_reason, created_at, updated_at)
+    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run('legacy-artifact', 'legacy-kind', 'legacy-target', 'legacy-scope', null, null, null,
+      digest, 'unknown', 'unreviewed', 'pending', 'unknown', null, null, 'legacy fixture',
+      '2026-11-02T08:00:00.000Z', '2026-11-02T08:00:00.000Z');
+  db.prepare(`INSERT INTO derived_artifact_source(artifact_id, bank_id, endpoint, document_id,
+    validated_epoch, validated_fence, source_revision, content_digest, segment_digest, validation_state,
+    correlation_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run('legacy-artifact', 'legacy-bank', 'https://memory.test', 'legacy-doc',
+      3, null, 'legacy-revision', null, null, 'unknown', null);
 }

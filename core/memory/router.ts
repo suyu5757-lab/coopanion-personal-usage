@@ -1,4 +1,5 @@
 import { DEFAULT_RECALL_TIMEOUT_MS, MAX_DEEP_RECALL_TIMEOUT_MS, DEFAULT_SOURCE_FACTS_TOKEN_BUDGET, sourceFactsTokenBudget, recallContextCharBudget } from './recall-limits.ts';
+import { recallDateContext, recallDateNeedsHistory } from './recall-date.ts';
 
 /**
  * How much long-term memory a turn needs. Fast does no Hindsight I/O; deep is for questions
@@ -88,11 +89,12 @@ const BUDGET_ORDER = { low: 0, mid: 1, high: 2 } as const;
 export function planRecall(text: string, limits: RecallLimits = {}): RecallPlan {
   const query = text.trim();
   const currentPlan = currentPlanningQuestion(query);
+  const datedHistory = recallDateNeedsHistory(recallDateContext(query), query);
   const route: RecallRoute = !query || isForgetRequest(query)
     ? 'fast'
     : GREETING.test(query) && query.length <= 40
       ? 'fast'
-    : !currentPlan && (DEEP_ZH.test(query) || DEEP_EN.test(query) || DEEP_HISTORY_EN.test(query)
+    : !currentPlan && (datedHistory || DEEP_ZH.test(query) || DEEP_EN.test(query) || DEEP_HISTORY_EN.test(query)
         || implicitHistoricalDecisionQuestion(query) || implicitHistoricalExperienceQuestion(query)
         || (PAST_TIME_ZH.test(query) && PAST_QUESTION_ZH.test(query))
         || (PAST_TIME_EN.test(query) && PAST_QUESTION_EN.test(query)))

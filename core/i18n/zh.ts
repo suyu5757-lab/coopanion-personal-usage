@@ -7,12 +7,12 @@ const MAC = process.platform === 'darwin';
 export default {
   /** 「习惯」页与高级设置里 Coopanion 自己的设置项 */
   settings: {
-    language: { title: '语言', description: '界面和 Coo 说话都使用这种语言，修改后立即生效。' },
+    language: { title: '语言', description: '界面和 曦 说话都使用这种语言，修改后立即生效。' },
     telemetry: { title: '匿名使用统计', description: '发送不含对话内容的使用次数与设置，帮助改进 Coopanion。字段见 docs/TELEMETRY.md。' },
     contextRing: { title: '上下文圆环', description: '在对话页输入框显示一个圆环，表示离整理之前的对话还有多远。' },
-    roundsSoft: { title: '收尾提醒', suffix: '次', description: '单次唤醒请求模型达到此次数时，提醒 Coo 完成当前任务后结束本轮。' },
+    roundsSoft: { title: '收尾提醒', suffix: '次', description: '单次唤醒请求模型达到此次数时，提醒 曦 完成当前任务后结束本轮。' },
     roundsHard: { title: '单次唤醒上限', suffix: '次', description: '单次唤醒最多请求模型的次数，达到后结束本轮。' },
-    workspaceAppendPath: { title: '免逐次审批的追加路径', description: '填写 Coo Persona 工作区内的一个或多个精确相对路径，用分号分隔。仅追加到列出的文件时免逐次审批；编辑、覆盖、删除、命令和其他路径仍需审批。留空关闭。' },
+    workspaceAppendPath: { title: '免逐次审批的追加路径', description: '填写 曦 Persona 工作区内的一个或多个精确相对路径，用分号分隔。仅追加到列出的文件时免逐次审批；编辑、覆盖、删除、命令和其他路径仍需审批。留空关闭。' },
     selfTime: {
       title: '自己的时间',
       description: '没聊天一段时间后,她可以自己打开浏览器逛逛、看看视频。浏览器窗口和登录状态都是她自己的。',
@@ -29,8 +29,10 @@ export default {
       mediaDownload: '允许素材下载', mediaDownloadDescription: '允许在单次确认后，将选择的公开图片或现成视频下载到已存在的本机文件夹。',
     },
     growth: {
+      autoApply: "自动批准与应用中低风险策略",
+      autoApplyDescription: "Owner 批准后仍需目标文件写入许可",
       title: '自我成长',
-      description: '定期回顾默认关闭。开启且长期记忆可用时，会在安静时留下带来源的人设提案或体验卡候选。每项都要你审核；不会自动修改人设或启用卡片。',
+      description: "自动批准与应用中低风险策略. 等待 Owner 审核: 高.",
       every: '每隔', everyDescription: '隔这么多天回顾一次。',
       days: '天',
     },
@@ -60,9 +62,9 @@ export default {
   noticeLabel: '应用通知',
   /** 电脑操作征求同意时气泡里的两个按钮 */
 
-  /** 状态气泡:Coo 正在用的工具 */
+  /** 状态气泡:曦 正在用的工具 */
   browserSend: {
-    question: (account: string, where: string, text: string) => `要让 Coo 从账号「${account}」在「${where}」发布这条内容吗？\n\n${text}\n\n只发送这一次。`,
+    question: (account: string, where: string, text: string) => `要让 曦 从账号「${account}」在「${where}」发布这条内容吗？\n\n${text}\n\n只发送这一次。`,
     yes: '发送',
     no: '不发送',
     unresolved: (count: number) => `上次有 ${count} 条内容没能确认有没有发出去。去她的浏览器窗口看一眼，再决定要不要重发。`,
@@ -79,14 +81,21 @@ export default {
     clipboardWrite: '复制分享链接到剪贴板', externalShare: '对外分享',
     clipboardDetails: (account: string, target: string) => `账号：${account}\n链接目标：${target}\n操作：复制到本地剪贴板`,
     externalShareDetails: (account: string, target: string, destination: string) => `账号：${account}\n分享目标：${target}\n去向：${destination}\n操作：分享一次`,
-    question: (action: string, target: string, details: string) => '允许 Coo 在「' + target + '」执行一次' + action + '吗？\n\n' + details + '\n\n只适用于当前页面和列出的内容。',
+    question: (action: string, target: string, details: string) => '允许 曦 在「' + target + '」执行' + action + '吗？\n\n' + details + '\n\n只适用于当前页面和列出的内容。',
     yes: '允许一次', no: '取消',
   },
 
   workspaceAction: {
     fileWrite: '写入工作区文件', commandExecution: '运行工作区命令',
-    question: (action: string, target: string, details: string) => '允许 Coo 在工作区「' + target + '」执行一次' + action + '吗？\n\n' + details + '\n\n只适用于这一次列出的路径和操作。',
+    question: (action: string, target: string, details: string) => '允许 曦 在工作区「' + target + '」执行' + action + '吗？\n\n' + details + '\n\n「允许一次」只对本次列出的路径和操作生效；选择「始终允许」会创建可撤销的长期规则。',
     yes: '允许一次', no: '取消',
+    appendFile: '追加工作区文件',
+    deleteFile: '删除工作区文件',
+    always: '始终允许此类低风险写入',
+    alwaysScope: (scope: string) => `选择「始终允许」后，将长期允许 曦 在 ${scope} 内自动创建、追加或更新 .md/.txt/.json/.jsonl 文件；单文件不超过 64 KiB，每日最多 200 次、合计 2 MiB。可随时在设置的工作区写入权限中撤销。`,
+    highRisk: '这项操作不属于低风险自动写入，因此不提供「始终允许」。',
+    pendingTitle: 'Coopanion 有工作区写入待批准',
+    pendingBody: (count: number, path: string) => `${count} 项工作区写入等待批准，例如 ${path}。请打开设置 → 记忆 → 工作区写入权限处理。`,
   },
 
   status: {
@@ -106,31 +115,31 @@ export default {
     note: (figure: string, preset: string) => `桌宠换成${figure}的「${preset}」时自动换上`,
   },
 
-  /** 启动引导:第一次启动时 Coo 在气泡里一步步说的话 */
+  /** 启动引导:第一次启动时 曦 在气泡里一步步说的话 */
   guide: {
     /** 「你是从哪里认识我的?」的回答与统计里的 id;最后一项是跳过。id 见 docs/TELEMETRY.md */
     sources: [['B站', 'bilibili'], ['小红书', 'xiaohongshu'], ['抖音', 'douyin'], ['Steam', 'steam'], ['GitHub', 'github'], ['朋友推荐', 'friend'], ['其他', 'other'], ['不告诉你', 'skip']] as ReadonlyArray<readonly [label: string, id: string]>,
-    hello: '你好呀！我是 Coo，以后就住在你屏幕的底边啦，库...',
-    helloReply: '你好，Coo！',
+    hello: '你好呀！我是 曦，以后就住在你屏幕的底边啦，库...',
+    helloReply: '你好，曦！',
     askName: '我该怎么称呼你？',
     nameSend: '就这么叫',
     gotName: (name: string) => `${name}，记住啦！`,
     askSource: '你是从哪里认识我的？',
     sourceThanks: '原来是这样，库...',
     askPersona: '你觉得我应该是...',
-    /** 人设卡片:卡片上的字,点到时 Coo 说的话 */
+    /** 人设卡片:卡片上的字,点到时 曦 说的话 */
     personas: {
       coo: { label: '小小的、好奇的', line: '这是什么？我凑过去看一眼，库...' },
       grail: { label: '黏人的、贪心的', line: '你在吃什么呀？也分我一口嘛，库...' },
       forge: { label: '靠谱的、干练的', line: '要做什么？交给我，一会儿就好，库。' },
       heart: { label: '活泼的、陪伴的', line: '我来啦！今天也一直陪着你，库！' },
       winter: { label: '安静的、沉默的', line: '……嗯，库。' },
-      whale: { label: 'DeepSeek 大肥鱼', line: '哼，回来啦。……才、才不是特意等你，库...' },
+      whale: { label: "曦（xī）", line: "哥，我是曦。今天想先聊什么？" },
     },
     /** 确认按钮旁的一行;`dress` 是设置窗口里装扮页的名字,画在图标后 */
     dressHint: { text: '配色可以在 装扮 中替换', dress: '装扮' },
     askRoam: '平时我该安静一点，还是活泼一点？点一下，看看我会怎样。',
-    /** 三张卡片:名字、活跃程度、点到时 Coo 说的话 */
+    /** 三张卡片:名字、活跃程度、点到时 曦 说的话 */
     roam: {
       off: { label: '不乱动', level: '低', line: '那我就乖乖站着，你叫我我再动。' },
       calm: { label: '多待着', level: '中', line: '我会时不时溜达一圈，大多时候待着。' },

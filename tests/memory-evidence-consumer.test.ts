@@ -13,6 +13,7 @@ import { nullLogger } from 'cortico/core/util.ts';
 import { functionCall, functionResult, inputItem, message, withText, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import type { Request } from 'cortico/protocol/open-responses/index.ts';
 import type { GenerateOptions } from 'cortico/core/generation.ts';
+import { NOT_EXECUTED_BARRIER } from 'cortico/core/markers.ts';
 import { buildResponsesBody, ResponsesProvider } from 'cortico/providers/openai-responses-compat/native.ts';
 import { VendorChat } from '../packages/cortico-provider-coo/src/chat.ts';
 import { claudeRequest } from '../packages/cortico-provider-coo/src/anthropic/wire.ts';
@@ -24,12 +25,14 @@ import { WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGi
 import { Core } from '../vendor/cortico/tests/core/fixture-core.ts';
 import { FakeLLM, makeCfg, makeFakeIO, makeLoaded, makeTool, textReply, toolReply } from '../vendor/cortico/tests/core/helpers.ts';
 import { coopanionPersona, isTrustedPartnerReadText, PARTNER_FILE } from '../core/persona.ts';
+import { NoticeWorld } from '../core/notice.ts';
 import { COOPANION_TOOL_SCHEMA_DIGESTS } from '../core/tool-schema-roots.ts';
 import { EXPERIENCE_CONTEXT_HEADER, ExperienceCards, experienceCardArtifactText } from '../core/growth/experience-cards.ts';
 import { GrowthProposals, growthProposalArtifactText } from '../core/growth/proposals.ts';
 import { GrowthReview, isTrustedGrowthToolText } from '../core/growth/review.ts';
+import { isTrustedMemorySearchNotice } from '../core/memory/model-text.ts';
 import { HindsightMemory } from '../core/memory/hindsight.ts';
-import { MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE } from '../core/memory/model-text.ts';
+import { MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, memoryReadNotice } from '../core/memory/model-text.ts';
 import { loadHindsightConfig } from '../core/memory/config.ts';
 import { ForgetLedger } from '../core/memory/forget-ledger.ts';
 import { MemoryOutbox } from '../core/memory/outbox.ts';
@@ -98,6 +101,7 @@ async function hindsightServer(
   otherBank?: { bankId: string; sourceText: string },
   bankId = 'fixture-bank',
   documentText?: string,
+  listDocuments = false,
 ): Promise<{ baseUrl: string; recallRequests: () => number; seed: (documentId: string, text: string) => void;
   setSourceAvailable: (value: boolean) => void; setRetainAvailable: (value: boolean) => void }> {
   let recallCount = 0;
@@ -172,7 +176,10 @@ async function hindsightServer(
         return;
       }
       if (url.pathname.endsWith('/documents') && req.method === 'GET') {
-        send({ items: [], total: 0, limit: Number(url.searchParams.get('limit') ?? 0), offset: Number(url.searchParams.get('offset') ?? 0) });
+        const items = listDocuments ? ['doc-1', ...additionalSources.map((source) => source.documentId)]
+          .filter((documentId) => !deleted.has(`${bank ?? ''}:${documentId}`))
+          .map((id) => ({ id, bank_id: bankId, document_metadata: { source_actor: 'user', kind: 'event' } })) : [];
+        send({ items, total: items.length, limit: Number(url.searchParams.get('limit') ?? 0), offset: Number(url.searchParams.get('offset') ?? 0) });
         return;
       }
       const documentId = decodeURIComponent(url.pathname.split('/').at(-1) ?? '');
@@ -233,16 +240,18 @@ async function buildRig(
     /** A synthetic Hindsight endpoint built by the test, so two rigs can use distinct endpoints. */
     server?: Awaited<ReturnType<typeof hindsightServer>>;
     bankId?: string;
+    listDocuments?: boolean;
     extraTrustedToolDigests?: string[];
     extraToolTextTrust?: (tool: string, text: string) => boolean;
+    worldDeferredTrust?: (world: World, type: string, rendered: unknown) => boolean;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'coo-memory-evidence-consumer-'));
   roots.push(root);
   const memoryDir = join(root, 'persona');
-  const server = options.server
-    ?? await hindsightServer(sourceAvailable, factText, beforeDocumentRead, options.additionalSources, options.sourceFactsTruncated, options.otherBank);
   const bankId = options.bankId ?? 'fixture-bank';
+  const server = options.server
+    ?? await hindsightServer(sourceAvailable, factText, beforeDocumentRead, options.additionalSources, options.sourceFactsTruncated, options.otherBank, bankId, undefined, options.listDocuments);
   const store = openMemoryStateStore(join(root, 'memory-state.sqlite'));
   const memory = new HindsightMemory();
   Object.assign(memory, {
@@ -295,7 +304,7 @@ async function buildRig(
         ...derivedPartnerParagraphs.map((entry, index) => ({
           id: `00000000-0000-0000-0000-${String(index + 1).padStart(12, '0')}`,
           segmentDigest: partnerSegmentDigest(entry.text), origin: 'derived' as const,
-          sourceIds: [entry.documentId], sourceScopeDigest: partnerSourceScopeDigest('fixture-bank', server.baseUrl), state: 'current' as const,
+          sourceIds: [entry.documentId], sourceScopeDigest: partnerSourceScopeDigest(bankId, server.baseUrl), state: 'current' as const,
         })),
         ...(options.partnerUserNote ? [{
           id: `00000000-0000-0000-0000-${String(derivedPartnerParagraphs.length + 1).padStart(12, '0')}`,
@@ -341,13 +350,16 @@ async function buildRig(
     persona,
     worlds,
     llm,
-    toolTextTrust: (tool, text) => isTrustedGrowthToolText(tool, text)
+    toolTextTrust: (tool, text) => isTrustedMemorySearchNotice(tool, text) || isTrustedGrowthToolText(tool, text)
       || (tool === 'read_file' && isTrustedPartnerReadText(text))
       || options.extraToolTextTrust?.(tool, text) === true,
     requireCompleteEvidence: options.requireCompleteEvidence,
     trustedToolSchemaDigests: [...COOPANION_TOOL_SCHEMA_DIGESTS, ...(options.extraTrustedToolDigests ?? [])],
     worldEventTrust: (candidate, event) => candidate === world
       && ['desktop-pet.message', 'desktop-pet.speech', 'desktop-pet.touch'].includes(event.type),
+    worldToolOutcomeTrust: (candidate, tool, outcome) => candidate === world && world instanceof DesktopPetWorld
+      && tool === 'pet_say' && world.admitSayReceipt(outcome),
+    worldDeferredTrust: options.worldDeferredTrust,
     worldPromptTrust: (candidate) => candidate === world && world instanceof DesktopPetWorld
       ? { templateDigests: DESKTOP_PET_TRUSTED_TEMPLATE_DIGESTS, independentVariables: true }
       : { templateDigests: [createHash('sha256').update(options.trustedWorldTemplate ?? 'World fact: {{verified.fact}} / {{verified.fact}}.').digest('hex')], independentVariables: false },
@@ -376,7 +388,7 @@ async function buildRig(
     return host;
   };
   return {
-    root, memoryDir, core, llm, memory, persona, world, baseUrl: server.baseUrl, recallRequests: server.recallRequests, seedSource: server.seed, setSourceAvailable: server.setSourceAvailable, setRetainAvailable: server.setRetainAvailable, serializedBodies, dispatchedBodies, requestSnapshots,
+    root, memoryDir, core, llm, memory, persona, world, bankId, baseUrl: server.baseUrl, recallRequests: server.recallRequests, seedSource: server.seed, setSourceAvailable: server.setSourceAvailable, setRetainAvailable: server.setRetainAvailable, serializedBodies, dispatchedBodies, requestSnapshots,
     api: coreApi,
     host: worldHost, page,
   };
@@ -393,7 +405,7 @@ async function reopenRigMemory(rig: Awaited<ReturnType<typeof buildRig>>, forget
   const store = openMemoryStateStore(join(rig.root, 'memory-state.sqlite'));
   const memory = new HindsightMemory();
   Object.assign(memory, {
-    config: loadHindsightConfig(rig.memoryDir, { enabled: true, autostart: false, apiUrl: rig.baseUrl, bankId: 'fixture-bank' }),
+    config: loadHindsightConfig(rig.memoryDir, { enabled: true, autostart: false, apiUrl: rig.baseUrl, bankId: rig.bankId }),
     client: new HindsightClient({ baseUrl: rig.baseUrl, maxAttempts: 1 }),
     stateStore: store,
     outbox: new MemoryOutbox(store),
@@ -587,11 +599,13 @@ describe('Memory source evidence through the real Core consumer', () => {
 
     const segments = await rig.persona.systemSegments({ now: new Date(), timezone: 'UTC', worlds: [] });
     const workspace = segments.find((segment) => segment.title === 'WORKSPACE')!;
-    const hint = '- Use list_files with dir handoffs to find handoff notes; verify a note and its current sources before using it.';
-    const start = workspace.text.indexOf(hint);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(workspace.sourceMapSpans).toContainEqual({ start, end: start + hint.length,
-      digest: createHash('sha256').update(hint).digest('hex'), origin: 'core-generated' });
+    expect(workspace.text.trim()).toBe(expected.trim());
+    expect(workspace.text).toContain('Use list_files with dir handoffs to find handoff notes;');
+    expect(workspace.text).not.toContain('one.md');
+    expect(workspace.text).not.toContain('two.md');
+    expect(workspace.text).not.toContain('pending.md');
+    expect(workspace.sourceMapSpans).toEqual([{ start: 0, end: workspace.text.length,
+      digest: createHash('sha256').update(workspace.text).digest('hex'), origin: 'core-generated' }]);
   });
 
   it('checks the actual desktop World template before dispatch', async () => {
@@ -634,8 +648,9 @@ describe('Memory source evidence through the real Core consumer', () => {
     await waitFor(() => rig.api().generationEvidence('main').length > 0);
     await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
     const answer = rig.core.store.range({ source: 'desktop-pet' }).find((event) => event.type === 'desktop-pet.answer')!;
-    expect(answer.text).toContain(question);
-    expect(answer.text).toContain(option);
+    expect(answer.text).not.toContain(question);
+    expect(answer.text).not.toContain(option);
+    expect(answer.text).toContain('selected option 1');
     expect(answer.dependencyOrigin).toBeUndefined();
     const state = rig.memory as unknown as { outbox: MemoryOutbox };
     expect(state.outbox.matching((item) => item.documentId === `user:main:${answer.cursor}`)).toEqual([]);
@@ -799,11 +814,251 @@ describe('Memory source evidence through the real Core consumer', () => {
     await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
     const evidence = rig.api().generationEvidence('main');
     expect(evidence[0]).toMatchObject({ requestState: 'sent', mappingState: 'complete' });
-    expect(evidence[1]).toMatchObject({ requestState: 'unobserved', mappingState: 'missing', requestBlockReason: 'mapping-incomplete' });
-    expect(rig.llm.calls).toHaveLength(1);
-    expect(rig.dispatchedBodies).toHaveLength(1);
+    // The tool replaces the unverified excerpt with its fixed notice, so the follow-up request
+    // carries no unverified source text and can still answer.
+    expect(evidence[1]).toMatchObject({ requestState: 'sent', mappingState: 'complete' });
+    expect(evidence[1]?.exposedSources).toEqual([]);
+    const receipt = rig.core.session.records.find((record) => record.item.type === 'function_call_output'
+      && textOf(record) === MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE);
+    expect(receipt).toBeTruthy();
+    expect(receipt?.context.sourceMapSpans).toMatchObject([{ origin: 'core-generated', start: 0 }]);
+    expect(rig.llm.calls).toHaveLength(2);
+    expect(rig.dispatchedBodies).toHaveLength(2);
     expect(rig.dispatchedBodies.join('\n')).not.toContain(changed);
     expect(rig.dispatchedBodies.join('\n')).not.toContain('A past record.');
+  });
+
+  it('dispatches the next generation after one verified Memory search receipt', async () => {
+    const rig = await buildRig(true, undefined, undefined, {
+      desktopPet: {}, additionalSources: [{ documentId: 'doc-2', text: SOURCE_TEXT }], requireCompleteEvidence: true,
+      llmSetup: (llm) => llm.script(
+        toolReply([{ name: 'memory_search', args: { query: 'only the second fixture source' }, id: 'memory-search-once' }]),
+        textReply('The synthetic preference is jasmine tea.'),
+      ),
+    });
+    if (!rig.page) throw new Error('the DesktopPet page did not open');
+    rig.page.send({ t: 'text', text: 'What synthetic preference did I share?' });
+    await waitFor(() => rig.api().generationEvidence('main').length >= 2);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+
+    const evidence = rig.api().generationEvidence('main');
+    const memoryCall = rig.core.session.records.find((record) =>
+      record.item.type === 'function_call' && record.item.name === 'memory_search');
+    const receipt = rig.core.session.records.find((record) =>
+      record.item.type === 'function_call_output' && memoryCall?.item.type === 'function_call'
+        && record.item.call_id === memoryCall.item.call_id);
+    expect(rig.llm.calls[0]?.tools?.some((tool) => tool.name === 'memory_search')).toBe(true);
+    expect(evidence).toHaveLength(2);
+    expect(evidence[0]).toMatchObject({ requestState: 'sent', mappingState: 'complete', responseJoinState: 'matched' });
+    expect(evidence[1]).toMatchObject({ requestState: 'sent', mappingState: 'complete', responseJoinState: 'matched' });
+    expect(receipt?.context.toolReceiptRef).toBeTruthy();
+    expect(receipt?.context.sourceMapSpans?.length).toBeGreaterThan(0);
+    expect(receipt?.context.evidence?.[0]).toMatchObject({
+      bankId: 'fixture-bank', documentId: 'doc-2', validationStatus: 'validated', revisionState: 'current',
+    });
+    expect(rig.dispatchedBodies).toHaveLength(2);
+    expect(rig.requestSnapshots[1]?.context.some((record) =>
+      record.item.type === 'function_call_output' && record.context.toolReceiptRef === receipt?.context.toolReceiptRef)).toBe(true);
+    expect(rig.core.session.records.some((record) =>
+      record.item.type === 'message' && record.item.role === 'assistant' && textOf(record) === 'The synthetic preference is jasmine tea.')).toBe(true);
+  });
+
+  it('continues after an empty pet_say receipt and a later user turn under strict evidence', async () => {
+    const rig = await buildRig(true, undefined, undefined, {
+      desktopPet: {}, requireCompleteEvidence: true, useOpening: true,
+      llmSetup: (llm) => llm.script(
+        toolReply([{ name: 'pet_say', args: { script: 'A synthetic greeting.' }, id: 'r28-f2-pet-say' }]),
+        textReply('The greeting is complete.'),
+        textReply('The ordinary follow-up is complete.'),
+      ),
+    });
+    if (!rig.page) throw new Error('the DesktopPet page did not open');
+    rig.page.send({ t: 'text', text: 'Say hello.' });
+    await waitFor(() => rig.api().generationEvidence('main').length >= 2);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+
+    const first = rig.api().generationEvidence('main')[0]!;
+    const continuation = rig.api().generationEvidence('main')[1]!;
+    const call = rig.core.session.records.find((record) =>
+      record.item.type === 'function_call' && record.item.call_id === 'r28-f2-pet-say');
+    const receipt = rig.core.session.records.find((record) =>
+      record.item.type === 'function_call_output' && record.item.call_id === 'r28-f2-pet-say');
+    expect(call?.item.type).toBe('function_call');
+    expect(receipt?.item.type).toBe('function_call_output');
+    if (receipt?.item.type !== 'function_call_output') throw new Error('pet_say receipt is missing');
+    if (typeof receipt.item.output !== 'string') throw new Error('pet_say receipt is not plain text');
+    const receiptText = receipt.item.output;
+    expect(receiptText.length).toBeGreaterThan(0);
+    expect(receipt.context.sourceMapSpans?.[0]).toMatchObject({
+      start: 0,
+      end: receiptText.length,
+      digest: createHash('sha256').update(receiptText, 'utf8').digest('hex'),
+      origin: 'core-generated',
+    });
+
+    rig.page.send({ t: 'text', text: 'What did you just say?' });
+    await waitFor(() => rig.api().generationEvidence('main').length >= 3);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    const followUp = rig.api().generationEvidence('main')[2]!;
+    const evidence = rig.api().generationEvidence('main');
+    const snapshotFor = (index: number) => rig.requestSnapshots[index]?.context ?? [];
+    const textOfItem = (record: ContextRecord): string => record.item.type === 'function_call'
+      ? record.item.arguments
+      : record.item.type === 'function_call_output'
+        ? (typeof record.item.output === 'string' ? record.item.output : '')
+        : textOf(record);
+    const diagnostic = (entry: (typeof evidence)[number], requestIndex: number) => ({
+      generationId: entry.providerGenerationId,
+      providerAttemptId: entry.providerAttemptId,
+      traceId: null,
+      requestState: entry.requestState,
+      requestBlockReason: entry.requestBlockReason ?? null,
+      mappingState: entry.mappingState,
+      items: entry.items.map((item) => {
+        const context = snapshotFor(requestIndex);
+        const messageIndex = context.findIndex((record) => record.item.id === item.itemId);
+        const record = context[messageIndex];
+        const value = record ? textOfItem(record) : '';
+        const covered = new Uint8Array(value.length);
+        const spanOrigins: Record<string, number> = {};
+        const spanStates: Record<string, number> = {};
+        for (const span of item.spans) {
+          spanOrigins[span.origin] = (spanOrigins[span.origin] ?? 0) + 1;
+          spanStates[span.mappingState] = (spanStates[span.mappingState] ?? 0) + 1;
+          if (span.mappingState !== 'complete') continue;
+          for (let offset = Math.max(0, span.start); offset < Math.min(value.length, span.end); offset += 1) covered[offset] = 1;
+        }
+        let firstGap: { start: number; end: number } | null = null;
+        for (let offset = 0; offset < value.length; offset += 1) {
+          if (/\s/u.test(value[offset]!) || covered[offset]) continue;
+          const start = offset;
+          while (offset < value.length && !/\s/u.test(value[offset]!) && !covered[offset]) offset += 1;
+          firstGap = { start, end: offset };
+          break;
+        }
+        return {
+          messageIndex,
+          role: record?.item.type === 'message' ? record.item.role : null,
+          segmentType: record?.item.type ?? null,
+          toolName: record?.item.type === 'function_call' ? record.item.name : null,
+          textLengthUtf16: value.length,
+          nonWhitespaceFullyCovered: firstGap === null,
+          firstGap,
+          spanCount: item.spans.length,
+          spanOrigins,
+          spanStates,
+          spans: item.spans.filter((span) => span.origin !== 'core-generated' || span.mappingState !== 'complete'
+            || span.sourceProof !== undefined || span.generationEvidenceId !== undefined).map((span) => ({
+            startUtf16: span.start,
+            endUtf16: span.end,
+            origin: span.origin,
+            mappingState: span.mappingState,
+            sourceIdentityHashes: span.exposedSources.map((source) => createHash('sha256')
+              .update(JSON.stringify([source.bankId, source.endpoint, source.documentId])).digest('hex').slice(0, 12)),
+            sourceProofPresent: span.sourceProof !== undefined,
+            generationEvidenceRef: span.generationEvidenceId
+              ? createHash('sha256').update(span.generationEvidenceId).digest('hex').slice(0, 12) : null,
+            serializedRanges: span.serializedRanges.map((range) => ({ field: range.field, start: range.start, end: range.end })),
+          })),
+        };
+      }),
+    });
+    if (process.env.R28_SOURCE_DIAGNOSTIC === '1') {
+      console.info('R28_SOURCE_SPAN_DIAGNOSTIC', JSON.stringify({
+        firstSuccessful: diagnostic(first, 0),
+        petSayContinuation: diagnostic(continuation, 1),
+        nextUserTurn: diagnostic(followUp, 2),
+      }));
+    }
+    expect(first).toMatchObject({ requestState: 'sent', mappingState: 'complete', responseJoinState: 'matched' });
+    expect(continuation).toMatchObject({ requestState: 'sent', mappingState: 'complete', responseJoinState: 'matched' });
+    expect(followUp).toMatchObject({ requestState: 'sent', mappingState: 'complete', responseJoinState: 'matched' });
+    expect(rig.dispatchedBodies).toHaveLength(3);
+  });
+
+  it('safely rebuilds a restored memory context when its source map is incomplete', async () => {
+    const template = 'Static restart World fixture.';
+    const rig = await buildRig(true, undefined, undefined, {
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      llmSetup: (llm) => llm.script(textReply('The recovered context is ready.')),
+    });
+    const notice = '[system] 1 new event.';
+    const memoryText = `[memory] Previous source context. ${SOURCE_TEXT}`;
+    const text = `${notice}\n${memoryText}`;
+    const sourceStart = text.indexOf(SOURCE_TEXT);
+    const evidence = await rig.memory.evidenceForSegments(text, [{
+      documentId: 'doc-1', start: sourceStart, end: sourceStart + SOURCE_TEXT.length,
+    }]);
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]?.segment.sourceProof).toBeDefined();
+    const persistedEvidence = evidence.map((attachment) => ({
+      ...attachment,
+      segment: {
+        ...attachment.segment,
+        sourceProof: { ...attachment.segment.sourceProof!, token: 'previous-process-source-proof' },
+      },
+    }));
+
+    const dependency = (start: number, end: number, proofId: string) => ({
+      start, end, digest: createHash('sha256').update(text.slice(start, end), 'utf8').digest('hex'),
+      exposedSources: [] as SourceExposureRef[], proofId,
+    });
+    rig.core.session.append(message('user', text, {
+      evidence: persistedEvidence,
+      sourceDependencySpans: [
+        dependency(0, notice.length, 'restored-delivery-notice'),
+        dependency(notice.length + 1, text.length, 'restored-memory-injection'),
+      ],
+    }));
+
+    const blockedText = 'Continue with the current topic.';
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: blockedText, meta: { text: blockedText },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.api().handoffOutcome() !== null, 10000);
+    expect(rig.api().handoffOutcome()).toMatchObject({ status: 'committed', mappingState: 'complete' });
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle', 10000);
+
+    const envelopes = rig.api().generationEvidence('main');
+    const blockedIndex = envelopes.findIndex((entry) => entry.requestState === 'unobserved'
+      && (entry.requestBlockReason === 'mapping-incomplete' || entry.requestBlockReason === 'source-invalid'));
+    const blocked = envelopes[blockedIndex];
+    expect(blocked).toMatchObject({ requestState: 'unobserved', requestBlockReason: 'source-invalid' });
+    const sent = envelopes.slice(blockedIndex + 1).find((entry) => entry.requestState === 'sent');
+    expect(sent).toMatchObject({ requestState: 'sent', mappingState: 'complete', responseJoinState: 'matched' });
+    expect(sent?.serializedBodyDigest).not.toBe(blocked?.serializedBodyDigest);
+    expect(rig.dispatchedBodies.some((body) => body.includes(blockedText) && body.includes(SOURCE_TEXT))).toBe(true);
+  });
+
+  it('blocks continuation when a same-response Memory search hits the Core tool barrier', async () => {
+    const rig = await buildRig(true, undefined, undefined, {
+      desktopPet: {}, additionalSources: [{ documentId: 'doc-2', text: SOURCE_TEXT }], requireCompleteEvidence: true,
+      llmSetup: (llm) => llm.script(
+        toolReply([
+          { name: 'memory_search', args: { query: 'only the second fixture source' }, id: 'memory-search-first' },
+          { name: 'memory_search', args: { query: 'jasmine tea source' }, id: 'memory-search-second' },
+        ]),
+        textReply('This response must not be dispatched.'),
+      ),
+    });
+    if (!rig.page) throw new Error('the DesktopPet page did not open');
+    rig.page.send({ t: 'text', text: 'hello' });
+    await waitFor(() => rig.api().generationEvidence('main').length >= 2);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+
+    const receipts = rig.core.session.records.filter((record) => record.item.type === 'function_call_output');
+    const blockedReceipt = receipts.find((record) => textOf(record) === NOT_EXECUTED_BARRIER);
+    expect(blockedReceipt).toBeDefined();
+    expect(blockedReceipt?.context.sourceMapSpans).toBeUndefined();
+    expect(blockedReceipt?.context.toolReceiptRef).toBeUndefined();
+    expect(rig.api().generationEvidence('main')[0]).toMatchObject({ requestState: 'sent', mappingState: 'complete' });
+    expect(rig.api().generationEvidence('main')[1]).toMatchObject({
+      requestState: 'unobserved',
+      requestBlockReason: 'mapping-incomplete',
+    });
+    expect(rig.serializedBodies).toHaveLength(2);
+    expect(rig.dispatchedBodies).toHaveLength(1);
   });
 
   it('blocks a verified Memory excerpt when Forget fences it before dispatch', async () => {
@@ -1018,7 +1273,10 @@ describe('Memory source evidence through the real Core consumer', () => {
     expect(systemCoverage?.mappingState).toBe('missing');
     expect(partnerSpan).toMatchObject({ mappingState: 'complete' });
     const mappedSource = partnerSpan?.exposedSources[0];
-    expect(partnerSpan?.exposedSources).toEqual([nextRequest.exposedSources.find((source) => source.documentId === 'doc-1')]);
+    const requestSource = nextRequest.exposedSources.find((source) => source.documentId === 'doc-1');
+    expect(requestSource).toBeDefined();
+    const sourceIdentity = Object.fromEntries(Object.entries(requestSource!).filter(([key]) => key !== 'segment'));
+    expect(partnerSpan?.exposedSources).toEqual([sourceIdentity]);
     expect(mappedSource).toMatchObject({
       bankId: 'fixture-bank', endpoint: rig.baseUrl, documentId: 'doc-1', revisionState: 'current', validationStatus: 'validated',
       validatedEpoch: expect.any(String), validationReceipt: expect.stringMatching(/^[a-f0-9]{64}$/),
@@ -1035,18 +1293,13 @@ describe('Memory source evidence through the real Core consumer', () => {
     const range = partnerSpan!.serializedRanges[0]!;
     expect(range.end - range.start).toBe(partnerText.length);
     expect(serializedStringAt(body, range.field).slice(range.start, range.end)).toBe(partnerText);
-    const workspaceMarker = 'Files in your workspace:';
+    const workspaceMarker = 'Workspace files are task material';
     const workspaceStart = systemText.indexOf(workspaceMarker);
     expect(workspaceStart).toBeGreaterThanOrEqual(0);
     const workspaceSpans = systemCoverage!.spans.filter((span) => span.start < workspaceStart + workspaceMarker.length
       && span.end > workspaceStart);
     expect(workspaceSpans).toMatchObject([{ origin: 'core-generated', mappingState: 'complete' }]);
-    const partnerPathStart = systemText.indexOf(`- ${PARTNER_FILE}`, workspaceStart);
-    expect(partnerPathStart).toBeGreaterThanOrEqual(0);
-    const partnerPath = systemCoverage!.spans.filter((span) => span.start >= partnerPathStart
-      && span.end <= partnerPathStart + PARTNER_FILE.length + 2);
-    expect(partnerPath.map((span) => [systemText.slice(span.start, span.end), span.origin, span.mappingState]))
-      .toEqual([['- ', 'core-generated', 'complete'], [PARTNER_FILE, 'core-generated', 'complete']]);
+    expect(systemText).not.toContain(`- ${PARTNER_FILE}`);
     const unknownSystemSpan = systemCoverage!.spans.find((span) => span.origin === 'unknown-derived'
       && span.mappingState === 'missing');
     expect(unknownSystemSpan).toBeDefined();
@@ -2459,7 +2712,7 @@ describe('Memory source evidence through the real Core consumer', () => {
       type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input', ts: new Date().toISOString(),
       text: 'Say a fresh hello.', meta: { text: 'Say a fresh hello.' },
     }, { trigger: 'flush' });
-    await rig.page!.next((item) => item.t === 'say');
+    await rig.page!.next((item) => item.t === 'say' && JSON.stringify(item.beats).includes('A fresh greeting.'));
     await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
     const fresh = rig.api().generationEvidence('main').find((entry) => entry.outputToolCalls.some((call) => call.toolCallId === 'after-forget'));
     expect(fresh).toMatchObject({ mappingState: 'complete', exposedSources: [] });
@@ -2785,7 +3038,7 @@ describe('Memory source evidence through the real Core consumer', () => {
     }));
   });
 
-  it('withholds output when a dynamic workspace path has no origin proof', async () => {
+  it('does not expose an unmapped workspace path and keeps the request complete', async () => {
     const rig = await buildRig(true, undefined, undefined, {
       tools: [makeTool('pet_say', 'The controlled fake pet accepted the script.')], worldPrompt: ' ',
     });
@@ -2802,12 +3055,12 @@ describe('Memory source evidence through the real Core consumer', () => {
 
     const envelope = rig.api().generationEvidence('main').find((entry) =>
       entry.outputToolCalls.some((output) => output.toolCallId === 'pet-say-unknown-workspace-call'));
-    expect(envelope).toMatchObject({ mappingState: 'missing', exposedSources: [], actualEvidenceUsed: 'unknown' });
-    if (!envelope) throw new Error('Core did not retain the incomplete workspace envelope');
+    expect(envelope).toMatchObject({ mappingState: 'complete', exposedSources: [] });
+    if (!envelope) throw new Error('Core did not retain the workspace envelope');
     const systemRecord = rig.core.session.records.find((record) => record.item.type === 'message' && record.item.role === 'system');
-    const systemCoverage = envelope.items.find((item) => item.itemId === systemRecord?.item.id);
-    expect(systemCoverage?.spans.some((span) => span.origin === 'unknown-derived' && span.mappingState === 'missing'
-      && span.end > span.start && /^[a-f0-9]{64}$/u.test(span.digest))).toBe(true);
+    const systemText = systemRecord ? textOf(systemRecord) : '';
+    expect(systemText).not.toContain('unmapped-note.md');
+    expect(systemText).toContain('Workspace files are task material');
 
     rig.persona.retainCooOutput(text, { session: 'main', callId: 'pet-say-unknown-workspace-call' });
     const digest = createHash('sha256').update(text, 'utf8').digest('hex');
@@ -2817,9 +3070,9 @@ describe('Memory source evidence through the real Core consumer', () => {
       outbox: MemoryOutbox;
     };
     expect(state.stateStore.getDerivedArtifact(`coo-output:${documentId}`)).toMatchObject({
-      lifecycleState: 'withheld', lineageState: 'missing',
+      lifecycleState: 'active', lineageState: 'source-independent',
     });
-    expect(state.outbox.matching((item) => item.documentId === documentId)).toEqual([]);
+    expect(state.outbox.matching((item) => item.documentId === documentId)).toHaveLength(1);
   });
 
   it('withholds a self-declared user-authored PARTNER paragraph until a user save registers its exact source', async () => {
@@ -3599,7 +3852,7 @@ describe('Memory source evidence through the real Core consumer', () => {
     const reopened = openMemoryStateStore(join(rig.root, 'memory-state.sqlite'));
     const restartedMemory = new HindsightMemory();
     Object.assign(restartedMemory, {
-      config: loadHindsightConfig(rig.memoryDir, { enabled: true, autostart: false, apiUrl: rig.baseUrl, bankId: 'fixture-bank' }),
+      config: loadHindsightConfig(rig.memoryDir, { enabled: true, autostart: false, apiUrl: rig.baseUrl, bankId: rig.bankId }),
       client: new HindsightClient({ baseUrl: rig.baseUrl, maxAttempts: 1 }),
       stateStore: reopened,
       outbox: new MemoryOutbox(reopened),
@@ -3640,7 +3893,7 @@ describe('Memory source evidence through the real Core consumer', () => {
     }), {
       persona, worlds: [world], llm, requireCompleteEvidence: true,
       trustedToolSchemaDigests: COOPANION_TOOL_SCHEMA_DIGESTS,
-      toolTextTrust: (tool, text) => isTrustedGrowthToolText(tool, text)
+      toolTextTrust: (tool, text) => isTrustedMemorySearchNotice(tool, text) || isTrustedGrowthToolText(tool, text)
         || (tool === 'read_file' && isTrustedPartnerReadText(text)),
       worldEventTrust: (candidate, event) => candidate === world && event.type === 'desktop-pet.message',
       worldPromptTrust: (candidate) => candidate === world
@@ -3693,6 +3946,246 @@ describe('Memory source evidence through the real Core consumer', () => {
     });
     expect(restartedMemory.sourceExposureCurrent([freshSource])).toBe(true);
     expect(restartedMemory.sourceEvidenceCurrent({ exposedSources: [freshSource], items: [] })).toBe(true);
+  });
+
+  it('reissues a historical hindsight-source proof through a fresh Core and Memory reopen', async () => {
+    const template = 'Static restart World fixture.';
+    const rig = await buildRig(true, undefined, undefined, {
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+    });
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'remember the synthetic jasmine tea', meta: { text: 'remember the synthetic jasmine tea' },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.api().generationEvidence('main').length >= 3);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    expect(rig.dispatchedBodies.some((body) => body.includes(SOURCE_TEXT))).toBe(true);
+
+    const historical = rig.core.session.records.find((record) =>
+      record.context.evidence?.some((attachment) => attachment.documentId === 'doc-1'));
+    const oldAttachment = historical?.context.evidence?.find((attachment) => attachment.documentId === 'doc-1');
+    if (!oldAttachment?.segment.sourceProof) throw new Error('the first Core did not mint a historical source proof');
+    const oldToken = oldAttachment.segment.sourceProof.token;
+
+    const { memory: restartedMemory } = await reopenRigMemory(rig);
+    expect(restartedMemory.sourceEvidenceCurrent(inspectContextEvidence([historical!], {}))).toBe(false);
+    const continued = await startContinuedRig(rig, restartedMemory, template);
+    const refreshed = continued.core.session.records.find((candidate) =>
+      candidate.context.evidence?.some((attachment) => attachment.documentId === 'doc-1'))!;
+    let inspection: ReturnType<typeof inspectContextEvidence> | null = null;
+    await waitFor(() => {
+      inspection = inspectContextEvidence([refreshed], {
+        verifyDependency: (span, text) => continued.core.loop.resolveSourceDependency(span, text),
+      });
+      return inspection.mappingState === 'complete' && restartedMemory.sourceEvidenceCurrent(inspection);
+    }, 10000);
+
+    const newAttachment = refreshed.context.evidence!.find((attachment) => attachment.documentId === 'doc-1')!;
+    // Frozen records keep the token they were written with; the reopened provider re-read the
+    // source and registered a current proof for that persisted key. The old token alone never
+    // passes: sourceEvidenceCurrent was false above and becomes true only after the read-back.
+    expect(newAttachment.segment.sourceProof?.token).toBe(oldToken);
+    expect(newAttachment).toMatchObject({
+      bankId: 'fixture-bank', endpoint: rig.baseUrl, documentId: 'doc-1',
+      validationStatus: 'validated', revisionState: 'current',
+    });
+    expect(inspection!.mappingState).toBe('complete');
+    expect(restartedMemory.sourceEvidenceCurrent(inspection!)).toBe(true);
+
+    continued.llm.script(textReply('Second answer after restart.'));
+    await continued.host.pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'say it again after restart', meta: { text: 'say it again after restart' },
+    }, { trigger: 'flush' });
+    await waitFor(() => continued.api.generationEvidence('main').some((entry) => entry.requestState === 'sent'), 10000);
+    await waitFor(() => continued.core.loop.getStatus().phase.state === 'idle');
+    expect(continued.dispatched.some((body) => body.includes(SOURCE_TEXT) && body.includes('remember the synthetic jasmine tea'))).toBe(true);
+  });
+
+  it('keeps a forgotten historical hindsight source closed after a fresh Core and Memory reopen', async () => {
+    const template = 'Static restart World fixture.';
+    const rig = await buildRig(true, undefined, undefined, {
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+    });
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'remember the synthetic jasmine tea', meta: { text: 'remember the synthetic jasmine tea' },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.api().generationEvidence('main').length >= 3);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    expect(rig.dispatchedBodies.some((body) => body.includes(SOURCE_TEXT))).toBe(true);
+
+    const { memory: restartedMemory } = await reopenRigMemory(rig, 'doc-1');
+    expect(restartedMemory.sourceFenced('doc-1')).toBe(true);
+    const continued = await startContinuedRig(rig, restartedMemory, template);
+    const historical = continued.core.session.records.find((candidate) =>
+      candidate.context.evidence?.some((attachment) => attachment.documentId === 'doc-1'))!;
+    await waitFor(() => continued.core.loop.getStatus().phase.state === 'idle');
+    expect(restartedMemory.sourceEvidenceCurrent(inspectContextEvidence([historical], {
+      verifyDependency: (span, text) => continued.core.loop.resolveSourceDependency(span, text),
+    }))).toBe(false);
+
+    const before = continued.dispatched.length;
+    continued.llm.script(textReply('This must not be sent.'));
+    await continued.host.pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'say it again after forget', meta: { text: 'say it again after forget' },
+    }, { trigger: 'flush' });
+    await waitFor(() => continued.api.generationEvidence('main').some((entry) =>
+      entry.requestState === 'unobserved' && entry.requestBlockReason === 'source-invalid'), 10000);
+    expect(continued.dispatched.slice(before).some((body) => body.includes('remember the synthetic jasmine tea'))).toBe(false);
+  });
+
+  it.each([['internal', 'attachment'], ['external', 'attachment'], ['internal', 'map'], ['external', 'map']] as const)('delivers a verified %s deferred source via %s and keeps Forget authoritative', async (origin, mode) => {
+    const template = 'Static deferred World fixture.';
+    const rig = await buildRig(true, undefined, undefined, {
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      llmSetup: (llm) => llm.script(textReply('Deferred source received.')),
+    });
+    const [attachment] = await rig.memory.evidenceForSegments(SOURCE_TEXT, [
+      { documentId: 'doc-1', start: 0, end: SOURCE_TEXT.length },
+    ]);
+    if (!attachment?.segment.sourceProof) throw new Error('No read-back proof for the deferred source');
+    const { segment, ...source } = attachment;
+    const sourceMapSpans = [{ start: segment.start, end: segment.end, digest: segment.digest,
+      origin: 'hindsight-source' as const, exposedSources: [source], sourceProof: segment.sourceProof }];
+    rig.host().pushDeferred({ type: 'fixture.deferred', origin, render: () => mode === 'attachment'
+      ? { text: SOURCE_TEXT, evidence: [attachment] } : { text: SOURCE_TEXT, sourceMapSpans } }, { trigger: 'flush' });
+    await waitFor(() => rig.dispatchedBodies.some(body => body.includes(SOURCE_TEXT)), 10000);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    const event = rig.core.store.range({}).find(entry => entry.type === 'fixture.deferred');
+    if (mode === 'attachment') expect(event?.evidence).toEqual([attachment]);
+    else expect(event?.sourceMapSpans).toEqual(sourceMapSpans);
+    const isSource = (entry: ContextRecord) => entry.context.evidence?.some(e => e.documentId === 'doc-1')
+      || entry.context.sourceMapSpans?.some(span => span.exposedSources?.some(e => e.documentId === 'doc-1'));
+    const record = rig.core.session.records.find(isSource);
+    if (!record) throw new Error('No deferred source in the session');
+    const inspection = inspectContextEvidence([record]);
+    expect(inspection.mappingState).toBe('complete');
+    expect(rig.memory.sourceEvidenceCurrent(inspection)).toBe(true);
+    expect(rig.api().generationEvidence('main').some(entry => entry.requestState === 'sent' && entry.mappingState === 'complete'
+      && entry.exposedSources.some(source => source.documentId === 'doc-1'))).toBe(true);
+    const { memory: reopened } = await reopenRigMemory(rig);
+    expect(reopened.sourceEvidenceCurrent(inspection)).toBe(false);
+    const continued = await startContinuedRig(rig, reopened, template);
+    const restored = continued.core.session.records.find(isSource);
+    if (!restored) throw new Error('Deferred source was not restored');
+    await waitFor(() => reopened.sourceEvidenceCurrent(inspectContextEvidence([restored])), 10000);
+    continued.llm.script(textReply('Deferred source verified again.'));
+    await continued.host.pushEvent({ type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'continue after restart', meta: { text: 'continue after restart' } }, { trigger: 'flush' });
+    await waitFor(() => continued.dispatched.some(body => body.includes(SOURCE_TEXT) && body.includes('continue after restart')), 10000);
+    expect((await reopened.forgetDocument('doc-1')).acceptance).toBe('accepted');
+    expect(reopened.sourceEvidenceCurrent(inspectContextEvidence([restored]))).toBe(false);
+  });
+
+  it.each(['attachment', 'map'] as const)('does not revive a forged deferred %s token after Core restart', async (mode) => {
+    const template = 'Static forged deferred fixture.';
+    const rig = await buildRig(true, undefined, undefined, {
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      llmSetup: llm => llm.script(textReply('Must remain blocked.')),
+    });
+    const [attachment] = await rig.memory.evidenceForSegments(SOURCE_TEXT, [{ documentId: 'doc-1', start: 0, end: SOURCE_TEXT.length }]);
+    if (!attachment?.segment.sourceProof) throw new Error('Missing test proof');
+    const forged = structuredClone(attachment);
+    forged.segment.sourceProof!.token = 'never-issued';
+    const { segment, ...source } = forged;
+    const spans = [{ start: segment.start, end: segment.end, digest: segment.digest,
+      origin: 'hindsight-source' as const, exposedSources: [source], sourceProof: segment.sourceProof }];
+    rig.host().pushDeferred({ type: 'fixture.forged', origin: 'internal', render: () => mode === 'attachment'
+      ? { text: SOURCE_TEXT, evidence: [forged] } : { text: SOURCE_TEXT, sourceMapSpans: spans } }, { trigger: 'flush' });
+    await waitFor(() => rig.api().generationEvidence('main').some(e => e.requestState === 'unobserved'), 10000);
+    expect(rig.dispatchedBodies).toEqual([]);
+    const event = rig.core.store.range({}).find(entry => entry.type === 'fixture.forged');
+    expect(event?.evidence).toBeUndefined();
+    expect(event?.sourceMapSpans).toBeUndefined();
+    const { memory: reopened } = await reopenRigMemory(rig);
+    const continued = await startContinuedRig(rig, reopened, template);
+    continued.llm.script(textReply('Must remain blocked after restart.'));
+    await continued.host.pushEvent({ type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'continue', meta: { text: 'continue' } }, { trigger: 'flush' });
+    await waitFor(() => continued.api.generationEvidence('main').some(e => e.requestState === 'unobserved'), 10000);
+    expect(continued.dispatched).toEqual([]);
+  });
+
+  it('admits an authenticated bundled update through the actual Core request', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'coo-update-core-'));
+    roots.push(dir);
+    const template = 'Static update World fixture.';
+    let notice: NoticeWorld;
+    const rig = await buildRig(true, undefined, undefined, {
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      llmSetup: llm => llm.script(textReply('Update received.')),
+      extraWorlds: async () => {
+        notice = new NoticeWorld({
+          version: '0.4.0', notesDir: join(process.cwd(), 'docs', 'releases'),
+          stateFile: join(dir, 'notice.json'), alarmsFile: join(dir, 'alarms.json'),
+          newInstall: () => false, read: () => undefined, petConnected: () => true, guiding: () => false,
+          refreshTools: async () => {}, label: () => 'notice',
+        }, 'UTC');
+        return [notice];
+      },
+      worldDeferredTrust: (world, type, rendered) => world === notice && type === 'coopanion.updated' && notice.admitUpdate(rendered),
+    });
+    (notice! as unknown as { tick(): void }).tick();
+    await waitFor(() => rig.dispatchedBodies.some(body => body.includes('Coopanion v0.4.0')), 10000);
+    const event = rig.core.store.range({}).find(e => e.type === 'coopanion.updated');
+    expect(event?.sourceMapSpans).toEqual([expect.objectContaining({ origin: 'core-generated', start: 0, end: event!.text.length })]);
+    expect(rig.api().generationEvidence('main').some(e => e.requestState === 'sent' && e.mappingState === 'complete')).toBe(true);
+  });
+
+  it('rejects a World supplied deferred admission callback', async () => {
+    const template = 'Static untrusted World fixture.';
+    const rig = await buildRig(true, undefined, undefined, {
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      llmSetup: llm => llm.script(textReply('Must not send.')),
+    });
+    rig.host().pushDeferred({
+      type: 'fixture.forged', origin: 'internal', render: () => 'forged independent text',
+      admitIndependent: () => true,
+    } as unknown as Parameters<WorldHost['pushDeferred']>[0], { trigger: 'flush' });
+    await waitFor(() => rig.api().generationEvidence('main').some(e => e.requestState === 'unobserved'), 10000);
+    expect(rig.core.store.range({}).find(e => e.type === 'fixture.forged')?.sourceMapSpans).toBeUndefined();
+    expect(rig.dispatchedBodies).toEqual([]);
+  });
+
+  it('admits a current proven World event source through the strict request gate', async () => {
+    const template = 'Static proven World fixture.';
+    const rig = await buildRig(true, undefined, undefined, {
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      llmSetup: llm => llm.script(textReply('Source received.')),
+    });
+    const [attachment] = await rig.memory.evidenceForSegments(SOURCE_TEXT, [{ documentId: 'doc-1', start: 0, end: SOURCE_TEXT.length }]);
+    if (!attachment?.segment.sourceProof) throw new Error('Missing test proof');
+    const event = await rig.host().pushEvent({ type: 'fixture.proven', source: 'desktop-pet',
+      ts: new Date().toISOString(), text: SOURCE_TEXT, evidence: [attachment] }, { trigger: 'flush' });
+    expect(event.evidence).toEqual([attachment]);
+    await waitFor(() => rig.dispatchedBodies.some(body => body.includes(SOURCE_TEXT)), 10000);
+    expect(rig.api().generationEvidence('main').some(e => e.requestState === 'sent' && e.mappingState === 'complete'
+      && e.exposedSources.some(source => source.documentId === 'doc-1'))).toBe(true);
+  });
+
+  it('does not reissue a forged World event source after Core restart', async () => {
+    const template = 'Static forged World fixture.';
+    const rig = await buildRig(true, undefined, undefined, {
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      llmSetup: llm => llm.script(textReply('Must stay blocked.')),
+    });
+    const [attachment] = await rig.memory.evidenceForSegments(SOURCE_TEXT, [{ documentId: 'doc-1', start: 0, end: SOURCE_TEXT.length }]);
+    if (!attachment?.segment.sourceProof) throw new Error('Missing test proof');
+    const forged = structuredClone(attachment);
+    forged.segment.sourceProof!.token = 'never-issued';
+    const event = await rig.host().pushEvent({ type: 'fixture.forged', source: 'desktop-pet',
+      ts: new Date().toISOString(), text: SOURCE_TEXT, evidence: [forged] }, { trigger: 'flush' });
+    await waitFor(() => rig.api().generationEvidence('main').some(e => e.requestState === 'unobserved'), 10000);
+    expect(event.evidence).toBeUndefined();
+    const { memory: reopened } = await reopenRigMemory(rig);
+    const continued = await startContinuedRig(rig, reopened, template);
+    continued.llm.script(textReply('Must remain blocked after restart.'));
+    await continued.host.pushEvent({ type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'continue', meta: { text: 'continue' } }, { trigger: 'flush' });
+    await waitFor(() => continued.api.generationEvidence('main').some(e => e.requestState === 'unobserved'), 10000);
+    expect(continued.dispatched).toEqual([]);
   });
 
   it('rejects a source tuple from another bank, epoch, endpoint or UTF-16 range and keeps the legal source current', async () => {
@@ -4005,6 +4498,133 @@ describe('Memory source evidence through the real Core consumer', () => {
     },
   );
 
+  it('continues a raw two-source conversation after forgetting one source', async () => {
+    const surviving = 'The person prefers a quiet workspace.';
+    const template = 'Static restart World fixture.';
+    const rig = await buildRig(true, undefined, undefined, {
+      additionalSources: [{ documentId: 'doc-2', text: surviving }],
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      llmSetup: (llm) => llm.script(
+        toolReply([{ name: 'memory_search', args: { query: 'both fixture sources' }, id: 'raw-two-sources' }]),
+        textReply('Two sources were read.'),
+      ),
+    });
+    const originalQuestion = `Read both sources: ${SOURCE_TEXT}`;
+    await rig.host().pushEvent({ type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: originalQuestion, meta: { text: originalQuestion } }, { trigger: 'flush' });
+    await waitFor(() => rig.core.session.records.some((record) => record.item.type === 'message'
+      && record.item.role === 'assistant' && textOf(record).includes('Two sources were read.')), 10000);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    const before = rig.core.store.range({ fromCursor: 1, toCursor: rig.core.store.latestCursor() });
+    const originalEvent = before.find((event) => event.text === originalQuestion);
+    expect(originalEvent).toBeTruthy();
+    expect((await rig.memory.forgetDocument('doc-1')).acceptance).toBe('accepted');
+    await waitFor(() => rig.memory.settled(), 10000);
+    rig.llm.script(toolReply([{ name: 'memory_search', args: { query: 'only the second fixture source' }, id: 'raw-survivor' }]),
+      textReply('The remaining source was read.'));
+    await rig.host().pushEvent({ type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'Read remaining source', meta: { text: 'Read remaining source' } }, { trigger: 'flush' });
+    await waitFor(() => rig.dispatchedBodies.some((body) => body.includes('Read remaining source') && body.includes(surviving)), 10000);
+    const body = rig.dispatchedBodies.find((value) => value.includes('Read remaining source') && value.includes(surviving))!;
+    expect(body).not.toContain(SOURCE_TEXT);
+    const archiveDir = join(rig.root, 'data', 'session-archive');
+    const archives = readdirSync(archiveDir).map((name) => readFileSync(join(archiveDir, name), 'utf8'));
+    expect(archives.some((archive) => archive.includes(SOURCE_TEXT) && archive.includes('Read both sources'))).toBe(true);
+    expect(rig.core.store.get(originalEvent!.cursor)).toEqual(originalEvent);
+    expect(rig.memory.sourceFenced('doc-1')).toBe(true);
+    expect(rig.memory.sourceFenced('doc-2')).toBe(false);
+  });
+
+  it('recovers after the model runs memory_forget against raw two-source context', async () => {
+    const surviving = 'The person prefers a quiet workspace.';
+    const template = 'Static restart World fixture.';
+    const rig = await buildRig(true, undefined, undefined, {
+      additionalSources: [{ documentId: 'doc-2', text: surviving }], listDocuments: true,
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      llmSetup: (llm) => llm.script(
+        toolReply([{ name: 'memory_search', args: { query: 'both fixture sources' }, id: 'tool-forget-search' }]),
+        textReply('Two sources were read.'),
+      ),
+    });
+    await rig.host().pushEvent({ type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: `Read both: ${SOURCE_TEXT}`, meta: {} }, { trigger: 'flush' });
+    await waitFor(() => rig.core.session.records.some((record) => record.item.type === 'message'
+      && record.item.role === 'assistant' && textOf(record).includes('Two sources were read.')), 10000);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    rig.llm.script(toolReply([{ name: 'memory_forget', args: { query: 'jasmine' }, id: 'tool-forget-first' }]));
+    await rig.host().pushEvent({ type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'Forget the first source', meta: {} }, { trigger: 'flush' });
+    await waitFor(() => rig.memory.sourceFenced('doc-1'), 10000);
+    await waitFor(() => rig.api().handoffOutcome()?.status === 'committed', 10000);
+    rig.llm.script(toolReply([{ name: 'memory_search', args: { query: 'only the second fixture source' }, id: 'tool-forget-survivor' }]),
+      textReply('The remaining source was read.'));
+    await rig.host().pushEvent({ type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'Read the remaining source after tool Forget', meta: {} }, { trigger: 'flush' });
+    await waitFor(() => rig.dispatchedBodies.some((body) => body.includes('Read the remaining source after tool Forget')
+      && body.includes(surviving)), 10000);
+    const body = rig.dispatchedBodies.find((value) => value.includes('Read the remaining source after tool Forget')
+      && value.includes(surviving))!;
+    expect(body).not.toContain(SOURCE_TEXT);
+    expect(rig.memory.sourceFenced('doc-2')).toBe(false);
+    expect(readdirSync(join(rig.root, 'data', 'session-archive')).length).toBeGreaterThan(0);
+  });
+
+  it('continues a source-free search after all synthetic sources are forgotten', async () => {
+    const surviving = 'The person prefers a quiet workspace.';
+    const template = 'Static restart World fixture.';
+    const rig = await buildRig(true, undefined, undefined, {
+      additionalSources: [{ documentId: 'doc-2', text: surviving }],
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      llmSetup: (llm) => llm.script(
+        toolReply([{ name: 'memory_search', args: { query: 'both fixture sources' }, id: 'all-forgotten-search' }]),
+        textReply('No current source was found.'),
+      ),
+    });
+    expect((await rig.memory.forgetDocument('doc-1')).acceptance).toBe('accepted');
+    expect((await rig.memory.forgetDocument('doc-2')).acceptance).toBe('accepted');
+    await waitFor(() => rig.memory.settled(), 10000);
+    await rig.host().pushEvent({ type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'Search after all sources were forgotten', meta: {} }, { trigger: 'flush' });
+    await waitFor(() => rig.core.session.records.some((record) => record.item.type === 'message'
+      && record.item.role === 'assistant' && textOf(record).includes('No current source was found.')), 10000);
+    const body = rig.dispatchedBodies.find((value) => value.includes('No verified source record matched this query.'))!;
+    expect(body).toBeTruthy();
+    expect(body).not.toContain(SOURCE_TEXT);
+    expect(body).not.toContain(surviving);
+    const digest = createHash('sha256').update(body, 'utf8').digest('hex');
+    expect(rig.api().generationEvidence('main').find((entry) => entry.serializedBodyDigest === digest))
+      .toMatchObject({ requestState: 'sent', mappingState: 'complete', exposedSources: [] });
+  });
+
+  it('keeps the original context closed when the clean-session archive fails', async () => {
+    const template = 'Static restart World fixture.';
+    const rig = await buildRig(true, undefined, undefined, {
+      additionalSources: [{ documentId: 'doc-2', text: 'A remaining synthetic source.' }],
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      llmSetup: (llm) => llm.script(
+        toolReply([{ name: 'memory_search', args: { query: 'both fixture sources' }, id: 'archive-failure-search' }]),
+        textReply('Sources read before forgetting.'),
+      ),
+    });
+    await rig.host().pushEvent({ type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'Read sources before archive failure', meta: {} }, { trigger: 'flush' });
+    await waitFor(() => rig.core.session.records.some((record) => record.item.type === 'message'
+      && record.item.role === 'assistant' && textOf(record).includes('Sources read before forgetting.')), 10000);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    const sessionFile = join(rig.root, 'data', 'session-main.jsonl');
+    const before = readFileSync(sessionFile, 'utf8');
+    writeFileSync(join(rig.root, 'data', 'session-archive'), 'synthetic directory obstruction');
+    expect((await rig.memory.forgetDocument('doc-1')).acceptance).toBe('accepted');
+    await waitFor(() => rig.api().handoffOutcome()?.reason === 'session-archive-failed', 10000);
+    expect(readFileSync(sessionFile, 'utf8')).toBe(before);
+    expect(rig.memory.sourceFenced('doc-1')).toBe(true);
+    rig.llm.script(textReply('Must not be dispatched.'));
+    await rig.host().pushEvent({ type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'After archive failure', meta: {} }, { trigger: 'flush' });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(rig.dispatchedBodies.some((body) => body.includes('After archive failure'))).toBe(false);
+  });
+
   it.each(['doc-1', 'doc-2'] as const)(
     'continues a delivered mixed Handoff after forgetting %s',
     async (forgotten) => {
@@ -4016,6 +4636,7 @@ describe('Memory source evidence through the real Core consumer', () => {
       const rig = await buildRig(true, partnerText, undefined, {
         additionalSources: [{ documentId: 'doc-2', text: worldText }],
         worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+        bankId: 'coopanion-test:rev28-b1-f5',
       });
       await rig.host().pushEvent({
         type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
@@ -4026,6 +4647,10 @@ describe('Memory source evidence through the real Core consumer', () => {
       expect(rig.api().requestContextHandoff()).toBe(true);
       await waitFor(() => rig.api().handoffOutcome()?.status === 'committed');
       await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+      const originalHandoffOutcome = rig.api().handoffOutcome();
+      if (!originalHandoffOutcome || originalHandoffOutcome.status !== 'committed') {
+        throw new Error('The initial mixed Handoff has no committed status receipt');
+      }
 
       const { store, memory } = await reopenRigMemory(rig);
       const continued = await startContinuedRig(rig, memory, template);
@@ -4038,7 +4663,7 @@ describe('Memory source evidence through the real Core consumer', () => {
       await waitFor(() => continued.core.loop.getStatus().phase.state === 'idle');
       expect(continued.dispatched.some((body) => body.includes(partnerText) && body.includes(worldText))).toBe(true);
 
-      const independentMarker = 'B6 independent user note before forget';
+      const independentMarker = 'B6 independent user note 🐋 before forget';
       continued.llm.script(textReply('Independent before forget.'));
       await continued.host.pushEvent({
         type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
@@ -4059,250 +4684,639 @@ describe('Memory source evidence through the real Core consumer', () => {
         && event.source === 'desktop-pet' && event.dependencyOrigin === 'user-input' && event.text === independentMarker);
       if (!independentEvent) throw new Error('The independent user event is missing from the EventStore');
       const independentDigest = createHash('sha256').update(independentMarker, 'utf8').digest('hex');
+      expect(independentEvent).toMatchObject({
+        cursor: expect.any(Number),
+        type: 'desktop-pet.message',
+        source: 'desktop-pet',
+        origin: 'external',
+        dependencyOrigin: 'user-input',
+        contextDelivery: 'deliver',
+        text: independentMarker,
+      });
+      const independentRecord = continued.core.session.records.find((record) =>
+        record.context.frame?.events?.some((frame) => frame.type === 'desktop-pet.message'
+          && frame.cursor === independentEvent.cursor));
+      if (!independentRecord) throw new Error('The independent user event has no Core frame');
+      const independentFrame = independentRecord.context.frame?.events.find((frame) =>
+        frame.type === 'desktop-pet.message' && frame.cursor === independentEvent.cursor);
+      if (!independentFrame) throw new Error('The independent user frame is missing');
+      const independentFrameEnd = independentFrame.start + independentFrame.chars;
+      expect(independentFrame).toMatchObject({
+        cursor: independentEvent.cursor,
+        ts: independentEvent.ts,
+        type: 'desktop-pet.message',
+        source: 'desktop-pet',
+        chars: independentMarker.length,
+      });
+      expect(textOf(independentRecord).slice(independentFrame.start, independentFrameEnd)).toBe(independentMarker);
+      const independentSourceSpan = (independentRecord.context.sourceIndependentSpans ?? []).find((span) =>
+        span.origin === 'user-input' && span.start === independentFrame.start && span.end === independentFrameEnd);
+      expect(independentSourceSpan).toMatchObject({
+        start: independentFrame.start,
+        end: independentFrameEnd,
+        digest: independentDigest,
+        origin: 'user-input',
+      });
+      const independentGeneration = continued.api.generationEvidence('main').find((entry) =>
+        entry.items.some((item) => item.itemId === independentRecord.item.id));
+      expect(independentGeneration).toMatchObject({
+        requestState: 'sent',
+        mappingState: 'complete',
+        responseJoinState: 'matched',
+      });
+      const independentItemEvidence = independentGeneration?.items.find((item) =>
+        item.itemId === independentRecord.item.id);
+      expect(independentItemEvidence?.mappingState).toBe('complete');
+      expect(independentItemEvidence?.spans.find((span) =>
+        span.origin === 'user-input' && span.digest === independentDigest)).toMatchObject({
+        origin: 'user-input',
+        digest: independentDigest,
+        mappingState: 'complete',
+      });
       const handoffArtifact = memory.listHandoffArtifacts().find((artifact) => artifact.lifecycleState === 'active');
 
-      continued.llm.script(textReply('After handoff.'), textReply('After forget.'));
-      expect((await memory.forgetDocument(forgotten)).acceptance).toBe('accepted');
-      await waitFor(() => memory.settled(), 10000);
-      expect(continued.api.requestContextHandoff()).toBe(true);
-      await waitFor(() => continued.api.handoffOutcome()?.status === 'committed', 10000);
-      await waitFor(() => continued.core.loop.getStatus().phase.state === 'idle');
-      await continued.host.pushEvent({
-        type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
-        ts: new Date().toISOString(), text: 'after delivered note forget', meta: { text: 'after delivered note forget' },
-      }, { trigger: 'flush' });
-      await waitFor(() => continued.dispatched.some((body) => body.includes('after delivered note forget')), 10000);
-      await waitFor(() => continued.core.loop.getStatus().phase.state === 'idle');
-      expect(continued.api.handoffOutcome()).toMatchObject({ status: 'committed' });
-      const secondBody = continued.dispatched.find((body) => body.includes('after delivered note forget'));
-      if (!secondBody) throw new Error('The post-forget request was not dispatched');
-      expect(secondBody).toContain(otherText);
-      expect(secondBody).not.toContain(forgotten === 'doc-1' ? partnerText : worldText);
-      const secondDigest = createHash('sha256').update(secondBody, 'utf8').digest('hex');
-      const secondEvidence = continued.api.generationEvidence('main')
-        .find((entry) => entry.serializedBodyDigest === secondDigest);
-      expect(secondEvidence).toMatchObject({ requestState: 'sent', mappingState: 'complete', responseJoinState: 'matched' });
-      expect(secondBody).toContain(independentMarker);
-      const retainedRecord = continued.core.session.records.find((record) =>
-        record.context.frame?.events.some((event) => event.type === 'desktop-pet.message'
-          && event.cursor === independentEvent.cursor));
-      if (!retainedRecord) throw new Error('The original user event identity was not retained in the new session');
-      const retainedFrame = retainedRecord.context.frame!.events.find((event) =>
-        event.type === 'desktop-pet.message' && event.cursor === independentEvent.cursor)!;
-      const retainedText = textOf(retainedRecord);
-      const retainedStart = retainedFrame.start;
-      const retainedEnd = retainedFrame.start + retainedFrame.chars;
-      expect(retainedFrame).toMatchObject({ type: 'desktop-pet.message', source: 'desktop-pet', cursor: independentEvent.cursor });
-      expect(retainedText.slice(retainedStart, retainedEnd)).toBe(independentMarker);
-      const retainedSpan = retainedRecord.context.sourceIndependentSpans?.find((span) =>
-        span.origin === 'user-input' && span.start === retainedStart && span.end === retainedEnd);
-      expect(retainedSpan).toMatchObject({ start: retainedStart, end: retainedEnd, digest: independentDigest, origin: 'user-input' });
-      const retainedItemEvidence = secondEvidence?.items.find((item) => item.itemId === retainedRecord.item.id);
-      expect(retainedItemEvidence).toMatchObject({ mappingState: 'complete' });
-      expect(retainedItemEvidence?.spans).toEqual(expect.arrayContaining([expect.objectContaining({
-        start: retainedStart, end: retainedEnd, digest: independentDigest, origin: 'user-input', mappingState: 'complete',
-      })]));
+      if (!handoffArtifact) throw new Error('The delivered mixed Handoff artifact was not active before Forget');
+      const oldNotePath = join(rig.memoryDir, handoffArtifact.target);
+      const oldNoteBefore = readFileSync(oldNotePath, 'utf8');
+      const forgottenText = forgotten === 'doc-1' ? partnerText : worldText;
+      const epochBeforeForget = memory.evidenceEpoch();
+      const sourceCurrentBeforeForget = {
+        doc1: memory.sourceCurrentForContext('doc-1'), doc2: memory.sourceCurrentForContext('doc-2'),
+      };
 
+      const postForgetSearchId = 'f6-post-forget-memory-search';
+      const postForgetAnswer = `The remaining source says: ${otherText}`;
       continued.llm.script(
+        textReply('After handoff.'),
         toolReply([{
           name: 'memory_search',
           args: { query: otherDocumentId === 'doc-2' ? 'only the second fixture source' : 'only the first fixture source' },
-          id: 'b5-independent-search',
+          id: postForgetSearchId,
         }]),
-        textReply('Independent answer.'),
+        textReply(postForgetAnswer),
       );
-      await continued.host.pushEvent({
-        type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
-        ts: new Date().toISOString(), text: 'after independent recall', meta: { text: 'after independent recall' },
-      }, { trigger: 'flush' });
-      await waitFor(() => continued.dispatched.some((body) => body.includes('after independent recall')));
-      await waitFor(() => continued.core.loop.getStatus().phase.state === 'idle');
-      const recallEvidence = [...continued.api.generationEvidence('main')].reverse().find((entry) =>
-        entry.requestState === 'sent' && entry.exposedSources.some((source) => source.documentId === otherDocumentId));
-      if (!recallEvidence) throw new Error('The independent recall request was not dispatched');
-      const recallBody = continued.dispatched.find((body) =>
-        createHash('sha256').update(body, 'utf8').digest('hex') === recallEvidence.serializedBodyDigest);
-      if (!recallBody) throw new Error('The independent recall body is unavailable');
-      expect(recallBody).toContain(otherText);
-      expect(recallBody).not.toContain(forgotten === 'doc-1' ? partnerText : worldText);
-      expect(recallEvidence).toMatchObject({ requestState: 'sent', mappingState: 'complete', responseJoinState: 'matched' });
-      expect(recallEvidence.exposedSources.map((source) => source.documentId)).toEqual([otherDocumentId]);
-
-      const auditAfter = continued.core.store.range({
-        fromCursor: 1, toCursor: continued.core.store.latestCursor(),
+      const forgetResult = await memory.forgetDocument(forgotten);
+      expect(forgetResult.acceptance).toBe('accepted');
+      await waitFor(() => memory.settled(), 10000);
+      const epochAfterForget = memory.evidenceEpoch();
+      await waitFor(() => (continued.persona as any).lastForgottenHandoffBlock?.status === 'blocked', 10000);
+      expect((continued.persona as any).lastForgottenHandoffBlock).toMatchObject({
+        status: 'blocked', mappingState: 'complete', reason: 'original-memory-source-dependency-unverified',
       });
-      for (const event of auditBefore) {
-        expect(auditAfter.find((candidate) => candidate.cursor === event.cursor)).toEqual(event);
-      }
-      if (!handoffArtifact) throw new Error('The delivered handoff artifact was not active before Forget');
-      const artifactAfter = store.getDerivedArtifact(handoffArtifact.artifactId);
-      expect(artifactAfter).toMatchObject({
+      await waitFor(() => memory.listHandoffArtifacts().some((artifact) => artifact.lifecycleState === 'active'
+        && artifact.artifactId !== handoffArtifact.artifactId
+        && artifact.sources.length === 1 && artifact.sources[0].documentId === otherDocumentId), 10000);
+      const rebuiltArtifact = memory.listHandoffArtifacts().find((artifact) => artifact.lifecycleState === 'active'
+        && artifact.artifactId !== handoffArtifact.artifactId);
+      if (!rebuiltArtifact) throw new Error('The clean remaining-source Handoff was not committed');
+      await waitFor(() => {
+        const outcome = continued.api.handoffOutcome();
+        return outcome?.status === 'committed'
+          && outcome.candidateSnapshotId !== originalHandoffOutcome.candidateSnapshotId;
+      }, 10000);
+      await waitFor(() => continued.core.loop.getStatus().phase.state === 'idle');
+      const rebuiltOutcome = continued.api.handoffOutcome();
+      expect(rebuiltOutcome).toMatchObject({ status: 'committed', mappingState: 'complete' });
+      expect(rebuiltOutcome?.candidateSnapshotId).not.toBe(originalHandoffOutcome.candidateSnapshotId);
+
+      const staleOldArtifact = store.getDerivedArtifact(handoffArtifact.artifactId);
+      expect(staleOldArtifact).toMatchObject({
         artifactId: handoffArtifact.artifactId,
         target: handoffArtifact.target,
         bodyDigest: handoffArtifact.bodyDigest,
         lifecycleState: 'stale',
         statusReason: 'source-forgotten',
       });
-      expect(artifactAfter?.sources.map((source) => source.documentId).sort()).toEqual(['doc-1', 'doc-2']);
-      expect(continued.core.session.records.some((record) => textOf(record).includes('deliver the valid note')
-        || textOf(record).includes('hello'))).toBe(true);
-      const handoffNoteRecord = continued.core.session.records.find((record) =>
-        record.context.frame?.events.some((event) => event.type === 'handoff-note'));
-      expect(handoffNoteRecord).toBeDefined();
-      expect(textOf(handoffNoteRecord!)).toContain(independentMarker);
-      const handoffNoteText = textOf(handoffNoteRecord!);
-      expect(handoffNoteRecord!.context.frame?.events.every((event) => event.type === 'handoff-note'
-        || (event.type === 'desktop-pet.message' && event.source === 'desktop-pet'))).toBe(true);
-      for (const event of handoffNoteRecord!.context.frame?.events ?? []) {
-        if (event.type !== 'desktop-pet.message') continue;
-        expect((handoffNoteRecord!.context.sourceDependencySpans ?? []).some((span) =>
-          span.start < event.start + event.chars && span.end > event.start)).toBe(false);
-        expect(handoffNoteText.slice(event.start, event.start + event.chars).length).toBe(event.chars);
+      expect(staleOldArtifact?.sources).toEqual(handoffArtifact.sources);
+      expect(readFileSync(oldNotePath, 'utf8')).toBe(oldNoteBefore);
+      expect(createHash('sha256').update(oldNoteBefore, 'utf8').digest('hex')).toBe(handoffArtifact.bodyDigest);
+
+      expect(rebuiltArtifact.sources.map((source) => source.documentId)).toEqual([otherDocumentId]);
+      expect(rebuiltArtifact.sources[0]).toMatchObject({
+        bankId: 'coopanion-test:rev28-b1-f5', endpoint: rig.baseUrl,
+        contentDigest: createHash('sha256').update(otherText, 'utf8').digest('hex'),
+        validationState: 'validated', validatedFence: '1',
+      });
+      const rebuiltNote = readFileSync(join(rig.memoryDir, rebuiltArtifact.target), 'utf8');
+      expect(createHash('sha256').update(rebuiltNote, 'utf8').digest('hex')).toBe(rebuiltArtifact.bodyDigest);
+      expect(rebuiltNote).toContain(otherText);
+      expect(rebuiltNote).not.toContain(forgottenText);
+      expect(rebuiltNote).not.toContain('Independent before forget.');
+      expect((continued.persona as any).pendingCleanHandoffRebuild).toBeNull();
+
+      const postForgetMarker = 'F6 post-Forget memory search';
+      await continued.host.pushEvent({
+        type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+        ts: new Date().toISOString(), text: postForgetMarker, meta: { text: postForgetMarker },
+      }, { trigger: 'flush' });
+      await waitFor(() => continued.dispatched.some((body) => body.includes(postForgetMarker)), 10000);
+      await waitFor(() => continued.core.loop.getStatus().phase.state === 'idle');
+      const secondBody = continued.dispatched.find((body) => body.includes(postForgetMarker));
+      if (!secondBody) throw new Error('The post-forget request was not dispatched');
+      expect(secondBody).toContain(postForgetMarker);
+      expect(secondBody).toContain(otherText);
+      expect(secondBody).not.toContain(forgottenText);
+      expect(secondBody).toContain(independentMarker);
+      const secondEvidence = continued.api.generationEvidence('main').find((entry) =>
+        entry.serializedBodyDigest === createHash('sha256').update(secondBody, 'utf8').digest('hex'));
+      expect(secondEvidence).toMatchObject({ requestState: 'sent', mappingState: 'complete', responseJoinState: 'matched' });
+      expect(secondEvidence?.exposedSources.map((source) => source.documentId)).toEqual([otherDocumentId]);
+      const postForgetCall = continued.core.session.records.find((record) =>
+        record.item.type === 'function_call' && record.item.name === 'memory_search');
+      if (!postForgetCall || postForgetCall.item.type !== 'function_call') {
+        throw new Error('The post-Forget turn did not call memory_search');
       }
-      for (const span of (handoffNoteRecord!.context.sourceIndependentSpans ?? []).filter((entry) => entry.origin === 'user-input')) {
-        expect(handoffNoteRecord!.context.frame?.events.some((event) =>
-          event.type === 'desktop-pet.message' && event.source === 'desktop-pet'
-          && event.start === span.start && event.start + event.chars === span.end)).toBe(true);
-      }
-      const originalIndependentFrame = continued.core.session.records.some((record) =>
-        record !== handoffNoteRecord && record.context.frame?.events.some((event) => event.type === 'desktop-pet.message'
-          && textOf(record).slice(event.start, event.start + event.chars).includes(independentMarker)));
-      expect(originalIndependentFrame).toBe(true);
+      expect(postForgetCall.item.call_id).toBe(postForgetSearchId);
+      const postForgetCallId = postForgetCall.item.call_id;
+      const postForgetReceipt = continued.core.session.records.find((record) =>
+        record.item.type === 'function_call_output' && record.item.call_id === postForgetCallId);
+      expect(postForgetReceipt?.context.toolReceiptRef).toBeTruthy();
+      expect(postForgetReceipt?.context.evidence?.map((source) => source.documentId)).toEqual([otherDocumentId]);
+      expect(postForgetReceipt?.context.evidence?.[0]).toMatchObject({
+        bankId: 'coopanion-test:rev28-b1-f5',
+        endpoint: rig.baseUrl,
+        documentId: otherDocumentId,
+        contentDigest: createHash('sha256').update(otherText, 'utf8').digest('hex'),
+        validationStatus: 'validated',
+        revisionState: 'current',
+      });
+      expect(continued.core.session.records.some((record) =>
+        record.item.type === 'message' && record.item.role === 'assistant'
+          && textOf(record).includes(postForgetAnswer))).toBe(true);
+
+      const [remainingAttachment] = await memory.evidenceForSegments(otherText, [
+        { documentId: otherDocumentId, start: 0, end: otherText.length },
+      ]);
+      if (!remainingAttachment?.segment.sourceProof) throw new Error('The remaining source has no exact slice proof');
+      expect(remainingAttachment.segment.digest).toBe(createHash('sha256').update(otherText, 'utf8').digest('hex'));
+      const { segment: _remainingSegment, ...remainingSource } = remainingAttachment;
+      const settledEpoch = memory.evidenceEpoch();
+      if (!settledEpoch) throw new Error('The settled source epoch is unavailable');
+      expect(await memory.verifyExposureSources([remainingSource], settledEpoch)).toBe(true);
+      expect(memory.sourceFenced(forgotten)).toBe(true);
+      expect(memory.sourceFenced(otherDocumentId)).toBe(false);
+
+      const auditAfter = continued.core.store.range({ fromCursor: 1, toCursor: continued.core.store.latestCursor() });
+      expect(auditAfter.find((event) => event.cursor === independentEvent.cursor)).toEqual(independentEvent);
+      const postForgetEvent = auditAfter.find((event) => event.type === 'desktop-pet.message'
+        && event.source === 'desktop-pet' && event.dependencyOrigin === 'user-input' && event.text === postForgetMarker);
+      if (!postForgetEvent) throw new Error('The post-Forget user event is missing from the EventStore');
+      const postForgetDigest = createHash('sha256').update(postForgetMarker, 'utf8').digest('hex');
+      const postForgetFrameRecord = continued.core.session.records.find((record) =>
+        record.context.frame?.events?.some((frame) => frame.type === 'desktop-pet.message'
+          && frame.cursor === postForgetEvent.cursor));
+      if (!postForgetFrameRecord) throw new Error('The post-Forget user event has no Core frame');
+      const postForgetFrame = postForgetFrameRecord.context.frame?.events.find((frame) =>
+        frame.type === 'desktop-pet.message' && frame.cursor === postForgetEvent.cursor);
+      if (!postForgetFrame) throw new Error('The post-Forget user frame is missing');
+      const postForgetFrameEnd = postForgetFrame.start + postForgetFrame.chars;
+      expect(postForgetFrame.chars).toBe(postForgetMarker.length);
+      expect(textOf(postForgetFrameRecord).slice(postForgetFrame.start, postForgetFrameEnd)).toBe(postForgetMarker);
+      expect((postForgetFrameRecord.context.sourceIndependentSpans ?? []).find((span) =>
+        span.origin === 'user-input' && span.start === postForgetFrame.start && span.end === postForgetFrameEnd))
+        .toMatchObject({ start: postForgetFrame.start, end: postForgetFrameEnd, digest: postForgetDigest, origin: 'user-input' });
+      expect(auditAfter.find((event) => event.cursor === noteEvent?.cursor)?.sourceDependencies?.exposedSources
+        .map((source) => source.documentId).sort()).toEqual(['doc-1', 'doc-2']);
       expect((memory as unknown as { outbox: MemoryOutbox }).outbox.matching((item) =>
         item.documentId.startsWith('coo:'))).toEqual([]);
-      const originalAfter = continued.core.store.get(independentEvent.cursor);
-      if (process.env.CORTICO_S1_TRACE === '1') console.info('S1_R6B_TRACE', JSON.stringify({
-        forgotten,
-        originalEvent: {
-          cursor: independentEvent.cursor, run: independentEvent.run ?? null, type: independentEvent.type,
-          source: independentEvent.source, dependencyOrigin: independentEvent.dependencyOrigin ?? null,
-          text: independentEvent.text, digest: independentDigest,
-        },
-        retained: {
-          itemId: retainedRecord.item.id, itemType: retainedRecord.item.type,
-          frame: { cursor: retainedFrame.cursor, type: retainedFrame.type, source: retainedFrame.source,
-            start: retainedStart, chars: retainedFrame.chars, end: retainedEnd },
-          span: retainedSpan && { start: retainedSpan.start, end: retainedSpan.end, digest: retainedSpan.digest, origin: retainedSpan.origin },
-        },
-        note: {
-          cursor: noteEvent?.cursor ?? null,
-          frame: handoffNoteRecord?.context.frame?.events.map((event) => ({ type: event.type, start: event.start, chars: event.chars, source: event.source })) ?? [],
-          hasMarker: textOf(handoffNoteRecord!).includes(independentMarker),
-          hasUserSpan: (handoffNoteRecord?.context.sourceIndependentSpans ?? []).some((span) => span.origin === 'user-input'),
-        },
-        final: secondEvidence && {
-          bodyDigest: secondDigest, serializedBodyDigest: secondEvidence.serializedBodyDigest,
-          requestState: secondEvidence.requestState, mappingState: secondEvidence.mappingState,
-          responseJoinState: secondEvidence.responseJoinState,
-          sources: secondEvidence.exposedSources.map((source) => source.documentId),
-        },
-        eventStore: {
-          originalCursor: independentEvent.cursor, latestCursor: continued.core.store.latestCursor(),
-          originalStillPresent: !!originalAfter, originalUnchanged: JSON.stringify(originalAfter) === JSON.stringify(independentEvent),
-        },
-        r6b: { summarizedInHandoffNote: textOf(handoffNoteRecord!).includes(independentMarker), originalIndependentFrame },
-      }));
-      if (process.env.CORTICO_B5_TRACE === '1') console.info('B5_TRACE', JSON.stringify({
-        forgotten, otherDocumentId,
-        handoff: continued.api.handoffOutcome(),
-        auditBefore: auditBefore.length, auditAfter: auditAfter.length, noteCursor: noteEvent?.cursor,
-        artifactBefore: handoffArtifact && { id: handoffArtifact.artifactId, state: handoffArtifact.lifecycleState, target: handoffArtifact.target },
-        artifactAfter: handoffArtifact ? store.getDerivedArtifact(handoffArtifact.artifactId) : null,
-        sessionKept: continued.core.session.records.some((record) => textOf(record).includes('deliver the valid note')
-          || textOf(record).includes('hello')),
-        r6b: { summarizedInHandoffNote: textOf(handoffNoteRecord!).includes(independentMarker), originalIndependentFrame },
-        records: continued.core.session.records.map((record) => ({
-          item: record.item.type, role: (record.item as { role?: string }).role,
-          text: textOf(record).slice(0, 120),
-          frame: record.context.frame?.events.map((event) => ({ type: event.type, start: event.start, chars: event.chars, source: event.source })),
-          independent: record.context.sourceIndependentSpans?.map((span) => ({ start: span.start, end: span.end, origin: span.origin })),
-        })),
-        second: secondEvidence && {
-          requestState: secondEvidence.requestState, mappingState: secondEvidence.mappingState,
-          sources: secondEvidence.exposedSources.map((source) => source.documentId),
-        },
-        recall: recallEvidence && {
-          requestState: recallEvidence.requestState, mappingState: recallEvidence.mappingState,
-          sources: recallEvidence.exposedSources.map((source) => source.documentId),
-        },
-      }));
 
-      // S2 cross-restart probe: the S1 bridge lives in the in-memory tail. A fresh
-      // Core/Memory reopen must be observed rather than assumed to preserve it.
+      const preRestartHandoff = continued.api.handoffOutcome();
+      if (!preRestartHandoff) throw new Error('The post-Forget Handoff outcome is missing before restart');
+      expect(continued.api.requestContextHandoff()).toBe(true);
+      await waitFor(() => {
+        const outcome = continued.api.handoffOutcome();
+        return outcome?.status === 'committed'
+          && outcome.candidateSnapshotId !== preRestartHandoff.candidateSnapshotId;
+      }, 10000);
+      const postForgetHandoff = continued.api.handoffOutcome();
+      expect(postForgetHandoff).toMatchObject({ status: 'committed', mappingState: 'complete' });
+      const postForgetArtifact = memory.listHandoffArtifacts().find((artifact) =>
+        artifact.lifecycleState === 'active' && artifact.artifactId !== rebuiltArtifact.artifactId);
+      if (!postForgetArtifact) throw new Error('The post-search Handoff did not retain a verified source artifact');
+      expect(postForgetArtifact.sources.map((source) => source.documentId)).toEqual([otherDocumentId]);
+
       await continued.core.stop();
       const continuedIndex = activeCores.indexOf(continued.core);
       if (continuedIndex >= 0) activeCores.splice(continuedIndex, 1);
       (rig as { core: typeof continued.core }).core = continued.core;
       const { memory: restartedMemory } = await reopenRigMemory(rig);
       const restarted = await startContinuedRig(rig, restartedMemory, template);
-      const persistedOriginal = restarted.core.store.get(independentEvent.cursor);
-      const restartedRecord = restarted.core.session.records.find((record) =>
-        record.context.frame?.events.some((event) => event.type === 'desktop-pet.message'
-          && event.cursor === independentEvent.cursor));
-      const restartedFrame = restartedRecord?.context.frame?.events.find((event) =>
-        event.type === 'desktop-pet.message' && event.cursor === independentEvent.cursor);
-      const restartedSpan = restartedRecord?.context.sourceIndependentSpans?.find((span) =>
-        span.origin === 'user-input' && span.start === restartedFrame?.start
-        && span.end === (restartedFrame?.start ?? 0) + (restartedFrame?.chars ?? 0));
-      const restartedEvidence = restarted.api.generationEvidence('main').map((entry) => ({
-        requestState: entry.requestState, mappingState: entry.mappingState, responseJoinState: entry.responseJoinState,
-        reason: entry.requestBlockReason, sources: entry.exposedSources.map((source) => source.documentId),
-      }));
-      if (process.env.CORTICO_S2_TRACE === '1') console.info('S2_RESTART_TRACE', JSON.stringify({
-        forgotten,
-        originalCursor: independentEvent.cursor,
-        persistedOriginal: !!persistedOriginal,
-        persistedTextMatches: persistedOriginal?.text === independentEvent.text,
-        restartedOriginalFrame: !!restartedFrame,
-        restartedFrame: restartedFrame && { cursor: restartedFrame.cursor, start: restartedFrame.start, chars: restartedFrame.chars },
-        restartedSpan: restartedSpan && { start: restartedSpan.start, end: restartedSpan.end, digest: restartedSpan.digest, origin: restartedSpan.origin },
-        restartedHasHandoffNote: restarted.core.session.records.some((record) =>
-          record.context.frame?.events.some((event) => event.type === 'handoff-note')),
-        restartedEvidence,
-        finalProviderObserved: restarted.dispatched.some((body) => body.includes(independentMarker)),
-      }));
-      expect(persistedOriginal).toEqual(independentEvent);
-      expect(restartedFrame).toMatchObject({ cursor: independentEvent.cursor, type: 'desktop-pet.message', source: 'desktop-pet' });
-      expect(restartedSpan).toMatchObject({ start: 14, end: 52, digest: independentDigest, origin: 'user-input' });
-      // The restored old handoff note is stale. Warm the reopened Memory so the same
-      // source/epoch checks as the live app can run before recording the next handoff.
-      await restartedMemory.sessionBriefing().catch(() => null);
-      const restartHandoffRequested = restarted.api.requestContextHandoff();
-      await waitFor(() => restarted.api.handoffOutcome() !== null, 3000).catch(() => undefined);
-      const restartHandoffOutcome = restarted.api.handoffOutcome();
+      await waitFor(() => restarted.core.loop.getStatus().phase.state === 'idle', 10000);
+      expect(restartedMemory.derivedArtifact(handoffArtifact.artifactId)).toMatchObject({
+        artifactId: handoffArtifact.artifactId, lifecycleState: 'stale', statusReason: 'source-forgotten',
+      });
+      expect(restartedMemory.listHandoffArtifacts().find((artifact) => artifact.artifactId === rebuiltArtifact.artifactId))
+        .toMatchObject({ lifecycleState: 'active', sources: [expect.objectContaining({ documentId: otherDocumentId })] });
+      const exactAfterRestart = await restartedMemory.readExactSourceEvidence(otherDocumentId);
+      if (!exactAfterRestart) throw new Error('The remaining source could not be read back after restart');
+      expect(exactAfterRestart).toMatchObject({
+        bankId: 'coopanion-test:rev28-b1-f5', endpoint: rig.baseUrl,
+        documentId: otherDocumentId, endpointBinding: 'configured-client', storedText: otherText,
+        contentDigest: createHash('sha256').update(otherText, 'utf8').digest('hex'),
+        evidenceEpoch: restartedMemory.evidenceEpoch(), fenceEpoch: '1',
+      });
+      const [restartAttachment] = await restartedMemory.evidenceForSegments(exactAfterRestart.storedText, [
+        { documentId: otherDocumentId, start: 0, end: exactAfterRestart.storedText.length },
+      ]);
+      if (!restartAttachment?.segment.sourceProof) throw new Error('Restart readback did not mint an exact slice proof');
+      const { segment: _restartSegment, ...restartSource } = restartAttachment;
+      expect(await restartedMemory.verifyExposureSources([restartSource], exactAfterRestart.evidenceEpoch)).toBe(true);
+      expect(restartedMemory.sourceFenced(forgotten)).toBe(true);
+      expect(restartedMemory.sourceFenced(otherDocumentId)).toBe(false);
+
+      const persistedIndependent = restarted.core.store.get(independentEvent.cursor);
+      expect(persistedIndependent).toEqual(independentEvent);
+      const persistedPostForgetEvent = restarted.core.store.get(postForgetEvent.cursor);
+      expect(persistedPostForgetEvent).toEqual(postForgetEvent);
+      const restartedIndependentRecord = restarted.core.session.records.find((record) =>
+        record.context.frame?.events?.some((frame) => frame.type === 'desktop-pet.message'
+          && frame.cursor === postForgetEvent.cursor));
+      if (!restartedIndependentRecord) throw new Error('The post-Forget independent user frame did not survive Core restart');
+      const restartedIndependentFrame = restartedIndependentRecord.context.frame?.events.find((frame) =>
+        frame.type === 'desktop-pet.message' && frame.cursor === postForgetEvent.cursor);
+      if (!restartedIndependentFrame) throw new Error('The restarted post-Forget user frame is missing');
+      const restartedFrameEnd = restartedIndependentFrame.start + restartedIndependentFrame.chars;
+      expect(textOf(restartedIndependentRecord).slice(restartedIndependentFrame.start, restartedFrameEnd))
+        .toBe(postForgetMarker);
+      expect((restartedIndependentRecord.context.sourceIndependentSpans ?? []).find((span) =>
+        span.origin === 'user-input' && span.start === restartedIndependentFrame.start && span.end === restartedFrameEnd))
+        .toMatchObject({
+          start: restartedIndependentFrame.start,
+          end: restartedFrameEnd,
+          digest: postForgetDigest,
+          origin: 'user-input',
+        });
+
+      const restartMarker = 'F6 after-restart memory search';
+      const restartSearchId = 'f6-after-restart-memory-search';
+      const restartAnswer = `After restart, the remaining source says: ${otherText}`;
+      restarted.llm.script(
+        toolReply([{
+          name: 'memory_search',
+          args: { query: otherDocumentId === 'doc-2' ? 'only the second fixture source' : 'only the first fixture source' },
+          id: restartSearchId,
+        }]),
+        textReply(restartAnswer),
+      );
+      await restarted.host.pushEvent({
+        type: 'desktop-pet.message',
+        source: 'desktop-pet',
+        dependencyOrigin: 'user-input',
+        ts: new Date().toISOString(),
+        text: restartMarker,
+        meta: { text: restartMarker },
+      }, { trigger: 'flush' });
+      await waitFor(() => restarted.dispatched.some((body) => body.includes(restartMarker)), 10000);
       await waitFor(() => restarted.core.loop.getStatus().phase.state === 'idle');
-      let restartBody: string | undefined;
-      if (restartHandoffOutcome?.status === 'committed') {
-        restarted.llm.script(textReply('After restart.'));
-        await restarted.host.pushEvent({
-          type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
-          ts: new Date().toISOString(), text: 'after cross-restart probe', meta: { text: 'after cross-restart probe' },
-        }, { trigger: 'flush' });
-        await waitFor(() => restarted.dispatched.some((body) => body.includes('after cross-restart probe')), 3000)
-          .catch(() => undefined);
-        await waitFor(() => restarted.core.loop.getStatus().phase.state === 'idle');
-        restartBody = restarted.dispatched.find((body) => body.includes('after cross-restart probe'));
-      }
-      const restartEvidence = restartBody
-        ? restarted.api.generationEvidence('main').find((entry) =>
-          entry.serializedBodyDigest === createHash('sha256').update(restartBody!, 'utf8').digest('hex'))
-        : undefined;
-      if (process.env.CORTICO_S2_TRACE === '1') console.info('S2_RESTART_SEND_TRACE', JSON.stringify({
-        forgotten, restartHandoffRequested, restartHandoffOutcome,
-        dispatched: restarted.dispatched.length,
-        finalProviderObserved: !!restartBody,
-        finalRequestHasMarker: !!restartBody?.includes(independentMarker),
-        finalEvidence: restartEvidence && {
-          requestState: restartEvidence.requestState, mappingState: restartEvidence.mappingState,
-          responseJoinState: restartEvidence.responseJoinState,
-          serializedBodyDigest: restartEvidence.serializedBodyDigest,
-          sources: restartEvidence.exposedSources.map((source) => source.documentId),
+      const restartBody = restarted.dispatched.find((body) => body.includes(restartMarker));
+      if (!restartBody) throw new Error('The post-restart request was not dispatched');
+      expect(restartBody).toContain(otherText);
+      expect(restartBody).not.toContain(forgottenText);
+      const restartDigest = createHash('sha256').update(restartBody, 'utf8').digest('hex');
+      const restartEvidence = restarted.api.generationEvidence('main').find((entry) =>
+        entry.serializedBodyDigest === restartDigest);
+      expect(restartEvidence).toMatchObject({
+        requestState: 'sent', mappingState: 'complete', responseJoinState: 'matched',
+      });
+      expect(restartEvidence?.exposedSources.map((source) => source.documentId)).toEqual([otherDocumentId]);
+      const restartCall = restarted.core.session.records.find((record) =>
+        record.item.type === 'function_call' && record.item.name === 'memory_search');
+      if (!restartCall || restartCall.item.type !== 'function_call') throw new Error('The post-restart turn did not call memory_search');
+      expect(restartCall.item.call_id).toBe(restartSearchId);
+      const restartCallId = restartCall.item.call_id;
+      const restartReceipt = restarted.core.session.records.find((record) =>
+        record.item.type === 'function_call_output' && record.item.call_id === restartCallId);
+      expect(restartReceipt?.context.toolReceiptRef).toBeTruthy();
+      expect(restartReceipt?.context.evidence?.map((source) => source.documentId)).toEqual([otherDocumentId]);
+      expect(restartReceipt?.context.evidence?.[0]).toMatchObject({
+        bankId: 'coopanion-test:rev28-b1-f5',
+        endpoint: rig.baseUrl,
+        documentId: otherDocumentId,
+        contentDigest: createHash('sha256').update(otherText, 'utf8').digest('hex'),
+        validationStatus: 'validated',
+        revisionState: 'current',
+      });
+      expect(restarted.core.session.records.some((record) =>
+        record.item.type === 'message' && record.item.role === 'assistant'
+          && textOf(record).includes(restartAnswer))).toBe(true);
+      if (process.env.CORTICO_F5_TRACE === '1') console.info('F5_EVIDENCE', JSON.stringify({
+        forgotten,
+        beforeForget: { epoch: epochBeforeForget, sourceCurrent: sourceCurrentBeforeForget },
+        forget: {
+          acceptance: forgetResult.acceptance, local: forgetResult.local, deleted: forgetResult.deleted,
+          pending: forgetResult.pending, failed: forgetResult.failed, epoch: epochAfterForget,
+          fences: { doc1: memory.sourceFenced('doc-1'), doc2: memory.sourceFenced('doc-2') },
+          sourceCurrent: { doc1: memory.sourceCurrentForContext('doc-1'), doc2: memory.sourceCurrentForContext('doc-2') },
+        },
+        old: {
+          artifactId: handoffArtifact.artifactId, lifecycleState: staleOldArtifact?.lifecycleState,
+          statusReason: staleOldArtifact?.statusReason, target: handoffArtifact.target,
+          bodyDigest: handoffArtifact.bodyDigest,
+          sourceIds: staleOldArtifact?.sources.map((source) => source.documentId),
+        },
+        blocked: (continued.persona as any).lastForgottenHandoffBlock,
+        rebuilt: {
+          artifactId: rebuiltArtifact.artifactId, lifecycleState: rebuiltArtifact.lifecycleState,
+          bodyDigest: rebuiltArtifact.bodyDigest,
+          sources: rebuiltArtifact.sources.map((source) => ({
+            bankId: source.bankId, endpoint: source.endpoint, documentId: source.documentId,
+            validatedEpoch: source.validatedEpoch, validatedFence: source.validatedFence,
+            contentDigest: source.contentDigest, segmentDigest: source.segmentDigest, validationState: source.validationState,
+          })),
+          bodySha256: createHash('sha256').update(rebuiltNote, 'utf8').digest('hex'),
+          containsForgottenText: rebuiltNote.includes(forgottenText),
+        },
+        afterRestartReadback: {
+          evidenceEpoch: exactAfterRestart.evidenceEpoch, sourceEpoch: exactAfterRestart.sourceEpoch,
+          fenceEpoch: exactAfterRestart.fenceEpoch, revision: exactAfterRestart.revision,
+          contentDigest: exactAfterRestart.contentDigest, storedTextChars: exactAfterRestart.storedText.length,
+          sourceProof: {
+            token: restartAttachment.segment.sourceProof.token,
+            startUtf16: restartAttachment.segment.sourceProof.startUtf16,
+            endUtf16: restartAttachment.segment.sourceProof.endUtf16,
+            segmentDigest: restartAttachment.segment.digest,
+          },
+          verifyExposureSources: true,
+        },
+        restart: {
+          oldArtifactState: restartedMemory.derivedArtifact(handoffArtifact.artifactId)?.lifecycleState,
+          currentArtifactState: restartedMemory.derivedArtifact(rebuiltArtifact.artifactId)?.lifecycleState,
+          fences: { doc1: restartedMemory.sourceFenced('doc-1'), doc2: restartedMemory.sourceFenced('doc-2') },
         },
       }));
-      if (restartBody) {
-        expect(restartBody).toContain(independentMarker);
-        expect(restartEvidence).toMatchObject({ requestState: 'sent', mappingState: 'complete', responseJoinState: 'matched' });
+      await restarted.core.stop();
+    },
+  );
+
+  it('discards an exact Handoff source readback when Core changes generation', async () => {
+    const partnerText = SOURCE_TEXT;
+    const worldText = 'The person prefers a quiet workspace.';
+    const template = 'Static restart World fixture.';
+    const rig = await buildRig(true, partnerText, undefined, {
+      additionalSources: [{ documentId: 'doc-2', text: worldText }],
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      bankId: 'coopanion-test:rev28-b1-f5',
+    });
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.api().generationEvidence('main').length >= 3);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    expect(rig.api().requestContextHandoff()).toBe(true);
+    await waitFor(() => rig.api().handoffOutcome()?.status === 'committed');
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+
+    const { memory } = await reopenRigMemory(rig);
+    const continued = await startContinuedRig(rig, memory, template);
+    continued.llm.script(textReply('Delivered old mixed note.'));
+    await continued.host.pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'deliver the old mixed note', meta: { text: 'deliver the old mixed note' },
+    }, { trigger: 'flush' });
+    await waitFor(() => continued.dispatched.some((body) => body.includes('deliver the old mixed note')));
+    await waitFor(() => continued.core.loop.getStatus().phase.state === 'idle');
+    const oldArtifact = memory.listHandoffArtifacts().find((artifact) => artifact.lifecycleState === 'active');
+    if (!oldArtifact) throw new Error('The original mixed Handoff artifact was not active');
+
+    let holdExactRead = false;
+    let readHeld = false;
+    let readReturned = false;
+    let readGenerationToken: string | undefined;
+    let signalReadStarted!: () => void;
+    let releaseRead!: () => void;
+    const readStarted = new Promise<void>((resolve) => { signalReadStarted = resolve; });
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const readExact = memory.readExactSourceEvidence.bind(memory);
+    memory.readExactSourceEvidence = async (documentId) => {
+      if (holdExactRead && documentId === 'doc-2' && !readHeld) {
+        readHeld = true;
+        readGenerationToken = continued.api.sessionInfo('main').generation?.token;
+        signalReadStarted();
+        await readGate;
       }
+      const exact = await readExact(documentId);
+      if (documentId === 'doc-2' && readHeld) readReturned = true;
+      return exact;
+    };
+    holdExactRead = true;
+    expect((await memory.forgetDocument('doc-1')).acceptance).toBe('accepted');
+    await waitFor(() => memory.settled(), 10000);
+    await readStarted;
+
+    if (!readGenerationToken) throw new Error('The delayed exact readback has no Core generation token');
+    const invalidate = continued.api.invalidateGeneration;
+    if (!invalidate) throw new Error('Core did not expose generation invalidation');
+    await expect(invalidate({
+      sessionId: 'main', expectedGeneration: readGenerationToken,
+      reason: 'forget', idempotencyKey: 'f6-delayed-handoff-readback',
+    })).resolves.toMatchObject({ status: 'acknowledged' });
+    expect(continued.api.sessionInfo('main').generation?.token).not.toBe(readGenerationToken);
+
+    releaseRead();
+    await waitFor(() => readReturned, 10000);
+    await waitFor(() => (continued.persona as any).pendingForgottenHandoffReset === null
+      && (continued.persona as any).pendingCleanHandoffRebuild === null, 10000);
+    expect(memory.derivedArtifact(oldArtifact.artifactId)).toMatchObject({
+      lifecycleState: 'stale', statusReason: 'source-forgotten', sources: oldArtifact.sources,
+    });
+    expect(memory.listHandoffArtifacts().filter((artifact) => artifact.lifecycleState === 'active')).toEqual([]);
+    expect(memory.sourceFenced('doc-1')).toBe(true);
+    expect(memory.sourceFenced('doc-2')).toBe(false);
+    await continued.core.stop();
+  });
+
+  it('blocks the rebuilt candidate when Forget wins after its exact readback and before commit', async () => {
+    const partnerText = SOURCE_TEXT;
+    const worldText = 'The person prefers a quiet workspace.';
+    const template = 'Static restart World fixture.';
+    const rig = await buildRig(true, partnerText, undefined, {
+      additionalSources: [{ documentId: 'doc-2', text: worldText }],
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      bankId: 'coopanion-test:rev28-b1-f5',
+    });
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.api().generationEvidence('main').length >= 3);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    expect(rig.api().requestContextHandoff()).toBe(true);
+    await waitFor(() => rig.api().handoffOutcome()?.status === 'committed');
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+
+    const { memory } = await reopenRigMemory(rig);
+    const continued = await startContinuedRig(rig, memory, template);
+    continued.llm.script(textReply('Delivered old mixed note.'));
+    await continued.host.pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'deliver the old mixed note', meta: { text: 'deliver the old mixed note' },
+    }, { trigger: 'flush' });
+    await waitFor(() => continued.dispatched.some((body) => body.includes('deliver the old mixed note')));
+    await waitFor(() => continued.core.loop.getStatus().phase.state === 'idle');
+    const oldArtifact = memory.listHandoffArtifacts().find((artifact) => artifact.lifecycleState === 'active');
+    if (!oldArtifact) throw new Error('The original mixed Handoff artifact was not active');
+
+    const ledger = (memory as unknown as { ledger: ForgetLedger }).ledger;
+    const sourceExposureCurrent = memory.sourceExposureCurrent.bind(memory);
+    let racedForget = false;
+    memory.sourceExposureCurrent = (sources) => {
+      const staging = join(rig.memoryDir, 'handoffs', '.staging');
+      const hasStagedCandidate = existsSync(staging) && readdirSync(staging).some((name) => name.endsWith('.md'));
+      if (!racedForget && hasStagedCandidate
+        && (continued.persona as any).pendingCleanHandoffRebuild
+        && sources.some((source) => source.documentId === 'doc-2')) {
+        racedForget = true;
+        expect(ledger.addMany([{
+          bankId: 'coopanion-test:rev28-b1-f5', endpoint: rig.baseUrl, documentId: 'doc-2',
+          reason: 'synthetic F5 commit race',
+        }], 'synthetic F5 commit race').failed).toBe(0);
+      }
+      return sourceExposureCurrent(sources);
+    };
+
+    expect((await memory.forgetDocument('doc-1')).acceptance).toBe('accepted');
+    await waitFor(() => memory.settled(), 10000);
+    await waitFor(() => racedForget, 10000);
+    await waitFor(() => continued.api.handoffOutcome()?.status === 'blocked', 10000);
+    await waitFor(() => continued.core.loop.getStatus().phase.state === 'idle');
+    expect(continued.api.handoffOutcome()).toMatchObject({ status: 'blocked', reason: 'clean-handoff-source-proof-changed' });
+    expect(memory.sourceFenced('doc-1')).toBe(true);
+    expect(memory.sourceFenced('doc-2')).toBe(true);
+    expect(memory.derivedArtifact(oldArtifact.artifactId)).toMatchObject({
+      lifecycleState: 'stale', statusReason: 'source-forgotten', sources: oldArtifact.sources,
+    });
+    expect(memory.listHandoffArtifacts().filter((artifact) => artifact.lifecycleState === 'active')).toEqual([]);
+    expect(readdirSync(join(rig.memoryDir, 'handoffs')).filter((name) => name.endsWith('.md')))
+      .toEqual([oldArtifact.target.slice('handoffs/'.length)]);
+    const stagingPath = join(rig.memoryDir, 'handoffs', '.staging');
+    if (existsSync(stagingPath)) expect(readdirSync(stagingPath)).toEqual([]);
+    await continued.core.stop();
+  });
+
+  it('keeps Handoff closed after every source in a mixed note is forgotten', async () => {
+    const partnerText = SOURCE_TEXT;
+    const worldText = 'The person prefers a quiet workspace.';
+    const template = 'Static restart World fixture.';
+    const rig = await buildRig(true, partnerText, undefined, {
+      additionalSources: [{ documentId: 'doc-2', text: worldText }],
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      bankId: 'coopanion-test:rev28-b1-f5',
+    });
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.api().generationEvidence('main').length >= 3);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    expect(rig.api().requestContextHandoff()).toBe(true);
+    await waitFor(() => rig.api().handoffOutcome()?.status === 'committed');
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+
+    const { memory } = await reopenRigMemory(rig);
+    const continued = await startContinuedRig(rig, memory, template);
+    continued.llm.script(textReply('Delivered old mixed note.'));
+    await continued.host.pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'deliver the old mixed note', meta: { text: 'deliver the old mixed note' },
+    }, { trigger: 'flush' });
+    await waitFor(() => continued.dispatched.some((body) => body.includes('deliver the old mixed note')));
+    await waitFor(() => continued.core.loop.getStatus().phase.state === 'idle');
+    const oldArtifact = memory.listHandoffArtifacts().find((artifact) => artifact.lifecycleState === 'active');
+    if (!oldArtifact) throw new Error('The original mixed Handoff artifact was not active');
+
+    expect((await memory.forgetDocument('doc-1')).acceptance).toBe('accepted');
+    await waitFor(() => memory.settled(), 10000);
+    await waitFor(() => memory.listHandoffArtifacts().some((artifact) => artifact.lifecycleState === 'active'
+      && artifact.artifactId !== oldArtifact.artifactId && artifact.sources.map((source) => source.documentId).join() === 'doc-2'), 10000);
+    const survivingArtifact = memory.listHandoffArtifacts().find((artifact) => artifact.lifecycleState === 'active'
+      && artifact.artifactId !== oldArtifact.artifactId);
+    if (!survivingArtifact) throw new Error('The first Forget did not rebuild from the surviving source');
+    expect((await memory.forgetDocument('doc-2')).acceptance).toBe('accepted');
+    await waitFor(() => memory.settled(), 10000);
+    await waitFor(() => (continued.persona as any).pendingForgottenHandoffReset === null
+      && memory.listHandoffArtifacts().every((artifact) => artifact.lifecycleState !== 'active'), 10000);
+    expect(memory.sourceFenced('doc-1')).toBe(true);
+    expect(memory.sourceFenced('doc-2')).toBe(true);
+    expect(memory.derivedArtifact(oldArtifact.artifactId)).toMatchObject({
+      lifecycleState: 'stale', statusReason: 'source-forgotten', sources: oldArtifact.sources,
+    });
+    expect(memory.derivedArtifact(survivingArtifact.artifactId)).toMatchObject({
+      lifecycleState: 'stale', statusReason: 'source-forgotten',
+      sources: [expect.objectContaining({ documentId: 'doc-2' })],
+    });
+    expect(memory.listHandoffArtifacts().filter((artifact) => artifact.lifecycleState === 'active')).toEqual([]);
+    await continued.core.stop();
+  });
+
+  it.each(['missing-readback', 'bad-digest', 'expired-revision', 'wrong-bank', 'wrong-endpoint', 'forged-proof'] as const)(
+    'blocks clean Handoff recovery for %s source evidence', async (failure) => {
+      const partnerText = SOURCE_TEXT;
+      const worldText = 'The person prefers a quiet workspace.';
+      const template = 'Static restart World fixture.';
+      const rig = await buildRig(true, partnerText, undefined, {
+        additionalSources: [{ documentId: 'doc-2', text: worldText }],
+        worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+        bankId: 'coopanion-test:rev28-b1-f5',
+      });
+      await rig.host().pushEvent({
+        type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+        ts: new Date().toISOString(), text: 'hello', meta: { text: 'hello' },
+      }, { trigger: 'flush' });
+      await waitFor(() => rig.api().generationEvidence('main').length >= 3);
+      await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+      expect(rig.api().requestContextHandoff()).toBe(true);
+      await waitFor(() => rig.api().handoffOutcome()?.status === 'committed');
+      await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+
+      const { memory } = await reopenRigMemory(rig);
+      const continued = await startContinuedRig(rig, memory, template);
+      continued.llm.script(textReply('Delivered old mixed note.'));
+      await continued.host.pushEvent({
+        type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+        ts: new Date().toISOString(), text: 'deliver the old mixed note', meta: { text: 'deliver the old mixed note' },
+      }, { trigger: 'flush' });
+      await waitFor(() => continued.dispatched.some((body) => body.includes('deliver the old mixed note')));
+      await waitFor(() => continued.core.loop.getStatus().phase.state === 'idle');
+      const oldArtifact = memory.listHandoffArtifacts().find((artifact) => artifact.lifecycleState === 'active');
+      if (!oldArtifact) throw new Error('The original mixed Handoff artifact was not active');
+
+      if (failure === 'forged-proof') {
+        const evidenceForSegments = memory.evidenceForSegments.bind(memory);
+        memory.evidenceForSegments = async (text, segments, options) => {
+          const evidence = await evidenceForSegments(text, segments, options);
+          return segments.some((segment) => segment.documentId === 'doc-2')
+            ? evidence.map((attachment) => ({ ...attachment, segment: {
+              ...attachment.segment,
+              sourceProof: { token: 'forged-source-slice-proof', startUtf16: 0, endUtf16: worldText.length },
+            } }))
+            : evidence;
+        };
+      } else {
+        const readExact = memory.readExactSourceEvidence.bind(memory);
+        memory.readExactSourceEvidence = async (documentId) => {
+          const exact = await readExact(documentId);
+          if (documentId !== 'doc-2' || !exact) return exact;
+          if (failure === 'missing-readback') return null;
+          if (failure === 'bad-digest') return { ...exact, contentDigest: '0'.repeat(64) };
+          if (failure === 'expired-revision') return { ...exact, revision: 'expired-revision' };
+          if (failure === 'wrong-bank') return { ...exact, bankId: 'another-coopanion-test-bank' };
+          return { ...exact, endpoint: 'http://127.0.0.1:1' };
+        };
+      }
+
+      expect((await memory.forgetDocument('doc-1')).acceptance).toBe('accepted');
+      await waitFor(() => memory.settled(), 10000);
+      await waitFor(() => (continued.persona as any).lastForgottenHandoffBlock?.status === 'blocked', 10000);
+      await waitFor(() => (continued.persona as any).pendingForgottenHandoffReset === null, 10000);
+      expect(memory.derivedArtifact(oldArtifact.artifactId)).toMatchObject({
+        lifecycleState: 'stale', statusReason: 'source-forgotten',
+        sources: oldArtifact.sources,
+      });
+      expect(memory.listHandoffArtifacts().filter((artifact) => artifact.lifecycleState === 'active')).toEqual([]);
+      expect(memory.listHandoffArtifacts().some((artifact) => artifact.artifactId !== oldArtifact.artifactId
+        && artifact.lifecycleState === 'pending')).toBe(false);
+      await continued.core.stop();
     },
   );
 
@@ -4840,7 +5854,7 @@ describe('Memory source evidence through the real Core consumer', () => {
       persona,
       worlds: [world],
       llm,
-      toolTextTrust: (tool, text) => isTrustedGrowthToolText(tool, text)
+      toolTextTrust: (tool, text) => isTrustedMemorySearchNotice(tool, text) || isTrustedGrowthToolText(tool, text)
       || (tool === 'read_file' && isTrustedPartnerReadText(text)),
       worldEventTrust: (candidate, event) => candidate === world && event.type === 'desktop-pet.message',
       worldPromptTrust: (candidate) => candidate === world
@@ -5684,6 +6698,36 @@ describe('R6-B ordinary source-free restart', () => {
     },
   );
 
+  it('archives unproven legacy history before explicitly starting a clean conversation', async () => {
+    const template = 'Static restart World fixture.';
+    const rig = await buildRig(true, undefined, undefined, {
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      llmSetup: (llm) => llm.script(textReply('Initial answer.')),
+    });
+    await rig.host().pushEvent({ type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'Initial question', meta: {} }, { trigger: 'flush' });
+    await waitFor(() => rig.core.session.records.some((record) => record.item.type === 'message'
+      && record.item.role === 'assistant' && textOf(record).includes('Initial answer.')), 10000);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    const legacy = 'Synthetic unproven legacy history';
+    rig.core.session.append(message('user', legacy));
+    rig.llm.script(textReply('Must remain blocked.'));
+    await rig.host().pushEvent({ type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'Blocked legacy question', meta: {} }, { trigger: 'flush' });
+    await waitFor(() => rig.api().generationEvidence('main').some((entry) => entry.requestBlockReason === 'mapping-incomplete'), 10000);
+    expect(rig.dispatchedBodies.some((body) => body.includes('Blocked legacy question'))).toBe(false);
+    await rig.core.loop.clearSession();
+    const archiveDir = join(rig.root, 'data', 'session-archive');
+    expect(readdirSync(archiveDir).some((name) => readFileSync(join(archiveDir, name), 'utf8').includes(legacy))).toBe(true);
+    rig.llm.script(textReply('Fresh answer.'));
+    await rig.host().pushEvent({ type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'Fresh question', meta: {} }, { trigger: 'flush' });
+    await waitFor(() => rig.dispatchedBodies.some((body) => body.includes('Fresh question')), 10000);
+    const body = rig.dispatchedBodies.find((value) => value.includes('Fresh question'))!;
+    expect(body).not.toContain(legacy);
+    expect(body).not.toContain('Blocked legacy question');
+  });
+
   it('retains a source-bearing assistant history across a fresh Core and Memory reopen', async () => {
     const template = 'Static restart World fixture.';
     const rig = await buildRig(true, undefined, undefined, {
@@ -5715,6 +6759,53 @@ describe('R6-B ordinary source-free restart', () => {
     expect(evidence).toMatchObject({ requestState: 'sent', mappingState: 'complete', responseJoinState: 'matched' });
     expect(evidence?.exposedSources.map((source) => source.documentId)).toContain('doc-1');
     expect(body).toContain('First answer.');
+  });
+
+  it('revalidates search results and generated answers together after restart', async () => {
+    const template = 'Static restart World fixture.';
+    const rig = await buildRig(true, undefined, undefined, {
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      llmSetup: (llm) => llm.script(
+        toolReply([{ name: 'memory_search', args: { query: 'only the first fixture source' }, id: 'restart-search-source' }]),
+        textReply('The source supports this answer.'),
+      ),
+    });
+    await rig.host().pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'Find the first source', meta: { text: 'Find the first source' },
+    }, { trigger: 'flush' });
+    await waitFor(() => rig.core.session.records.some((record) => record.item.type === 'message'
+      && record.item.role === 'assistant' && textOf(record).includes('The source supports this answer.')), 10000);
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
+    const original = rig.core.session.records.find((record) => record.item.type === 'function_call_output'
+      && record.item.call_id === 'restart-search-source');
+    expect(original?.context.evidence?.map((source) => source.documentId)).toContain('doc-1');
+    const previousEpoch = rig.memory.evidenceEpoch();
+    const ledger = (rig.memory as unknown as { ledger: ForgetLedger }).ledger;
+    expect(ledger.addMany([{ bankId: rig.bankId, endpoint: rig.baseUrl, documentId: 'unrelated-doc',
+      reason: 'synthetic unrelated forget' }], 'synthetic unrelated forget').failed).toBe(0);
+    expect(rig.memory.evidenceEpoch()).not.toBe(previousEpoch);
+    const { memory } = await reopenRigMemory(rig);
+    const continued = await startContinuedRig(rig, memory, template);
+    continued.llm.script(
+      toolReply([{ name: 'memory_search', args: { query: 'only the first fixture source' }, id: 'restart-search-again' }]),
+      textReply('Continued after restart.'),
+    );
+    await continued.host.pushEvent({
+      type: 'desktop-pet.message', source: 'desktop-pet', dependencyOrigin: 'user-input',
+      ts: new Date().toISOString(), text: 'Continue after restart', meta: { text: 'Continue after restart' },
+    }, { trigger: 'flush' });
+    await waitFor(() => continued.dispatched.some((body) => body.includes('Continue after restart')), 10000);
+    await waitFor(() => continued.core.session.records.some((record) => record.item.type === 'message'
+      && record.item.role === 'assistant' && textOf(record).includes('Continued after restart.')), 10000);
+    const body = continued.dispatched.find((value) => value.includes('Continue after restart')
+      && value.includes('restart-search-again'))!;
+    expect(body).toBeTruthy();
+    expect(body).toContain('The source supports this answer.');
+    const digest = createHash('sha256').update(body, 'utf8').digest('hex');
+    expect(continued.api.generationEvidence('main').find((entry) => entry.serializedBodyDigest === digest))
+      .toMatchObject({ requestState: 'sent', mappingState: 'complete',
+        exposedSources: [expect.objectContaining({ documentId: 'doc-1' })] });
   });
 
   it('keeps a source-bearing assistant history fail-closed after Forget', async () => {
@@ -6081,6 +7172,24 @@ describe('R6-B frame boundary and applicable ID closure', () => {
       realRecovery: await rig.persona.revalidateSourceDependencies([record!]),
       syntheticRecovery: await rig.persona.revalidateSourceDependencies([synthetic]),
     }));
+  });
+
+  it('re-proves a fixed fenced memory notice after restart (SF-MEMORY-NOTICE)', async () => {
+    const template = 'Static restart World fixture.';
+    const rig = await buildRig(false, undefined, undefined, {
+      worldPrompt: template, trustedWorldTemplate: template, requireCompleteEvidence: true,
+      llmSetup: (llm) => llm.script(textReply('Memory notice answer.')),
+    });
+    const notice = `${memoryReadNotice('fenced')} If you are not sure, say so; do not invent dates, names or past events.`;
+    const hash = createHash('sha256').update(notice, 'utf8').digest('hex');
+    const synthetic = message('user', notice, {
+      sourceDependencySpans: [{
+        start: 0, end: notice.length, digest: hash, exposedSources: [], proofId: 'synthetic-fenced-notice',
+      }],
+    });
+    await expect(rig.persona.revalidateSourceDependencies([synthetic])).resolves.toEqual([{
+      proofId: 'synthetic-fenced-notice', digest: hash, persistedSources: [], currentSources: [],
+    }]);
   });
 
   it('keeps the active Parent main session on the default tool event delivery (ID-08 applicability)', () => {
@@ -6858,14 +7967,25 @@ function stateSchemaVersion(file: string): number {
 
 describe('P3 G-05 tool receipt and generation identity', () => {
   it('accepts the real joined receipt and rejects duplicate, forged, stale, and retargeted copies', async () => {
+    // The ordinary Recall baseline is withheld under the P2/P3 rule (an unproven summary never
+    // enters a request), so a request only becomes source-bearing through the verified
+    // `memory_search` receipt. Warm that receipt in one turn, then join the G-05 call in the
+    // next turn: the G-05 envelope must carry both the joined call and the verified source.
     const rig = await buildRig(true, SOURCE_TEXT, undefined, {
       worldPrompt: ' ', requireCompleteEvidence: true,
       llmSetup: (llm) => llm.script(
+        toolReply([{ name: 'memory_search', args: { query: 'tea preference' }, id: 'g05-warm' }]),
+        textReply('Warm answer.'),
         toolReply([{ name: 'memory_search', args: { query: 'tea preference' }, id: 'g05-search' }]),
         textReply('G05 answer.'),
       ),
     });
     await wakeTriad(rig, 'Remember the tea preference.');
+    await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle'
+      && triadEnvelope(rig, 'g05-warm')?.responseId !== undefined
+      && rig.api().generationEvidence('main').some((entry) => entry.requestState === 'sent'
+        && entry.exposedSources.length > 0));
+    await wakeTriad(rig, 'Which tea do I prefer?');
     await waitFor(() => triadEnvelope(rig, 'g05-search') !== undefined);
     await waitFor(() => rig.core.loop.getStatus().phase.state === 'idle');
     const envelope = triadEnvelope(rig, 'g05-search')!;
@@ -7592,7 +8712,7 @@ describe('P3 G-04 cross-bank and cross-endpoint source identity', () => {
     activeCores.splice(activeCores.indexOf(rigB.core), 1);
     closeMemoryStateStores();
     const stateA = openMemoryStateStore(join(rigA.root, 'memory-state.sqlite'));
-    expect(stateSchemaVersion(join(rigA.root, 'memory-state.sqlite'))).toBe(4);
+    expect(stateSchemaVersion(join(rigA.root, 'memory-state.sqlite'))).toBe(5);
     const ledgerA = new ForgetLedger(stateA);
     expect(ledgerA.forgotten('bank-a', serverA.baseUrl, 'doc-1')).toBe(true);
     expect(ledgerA.forgotten('bank-b', serverB.baseUrl, 'doc-1')).toBe(false);
@@ -7728,7 +8848,7 @@ describe('W04 P2 same-source triad', () => {
     if (index >= 0) activeCores.splice(index, 1);
     closeMemoryStateStores();
     const stateFile = join(rig.root, 'memory-state.sqlite');
-    expect(stateSchemaVersion(stateFile)).toBe(4);
+    expect(stateSchemaVersion(stateFile)).toBe(5);
     const reopened = openMemoryStateStore(stateFile);
     expect(reopened.getDerivedArtifact(`coo-output:${triadOutputId('w04-p1-round-1', 'First mapped line.')}`))
       .toMatchObject({ lifecycleState: 'stale' });
@@ -7834,7 +8954,7 @@ describe('W04 P2 same-source triad', () => {
     if (index >= 0) activeCores.splice(index, 1);
     closeMemoryStateStores();
     const stateFile = join(rig.root, 'memory-state.sqlite');
-    expect(stateSchemaVersion(stateFile)).toBe(4);
+    expect(stateSchemaVersion(stateFile)).toBe(5);
     const reopened = openMemoryStateStore(stateFile);
     expect(reopened.getDerivedArtifact(`coo-output:${triadOutputId('w04-p2-round-1', 'First shared line.')}`))
       .toMatchObject({ lifecycleState: 'stale' });
@@ -7915,7 +9035,7 @@ describe('W04 P2 same-source triad', () => {
     if (index >= 0) activeCores.splice(index, 1);
     closeMemoryStateStores();
     const stateFile = join(rig.root, 'memory-state.sqlite');
-    expect(stateSchemaVersion(stateFile)).toBe(4);
+    expect(stateSchemaVersion(stateFile)).toBe(5);
     const reopened = openMemoryStateStore(stateFile);
     const artifact = reopened.getDerivedArtifact(`coo-output:${triadOutputId('w04-n1-call', 'Tamper probe line.')}`);
     if (tampered) {
@@ -8001,7 +9121,7 @@ describe('W04 P2 same-source triad', () => {
     if (index >= 0) activeCores.splice(index, 1);
     closeMemoryStateStores();
     const stateFile = join(rig.root, 'memory-state.sqlite');
-    expect(stateSchemaVersion(stateFile)).toBe(4);
+    expect(stateSchemaVersion(stateFile)).toBe(5);
     const reopened = openMemoryStateStore(stateFile);
     expect(new ForgetLedger(reopened).forgotten('fixture-bank', rig.baseUrl, 'doc-1')).toBe(true);
     expect(reopened.getDerivedArtifact(`coo-output:${triadOutputId('w04-p1-race-1', 'This line must not be retained.')}`))
@@ -8449,16 +9569,11 @@ describe('P4 C2-13 next-session full system prefix', () => {
           return shown.includes('Coo') || shown.includes(partnerText) || shown.includes(worldText);
         }));
       expect(nameSpans.some((span) => span.origin === 'core-generated')).toBe(true);
-      const workspaceStart = systemText.indexOf('Files in your workspace:');
+      const workspaceStart = systemText.indexOf('Workspace files are task material');
       expect(workspaceStart).toBeGreaterThanOrEqual(0);
       const workspaceSpans = coverage.spans.filter((span) => span.start < workspaceStart + 24 && span.end > workspaceStart);
       expect(workspaceSpans).toMatchObject([{ origin: 'core-generated', mappingState: 'complete' }]);
-      const partnerPath = systemText.indexOf(`- ${PARTNER_FILE}`, workspaceStart);
-      expect(partnerPath).toBeGreaterThanOrEqual(0);
-      const partnerPathSpans = coverage.spans.filter((span) => span.start >= partnerPath
-        && span.end <= partnerPath + PARTNER_FILE.length + 2);
-      expect(partnerPathSpans.map((span) => [systemText.slice(span.start, span.end), span.origin, span.mappingState]))
-        .toEqual([['- ', 'core-generated', 'complete'], [PARTNER_FILE, 'core-generated', 'complete']]);
+      expect(systemText).not.toContain(`- ${PARTNER_FILE}`);
       expect(envelope.serializedBodyDigest).toBe(createHash('sha256').update(body, 'utf8').digest('hex'));
     };
 

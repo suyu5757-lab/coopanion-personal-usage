@@ -4,6 +4,7 @@ import type { WebUiPanel } from 'cortico/web/shared/client-panel.ts';
 import { llmSettingsPanel } from './builtins/llm-settings/panel.ts';
 import { panel as hindsightPanel } from './builtins/hindsight/panel.ts';
 import { panel as actionReceiptsPanel } from './builtins/action-receipts/panel.ts';
+import { panel as workspacePermissionsPanel } from './builtins/workspace-permissions/panel.ts';
 
 export type BuiltinPanels = Readonly<Record<string, WebUiPanel>>;
 
@@ -11,4 +12,5 @@ export const BUILTIN_PANELS: BuiltinPanels = {
   'llm-settings': llmSettingsPanel,
   hindsight: hindsightPanel,
   'action-receipts': actionReceiptsPanel,
+  'workspace-permissions': workspacePermissionsPanel,
 };

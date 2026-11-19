@@ -1,9 +1,6 @@
-/**
- * Growth proposals are files, not Persona edits. A review may suggest a small change to
- * CONSTITUTION.md or SELF.md; nothing is applied until the person approves it and a later
- * step writes the file through the normal committed file tools.
- */
-import { randomUUID } from 'node:crypto';
+/** Source-linked proposals remain reviewable records; bounded behavior policies have separate application receipts. */
+import type { GenerationEvidenceEnvelope } from 'cortico/core/types.ts';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { writeState } from '../state-file.ts';
@@ -11,11 +8,24 @@ import { writeState } from '../state-file.ts';
 export type GrowthRisk = 'low' | 'medium' | 'high';
 
 export interface GrowthChange {
-  file: 'CONSTITUTION.md' | 'SELF.md';
+  file: 'CONSTITUTION.md' | 'SELF.md' | 'BEHAVIOR_POLICY';
   /** The lines the proposal would replace; omitted when adding a new line. */
   from?: string;
   to: string;
   reason: string;
+}
+
+export interface GrowthSemanticReview {
+  verdict: 'passed' | 'rejected';
+  candidateDigest: string;
+  issues: string[];
+  generationProof?: GenerationEvidenceEnvelope;
+  interpretation: 'user_preference' | 'inference' | 'uncertain';
+  provenanceVerified: boolean;
+  contentConsistencyChecked: boolean;
+  planExecuted: false;
+  skillVerified: false;
+  toolExecutionPermitted: false;
 }
 
 export interface GrowthProposal {
@@ -32,6 +42,10 @@ export interface GrowthProposal {
   reviewNote?: string;
   appliedAt?: string;
   appliedCommit?: string;
+  /** Core's joined receipt; metadata and digests only, retained for candidate revalidation. */
+  generationProof?: GenerationEvidenceEnvelope;
+  autonomousKey?: string;
+  semanticReview?: GrowthSemanticReview;
 }
 
 export interface GrowthProposalInput {
@@ -43,15 +57,18 @@ export interface GrowthProposalInput {
   risk?: unknown;
 }
 
-export function growthProposalArtifactText(proposal: Pick<GrowthProposal, 'title' | 'summary' | 'evidence' | 'changes' | 'risk'>): string {
-  return JSON.stringify({ title: proposal.title, summary: proposal.summary, evidence: proposal.evidence, changes: proposal.changes, risk: proposal.risk });
+export function growthProposalArtifactText(proposal: Pick<GrowthProposal, 'title' | 'summary' | 'evidence' | 'changes' | 'risk' | 'generationProof' | 'sourceIds' | 'autonomousKey'>): string {
+  return JSON.stringify({ title: proposal.title, summary: proposal.summary, evidence: proposal.evidence, changes: proposal.changes, risk: proposal.risk,
+    ...(proposal.autonomousKey ? { autonomousKey: proposal.autonomousKey } : {}),
+    ...(proposal.generationProof ? { sourceIds: proposal.sourceIds, generationProofDigest: createHash('sha256').update(JSON.stringify(proposal.generationProof)).digest('hex') } : {}),
+  });
 }
 
 export type GrowthProposalResult =
   | { ok: true; proposal: GrowthProposal; path: string }
   | { ok: false; errors: string[] };
 
-const FILES = new Set(['CONSTITUTION.md', 'SELF.md']);
+const FILES = new Set(['CONSTITUTION.md', 'SELF.md', 'BEHAVIOR_POLICY']);
 const RISKS = new Set(['low', 'medium', 'high']);
 const MAX_TOTAL = 12_000;
 const PROPOSAL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -76,7 +93,7 @@ function changes(value: unknown): { changes: GrowthChange[]; errors: string[] } 
     const entry = raw as Record<string, unknown>;
     const file = typeof entry.file === 'string' ? entry.file.trim() : '';
     if (!FILES.has(file)) {
-      errors.push(`changes[${index}].file must be CONSTITUTION.md or SELF.md`);
+      errors.push(`changes[${index}].file must be CONSTITUTION.md, SELF.md or BEHAVIOR_POLICY`);
       continue;
     }
     const to = text(entry.to, 2000);
@@ -146,7 +163,7 @@ export function readProposalInput(input: GrowthProposalInput): { proposal: Omit<
 export class GrowthProposals {
   constructor(private readonly dir: string, private readonly now: () => Date = () => new Date()) {}
 
-  write(input: GrowthProposalInput): GrowthProposalResult {
+  write(input: GrowthProposalInput, generationProof?: GenerationEvidenceEnvelope, autonomousKey?: string): GrowthProposalResult {
     const parsed = readProposalInput(input);
     if ('errors' in parsed) return { ok: false, errors: parsed.errors };
     const proposal: GrowthProposal = {
@@ -154,6 +171,8 @@ export class GrowthProposals {
       id: randomUUID(),
       createdAt: this.now().toISOString(),
       state: 'candidate',
+      ...(autonomousKey ? { autonomousKey } : {}),
+      ...(generationProof ? { generationProof: structuredClone(generationProof) } : {}),
     };
     try {
       mkdirSync(this.dir, { recursive: true });
@@ -163,6 +182,14 @@ export class GrowthProposals {
     } catch (err) {
       return { ok: false, errors: [`could not write the proposal: ${err instanceof Error ? err.message : String(err)}`] };
     }
+  }
+
+  saveSemanticReview(id: string, review: GrowthSemanticReview): GrowthProposal | null {
+    const proposal = this.get(id);
+    if (!proposal || proposal.state !== 'candidate' || !proposal.autonomousKey) return null;
+    const next = { ...proposal, semanticReview: structuredClone(review) };
+    writeState(join(this.dir, `${id}.json`), `${JSON.stringify(next, null, 2)}\n`);
+    return next;
   }
 
   private read(name: string): GrowthProposal | null {

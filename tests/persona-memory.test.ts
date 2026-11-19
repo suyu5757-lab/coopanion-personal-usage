@@ -41,6 +41,7 @@ function personaWith() {
     forgetMostRecent,
     recallForTurn,
     evidenceForSegments: vi.fn(async () => []),
+    domainSupplementOptions: () => null,
     sessionBriefing,
     clear: clearMemory,
   } as unknown as HindsightMemory;
@@ -71,7 +72,10 @@ describe('Coo with long-term memory and the affinity extension', () => {
     expect(retainUser).toHaveBeenCalledWith('I like jasmine tea', expect.objectContaining({ session: 'main', cursor: 3 }));
     const userEventDocumentId = retainUser.mock.results[0]?.value;
     expect(recallForTurn).toHaveBeenCalledWith('I like jasmine tea', { userEventDocumentId, captureTrace: true });
-    expect(calls.some((call) => call.startsWith('memory:[memory] you like tea'))).toBe(true);
+    // P2/P3 contract: a Recall summary without a traced, verified source span never enters the
+    // request. The fixed incomplete-evidence notice is the only memory-facing text.
+    expect(calls.some((call) => call.startsWith('memory:[memory] you like tea'))).toBe(false);
+    expect(calls.some((call) => call.startsWith('memory:[memory] Supporting source evidence is incomplete'))).toBe(true);
   });
 
   it('does not retain a message that asks not to remember, and freezes recent writes', async () => {
@@ -114,6 +118,17 @@ describe('Coo with long-term memory and the affinity extension', () => {
     expect(storage.map((part) => part.key)).not.toContain('affection');
   });
 
+  it('moves workspace browsing to the Persona page and keeps the Memory page for long-term memory', () => {
+    const { p } = personaWith();
+    const decl = p.webUi('en');
+    expect(decl.panels?.map((panel) => panel.id)).toEqual(expect.arrayContaining(['workspace', 'history']));
+    expect(decl.memory?.panels?.map((panel) => panel.id) ?? []).not.toContain('workspace');
+    expect(decl.memory?.panels?.map((panel) => panel.id) ?? []).not.toContain('history');
+    const workspaceStorage = (decl.memory?.storage ?? []).find((part) => part.key === 'workspace')!;
+    expect(workspaceStorage.label).toContain('Workspace files');
+    expect(workspaceStorage.note).toContain('not long-term memory');
+  });
+
   it('does nothing memory-related when the service is off', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'coo-persona-memory-'));
     const calls: string[] = [];
@@ -125,5 +140,26 @@ describe('Coo with long-term memory and the affinity extension', () => {
     } as never;
     await p.onDelivery({ events: [event({ meta: { text: 'hello' } })] });
     expect(calls.some((line) => line.startsWith('memory:'))).toBe(false);
+  });
+
+  it('reports the domain supplement diagnostics as unavailable without memory', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'coo-persona-memory-'));
+    const Persona = coopanionPersona(Cormini);
+    const p = new Persona({ memoryDir: dir });
+    const invoke = p.webUi('en').invoke;
+    expect(invoke).toBeDefined();
+    const diagnostics = await invoke!('hindsight', 'domain-supplement-diagnostics', []) as Record<string, unknown>;
+    expect(diagnostics).toMatchObject({
+      available: false,
+      enabled: false,
+      receiptState: 'unavailable',
+      receiptPresent: false,
+      turnActive: false,
+      status: null,
+      candidateCount: null,
+      scope: 'persona-domain-supplement',
+      core: { requestState: 'UNKNOWN', actualEvidenceUsed: 'UNKNOWN', evidenceObserved: false },
+    });
+    expect(Object.isFrozen(diagnostics)).toBe(true);
   });
 });

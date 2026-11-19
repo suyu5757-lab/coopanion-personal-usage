@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
 import type { ToolDef, ToolOutcome, SourceMapSpan } from 'cortico/core/types.ts';
 import type { HindsightMemory, MemoryTextRead } from './hindsight.ts';
-import { evidenceCoversText } from './source-evidence.ts';
-import { MEMORY_SEARCH_DESCRIPTION, MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, WORKSPACE_HISTORY_EVIDENCE_DESCRIPTION, memoryReadNotice } from './model-text.ts';
+import { evidenceCoversSegments } from './source-evidence.ts';
+import { MEMORY_SEARCH_DESCRIPTION, MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, MEMORY_SOURCE_OMITTED_NOTICE, WORKSPACE_HISTORY_EVIDENCE_DESCRIPTION, isTrustedMemorySearchNotice, isTrustedMemoryWriteReceipt, memoryReadNotice } from './model-text.ts';
+import { functionResult } from 'cortico/protocol/open-responses/context.ts';
+import { digestText, inspectRequestEvidence, verifyToolTextOrigins } from 'cortico/core/evidence.ts';
 
 export interface MemoryToolDeps {
   memory: () => HindsightMemory | null;
@@ -12,7 +14,7 @@ export interface MemoryToolDeps {
 }
 
 function evidenceComplete(
-  read: { text: string; trace?: { format: { sourceSegments: Array<{ documentId: string; start: number; end: number }> } }; sourceSegments?: Array<{ documentId: string; start: number; end: number }> },
+  read: { text: string; dateFocused?: boolean; trace?: { format: { sourceSegments: Array<{ documentId: string; start: number; end: number }> } }; sourceSegments?: Array<{ documentId: string; start: number; end: number }> },
   evidence: ToolOutcome['evidence'],
   requireFullTextCoverage: boolean,
 ): boolean {
@@ -20,15 +22,39 @@ function evidenceComplete(
   const segments = read.sourceSegments ?? read.trace?.format.sourceSegments ?? [];
   if (segments.length === 0 || evidence?.length !== segments.length
     || evidence.some((attachment) => attachment.validationStatus !== 'validated' || attachment.revisionState !== 'current')) return false;
-  return !requireFullTextCoverage || evidenceCoversText(read.text, evidence);
+  if (!requireFullTextCoverage) return true;
+  // Source bodies are verified one by one. Core's fixed formatting (the `[memory]` header,
+  // result labels and the incomplete-facts notice) is not historical content and carries no
+  // source span, so it must not make an otherwise complete source body fail the gate.
+  return evidenceCoversSegments(read.text, segments, evidence);
 }
 
-function verifiedSourceText(output: string, evidence: ToolOutcome['evidence']): ToolOutcome {
+/** A fixed notice the tool wrote itself: it carries no source text and its span is verified as core-generated. */
+function fixedOutcome(text: string, failed = false): ToolOutcome {
+  return {
+    text,
+    ...(failed ? { failed: true } : {}),
+    sourceMapSpans: [{ start: 0, end: text.length, digest: createHash('sha256').update(text).digest('hex'), origin: 'core-generated' }],
+  };
+}
+
+/**
+ * Compose a source view from only the attachments selected. Every character of an excerpt is
+ * bound to its own evidence attachment; source IDs are separate source-identity spans. The view
+ * is then checked by the same Core inspector the next Provider request uses. If the full view
+ * does not map, the caller retries source by source and keeps only the sources that do.
+ */
+function composeSourceView(output: string, evidence: ToolOutcome['evidence'], selected: NonNullable<ToolOutcome['evidence']>): ToolOutcome | null {
   let text = '';
   const attachments: NonNullable<ToolOutcome['evidence']> = [];
   const sourceMapSpans: SourceMapSpan[] = [];
-  for (const attachment of evidence ?? []) {
+  for (const attachment of selected) {
     const segment = attachment.segment;
+    if (!evidence?.length) return null;
+    const same = evidence.some((candidate) => candidate.documentId === attachment.documentId
+      && candidate.segment.start === segment.start && candidate.segment.end === segment.end
+      && candidate.segment.digest === segment.digest);
+    if (!same) continue;
     if (attachment.validationStatus !== 'validated' || attachment.revisionState !== 'current'
       || !segment.sourceProof || !Number.isInteger(segment.start) || !Number.isInteger(segment.end)
       || segment.start < 0 || segment.end <= segment.start || segment.end > output.length) continue;
@@ -36,6 +62,8 @@ function verifiedSourceText(output: string, evidence: ToolOutcome['evidence']): 
     if (createHash('sha256').update(excerpt).digest('hex') !== segment.digest) continue;
     const { segment: _segment, ...source } = attachment;
     const id = JSON.stringify(source.documentId);
+    const piece = `${text ? '\n' : ''}${id}\n${excerpt}`;
+    if (text && text.length + piece.length > 6000) continue;
     if (text) text += '\n';
     const idStart = text.length;
     text += id;
@@ -46,19 +74,52 @@ function verifiedSourceText(output: string, evidence: ToolOutcome['evidence']): 
     text += excerpt;
     attachments.push({ ...attachment, segment: { ...segment, start, end: text.length } });
   }
-  if (!text || attachments.length !== (evidence?.length ?? 0)) return { text: MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, failed: true };
+  if (!text || attachments.length === 0) return null;
   return { text, evidence: attachments, sourceMapSpans };
+}
+
+/** The same Core inspector a next Provider request would use, without generation/tool digests. */
+function viewMaps(view: ToolOutcome): boolean {
+  const spans = verifyToolTextOrigins('memory_search', view.text, view.sourceMapSpans, isTrustedMemorySearchNotice);
+  const record = functionResult('call_readback', view.text, {
+    evidence: view.evidence, sourceMapSpans: spans, toolCallId: 'call_readback',
+  });
+  const request = { model: 'readback', input: [record.item] } as never;
+  return inspectRequestEvidence(request, [record], request as never).mappingState === 'complete';
 }
 
 function safeSearchResult(read: MemoryTextRead, output: string, evidence: ToolOutcome['evidence']): ToolOutcome {
   const format = read.trace?.format;
   if (read.status !== 'found' || read.sourceFactsTruncated || read.rejectedSourceDocumentIds?.length
-    || !evidenceComplete(read, evidence, false) || format?.sourceFactsTruncated
+    || format?.sourceFactsTruncated
     || format?.incompleteResultIds.length || format?.omittedSourceDocumentIds.length || format?.clippedResultIds.length
     || format?.clippedContextResultIds.length || format?.clippedSourceFactIds.length) {
-    return { text: MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, failed: true };
+    return fixedOutcome(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, true);
   }
-  return verifiedSourceText(output, evidence);
+  const total = evidence?.length ?? 0;
+  const withOmitted = (view: ToolOutcome): ToolOutcome => {
+    if (view.evidence?.length === total) return view;
+    const line = MEMORY_SOURCE_OMITTED_NOTICE;
+    const start = view.text.length + 1;
+    return {
+      ...view,
+      text: `${view.text}\n${line}`,
+      sourceMapSpans: [...(view.sourceMapSpans ?? []),
+        { start, end: view.text.length + line.length + 1, digest: digestText(line), origin: 'core-generated' }],
+    };
+  };
+  const all = composeSourceView(output, evidence, evidence ?? []);
+  if (all && viewMaps(withOmitted(all))) return withOmitted(all);
+  const kept: NonNullable<ToolOutcome['evidence']> = [];
+  for (const attachment of evidence ?? []) {
+    const single = composeSourceView(output, evidence, [attachment]);
+    if (single && viewMaps(single)) kept.push(attachment);
+  }
+  if (kept.length === 0) return fixedOutcome(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, true);
+  const filtered = composeSourceView(output, evidence, kept);
+  if (!filtered) return fixedOutcome(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, true);
+  const final = withOmitted(filtered);
+  return viewMaps(final) ? final : fixedOutcome(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, true);
 }
 
 function withIncompleteEvidence(text: string): string {
@@ -67,8 +128,52 @@ function withIncompleteEvidence(text: string): string {
     : [text, MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE].filter(Boolean).join('\n');
 }
 
+/**
+ * Runs a memory write tool and marks its own receipt as core-generated. The Persona's
+ * `toolTextTrust` re-checks the exact receipt shape, so a World or model cannot self-sign.
+ */
+function writeReceipt(name: string, run: ToolDef['handler']): ToolDef['handler'] {
+  return async (args, ctx) => {
+    const outcome = await run(args, ctx);
+    if (typeof outcome !== 'string' || !isTrustedMemoryWriteReceipt(name, outcome)) return outcome;
+    return fixedOutcome(outcome);
+  };
+}
+
 const text = (args: Record<string, unknown>, key: string): string =>
   typeof args[key] === 'string' ? (args[key] as string).trim() : '';
+
+/**
+ * The model often sends a whole phrase to a literal source scan. Split it into short
+ * verbatim candidates (2-4 CJK characters) and try them in order; the gate still accepts
+ * only a validated original source, so this changes recall, not trust.
+ */
+export function literalSourceQueries(query: string): string[] {
+  const trimmed = query.trim();
+  if (!trimmed) return [];
+  const cjk = /[\u3400-\u9fff]/u;
+  const tokens = trimmed.split(/[\s,，。.!！?？、;；:：/\\|()（）\[\]【】"'“”‘’]+/u).filter(Boolean);
+  const short = tokens.filter((token) => { const n = [...token].length; return n >= 2 && n <= 4 && cjk.test(token); });
+  const long = tokens.filter((token) => [...token].length > 4);
+  const windows: string[] = [];
+  for (const token of long) {
+    const chars = [...token];
+    for (const size of [4, 3, 2]) {
+      for (let index = 0; index + size <= chars.length; index += 1) {
+        const value = chars.slice(index, index + size).join('');
+        if (cjk.test(value)) windows.push(value);
+      }
+    }
+  }
+  const all = [...short, ...windows, ...[...trimmed].slice(-2).join('')]
+    .filter((value) => { const n = [...value].length; return n >= 2 && n <= 4 && cjk.test(value); });
+  const unique = [...new Set(all)];
+  // Prefer the phrase that appears latest in the user's sentence (the specific request),
+  // then a longer phrase over a generic topic word.
+  unique.sort((a, b) => (trimmed.lastIndexOf(b) - trimmed.lastIndexOf(a)) || ([...b].length - [...a].length));
+  return unique.slice(0, 16);
+}
+
 
 export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
   return [
@@ -92,8 +197,18 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         if (!memory?.enabled()) return '[memory] Long-term memory is not available.';
         if (args.sources === true) {
           const excludeDocumentId = deps.currentReadSource?.(ctx.role) ?? deps.currentUserSource?.(ctx.role) ?? undefined;
-          const read = await memory.searchSourceDocuments(text(args, 'query'), { excludeDocumentId });
-          if (!read.text) return memoryReadNotice(read.status);
+          const rawQuery = text(args, 'query');
+          let read = await memory.searchSourceDocuments(rawQuery, { excludeDocumentId });
+          if (!read.text || read.status !== 'found') {
+            for (const candidate of literalSourceQueries(rawQuery)) {
+              const next = await memory.searchSourceDocuments(candidate, { excludeDocumentId });
+              if (next.text && next.status === 'found') { read = next; break; }
+            }
+          }
+          if (!read.text) {
+            const notice = memoryReadNotice(read.status);
+            return isTrustedMemorySearchNotice('memory_search', notice) ? fixedOutcome(notice) : notice;
+          }
           const evidence = await memory.evidenceForRead(read);
           const output = evidenceComplete(read, evidence, false) ? read.text : withIncompleteEvidence(read.text);
           if (deps.sourceSafeToolResults) return safeSearchResult(read, output, evidence);
@@ -108,7 +223,9 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
           ? MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE
           : '';
         let output = [result, notice].filter(Boolean).join('\n');
-        if (!read.text) return output;
+        if (!read.text) {
+          return isTrustedMemorySearchNotice('memory_search', output) ? fixedOutcome(output) : output;
+        }
         const evidence = await memory.evidenceForRead(read);
         if (!evidenceComplete(read, evidence, true)) output = withIncompleteEvidence(output);
         if (deps.sourceSafeToolResults) return safeSearchResult(read, output, evidence);
@@ -126,7 +243,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         },
         required: ['text'],
       },
-      handler: async (args, ctx) => {
+      handler: writeReceipt('memory_remember', async (args, ctx) => {
         const memory = deps.memory();
         if (!memory?.enabled()) return '[memory] Long-term memory is not available.';
         const body = text(args, 'text');
@@ -146,7 +263,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         if (result === 'unverified') return '[remembered] The current user event completed remotely; source read-back is still pending.';
         if (result === 'verified') return '[remembered] The current user event is verified; no second memory was created.';
         return `[remembered] ${body} (saved locally; the service has not confirmed it yet)`;
-      },
+      }),
     },
     {
       name: 'memory_correct',
@@ -160,7 +277,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         },
         required: ['text', 'source_ids'],
       },
-      handler: async (args, ctx) => {
+      handler: writeReceipt('memory_correct', async (args, ctx) => {
         const memory = deps.memory();
         if (!memory?.enabled()) return '[memory] Long-term memory is not available.';
         const body = text(args, 'text');
@@ -182,7 +299,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         if (result === 'verified') return '[correction verified] The existing user event is linked to the cited source; no duplicate memory was created.';
         if (sourceDocumentId && result === 'queued') return '[correction queued] The current user event was linked to the cited source; its source document is not verified yet.';
         return `[correction queued] ${body} (saved locally; the service has not confirmed it yet)`;
-      },
+      }),
     },
     {
       name: 'memory_forget',
@@ -195,7 +312,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         },
         required: ['query'],
       },
-      handler: async (args) => {
+      handler: writeReceipt('memory_forget', async (args) => {
         const memory = deps.memory();
         if (!memory || (!memory.enabled() && !memory.forgetRecoveryBlocked())) return '[memory] Long-term memory is not available.';
         const result = await memory.forget(text(args, 'query'));
@@ -205,7 +322,7 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         if (result.acceptance === 'unknown-blocked') return `[forget recovery blocked] Forget acceptance could not be confirmed. Memory remains blocked; do not claim completion. Failed: ${result.failed}.`;
         const state = result.acceptance === 'partial' ? 'partially accepted' : 'accepted';
         return `[forget ${state}] local cancellations: ${result.local}; remote deletions acknowledged: ${result.deleted}; pending or retrying: ${result.pending}; retryable failures: ${result.failed}. The active conversation may still contain this source. Do not recover it from workspace files, Handoff notes or Git history.`;
-      },
+      }),
     },
     {
       name: 'memory_reflect',

@@ -3,6 +3,7 @@ import type { PetText } from './index.ts';
 
 const zhHant: Translation<PetText> = {
   defaultUser: '夥伴',
+  sessionArchived: "已封存先前的對話，並開始新對話。",
 
   menu: {
     quit: '結束',

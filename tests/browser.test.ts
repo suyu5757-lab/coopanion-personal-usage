@@ -1273,18 +1273,22 @@ describe('browser World', () => {
 
   it('has an env prompt that names the session and the allowed actions', async () => {
     const { world, setSelf } = await make();
-    expect(world.envPromptVars()).toMatchObject({ 'browser.session': '最多 20 分钟' });
+    const value = (name: string) => {
+      const entry = world.envPromptVars()![name];
+      return typeof entry === 'string' ? entry : entry.text;
+    };
+    expect(value('browser.session')).toBe('最多 20 分钟');
     setSelf({ sessionUnlimited: true });
-    expect(world.envPromptVars()).toMatchObject({ 'browser.session': '不限时长' });
+    expect(value('browser.session')).toBe('不限时长');
     setSelf({ sessionUnlimited: false });
-    expect(world.envPromptVars()!['browser.actions']).toContain('常规互动已关闭');
+    expect(value('browser.actions')).toContain('常规互动已关闭');
     setSelf({ actions: true });
-    expect(world.envPromptVars()!['browser.actions']).toContain('常规互动已开启');
-    expect(world.envPromptVars()!['browser.actions']).toContain('网页生图已关闭');
+    expect(value('browser.actions')).toContain('常规互动已开启');
+    expect(value('browser.actions')).toContain('网页生图已关闭');
     setSelf({ imageGeneration: true, imageSaving: true, mediaUpload: true });
-    expect(world.envPromptVars()!['browser.actions']).toContain('网页生图已开启');
-    expect(world.envPromptVars()!['browser.actions']).toContain('保存生成图片已开启');
-    expect(world.envPromptVars()!['browser.actions']).toContain('素材上传已开启');
+    expect(value('browser.actions')).toContain('网页生图已开启');
+    expect(value('browser.actions')).toContain('保存生成图片已开启');
+    expect(value('browser.actions')).toContain('素材上传已开启');
     const doc = world.webUi!('zh').promptDocs?.find((d) => d.role === 'envPrompt');
     expect(doc?.path).toBeTruthy();
     expect(existsSync(doc!.path)).toBe(true);

@@ -3,6 +3,7 @@ import type { PetText } from './index.ts';
 
 const ja: Translation<PetText> = {
   defaultUser: '相棒',
+  sessionArchived: "以前の会話を保存し、新しい会話を始めました。",
 
   menu: {
     quit: '終了',

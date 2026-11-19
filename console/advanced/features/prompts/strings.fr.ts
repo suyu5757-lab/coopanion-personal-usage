@@ -36,6 +36,12 @@ export const S: Partial<typeof en> = {
   undoAll: "Rétablir le contenu enregistré",
   undoAllHint: "Restaure le dernier contenu enregistré. Annuler permet de récupérer les modifications.",
   saveToFile: "Enregistrer",
+  attestLocal: "Confirmer la configuration locale",
+  attestTitle: "Confirmer la configuration locale actuelle",
+  attestBody: "Enregistre l’empreinte et l’heure des fichiers de personnalité locaux actuels comme une confirmation faite dans les réglages. Cela ne devient pas des paroles prononcées en conversation et n’est pas écrit dans la mémoire à long terme. Modifier un fichier plus tard demande une nouvelle confirmation.",
+  attestDone: (n: number) => `${n} fichier(s) de configuration locale confirmé(s).`,
+  attestNone: "Aucune configuration locale à confirmer ; ce sont les versions intégrées.",
+  attestFailed: (msg: string) => `Échec de la confirmation : ${msg}`,
   // index.ts
   title: 'Prompt système',
   introDesc: "Ctrl+S enregistre les modèles ; « Appliquer maintenant » met à jour le prompt de la conversation actuelle. Les sections générées sont en lecture seule.",

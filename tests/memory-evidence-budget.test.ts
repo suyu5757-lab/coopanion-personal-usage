@@ -46,22 +46,22 @@ describe('supporting evidence budgets', () => {
       stateStore: store, outbox, ledger, ready: true, unavailableUntil: 0,
     });
     try {
-      for (const budget of [1024, 4096, 8192]) {
+      for (const budget of [1024, 4096, 8192, 16_384]) {
         const read = await memory.recallBlockDetailed('What evidence supports the summary?', { maxTokens: 900, maxSourceFactsTokens: budget, captureTrace: true, activationEnabled: false });
         const count = Math.min(64, budget / 128);
         expect(read.trace?.search.sourceFactCounts).toEqual({ declared: 64, returned: count, valid: count, parsed: count, missing: 64 - count, invalid: 0 });
         expect(read.trace?.search.sourceFactsTokenBudget).toBe(budget);
         expect(read.trace?.search.sourceFactsTruncated).toBe(budget < 8192);
-        expect(read.trace?.format.includedSourceDocumentIds).toHaveLength(count);
+        expect(read.trace?.format.includedSourceDocumentIds).toHaveLength(count === 64 ? 64 : 0);
         expect(read.trace?.format.clippedSourceFactIds).toEqual([]);
-        expect(read.text.includes('Necessary evidence is cobalt.')).toBe(budget >= 4096);
+        expect(read.text.includes('Necessary evidence is cobalt.')).toBe(budget >= 8192);
         expect(read.text.length).toBeLessThanOrEqual(read.trace!.maxChars);
       }
       const turn = await memory.recallForTurn('What evidence supports the summary?', { activationEnabled: false });
       memory.markRecallInjected(turn.text);
       const receipt = (memory as unknown as { lastRecall: Record<string, unknown> }).lastRecall;
-      expect(receipt).toMatchObject({ route: 'standard', status: 'found', sourceFactCounts: { returned: 32, parsed: 32 } });
-      expect(receipt.injectedAt).toEqual(expect.any(String));
+      expect(receipt).toMatchObject({ route: 'standard', status: 'incomplete', sourceFactCounts: { returned: 32, parsed: 32 } });
+      expect(receipt.injectedAt).toBeUndefined();
       expect(JSON.stringify(receipt)).not.toContain('Necessary evidence is cobalt.');
       expect(JSON.stringify(receipt)).not.toContain('source-24');
       ledger.addMany([{ bankId: 'fixture-bank', endpoint: baseUrl, documentId: 'source-24', reason: 'Synthetic deletion check' }], 'Synthetic deletion check');

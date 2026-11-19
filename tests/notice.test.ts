@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { WorldHost } from 'cortico/core/types.ts';
-import { noticeDefinition, releaseNotes, type AlarmsState } from '../core/notice.ts';
+import { noticeDefinition, releaseNotes, NoticeWorld, type AlarmsState } from '../core/notice.ts';
 
 /** A releases directory with one file per version, each `## 下载` section after its body. */
 function releases(versions: string[]): string {
@@ -89,5 +89,79 @@ describe('notice state recovery', () => {
       expect(readFileSync(`${stateFile}.bad`, 'utf8')).toBe(content);
       expect(JSON.parse(readFileSync(stateFile, 'utf8'))).toEqual({ version: '0.2.6' });
     } finally { await world.stop(); }
+  });
+});
+
+
+describe('release notice source admission', () => {
+  it.each(['zh', 'en'] as const)('admits one unchanged bundled update in %s', async (language) => {
+    const dir = mkdtempSync(join(tmpdir(), 'coo-update-proof-'));
+    const world = new NoticeWorld({
+      version: '0.4.0', notesDir: join(process.cwd(), 'docs', 'releases'),
+      stateFile: join(dir, 'notice.json'), alarmsFile: join(dir, 'alarms.json'),
+      newInstall: () => false, read: path => path === 'language' ? language : undefined,
+      petConnected: () => true, guiding: () => false, refreshTools: async () => {}, label: () => 'notice',
+    }, 'UTC');
+    const queued: Array<{ type: string; render: () => unknown }> = [];
+    await world.start({ pushDeferred: (e: { type: string; render: () => unknown }) => queued.push(e) } as unknown as WorldHost);
+    try {
+      (world as unknown as { tick(): void }).tick();
+      expect(queued).toHaveLength(1);
+      const rendered = queued[0]!.render() as { text: string };
+      expect(queued[0]!.type).toBe('coopanion.updated');
+      expect(world.admitUpdate({ ...rendered })).toBe(false);
+      expect(world.admitUpdate(rendered)).toBe(true);
+      expect(world.admitUpdate(rendered)).toBe(false);
+    } finally { await world.stop(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('refuses changed release-note content', async () => {
+    const dir = releases(['0.4.0']);
+    const world = new NoticeWorld({
+      version: '0.4.0', notesDir: dir, stateFile: join(dir, 'notice.json'), alarmsFile: join(dir, 'alarms.json'),
+      newInstall: () => false, read: () => undefined, petConnected: () => true, guiding: () => false,
+      refreshTools: async () => {}, label: () => 'notice',
+    }, 'UTC');
+    const queued: Array<{ render: () => unknown }> = [];
+    await world.start({ pushDeferred: (e: { render: () => unknown }) => queued.push(e) } as unknown as WorldHost);
+    try {
+      (world as unknown as { tick(): void }).tick();
+      const rendered = queued[0]!.render();
+      expect(world.admitUpdate(rendered)).toBe(false);
+    } finally { await world.stop(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('settings change source admission', () => {
+  it('admits only the current rendered setting summary', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'coo-settings-source-'));
+    let user = '伙伴';
+    const queued: Array<{ type: string; render: () => unknown }> = [];
+    let notify!: (event: { type: string; render: () => unknown }) => void;
+    const queuedChange = new Promise<{ type: string; render: () => unknown }>((resolve) => { notify = resolve; });
+    const world = new NoticeWorld({
+      version: 'dev', notesDir: dir, stateFile: join(dir, 'notice.json'), alarmsFile: join(dir, 'alarms.json'),
+      newInstall: () => false,
+      read: (path) => path === 'worlds.desktop-pet.user' ? user : undefined,
+      petConnected: () => true, guiding: () => false, refreshTools: async () => {}, label: () => 'notice',
+    }, 'UTC');
+    await world.start({ pushDeferred: (event: { type: string; render: () => unknown }) => {
+      queued.push(event);
+      if (event.type === 'coopanion.settings-changed') notify(event);
+    } } as unknown as WorldHost);
+    try {
+      user = 'R4 验收伙伴';
+      (world as unknown as { tick(): void }).tick();
+      const event = await queuedChange;
+      expect(event.type).toBe('coopanion.settings-changed');
+      const rendered = event.render() as { text: string };
+      expect(rendered.text).toContain('R4 验收伙伴');
+      expect(world.admitSettingsChange({ ...rendered })).toBe(false);
+      expect(world.admitSettingsChange(rendered)).toBe(true);
+      expect(world.admitSettingsChange(rendered)).toBe(false);
+    } finally {
+      await world.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -49,7 +49,7 @@ describe('the memory transaction database', () => {
     }
   });
 
-  it('migrates the historical schema 2 fixture to 4 without changing committed delivery records', () => {
+  it('migrates the historical schema 2 fixture to 5 without changing committed delivery records', () => {
     const path = join(root(), 'memory-state.sqlite');
     createLegacyMemoryStateDatabase(path, 2);
     const old = openLegacyMemoryStateDatabase(path);
@@ -58,7 +58,7 @@ describe('the memory transaction database', () => {
 
     openMemoryStateStore(path);
     const migrated = new DatabaseSync(path);
-    expect((migrated.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(4);
+    expect((migrated.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(5);
     expect(snapshotLegacyDurableRows(migrated, 2)).toBe(before);
     migrated.close();
   });
@@ -863,7 +863,7 @@ describe('the memory transaction database', () => {
     expect(reopened.status().orphaned).toBe(1);
   });
 
-  it('keeps correction links after completed queue payloads expire', () => {
+  it('keeps correction links and the verified audit row after completed queue payloads age', () => {
     const path = join(root(), 'memory-state.sqlite');
     const store = openMemoryStateStore(path);
     store.importLegacy({ outbox: [], forget: emptyForget, forgetDamaged: false });
@@ -880,7 +880,7 @@ describe('the memory transaction database', () => {
     expect(outbox.markVerified(item.id)).toBe(true);
     now = new Date(now.getTime() + 8 * 86_400_000);
     expect(outbox.compact()).toBe(true);
-    expect(outbox.get(item.id)).toBeNull();
+    expect(outbox.get(item.id)?.state).toBe('verified');
     closeMemoryStateStores();
 
     const reopened = openMemoryStateStore(path);

@@ -34,7 +34,7 @@ describe('first-run seed', () => {
       seed(home, language === 'zh' ? 'en' : 'zh');
       expect(read(join(home, DEPLOYMENT, 'config.json'))).toMatchObject({ language, worlds: { 'desktop-pet': { cua: { permission: 'ask-once' } } } });
       expect(read(join(home, 'providers', endpoint, 'config.json'))).toMatchObject({ kind: 'coo', secret: vendor.secret, spec: { model: vendor.model } });
-      expect(readFileSync(join(home, DEPLOYMENT, 'workspace', 'CONSTITUTION.md'), 'utf8')).toBe(readFileSync(personaFile('coo', language), 'utf8'));
+      expect(readFileSync(join(home, DEPLOYMENT, 'workspace', 'CONSTITUTION.md'), 'utf8')).toBe(readFileSync(personaFile('whale', language), 'utf8'));
       expect(readFileSync(join(home, DEPLOYMENT, 'avatar.png')).subarray(1, 4).toString()).toBe('PNG');
     }
   });
@@ -182,10 +182,10 @@ describe('first-run seed', () => {
     mkdirSync(join(home, DEPLOYMENT));
     const cfg = join(home, DEPLOYMENT, 'config.json');
     const constitution = join(home, DEPLOYMENT, 'workspace', 'CONSTITUTION.md');
-    const shipped = (id: 'coo' | 'winter', language: 'zh' | 'ja' | 'zh-Hant') => readFileSync(personaFile(id, language), 'utf8');
+    const shipped = (id: 'coo' | 'winter' | 'whale', language: 'zh' | 'ja' | 'zh-Hant') => readFileSync(personaFile(id, language), 'utf8');
     writeFileSync(cfg, JSON.stringify({ language: 'ja' }));
     seed(home, 'zh');
-    expect(readFileSync(constitution, 'utf8')).toBe(shipped('coo', 'ja'));
+    expect(readFileSync(constitution, 'utf8')).toBe(shipped('whale', 'ja'));
     applyPersona(join(home, DEPLOYMENT, 'workspace'), 'winter', 'ja');
     writeFileSync(cfg, JSON.stringify({ language: 'zh-Hant' }));
     seed(home, 'zh');

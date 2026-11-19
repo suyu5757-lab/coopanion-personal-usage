@@ -11,6 +11,7 @@
  * the page tells both in its own language.
  */
 import type { EventEnvelope, RunPhase, WorldStreamSocket } from 'cortico/core/types.ts';
+import type { StreamEvent } from 'cortico/protocol/open-responses/index.ts';
 
 export const SELF_TYPE = 'desktop-pet.self';
 
@@ -34,6 +35,7 @@ export interface SayBeat { text: string; mood?: Record<string, string> }
 
 export type ChatItem =
   | { kind: 'user'; cursor: number; ts: string; via: 'chat' | 'bubble' | 'voice'; text: string; images?: WireImage[]; at?: number }
+  | { kind: 'assistant'; cursor: number; ts: string; text: string }
   | { kind: 'answer'; cursor: number; ts: string; askId: string; index?: number; text?: string; dismissed?: true }
   /** `text` for touches stored before they were stored as `touch`. */
   | { kind: 'touch'; cursor: number; ts: string; touch?: ChatTouch; text?: string }
@@ -86,6 +88,7 @@ export function chatItem(e: EventEnvelope): ChatItem | null {
       return { kind: 'figure', ...base, figure: { kind: f.kind as ChatFigure['kind'], name: f.name as Record<string, string> } };
     }
     default: {
+      if (m.kind === 'assistant') return e.text ? { kind: 'assistant', ...base, text: e.text } : null;
       if (m.kind === 'say' && Array.isArray(m.beats)) {
         const beats = (m.beats as Meta[]).flatMap((b) => (typeof b.text === 'string' && b.text ? [{ text: b.text, ...(b.mood && typeof b.mood === 'object' ? { mood: b.mood as Record<string, string> } : {}) }] : []));
         const images = wireImages(e);
@@ -102,6 +105,16 @@ export function chatItem(e: EventEnvelope): ChatItem | null {
       return null;
     }
   }
+}
+
+/** Text from a completed assistant response; tool arguments and reasoning stay out of the chat. */
+export function assistantReplyFromEvent(event: StreamEvent): { responseId: string; text: string } | null {
+  if (event.type !== 'response.completed' || event.response.status !== 'completed') return null;
+  const parts = event.response.output.flatMap((item) => item.type === 'message' && item.role === 'assistant'
+    ? item.content.flatMap((part) => part.type === 'output_text' ? [part.text] : [])
+    : []);
+  const text = parts.join('');
+  return text.trim() ? { responseId: event.response.id, text } : null;
 }
 
 /** Messages recorded as withdrawn, and where messages that waited were delivered (message cursor → record cursor). */

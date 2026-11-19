@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { closeSync, existsSync, openSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { ContextEvidenceInspection, EvidenceAttachment, GenerationEvidenceEnvelope, SourceExposureRef } from 'cortico/core/types.ts';
@@ -14,8 +14,9 @@ import { formatPortrait, formatRecall, formatRecallDetailed, type RecallFormatTr
 import { captureRetrievalScores, type RetrievalScoreEvidence } from './retrieval-scores.ts';
 import { sanitizeForMemory } from './policy.ts';
 import { loadHindsightConfig, type HindsightConfig, type HindsightFileConfig } from './config.ts';
+import { evidenceCoversText } from './source-evidence.ts';
 import { DeliveryError, OutboxDelivery, type DeliveryOps, type OperationState } from './delivery.ts';
-import { MemoryOutbox, readLegacyOutbox, type OutboxItem, type RetainItem } from './outbox.ts';
+import { MemoryOutbox, readLegacyOutbox, requestHashFor, type OutboxItem, type RetainItem } from './outbox.ts';
 import { ForgetLedger, readLegacyForget, type DeletionInput, type ForgetIntentAcceptance } from './forget-ledger.ts';
 import {
   memoryArtifactScope,
@@ -38,6 +39,7 @@ import { partnerSourceScopeDigest, partnerUserNoteDocumentId } from './partner-p
 import { sourceFactsTokenBudget as resolveSourceFactsTokenBudget, recallContextCharBudget } from './recall-limits.ts';
 import { summarizeSourceFacts, type SourceFactCounts } from './recall-evidence.ts';
 import { planRecallQueries, type SourceMatchType } from './recall-query.ts';
+import type { RecallDateContext } from './recall-date.ts';
 import {
   SOURCE_LOOKUP_CANDIDATE_HEADER,
   SOURCE_LOOKUP_HEADER,
@@ -45,6 +47,18 @@ import {
   SOURCE_LOOKUP_INVALID_CANDIDATE_NOTICE,
   sourceLookupMissNotice,
 } from './model-text.ts';
+import {
+  buildCooGrowthCandidateSource,
+  exactCooGrowthSourceMatches,
+  readCooGrowthCandidateSource,
+  type PersistCooGrowthCandidateSourceInput,
+} from './coo-growth-source.ts';
+import { verifyCooSelfGrowthCandidate } from './coo-self-growth-trust.ts';
+import type { CooGrowthCandidateSourceEvidence, SourceDomainClassificationInput } from './source-domains.ts';
+import { createSourceDomainReadbackAdapter } from './source-domain-readback-adapter.ts';
+import type { TrustedSourceReadbackProvider } from './source-domain-consumer.ts';
+import { createSourceDomainReadStore, type SourceDomainReadStore } from './source-domain-read-store.ts';
+import { DOMAIN_SUPPLEMENT_SOURCE_FACTS_TOKEN_BUDGET } from './recall-limits.ts';
 
 export type MemoryReadStatus = 'found' | 'absent' | 'incomplete' | 'unavailable' | 'fenced';
 export type TurnRecallStatus = MemoryReadStatus | 'skipped';
@@ -54,12 +68,19 @@ const MAX_SUPPLEMENTAL_RECALL_QUERIES = 2;
 const SUPPLEMENTAL_RECALL_MAX_TOKENS = 600;
 const SUPPLEMENTAL_SOURCE_FACTS_MAX_TOKENS = 1024;
 const MAX_PRIORITY_SOURCE_DOCUMENTS = DEEP_RECALL_MAX_ITEMS;
+const MAX_EXACT_SOURCE_FALLBACK_SOURCES = 35;
+const MAX_DATED_RECALL_UNITS = 12;
+const MAX_DATED_RECALL_DOCUMENTS = 8;
+const DATED_RECALL_PAGE_SIZE = 50;
+const DATE_FOCUSED_MAX_CHARS = 3_600;
 
 export interface MemoryTextRead {
   text: string;
   status: MemoryReadStatus;
   sourceFactsTruncated?: boolean;
   trace?: MemoryRecallTrace;
+  /** The block came from a resolved calendar-day journal lookup. */
+  dateFocused?: boolean;
   sourceDocuments?: OriginalSourceCandidate[];
   sourceSegments?: MemoryEvidenceSegment[];
   rejectedSourceDocumentIds?: string[];
@@ -111,6 +132,8 @@ export interface MemorySearchSourceFact {
   date: string;
   documentId: string;
   metadata?: Record<string, string>;
+  /** Present only for opt-in domain discovery; the exact source document must resolve its actor. */
+  metadataIncomplete?: boolean;
   sourceMatchType?: SourceMatchType;
 }
 
@@ -124,11 +147,18 @@ export interface MemorySearchResult {
   metadata?: Record<string, string>;
   sourceFacts?: MemorySearchSourceFact[];
   sourceFactsIncomplete?: boolean;
+  /**
+   * True when this result is a derived summary without a current parent source. The summary
+   * text and any retrieved context are dropped; only individually verified source facts remain.
+   */
+  derivedSummaryOmitted?: boolean;
   matchScore?: number;
   activationWeight?: number;
   retrievalScores?: RetrievalScoreEvidence;
   queryIndexes?: number[];
   sourceMatchType?: SourceMatchType;
+  /** A date-arm unit keeps its own identity instead of collapsing with its sibling chunks. */
+  unitKey?: string;
 }
 
 export interface MemorySearchRead {
@@ -136,6 +166,7 @@ export interface MemorySearchRead {
   status: MemoryReadStatus;
   sourceFactsTruncated?: boolean;
   trace?: MemorySearchTrace;
+  dateFocused?: boolean;
 }
 
 /** Local, durable state of one PARTNER paragraph registration. */
@@ -156,7 +187,7 @@ export interface MemorySearchTraceItem {
   declaredSourceFactIds: string[];
   verifiedSources: Array<{ sourceFactId: string; documentId: string }>;
   disposition: 'candidate' | 'visible' | 'filtered' | 'fenced';
-  reason?: 'forgotten-support' | 'unverified-source-fact' | 'unlinked-observation' | 'missing-source-id' | 'current-question-source' | 'fence-unresolved' | 'ledger-unreadable';
+  reason?: 'forgotten-support' | 'unverified-source-fact' | 'unlinked-observation' | 'missing-source-id' | 'current-question-source' | 'fence-unresolved' | 'ledger-unreadable' | 'derived-source-lineage-unavailable';
   sourceFactsIncomplete: boolean;
   activationWeight?: number;
   retrievalScores?: RetrievalScoreEvidence;
@@ -193,6 +224,8 @@ export interface RecallOptions {
   captureTrace?: boolean;
   userEventDocumentId?: string;
   queryIndex?: number;
+  /** Return source identities with missing fact metadata for exact-readback-only domain discovery. */
+  allowUnattributedSourceCandidates?: boolean;
 }
 
 interface UserEventSource {
@@ -220,12 +253,14 @@ function userEventSources(result: MemorySearchResult): UserEventSource[] {
 function historicalSourceMetadata(metadata: Record<string, string> | undefined): boolean {
   return !!metadata
     && ['user', 'coo', 'affinity', 'tool'].includes(metadata.source_actor ?? '')
-    && ['event', 'correction'].includes(metadata.kind ?? '')
+    && (['event', 'correction'].includes(metadata.kind ?? '')
+      || (metadata.source_actor === 'coo' && metadata.kind === 'reflection'
+        && metadata.journal_source === 'host-daily-task' && metadata.status === 'candidate'))
     && metadata.status !== 'disputed';
 }
 
 function recallResultKey(result: MemorySearchResult): string {
-  if (result.documentId && result.type !== 'observation') return `${result.type}\0${result.documentId}`;
+  if (result.documentId && result.type !== 'observation') return `${result.type}\0${result.documentId}\0${result.unitKey ?? ''}`;
   return `${result.type}\0${result.id}`;
 }
 
@@ -275,6 +310,7 @@ function mergeRecallReads(reads: readonly MemorySearchRead[]): MemorySearchRead 
     }
   }
   const results = [...merged.values()];
+  const dateFocused = reads.some((read) => read.dateFocused === true);
   const status = results.length ? 'found' : reads.some((read) => read.status === 'fenced') ? 'fenced'
     : reads.some((read) => read.status === 'incomplete') ? 'incomplete'
       : reads.some((read) => read.status === 'unavailable') ? 'unavailable' : 'absent';
@@ -289,7 +325,7 @@ function mergeRecallReads(reads: readonly MemorySearchRead[]): MemorySearchRead 
     ...(traceItems.length ? { sourceFactCounts } : {}),
     ...(attempts.length ? { queryAttempts: attempts } : {}),
   };
-  return { results, status, ...(sourceFactsTruncated ? { sourceFactsTruncated: true } : {}), trace };
+  return { results, status, ...(dateFocused ? { dateFocused: true } : {}), ...(sourceFactsTruncated ? { sourceFactsTruncated: true } : {}), trace };
 }
 
 function recallEvidenceCoversQuery(read: MemorySearchRead, phrases: readonly string[]): boolean {
@@ -324,6 +360,85 @@ function sourceDocumentIdsFromRecall(results: readonly MemorySearchResult[], exc
       && result.documentId !== excludeDocumentId) ids.add(result.documentId);
   }
   return [...ids];
+}
+
+function userSourceDocumentIdsFromFacts(results: readonly MemorySearchResult[], excludeDocumentId?: string): string[] {
+  const ids = new Set<string>();
+  const add = (documentId: string | null | undefined, metadata: Record<string, string> | undefined): void => {
+    if (documentId && documentId !== excludeDocumentId && metadata?.source_actor === 'user'
+      && ['event', 'correction'].includes(metadata.kind ?? '')) ids.add(documentId);
+  };
+  for (const result of results) {
+    if (result.type !== 'observation') add(result.documentId, result.metadata);
+    for (const fact of result.sourceFacts ?? []) {
+      add(fact.documentId, fact.metadata);
+      if (!fact.metadataIncomplete || !fact.documentId || fact.documentId === excludeDocumentId) continue;
+      const actor = fact.metadata?.source_actor;
+      const kind = fact.metadata?.kind;
+      const status = fact.metadata?.status;
+      if ((actor === undefined || actor === 'user')
+        && (kind === undefined || ['event', 'correction'].includes(kind))
+        && status !== 'superseded' && status !== 'disputed') ids.add(fact.documentId);
+    }
+  }
+  return [...ids];
+}
+
+function exactSourceFallbackTrace(
+  search: MemorySearchRead,
+  sourceRead: MemoryTextRead,
+  allCandidateDocumentIds: readonly string[],
+  maxTokens: number,
+  maxSourceFactsTokens: number,
+  maxChars: number,
+  queryAttempts: RecallQueryAttemptTrace[],
+): MemoryRecallTrace | null {
+  const documents = sourceRead.sourceDocuments ?? [];
+  const segments = sourceRead.sourceSegments ?? [];
+  if (documents.length === 0 || segments.length !== documents.length) return null;
+  const candidateIndexes = allCandidateDocumentIds.map((_, index) => index);
+  const inputResultIds = allCandidateDocumentIds.map((documentId) => `source-candidate:${hash(documentId)}`);
+  const includedResultIndexes = documents.map((_, index) => index);
+  const includedResultIds = documents.map((source) => `source-candidate:${hash(source.documentId)}`);
+  const includedIds = new Set(segments.map((segment) => segment.documentId));
+  const omittedDocumentIds = allCandidateDocumentIds.filter((documentId) => !includedIds.has(documentId));
+  const format: RecallFormatTrace = {
+    inputResultIndexes: candidateIndexes,
+    inputResultIds,
+    candidateResultIndexes: candidateIndexes,
+    candidateResultIds: inputResultIds,
+    includedResultIndexes,
+    includedResultIds,
+    omittedResultIndexes: candidateIndexes.filter((index) => !includedIds.has(allCandidateDocumentIds[index]!)),
+    omittedResultIds: inputResultIds.filter((_, index) => !includedIds.has(allCandidateDocumentIds[index]!)),
+    deduplicatedResultIndexes: [],
+    deduplicatedResultIds: [],
+    includedSourceDocumentIds: segments.map((segment) => segment.documentId),
+    includedSourceFactIds: [],
+    sourceSegments: segments.map((segment) => ({ ...segment })),
+    omittedSourceDocumentIds: omittedDocumentIds,
+    incompleteResultIds: [],
+    clippedResultIds: [],
+    clippedContextResultIds: [],
+    clippedSourceFactIds: [],
+    sourceFactsTruncated: false,
+    coverageWeight: 0,
+    activationInfluence: 0,
+    activationWeights: [],
+    retrievalScores: [],
+    maxChars,
+    usedChars: sourceRead.text.length,
+  };
+  const searchTrace = search.trace;
+  if (!searchTrace) return null;
+  return {
+    search: { ...searchTrace, queryAttempts },
+    format,
+    maxTokens,
+    maxChars,
+    sourceFactsTokenBudget: maxSourceFactsTokens,
+    queryAttempts,
+  };
 }
 
 function mergeOriginalSources(read: MemorySearchRead, sources: readonly OriginalSourceCandidate[]): MemorySearchRead {
@@ -401,6 +516,14 @@ export interface TurnRecall {
   found: boolean;
   status: TurnRecallStatus;
   trace?: MemoryRecallTrace;
+  /** The answer used a resolved calendar day and a journal-scoped date arm. */
+  dateFocused?: boolean;
+  /**
+   * Why a turn ended `fenced`, when the only cause was unprovable support rather than a real
+   * Forget fence. The opt-in domain supplement may still query for independently verifiable
+   * sources in that case; an actual fence never sets this.
+   */
+  fenceReasons?: NonNullable<MemorySearchTraceItem['reason']>[];
 }
 
 export interface TurnRecallReceipt {
@@ -426,6 +549,48 @@ export interface TurnRecallReceipt {
   includedSourceFactHashes: string[];
   includedSourceDocumentHashes: string[];
   automaticSourceLookup?: AutomaticSourceLookupReceipt;
+}
+
+/** One explicitly enabled, default-off domain supplement round. */
+export interface DomainSupplementOptions {
+  enabled: boolean;
+  /** Total wall-clock cap covering query, boundary readbacks and final proof minting. */
+  timeoutMs: number;
+  limits: {
+    queryTimeoutMs: number;
+    sourceFactsMaxTokens: number;
+    maxSources: number;
+    readbackTimeBudgetMs: number;
+    maxSupplementSources: number;
+    maxSupplementChars: number;
+    finalReadbackTimeBudgetMs: number;
+  };
+}
+
+/**
+ * Content-free observability for the opt-in domain supplement. Source text, spans and
+ * query strings are deliberately excluded; only counts, hashes and timings are kept.
+ */
+export interface DomainSupplementReceipt {
+  at: string;
+  enabled: true;
+  status: 'finalized' | 'fallback' | 'skipped';
+  fallbackReason: string | null;
+  baselineStatus: TurnRecallStatus;
+  queryHash: string | null;
+  candidateCount: number;
+  verifiedCount: number;
+  consumedCount: number;
+  addedSourceCount: number;
+  withheldCount: number;
+  fallbackCount: number;
+  finalizedSegmentCount: number;
+  queryCalls: number;
+  readbackCalls: number;
+  finalReadbackCalls: number;
+  supplementalChars: number;
+  elapsedMs: number;
+  rssDeltaBytes: number;
 }
 
 export interface SourceLookupReceipt {
@@ -498,8 +663,8 @@ export interface MemoryLifecycleHooks {
 /** Metadata that keeps an extracted fact tied to who said it and when, without a second fact graph. */
 export interface SourceMeta {
   actor: 'user' | 'coo' | 'affinity' | 'tool' | 'inference';
-  kind: 'fact' | 'preference' | 'plan' | 'event' | 'correction';
-  status?: 'current' | 'planned' | 'completed' | 'superseded' | 'disputed';
+  kind: 'fact' | 'preference' | 'plan' | 'reflection' | 'event' | 'correction';
+  status?: 'current' | 'planned' | 'candidate' | 'completed' | 'superseded' | 'disputed';
   saidAt?: string;
   eventId?: string;
   userVerified?: boolean;
@@ -514,6 +679,42 @@ export interface MemorySourceEvidence {
   kind?: string;
   occurredAt?: string;
 }
+
+export type ReadonlyGenerationEvidence = Readonly<Omit<GenerationEvidence, 'sources'>> & {
+  readonly sources: readonly Readonly<MemorySourceDependency>[];
+};
+
+export interface ExactMemorySourceEvidence {
+  readonly bankId: string;
+  readonly endpoint: string;
+  readonly endpointBinding: 'configured-client';
+  readonly documentId: string;
+  /** Exact `getDocument.original_text`; Coo RetainItems keep their stored prefix and truncation. */
+  readonly storedText: string;
+  readonly contentDigest: string;
+  readonly revision: string;
+  readonly sourceEpoch: number;
+  readonly fenceEpoch: string;
+  readonly evidenceEpoch: string;
+  readonly validationReceipt: string;
+  readonly actor: string | null;
+  readonly kind: string | null;
+  readonly status: string | null;
+  readonly saidAt: string | null;
+  readonly documentUpdatedAt: string;
+  readonly sdkContentHash: string | null;
+  readonly metadata: Readonly<Record<string, string>>;
+}
+
+export interface ExactCooGrowthSourceEvidence extends ExactMemorySourceEvidence {
+  readonly metadata: Readonly<Record<string, string>>;
+}
+
+export type PersistCooGrowthCandidateSourceResult =
+  | { status: 'persisted'; candidateId: string; documentId: string; artifactId: string; sourceBodyDigest: string }
+  | { status: 'queued'; candidateId: string; documentId: string; reason: string }
+  | { status: 'gated'; candidateId: string; reason: string }
+  | { status: 'persistence-error'; candidateId: string; reason: string };
 
 export interface DerivedArtifactRegistration {
   artifactId: string;
@@ -546,6 +747,13 @@ export interface HandoffArtifactCommit {
 interface MemorySourceExposure {
   attachment: Omit<EvidenceAttachment, 'segment'>;
   originalText: string;
+  actor: string | null;
+  kind: string | null;
+  status: string | null;
+  saidAt: string | null;
+  documentUpdatedAt: string;
+  sdkContentHash: string | null;
+  metadata: Readonly<Record<string, string>>;
 }
 
 function sourceMetadata(meta: SourceMeta): Record<string, string> {
@@ -556,6 +764,12 @@ function sourceMetadata(meta: SourceMeta): Record<string, string> {
   if (meta.userVerified !== undefined) out.user_verified = String(meta.userVerified);
   if (meta.supersedes?.length) out.supersedes_source_ids = JSON.stringify([...new Set(meta.supersedes)]);
   return out;
+}
+
+function stringMetadata(value: unknown): Readonly<Record<string, string>> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return Object.freeze({});
+  return Object.freeze(Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .filter((entry): entry is [string, string] => typeof entry[1] === 'string')));
 }
 
 export interface SessionBriefing {
@@ -593,6 +807,9 @@ const sourceTupleKey = (source: Pick<SourceExposureRef, 'bankId' | 'endpoint' | 
   JSON.stringify([source.bankId, source.endpoint, source.documentId]);
 const sourceProofKey = (source: SourceExposureRef): string =>
   JSON.stringify([source.validatedEpoch, source.validationReceipt, source.contentDigest]);
+const sourceRefKey = (source: SourceExposureRef): string =>
+  JSON.stringify([source.bankId, source.endpoint, source.documentId, source.validatedEpoch,
+    source.validationReceipt, source.contentDigest, source.revisionState, source.validationStatus]);
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -659,14 +876,28 @@ export class HindsightMemory {
   private readonly readBackProofs = new Map<string, string>();
   private readonly segmentProofs = new Map<string, { sourceTuple: string; sourceProof: string; sourceDigest: string;
     startUtf16: number; endUtf16: number; text: string }>();
+  /**
+   * Frozen session records keep the token and refs they were written with. A restart re-reads
+   * their sources and records the current, freshly minted proof under those persisted keys here.
+   * Nothing is inserted until document, text, span, digest, epoch, revision and fence all match.
+   */
+  private readonly refreshedSegmentProofs = new Map<string, { sourceTuple: string; sourceProof: string; sourceDigest: string;
+    startUtf16: number; endUtf16: number; text: string }>();
+  private readonly refreshedExposures = new Map<string, SourceExposureRef>();
   private readonly artifactProofs = new Map<string, Set<string>>();
   private recallCache = new Map<string, { at: number; value: string; trace?: MemoryRecallTrace }>();
   private lastRecall: TurnRecallReceipt | null = null;
+  private lastDomainSupplement: DomainSupplementReceipt | null = null;
   private lastSourceLookup: SourceLookupReceipt | null = null;
   private lastForgetSourceScan: ForgetSourceScanReceipt | null = null;
   private recallStats = { fast: 0, standard: 0, deep: 0, measured: 0, totalMs: 0 };
   /** Incremented by every invalidation; an in-flight read from an older epoch is discarded. */
   private cacheEpoch = 0;
+  /**
+   * Incremented only when the configured source namespace or its read-back proofs are reset.
+   * A retained event or a cleared read cache does not change which sources are current.
+   */
+  private sourceEpoch = 0;
   /** Whole-bank reads pause while a natural-language forget query is being resolved to sources. */
   private forgetScanDepth = 0;
   /** Fence epoch whose portraits have already been cleared in this process. */
@@ -1010,7 +1241,7 @@ export class HindsightMemory {
     const artifact = store.getDerivedArtifact(artifactId);
     if (!artifact || artifact.lifecycleState !== 'active' || artifact.bodyDigest !== sha256(content)
       || artifact.scope !== memoryArtifactScope(config.bankId, config.apiUrl)) return false;
-    if (artifact.lineageState === 'source-independent') return artifact.sources.length === 0;
+    if (artifact.lineageState === 'source-independent') return !artifact.target.startsWith('journal:generated:') && artifact.sources.length === 0;
     if (artifact.lineageState !== 'complete' || artifact.sources.length === 0) return false;
     return artifact.sources.every((source) => source.validationState === 'validated'
       && source.bankId === config.bankId && source.endpoint === config.apiUrl
@@ -1058,6 +1289,21 @@ export class HindsightMemory {
 
   derivedArtifact(artifactId: string): DerivedArtifact | null {
     return this.stateStore?.getDerivedArtifact(artifactId) ?? null;
+  }
+
+  getGenerationEvidence(sessionId: string, generationId: string): ReadonlyGenerationEvidence | null {
+    const store = this.stateStore;
+    if (!store || !sessionId || !generationId || sessionId.trim() !== sessionId || generationId.trim() !== generationId) return null;
+    try {
+      const evidence = store.getGenerationEvidence(sessionId, generationId);
+      if (!evidence || evidence.sessionId !== sessionId || evidence.generationId !== generationId) return null;
+      return Object.freeze({
+        ...evidence,
+        sources: Object.freeze(evidence.sources.map((source) => Object.freeze({ ...source }))),
+      });
+    } catch {
+      return null;
+    }
   }
 
   listDerivedArtifacts(kind: string): DerivedArtifact[] {
@@ -1144,6 +1390,145 @@ export class HindsightMemory {
     return store?.markDerivedArtifactState(artifactId, 'withdrawn', reason, new Date().toISOString()) ?? null;
   }
 
+  /** Persist an explicitly requested Coo Growth candidate as a candidate-only Hindsight source. */
+  async persistCooGrowthCandidateSource(
+    input: PersistCooGrowthCandidateSourceInput,
+  ): Promise<PersistCooGrowthCandidateSourceResult> {
+    const candidateId = input.candidate.id;
+    const trust = await verifyCooSelfGrowthCandidate(input);
+    if (trust.status !== 'candidate') return { status: 'gated', candidateId, reason: trust.reason };
+    const parentArtifact = this.derivedArtifact(candidateId);
+    if (!parentArtifact) return { status: 'gated', candidateId, reason: 'candidate artifact is unavailable' };
+    const bundle = buildCooGrowthCandidateSource(input.candidate, trust, parentArtifact);
+    if (!bundle) return { status: 'gated', candidateId, reason: 'candidate body or parent lineage is incomplete' };
+
+    const config = this.config;
+    const store = this.stateStore;
+    const outbox = this.outbox;
+    const ledger = this.ledger;
+    const expectedEpoch = this.evidenceEpoch();
+    if (!this.enabled() || !config || !store || !outbox || !ledger || !expectedEpoch) {
+      return { status: 'persistence-error', candidateId, reason: 'the configured memory store is unavailable' };
+    }
+    if (bundle.indexEvidence.bankId !== config.bankId || bundle.indexEvidence.endpoint !== config.apiUrl) {
+      return { status: 'gated', candidateId, reason: 'candidate parents do not belong to the configured Bank and endpoint' };
+    }
+    if (ledger.forgotten(config.bankId, config.apiUrl, bundle.documentId)) {
+      return { status: 'gated', candidateId, reason: 'candidate source is covered by a Forget fence' };
+    }
+
+    const now = new Date().toISOString();
+    const lineageReceiptDigest = sha256(JSON.stringify([
+      bundle.artifactId, bundle.bodyDigest, trust.evidence.generationReceiptDigest,
+      parentArtifact.lineageReceiptDigest,
+      parentArtifact.sources.map((source) => [source.bankId, source.endpoint, source.documentId,
+        source.validatedEpoch, source.validatedFence, source.revision, source.contentDigest, source.segmentDigest]),
+    ]));
+    const artifact: DerivedArtifactInput = {
+      artifactId: bundle.artifactId,
+      kind: 'coo-growth-candidate-source',
+      target: bundle.documentId,
+      scope: memoryArtifactScope(config.bankId, config.apiUrl),
+      creatorSessionId: bundle.creatorSessionId,
+      creatorGenerationId: bundle.creatorGenerationId,
+      creatorOperationId: bundle.creatorOperationId,
+      bodyDigest: bundle.bodyDigest,
+      origin: 'model-derived',
+      reviewState: 'unreviewed',
+      lifecycleState: 'pending',
+      lineageState: 'complete',
+      lineageReceiptDigest,
+      lineageValidatedAt: now,
+      statusReason: null,
+      createdAt: now,
+      updatedAt: now,
+      sources: parentArtifact.sources,
+    };
+    const existing = store.getDerivedArtifact(bundle.artifactId);
+    if (existing && (existing.kind !== artifact.kind || existing.target !== artifact.target
+      || existing.scope !== artifact.scope || existing.creatorSessionId !== artifact.creatorSessionId
+      || existing.creatorGenerationId !== artifact.creatorGenerationId || existing.creatorOperationId !== artifact.creatorOperationId
+      || existing.bodyDigest !== artifact.bodyDigest || existing.origin !== artifact.origin
+      || existing.lineageState !== artifact.lineageState || existing.lineageReceiptDigest !== artifact.lineageReceiptDigest
+      || JSON.stringify(existing.sources) !== JSON.stringify(artifact.sources))) {
+      return { status: 'persistence-error', candidateId, reason: 'candidate source artifact identity conflicts with local state' };
+    }
+    if (existing?.lifecycleState === 'active') {
+      const read = await readCooGrowthCandidateSource(input);
+      return read.status === 'trusted-candidate-source'
+        ? { status: 'persisted', candidateId, documentId: bundle.documentId, artifactId: bundle.artifactId, sourceBodyDigest: bundle.bodyDigest }
+        : { status: 'queued', candidateId, documentId: bundle.documentId, reason: read.reason };
+    }
+    if (existing && existing.lifecycleState !== 'pending') {
+      return { status: 'gated', candidateId, reason: 'candidate source artifact is no longer pending' };
+    }
+
+    try {
+      const queued = store.transaction(() => {
+        if (this.evidenceEpoch() !== expectedEpoch || ledger.damaged()
+          || ledger.forgotten(config.bankId, config.apiUrl, bundle.documentId)) return false;
+        if (!existing) store.saveDerivedArtifact(artifact);
+        const result = outbox.add({
+          bankId: config.bankId,
+          endpoint: config.apiUrl,
+          documentId: bundle.documentId,
+          content: bundle.content,
+          context: 'Coo-authored Growth candidate source. Candidate state only; no verified fact, execution, or tool permission.',
+          tags: ['scope:life', 'source:coo-growth', 'candidate:self-growth'],
+          metadata: bundle.metadata,
+          timestamp: bundle.candidateCreatedAt,
+          priority: 'low',
+        });
+        if (result !== 'queued') throw new Error(`Coo Growth source was not queued: ${result}`);
+        return true;
+      });
+      if (!queued) return { status: 'gated', candidateId, reason: 'Forget or the evidence epoch changed before queue commit' };
+    } catch (error) {
+      return { status: 'persistence-error', candidateId, reason: error instanceof Error ? error.message : String(error) };
+    }
+
+    await this.drain();
+    const exact = await this.readExactCooGrowthSourceEvidence(bundle.documentId);
+    if (!exact || !exactCooGrowthSourceMatches(exact, bundle)) {
+      return { status: 'queued', candidateId, documentId: bundle.documentId, reason: 'Hindsight has not returned the exact candidate source yet' };
+    }
+    const currentTrust = await verifyCooSelfGrowthCandidate(input);
+    if (currentTrust.status !== 'candidate' || JSON.stringify(currentTrust.evidence) !== JSON.stringify(trust.evidence)) {
+      return { status: 'gated', candidateId, reason: 'candidate or parent evidence changed during Hindsight write' };
+    }
+    const finalExact = await this.readExactCooGrowthSourceEvidence(bundle.documentId);
+    if (!finalExact || !exactCooGrowthSourceMatches(finalExact, bundle)
+      || finalExact.validationReceipt !== exact.validationReceipt) {
+      return { status: 'queued', candidateId, documentId: bundle.documentId, reason: 'Hindsight source changed during final read-back' };
+    }
+    const indexEvidence = this.cooGrowthIndexEvidence(finalExact);
+    if (!indexEvidence) return { status: 'queued', candidateId, documentId: bundle.documentId, reason: 'Coo source metadata is incomplete' };
+
+    try {
+      const committed = store.transaction(() => {
+        if (this.evidenceEpoch() !== expectedEpoch || ledger.damaged()
+          || ledger.forgotten(config.bankId, config.apiUrl, bundle.documentId)) return false;
+        store.putCooGrowthCandidateClassification({
+          ...bundle.classification,
+          sourceEpoch: finalExact.sourceEpoch,
+          sourceRevision: finalExact.contentDigest,
+          updatedAt: new Date().toISOString(),
+        }, indexEvidence);
+        return !!store.activateDerivedArtifact(bundle.artifactId, bundle.creatorOperationId, new Date().toISOString());
+      });
+      if (!committed) {
+        return { status: 'queued', candidateId, documentId: bundle.documentId, reason: 'candidate source was not activated after final safety checks' };
+      }
+    } catch (error) {
+      return { status: 'persistence-error', candidateId, reason: error instanceof Error ? error.message : String(error) };
+    }
+
+    const read = await readCooGrowthCandidateSource(input);
+    return read.status === 'trusted-candidate-source'
+      ? { status: 'persisted', candidateId, documentId: bundle.documentId, artifactId: bundle.artifactId, sourceBodyDigest: bundle.bodyDigest }
+      : { status: 'queued', candidateId, documentId: bundle.documentId, reason: read.reason };
+  }
+
   private persistUnknownDerivedArtifact(input: {
     artifactId: string;
     kind: string;
@@ -1185,9 +1570,13 @@ export class HindsightMemory {
     this.failedRefreshEpochs.clear();
     this.recallStats = { fast: 0, standard: 0, deep: 0, measured: 0, totalMs: 0 };
     this.lastRecall = null;
+    this.lastDomainSupplement = null;
     this.lastSourceLookup = null;
     this.lastForgetSourceScan = null;
     this.cacheEpoch += 1;
+    // A new deployment or endpoint can hold other sources; proofs from the previous configuration
+    // must not survive it.
+    this.sourceEpoch += 1;
     this.latestDelivery = null;
     this.briefing = null;
     if (this.drainTimer) {
@@ -1209,7 +1598,15 @@ export class HindsightMemory {
     this.opsClient = null;
     this.client = null;
     if (!this.config.enabled) return;
+    let heldOperationKeys: Set<string> | null = null;
     try {
+      const holdFile = join(rootDir, 'memory-delivery-holds.json');
+      if (existsSync(holdFile)) {
+        const hold = JSON.parse(readFileSync(holdFile, 'utf8'));
+        if (hold.v !== 1 || !Array.isArray(hold.operationKeys) || hold.operationKeys.length > 4096
+          || hold.operationKeys.some((key: unknown) => typeof key !== 'string' || !/^[a-f0-9]{64}$/.test(key))) throw new Error('The memory delivery hold list is invalid');
+        heldOperationKeys = new Set<string>(hold.operationKeys);
+      }
       this.stateStore = openMemoryStateStore(join(rootDir, 'memory-state.sqlite'));
       if (!this.stateStore.imported('outbox-v1') || !this.stateStore.imported('forget-v1')) {
         const legacyForget = readLegacyForget(
@@ -1223,7 +1620,7 @@ export class HindsightMemory {
           forgetDamaged: legacyForget.damaged,
         });
       }
-      this.outbox = new MemoryOutbox(this.stateStore, { log });
+      this.outbox = new MemoryOutbox(this.stateStore, { log, preserveFinished: this.config.readOnly || heldOperationKeys !== null });
       this.ledger = new ForgetLedger(this.stateStore, { log });
       this.ledger.damaged();
       this.client = new HindsightClient({
@@ -1243,17 +1640,20 @@ export class HindsightMemory {
       this.ledger = null;
       return;
     }
-    this.delivery = new OutboxDelivery(this.outbox, this.deliveryOps(), {
+    this.delivery = this.config.readOnly ? null : new OutboxDelivery(this.outbox, this.deliveryOps(), {
       log,
       target: () => ({ bankId: this.config!.bankId, endpoint: this.config!.apiUrl }),
-      forgotten: (item) => !!this.ledger?.damaged() || (this.ledger?.forgotten(
+      ...(heldOperationKeys ? { held: (item: OutboxItem) => heldOperationKeys!.has(sha256(JSON.stringify([item.bankId, item.endpoint, item.operationId]))) } : {}),
+      forgotten: (item) => !!this.ledger?.damaged()
+        || (item.documentId.startsWith('journal:generated:') && !this.sourceVisible(item.documentId))
+        || (this.ledger?.forgotten(
         item.bankId ?? this.config!.bankId,
         item.endpoint ?? this.config!.apiUrl,
         item.documentId,
       ) ?? false),
     });
     this.booting = this.runBootstrap();
-    this.startDelivery();
+    if (!this.config.readOnly) this.startDelivery();
   }
 
   enabled(): boolean {
@@ -1266,6 +1666,75 @@ export class HindsightMemory {
 
   bankId(): string | null {
     return this.config?.bankId ?? null;
+  }
+
+  /** The configured Hindsight endpoint, for consumers that must bind one source namespace. */
+  endpoint(): string | null {
+    return this.config?.apiUrl ?? null;
+  }
+
+  /**
+   * Reader-only facade over the live state store. Returns null unless the ordinary memory
+   * path is fully enabled and writable state is healthy.
+   */
+  domainStore(): SourceDomainReadStore | null {
+    return this.enabled() && this.stateStore ? createSourceDomainReadStore(this.stateStore) : null;
+  }
+
+  /**
+   * Readback provider bound to this bank, endpoint, real client and durable Forget epoch.
+   * It returns source bodies for verification only; it never writes or mutates memory.
+   */
+  domainReadbackProvider(): TrustedSourceReadbackProvider | null {
+    const config = this.config;
+    const client = this.client;
+    const ledger = this.ledger;
+    if (!config || !client || !ledger || !this.enabled()) return null;
+    return createSourceDomainReadbackAdapter({
+      bankId: config.bankId,
+      endpoint: config.apiUrl,
+      client,
+      epoch: (bankId, endpoint) => {
+        try { return ledger.epoch(bankId, endpoint); } catch { return -1; }
+      },
+    });
+  }
+
+  /**
+   * Supplement source types. This round deliberately mirrors the stock Recall allow-list;
+   * no additional source type (for example `opinion`) is enabled here.
+   */
+  domainSupplementTypes(): readonly string[] {
+    return [...(this.config?.recall.types ?? [])];
+  }
+
+  /** Default-off supplement budget and limits, separate from the stock Recall budget. */
+  domainSupplementOptions(): DomainSupplementOptions | null {
+    const config = this.config;
+    const supplement = config?.domainSupplement;
+    if (!supplement) return null;
+    return {
+      enabled: supplement.enabled,
+      timeoutMs: supplement.timeoutMs,
+      limits: {
+        queryTimeoutMs: supplement.queryTimeoutMs,
+        sourceFactsMaxTokens: DOMAIN_SUPPLEMENT_SOURCE_FACTS_TOKEN_BUDGET,
+        maxSources: supplement.maxSources,
+        readbackTimeBudgetMs: supplement.readbackTimeBudgetMs,
+        maxSupplementSources: supplement.maxSupplementSources,
+        maxSupplementChars: supplement.maxSupplementChars,
+        finalReadbackTimeBudgetMs: supplement.finalReadbackTimeBudgetMs,
+      },
+    };
+  }
+
+  /** Keeps one content-free receipt for the most recent opt-in supplement round. */
+  recordDomainSupplement(receipt: DomainSupplementReceipt): void {
+    this.lastDomainSupplement = { ...receipt };
+  }
+
+  lastDomainSupplementReceipt(): DomainSupplementReceipt | null {
+    return this.lastDomainSupplement ? { ...this.lastDomainSupplement } : null;
   }
 
   bootstrap(): Promise<void> {
@@ -1282,7 +1751,7 @@ export class HindsightMemory {
   }
 
   private async drain(): Promise<void> {
-    if (this.draining || !this.delivery) return;
+    if (this.config?.readOnly || this.draining || !this.delivery) return;
     this.draining = true;
     try {
       if (!this.canTry() || !await this.ensureStarted()) return;
@@ -1305,7 +1774,7 @@ export class HindsightMemory {
 
   /** Retry remote deletions for the current bank; tasks for another bank stay pending. */
   private async drainDeletions(): Promise<void> {
-    if (!this.ledger || !this.canTry() || !await this.ensureStarted()) return;
+    if (this.config?.readOnly || !this.ledger || !this.canTry() || !await this.ensureStarted()) return;
     const config = this.config!;
     for (const task of this.ledger.due(new Date(), 8, { bankId: config.bankId, endpoint: config.apiUrl })) {
       if (task.operationId) {
@@ -1345,6 +1814,24 @@ export class HindsightMemory {
     return {
       retain: async (item: OutboxItem) => {
         try {
+          if (item.documentId.startsWith('journal:generated:')) {
+            if (!await this.verifyDerivedArtifact(`journal-output:${item.documentId}`, item.content)) {
+              throw new DeliveryError('journal source evidence is no longer current', true);
+            }
+            try {
+              const existing = await this.client!.getDocument(item.bankId ?? config().bankId, item.documentId, { signal: AbortSignal.timeout(5_000) });
+              if (existing) {
+                if (existing.id !== item.documentId || existing.bank_id !== (item.bankId ?? config().bankId)
+                  || existing.original_text !== item.content
+                  || Object.entries(item.metadata ?? {}).some(([key, value]) => existing.document_metadata?.[key] !== value)) {
+                  throw new DeliveryError('journal identity already exists with different content or provenance', true);
+                }
+                return { async: false, operationId: null };
+              }
+            } catch (error) {
+              if (!isMissing(error)) throw error;
+            }
+          }
           const response = await this.client!.retain(item.bankId ?? config().bankId, item.content, {
             documentId: item.documentId,
             context: item.context,
@@ -1436,6 +1923,11 @@ export class HindsightMemory {
     this.bootingNow = true;
     try {
       await this.ensureServer();
+      if (this.config.readOnly) {
+        await this.client!.getBankConfig(this.config.bankId, { signal: AbortSignal.timeout(5_000) });
+        this.ready = true;
+        return;
+      }
       await this.ensureBank();
       this.ready = true;
       // A portrait is rebuilt only after the sources behind it are gone from the bank.
@@ -1468,7 +1960,7 @@ export class HindsightMemory {
 
   private async ensureServer(): Promise<void> {
     const config = this.config;
-    if (!config?.enabled || !config.autostart || !config.apiUrl || this.autostartTried) return;
+    if (!config?.enabled || config.readOnly || !config.autostart || !config.apiUrl || this.autostartTried) return;
     let host: string;
     try {
       host = new URL(config.apiUrl).hostname;
@@ -1574,7 +2066,11 @@ export class HindsightMemory {
       if (epoch !== this.cacheEpoch) return { text: '', source: 'none' };
       if (!fallback.text) return { text: '', source: 'none' };
       const evidence = await this.evidenceForRead(fallback);
-      if (epoch !== this.cacheEpoch || evidence.length === 0) return { text: '', source: 'none' };
+      // A briefing whose sources do not cover every character must not enter the session
+      // prefix: requireCompleteEvidence would reject every later request in that session.
+      if (epoch !== this.cacheEpoch || evidence.length === 0 || !evidenceCoversText(fallback.text, evidence)) {
+        return { text: '', source: 'none' };
+      }
       const value: SessionBriefing = { text: fallback.text, source: 'recall', evidence };
       this.briefing = { at: Date.now(), value };
       return value;
@@ -1746,14 +2242,29 @@ export class HindsightMemory {
           retrievalScores,
         } : undefined;
         if (traceItem) traceItems.push(traceItem);
+        const observation = result.type === 'observation';
+        const parentUnavailable = !!documentId && documentId.startsWith('coo:') && !this.sourceVisible(documentId);
+        // A direct result carries its own source text; an unprovable derived parent must not speak.
+        if (!observation && parentUnavailable) {
+          blockedDerivedResults += 1;
+          if (traceItem) {
+            traceItem.disposition = 'filtered';
+            traceItem.reason = 'derived-source-lineage-unavailable';
+          }
+          return [];
+        }
+        const factOnly = observation && (!documentId || parentUnavailable);
         let missingSourceFact = false;
+        let sourceMetadataIncomplete = false;
         let forgottenSupport = false;
+        let unavailableDerivedSupport = false;
         let currentQuestionSupport = false;
         for (const sourceFactId of sourceFactIds) {
           const fact = sourceFactsById[sourceFactId];
           const factDocumentId = fact?.document_id?.trim();
           const text = String(fact?.text ?? '').trim();
           if (!fact || fact.id !== sourceFactId || !factDocumentId || !text) {
+            // The server declared a fact it did not return: this result's support is incomplete.
             missingSourceFact = true;
             continue;
           }
@@ -1763,14 +2274,27 @@ export class HindsightMemory {
           }
           if (factDocumentId === opts.userEventDocumentId) {
             currentQuestionSupport = true;
-            missingSourceFact = true;
+            if (!factOnly) missingSourceFact = true;
+            continue;
+          }
+          if (factDocumentId.startsWith('coo:') && !this.sourceVisible(factDocumentId)) {
+            // A Coo-derived fact without reconstructable lineage is excluded on its own; it must
+            // never make the independently verifiable user facts of the same result unusable.
+            unavailableDerivedSupport = true;
+            if (!factOnly) missingSourceFact = true;
             continue;
           }
           const factMetadata = fact.metadata ? { ...fact.metadata } : {};
-          if (!historicalSourceMetadata(factMetadata)) {
+          const metadataIncomplete = !historicalSourceMetadata(factMetadata);
+          const candidateMetadataCanBeReadBack = opts.allowUnattributedSourceCandidates === true
+            && (factMetadata.source_actor === undefined || factMetadata.source_actor === 'user')
+            && (factMetadata.kind === undefined || factMetadata.kind === 'event' || factMetadata.kind === 'correction')
+            && factMetadata.status !== 'disputed' && factMetadata.status !== 'superseded';
+          if (metadataIncomplete && !candidateMetadataCanBeReadBack) {
             missingSourceFact = true;
             continue;
           }
+          sourceMetadataIncomplete ||= metadataIncomplete;
           const partnerFactStatus = this.partnerSourceStatusFor(factDocumentId);
           if (partnerFactStatus) factMetadata.status = partnerFactStatus;
           else if (currentRevisions.has(factDocumentId)) factMetadata.status = 'current';
@@ -1782,26 +2306,68 @@ export class HindsightMemory {
             date: String(fact.occurred_start ?? fact.mentioned_at ?? ''),
             documentId: factDocumentId,
             ...(Object.keys(factMetadata).length > 0 ? { metadata: factMetadata } : {}),
+            ...(metadataIncomplete ? { metadataIncomplete: true } : {}),
           });
-          traceItem?.verifiedSources.push({ sourceFactId, documentId: factDocumentId });
+          if (!metadataIncomplete) traceItem?.verifiedSources.push({ sourceFactId, documentId: factDocumentId });
         }
-        const cannotVerifySupport = sourceFactIds.length > 0 && missingSourceFact && sourceFacts.length === 0;
+        const cannotVerifySupport = sourceFactIds.length > 0 && missingSourceFact;
         // An observation's parent document does not identify the sources it was derived from.
-        const unlinkedObservation = result.type === 'observation' && sourceFactIds.length === 0;
+        const unlinkedObservation = observation && sourceFactIds.length === 0;
         const currentQuestionResult = !!documentId && documentId === opts.userEventDocumentId;
-        const missingDirectSource = result.type !== 'observation' && !documentId && sourceFacts.length === 0;
-        const unverifiedDirectSource = result.type !== 'observation' && !historicalSourceMetadata(metadata);
+        const missingDirectSource = !observation && !documentId && sourceFacts.length === 0;
+        const unverifiedDirectSource = !observation && !historicalSourceMetadata(metadata);
         if (traceItem) traceItem.sourceFactsIncomplete = sourceFactIds.length > 0 && missingSourceFact;
+        if (factOnly) {
+          // The summary text of a parentless or lineage-unavailable observation is derived and is
+          // never injected on its own. When at least one of its declared source facts is
+          // independently verified, those exact facts are kept as the unit of delivery; otherwise
+          // the result stays withheld.
+          if (sourceFacts.length === 0) {
+            blockedDerivedResults += 1;
+            if (traceItem) {
+              traceItem.disposition = 'filtered';
+              traceItem.reason = forgottenSupport ? 'forgotten-support'
+                : unavailableDerivedSupport ? 'derived-source-lineage-unavailable'
+                  : currentQuestionSupport || currentQuestionResult ? 'current-question-source'
+                    : cannotVerifySupport ? 'unverified-source-fact'
+                      : 'unlinked-observation';
+            }
+            return [];
+          }
+          const mapped: MemorySearchResult = {
+            id: result.id,
+            text: '',
+            type: String(result.type ?? 'memory'),
+            date: String(result.occurred_start ?? result.mentioned_at ?? ''),
+            documentId,
+            retrievalScores,
+            ...(typeof result.scores?.reranker === 'number' && Number.isFinite(result.scores.reranker)
+              ? { matchScore: result.scores.reranker }
+              : typeof result.scores?.semantic === 'number' && Number.isFinite(result.scores.semantic)
+                ? { matchScore: result.scores.semantic }
+                : {}),
+            sourceFacts,
+            derivedSummaryOmitted: true,
+            ...(sourceFactIds.length > 0 && missingSourceFact ? { sourceFactsIncomplete: true } : {}),
+            queryIndexes: [opts.queryIndex ?? 0],
+          };
+          // Each kept fact is independently verified, so a missing sibling fact marks the set as
+          // incomplete but never suppresses the verified facts of the same container.
+          verifiedSupport.add(mapped);
+          if (traceItem) traceByMapped?.set(mapped, traceItem);
+          return [mapped];
+        }
         if (forgottenSupport || currentQuestionSupport || currentQuestionResult || cannotVerifySupport
           || unlinkedObservation || missingDirectSource || unverifiedDirectSource) {
           blockedDerivedResults += 1;
           if (traceItem) {
             traceItem.disposition = 'filtered';
             traceItem.reason = forgottenSupport ? 'forgotten-support'
-              : currentQuestionSupport || currentQuestionResult ? 'current-question-source'
-                : missingDirectSource ? 'missing-source-id'
-                  : cannotVerifySupport || unverifiedDirectSource ? 'unverified-source-fact'
-                    : 'unlinked-observation';
+              : unavailableDerivedSupport ? 'derived-source-lineage-unavailable'
+                : currentQuestionSupport || currentQuestionResult ? 'current-question-source'
+                  : missingDirectSource ? 'missing-source-id'
+                    : cannotVerifySupport || unverifiedDirectSource ? 'unverified-source-fact'
+                      : 'unlinked-observation';
           }
           return [];
         }
@@ -1824,7 +2390,7 @@ export class HindsightMemory {
           ...(sourceFactsIncomplete ? { sourceFactsIncomplete: true } : {}),
           queryIndexes: [opts.queryIndex ?? 0],
         };
-        if (sourceFactIds.length > 0 && !missingSourceFact) verifiedSupport.add(mapped);
+        if (sourceFactIds.length > 0 && !missingSourceFact && !sourceMetadataIncomplete) verifiedSupport.add(mapped);
         if (traceItem) traceByMapped?.set(mapped, traceItem);
         return [mapped];
       });
@@ -1875,8 +2441,123 @@ export class HindsightMemory {
     return (await this.searchResultsDetailed(query, opts)).results;
   }
 
+  /**
+   * Reads valid memory units whose own date falls inside one resolved local day.
+   *
+   * A source can carry an unambiguous `mentioned_at` and still lose text retrieval: its body may
+   * not repeat the date, and the document id is not part of the text index. The date arm reads the
+   * bank's indexed time column, then applies the same metadata and Forget checks as recall. It
+   * does not read original documents and grants no trust by itself.
+   */
+  private async searchDatedResults(context: RecallDateContext, opts: RecallOptions = {}): Promise<MemorySearchRead> {
+    const traceItems: MemorySearchTraceItem[] = [];
+    const finishRead = (results: MemorySearchResult[], status: MemoryReadStatus): MemorySearchRead => ({
+      results,
+      status,
+      ...(results.length ? { dateFocused: true } : {}),
+      ...(opts.captureTrace ? {
+        trace: {
+          items: traceItems,
+          candidateResultIndexes: traceItems.filter((item) => item.disposition === 'visible').map((item) => item.resultIndex),
+          candidateResultIds: traceItems.filter((item) => item.disposition === 'visible').map((item) => item.resultId),
+          status,
+          sourceFactsTruncated: false,
+        },
+      } : {}),
+    });
+    if (this.forgetScanDepth > 0) return finishRead([], 'fenced');
+    if (!this.canTry() || !await this.ensureStarted()) return finishRead([], 'unavailable');
+    const epoch = this.cacheEpoch;
+    const config = this.config!;
+    const deadline = AbortSignal.timeout(opts.timeoutMs ?? config.recall.timeoutMs);
+    try {
+      const listPage = (tags: string[]) => this.client!.listMemories(config.bankId, {
+        limit: DATED_RECALL_PAGE_SIZE,
+        offset: 0,
+        state: 'valid',
+        timeField: 'mentioned_at',
+        startDate: context.start,
+        endDate: context.end,
+        ...(tags.length ? { tags, tagsMatch: 'any_strict' as const } : {}),
+        signal: deadline,
+      });
+      // A day can hold thousands of chat units, so the journal scoped page is read first; the
+      // unscoped page follows only for a general record or "what happened" question.
+      const pages = [await listPage(['source:journal'])];
+      if (context.recordKind === 'none') pages.push(await listPage([]));
+      if (epoch !== this.cacheEpoch) return finishRead([], 'fenced');
+      if (this.ledger?.damaged()) return finishRead([], 'fenced');
+      const candidates: Array<{ result: MemorySearchResult; journalLike: boolean }> = [];
+      for (const page of pages) {
+        for (const item of page.items) {
+          if (candidates.length >= MAX_DATED_RECALL_UNITS) break;
+          const documentId = item.document_id?.trim();
+          const text = String(item.text ?? '').trim();
+          if (!documentId || !text || item.fact_type === 'observation') continue;
+          if (item.fact_type !== 'world' && item.fact_type !== 'experience') continue;
+          if (this.forgottenSource(documentId)) continue;
+          const metadata = { ...stringMetadata(item.metadata) };
+          if (!historicalSourceMetadata(metadata)) continue;
+          const tags = Array.isArray(item.tags) ? item.tags : [];
+          const journalLike = tags.includes('source:journal') || documentId.startsWith('journal:')
+            || /(?:journal|diary|日记|日志|手记)/iu.test(`${String(item.context ?? '')}\n${text}`);
+          if (context.recordKind !== 'none' && !journalLike) continue;
+          if (candidates.some((candidate) => candidate.result.id === item.id)) continue;
+          candidates.push({
+            journalLike,
+            result: {
+              id: item.id,
+              text,
+              type: item.fact_type,
+              date: String(item.occurred_start ?? item.mentioned_at ?? item.date ?? ''),
+              documentId,
+              metadata,
+              queryIndexes: [opts.queryIndex ?? 0],
+              unitKey: item.id,
+            },
+          });
+        }
+      }
+      // A record question prefers the matching record source; every candidate still has to pass
+      // the metadata check above, so the ordering cannot promote an unattributed file or note.
+      candidates.sort((left, right) => Number(right.journalLike) - Number(left.journalLike));
+      const results: MemorySearchResult[] = [];
+      const documents = new Set<string>();
+      for (const candidate of candidates) {
+        const documentId = candidate.result.documentId!;
+        if (!documents.has(documentId) && documents.size >= MAX_DATED_RECALL_DOCUMENTS) continue;
+        documents.add(documentId);
+        results.push(candidate.result);
+      }
+      for (const [index, result] of results.entries()) {
+        traceItems.push({
+          resultIndex: index,
+          queryIndex: opts.queryIndex ?? 0,
+          resultId: result.id,
+          parentDocumentId: result.documentId,
+          declaredSourceFactIds: [],
+          verifiedSources: [],
+          disposition: 'visible',
+          sourceFactsIncomplete: false,
+        });
+      }
+      return finishRead(results, results.length ? 'found' : 'absent');
+    } catch (err) {
+      if (!deadline.aborted) this.noteFailure('recall', err);
+      return finishRead([], 'unavailable');
+    }
+  }
+
   async recallBlockDetailed(query: string, opts: RecallOptions = {}): Promise<MemoryTextRead> {
-    const read = await this.searchResultsDetailed(query, opts);
+    const plan = planRecallQueries(query);
+    const primary = await this.searchResultsDetailed(query, opts);
+    let read = primary;
+    if (plan.dateContext && primary.status !== 'fenced') {
+      const dated = await this.searchDatedResults(plan.dateContext, opts);
+      if (dated.status === 'found') {
+        read = plan.dateContext.recordKind === 'none' ? mergeRecallReads([primary, dated]) : dated;
+      } else if (dated.status === 'fenced') read = primary;
+    }
     if (opts.activationEnabled !== false && opts.userEventDocumentId && read.status === 'found') {
       this.reinforceFromUserTurn(read.results, opts.userEventDocumentId, query);
     }
@@ -1886,7 +2567,8 @@ export class HindsightMemory {
   private formatSearchReadDetailed(read: MemorySearchRead, opts: RecallOptions = {}): MemoryTextRead {
     const config = this.config;
     const maxTokens = opts.maxTokens ?? config?.recall.maxTokens ?? 900;
-    const maxChars = opts.maxChars ?? recallContextCharBudget(maxTokens, resolveSourceFactsTokenBudget(opts.maxSourceFactsTokens ?? config?.recall.maxSourceFactsTokens));
+    const requestedChars = opts.maxChars ?? recallContextCharBudget(maxTokens, resolveSourceFactsTokenBudget(opts.maxSourceFactsTokens ?? config?.recall.maxSourceFactsTokens));
+    const maxChars = read.dateFocused ? Math.min(requestedChars, DATE_FOCUSED_MAX_CHARS) : requestedChars;
     const formattedResults = read.results.map((result) => ({
       id: result.id,
       text: result.text,
@@ -1903,21 +2585,26 @@ export class HindsightMemory {
     }));
     const formatOptions = {
       maxChars,
-      ...(opts.maxItems === undefined ? {} : { maxItems: opts.maxItems }),
+      ...(opts.maxItems === undefined
+        ? (read.dateFocused ? { maxItems: 1 } : {})
+        : { maxItems: read.dateFocused ? Math.min(opts.maxItems, 1) : opts.maxItems }),
       ...(opts.coverageWeight === undefined ? {} : { coverageWeight: opts.coverageWeight }),
       ...(opts.activationEnabled === false
         ? { activationInfluence: 0 }
         : opts.activationInfluence === undefined ? {} : { activationInfluence: opts.activationInfluence }),
       ...(read.sourceFactsTruncated ? { sourceFactsTruncated: true } : {}),
+      ...(read.dateFocused ? { preserveDirectText: true } : {}),
     };
     if (opts.captureTrace) {
       const formatted = formatRecallDetailed(formattedResults, formatOptions);
       const incomplete = read.sourceFactsTruncated ? { sourceFactsTruncated: true } : {};
-      if (!read.trace) return { text: formatted.text, status: formatted.text ? 'found' : read.status, ...incomplete };
+      const dateFocused = read.dateFocused ? { dateFocused: true } : {};
+      if (!read.trace) return { text: formatted.text, status: formatted.text ? 'found' : read.status, ...incomplete, ...dateFocused };
       return {
         text: formatted.text,
         status: formatted.text ? 'found' : read.results.length > 0 ? 'absent' : read.status,
         ...incomplete,
+        ...dateFocused,
         trace: {
           search: read.trace,
           format: formatted.trace,
@@ -1929,9 +2616,10 @@ export class HindsightMemory {
       };
     }
     const text = formatRecall(formattedResults, formatOptions);
+    const dateFocused = read.dateFocused ? { dateFocused: true } : {};
     return text
-      ? { text, status: 'found', ...(read.sourceFactsTruncated ? { sourceFactsTruncated: true } : {}) }
-      : { text: '', status: read.status === 'found' ? 'absent' : read.status, ...(read.sourceFactsTruncated ? { sourceFactsTruncated: true } : {}) };
+      ? { text, status: 'found', ...(read.sourceFactsTruncated ? { sourceFactsTruncated: true } : {}), ...dateFocused }
+      : { text: '', status: read.status === 'found' ? 'absent' : read.status, ...(read.sourceFactsTruncated ? { sourceFactsTruncated: true } : {}), ...dateFocused };
   }
 
   async recallBlock(query: string, opts: RecallOptions = {}): Promise<string> {
@@ -1944,6 +2632,9 @@ export class HindsightMemory {
     candidateDocumentIds?: readonly string[];
     fallbackPhrases?: readonly string[];
     candidateOnly?: boolean;
+    maxSources?: number;
+    maxChars?: number;
+    maxSourceChars?: number;
     timeoutMs?: number;
   } = {}): Promise<MemoryTextRead> {
     const started = Date.now();
@@ -1995,9 +2686,12 @@ export class HindsightMemory {
     const timeoutMs = Math.min(config.recall.timeoutMs, opts.timeoutMs ?? config.recall.timeoutMs);
     if (timeoutMs <= 0) return finish('', 'unavailable');
     const deadline = AbortSignal.timeout(timeoutMs);
-    const {
-      maxChars, maxDocuments, maxSourceReads, maxSources, pageSize, concurrency,
-    } = SOURCE_LOOKUP_LIMITS;
+    const { maxDocuments, maxSourceReads, pageSize, concurrency } = SOURCE_LOOKUP_LIMITS;
+    const bounded = (value: number | undefined, fallback: number, ceiling: number): number =>
+      Number.isInteger(value) ? Math.min(ceiling, Math.max(1, value!)) : fallback;
+    const maxSources = bounded(opts.maxSources, SOURCE_LOOKUP_LIMITS.maxSources, 50);
+    const maxChars = bounded(opts.maxChars, SOURCE_LOOKUP_LIMITS.maxChars, 65_536);
+    const maxSourceChars = bounded(opts.maxSourceChars, SOURCE_LOOKUP_LIMITS.maxChars, 16_384);
     const header = opts.fallbackPhrases?.length || opts.candidateDocumentIds?.length
       ? SOURCE_LOOKUP_CANDIDATE_HEADER
       : SOURCE_LOOKUP_HEADER;
@@ -2045,8 +2739,8 @@ export class HindsightMemory {
           matchType,
           matchChars: matched.reduce((length, needle) => Math.max(length, needle.text.length), 0),
         });
-        const bounded = safe.text.slice(0, maxChars);
-        candidateBodies.set(doc.id, { text: bounded, clipped: bounded.length < safe.text.length });
+        const boundedText = safe.text.slice(0, maxSourceChars);
+        candidateBodies.set(doc.id, { text: boundedText, clipped: boundedText.length < safe.text.length });
       };
 
       const candidateLimit = opts.candidateOnly ? maxSources : MAX_PRIORITY_SOURCE_DOCUMENTS;
@@ -2181,7 +2875,15 @@ export class HindsightMemory {
       maxSourceFactsTokens: config.recall.maxSourceFactsTokens,
       budget: config.recall.budget,
     } : {});
-    const finish = (text: string, status: TurnRecallStatus, trace?: MemoryRecallTrace, cacheHit = false, automaticSourceLookup?: SourceLookupReceipt): TurnRecall => {
+    let dateFocused = false;
+    const finish = (
+      text: string,
+      status: TurnRecallStatus,
+      trace?: MemoryRecallTrace,
+      cacheHit = false,
+      automaticSourceLookup?: SourceLookupReceipt,
+      fenceReasons?: NonNullable<MemorySearchTraceItem['reason']>[],
+    ): TurnRecall => {
       this.recallStats[plan.route] += 1;
       if (plan.route !== 'fast') {
         this.recallStats.measured += 1;
@@ -2222,9 +2924,13 @@ export class HindsightMemory {
         found: status === 'found' && !!text,
         status,
         ...(context.captureTrace && trace ? { trace } : {}),
+        ...(dateFocused ? { dateFocused: true } : {}),
+        ...(fenceReasons?.length ? { fenceReasons: [...new Set(fenceReasons)] } : {}),
       };
     };
     if (plan.route === 'fast') return finish('', 'skipped');
+    const queryPlan = planRecallQueries(query);
+    dateFocused = queryPlan.dateContext?.recordKind !== undefined && queryPlan.dateContext.recordKind !== 'none';
     const key = `${config?.bankId ?? ''}|${config?.apiUrl ?? ''}|${this.visibilityEpoch()}|${plan.route}|${context.userEventDocumentId ?? ''}|${context.activationEnabled === false ? 'disabled' : 'enabled'}|${context.activationInfluence ?? 'default'}|${query.trim().toLowerCase().slice(0, 300)}`;
     const cached = !context.captureTrace && plan.route === 'standard' ? this.recallCache.get(key) : undefined;
     if (cached && Date.now() - cached.at < 5 * 60_000) return finish(cached.value, 'found', cached.trace, true);
@@ -2250,7 +2956,6 @@ export class HindsightMemory {
       }
       return finish(read.text, read.status, read.trace);
     }
-    const queryPlan = planRecallQueries(query);
     const queryAttempts: RecallQueryAttemptTrace[] = [];
     const reads: MemorySearchRead[] = [];
     const queryHash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -2291,10 +2996,115 @@ export class HindsightMemory {
     };
 
     const primary = await runRecall(query, 0, 'primary', false);
-    if (epoch !== this.cacheEpoch || primary.status === 'fenced') return finish('', 'fenced');
+    if (epoch !== this.cacheEpoch) return finish('', 'fenced');
+    if (primary.status === 'fenced') {
+      const fencedReasons = (primary.trace?.items ?? [])
+        .filter((item) => item.disposition === 'filtered' || item.disposition === 'fenced')
+        .map((item) => item.reason);
+      const exactFallbackAllowed = plan.route === 'deep' && fencedReasons.length > 0
+        && fencedReasons.every((reason) => reason === 'unverified-source-fact');
+      if (!exactFallbackAllowed) {
+        return finish('', 'fenced', undefined, false, undefined, (primary.trace?.items ?? [])
+          .filter((item) => item.disposition === 'filtered' || item.disposition === 'fenced')
+          .flatMap((item) => item.reason ? [item.reason] : []));
+      }
+
+      const remainingForCandidates = Math.max(0, plan.timeoutMs - (Date.now() - started));
+      const candidateReadStarted = Date.now();
+      const candidateTimeoutMs = Math.min(this.config?.domainSupplement.queryTimeoutMs ?? 8_000, remainingForCandidates);
+      if (candidateTimeoutMs <= 0) return finish('', 'fenced');
+      const candidateRead = await this.searchResultsDetailed(query, {
+        budget: 'low',
+        maxTokens: SUPPLEMENTAL_RECALL_MAX_TOKENS,
+        maxSourceFactsTokens: DOMAIN_SUPPLEMENT_SOURCE_FACTS_TOKEN_BUDGET,
+        timeoutMs: candidateTimeoutMs,
+        types: [...this.domainSupplementTypes()],
+        activationEnabled: false,
+        captureTrace: true,
+        allowUnattributedSourceCandidates: true,
+        ...(context.userEventDocumentId ? { userEventDocumentId: context.userEventDocumentId } : {}),
+        queryIndex: 1,
+      });
+      queryAttempts.push({
+        queryHash: queryHash(query),
+        strategy: 'topic',
+        status: candidateRead.status,
+        elapsedMs: Date.now() - candidateReadStarted,
+        resultCount: candidateRead.results.length,
+        sourceFactsTruncated: candidateRead.sourceFactsTruncated === true,
+        ...(candidateRead.trace?.recallTokenBudget === undefined ? {} : { recallTokenBudget: candidateRead.trace.recallTokenBudget }),
+        ...(candidateRead.trace?.sourceFactsTokenBudget === undefined ? {} : { sourceFactsTokenBudget: candidateRead.trace.sourceFactsTokenBudget }),
+      });
+      if (epoch !== this.cacheEpoch || candidateRead.status !== 'found' || candidateRead.sourceFactsTruncated
+        || candidateRead.results.some((result) => result.sourceFactsIncomplete)
+        || !candidateRead.trace?.sourceFactCounts
+        || candidateRead.trace.sourceFactCounts.missing > 0
+        || candidateRead.trace.sourceFactCounts.invalid > 0) return finish('', 'fenced');
+      const candidateDocumentIds = userSourceDocumentIdsFromFacts(candidateRead.results, context.userEventDocumentId);
+      if (candidateDocumentIds.length === 0 || candidateDocumentIds.length > MAX_EXACT_SOURCE_FALLBACK_SOURCES) return finish('', 'fenced');
+      const baselineDocumentIds = candidateDocumentIds.slice(0, SOURCE_LOOKUP_LIMITS.maxSources);
+      const remaining = Math.max(0, plan.timeoutMs - (Date.now() - started));
+      const maxChars = Math.min(SOURCE_LOOKUP_LIMITS.maxChars, plan.maxChars);
+      const sourceRead = await this.searchSourceDocuments(query, {
+        ...(context.userEventDocumentId ? { excludeDocumentId: context.userEventDocumentId } : {}),
+        candidateDocumentIds: baselineDocumentIds,
+        candidateOnly: true,
+        maxSources: SOURCE_LOOKUP_LIMITS.maxSources,
+        maxChars,
+        maxSourceChars: Math.min(SOURCE_LOOKUP_LIMITS.maxChars, maxChars),
+        timeoutMs: remaining,
+      });
+        const receipt = this.lastSourceLookup ?? undefined;
+        if (epoch !== this.cacheEpoch || sourceRead.status === 'fenced') return finish('', 'fenced', undefined, false, receipt);
+        const sources = sourceRead.sourceDocuments ?? [];
+        const sourceIds = new Set(sources.map((source) => source.documentId));
+        const complete = sourceRead.status === 'found'
+          && sources.length === baselineDocumentIds.length
+          && sourceIds.size === baselineDocumentIds.length
+          && baselineDocumentIds.every((documentId) => sourceIds.has(documentId))
+          && sources.every((source) => !source.clipped && ['current', 'completed'].includes(source.recordStatus))
+          && (sourceRead.sourceSegments?.length ?? 0) === baselineDocumentIds.length
+          && (sourceRead.rejectedSourceDocumentIds?.length ?? 0) === 0
+          && receipt?.scanIncomplete === false
+          && !sourceRead.text.includes(SOURCE_LOOKUP_INCOMPLETE_NOTICE);
+        if (!complete) return finish('', 'fenced', undefined, false, receipt);
+        const trace = exactSourceFallbackTrace(
+          candidateRead,
+          sourceRead,
+          candidateDocumentIds,
+          plan.maxTokens,
+          plan.maxSourceFactsTokens,
+          maxChars,
+          queryAttempts,
+        );
+        if (!trace) return finish('', 'fenced', undefined, false, receipt);
+        return finish(sourceRead.text, 'found', trace, false, receipt);
+    }
     let merged = mergeRecallReads(reads);
     let evidenceCovered = recallEvidenceCoversQuery(merged, queryPlan.sourcePhrases);
-    if (plan.route === 'deep' && !evidenceCovered && primary.status !== 'unavailable') {
+    if (queryPlan.dateContext && merged.status !== 'fenced') {
+      const dated = await this.searchDatedResults(queryPlan.dateContext, {
+        budget: 'low',
+        maxTokens: Math.min(SUPPLEMENTAL_RECALL_MAX_TOKENS, plan.maxTokens),
+        maxSourceFactsTokens: Math.min(SUPPLEMENTAL_SOURCE_FACTS_MAX_TOKENS, plan.maxSourceFactsTokens),
+        timeoutMs: Math.max(0, plan.timeoutMs - (Date.now() - started)),
+        ...(context.activationEnabled === undefined ? {} : { activationEnabled: context.activationEnabled }),
+        ...(context.activationInfluence === undefined ? {} : { activationInfluence: context.activationInfluence }),
+        captureTrace: true,
+        ...(context.userEventDocumentId ? { userEventDocumentId: context.userEventDocumentId } : {}),
+        queryIndex: 1,
+      });
+      if (epoch !== this.cacheEpoch) return finish('', 'fenced');
+      if (dated.status === 'fenced') return finish('', 'fenced');
+      if (dated.status === 'found') {
+        if (queryPlan.dateContext.recordKind !== 'none') reads.splice(0, reads.length, dated);
+        else reads.push(dated);
+        merged = mergeRecallReads(reads);
+        evidenceCovered = recallEvidenceCoversQuery(merged, queryPlan.sourcePhrases);
+      }
+    }
+    if (plan.route === 'deep' && !evidenceCovered && primary.status !== 'unavailable'
+      && queryPlan.dateContext?.recordKind !== 'journal' && queryPlan.dateContext?.recordKind !== 'record') {
       for (const [index, supplementalQuery] of queryPlan.supplementalQueries.entries()) {
         if (index >= MAX_SUPPLEMENTAL_RECALL_QUERIES || Date.now() - started >= plan.timeoutMs) break;
         const read = await runRecall(supplementalQuery, index + 1, index === 0 ? 'topic' : 'phrase', true);
@@ -2312,7 +3122,8 @@ export class HindsightMemory {
 
     let automaticSourceLookup: SourceLookupReceipt | undefined;
     let sourceRead: MemoryTextRead | undefined;
-    if (plan.route === 'deep' && merged.status !== 'unavailable') {
+    if (plan.route === 'deep' && merged.status !== 'unavailable'
+      && queryPlan.dateContext?.recordKind !== 'journal' && queryPlan.dateContext?.recordKind !== 'record') {
       const remaining = Math.max(0, plan.timeoutMs - (Date.now() - started));
       sourceRead = await this.searchSourceDocuments(query, {
         ...(context.userEventDocumentId ? { excludeDocumentId: context.userEventDocumentId } : {}),
@@ -2412,6 +3223,7 @@ export class HindsightMemory {
    * refresh reaches a successful terminal state.
    */
   private async clearDerived(): Promise<void> {
+    if (this.config?.readOnly) return;
     const config = this.config;
     const ledger = this.ledger;
     const client = this.client;
@@ -2460,9 +3272,9 @@ export class HindsightMemory {
       if (ledger.unresolved(config.bankId, config.apiUrl) > 0) return;
     }
     let refreshed = true;
-    const deadline = Date.now() + MENTAL_MODEL_REFRESH_TIMEOUT_MS;
     for (const id of MODEL_IDS) {
       try {
+        const deadline = Date.now() + MENTAL_MODEL_REFRESH_TIMEOUT_MS;
         const submission = await client.refreshMentalModel(config.bankId, id, { mode: 'full', signal: AbortSignal.timeout(15_000) });
         if (!submission.operation_id || !await this.waitForMentalModelRefresh(config, submission.operation_id, deadline)) {
           refreshed = false;
@@ -2510,13 +3322,25 @@ export class HindsightMemory {
   private forgottenSource(documentId: string | null): boolean {
     const config = this.config;
     if (!config || !this.ledger) return false;
-    return documentId !== null && this.ledger.forgotten(config.bankId, config.apiUrl, documentId);
+    return documentId !== null && (this.ledger.forgotten(config.bankId, config.apiUrl, documentId)
+      || (documentId.startsWith('journal:') && !this.sourceVisible(documentId)));
   }
 
   /** A read started under this epoch must not be used once a fence is written. */
   private visibilityEpoch(): number {
     const config = this.config;
     return config && this.ledger ? this.ledger.epoch(config.bankId, config.apiUrl) : 0;
+  }
+
+  /**
+   * Whether a workspace file's Bank document can still speak as history. `unknown` means there is
+   * no readable ledger, so the caller must keep the ordinary unverified workspace label.
+   */
+  historySourceStatus(documentId: string): 'visible' | 'forgotten' | 'unknown' {
+    const config = this.config;
+    const ledger = this.ledger;
+    if (!config || !ledger || ledger.damaged()) return 'unknown';
+    return ledger.forgotten(config.bankId, config.apiUrl, documentId) ? 'forgotten' : 'visible';
   }
 
   retainUser(text: string, meta: { session?: string; cursor?: number; timestamp?: string } = {}): string | null {
@@ -2770,6 +3594,7 @@ export class HindsightMemory {
     if (!body) return safe.skip ? 'sensitive' : 'empty';
     const sources = [...new Set(sourceIds.map((id) => id.trim()).filter(Boolean))];
     if (sources.length === 0 || sources.length > 8) return 'source-missing';
+    const expectedEpoch = this.evidenceEpoch();
     for (const sourceId of sources) {
       if (!this.sourceVisible(sourceId)) return 'forgotten';
       try {
@@ -2778,6 +3603,7 @@ export class HindsightMemory {
         return 'source-unavailable';
       }
     }
+    if (!expectedEpoch || this.evidenceEpoch() !== expectedEpoch || sources.some((sourceId) => !this.sourceVisible(sourceId))) return 'source-unavailable';
     const session = meta.session ?? 'main';
     if (meta.sourceDocumentId) {
       if (!this.sourceVisible(meta.sourceDocumentId)) return 'forgotten';
@@ -2839,9 +3665,12 @@ export class HindsightMemory {
     if (reason) parts.push(reason);
     const safe = sanitizeForMemory(parts.join('. '));
     if (!safe.text || safe.skip) return;
+    const documentId = `affinity-change:${subject}:${at}:${hash(safe.text)}`;
+    // Identity binds the event time and body; replay keeps the original provenance and status.
+    if (this.config && this.outbox && this.outbox.itemsForDocument(documentId, this.config.bankId, this.config.apiUrl).length > 0) return;
     this.enqueue({
       content: safe.text,
-      documentId: `affinity-change:${subject}:${at}:${hash(safe.text)}`,
+      documentId,
       context: 'This is an affinity change recorded by the Coopanion affinity extension. It is a fact about the relationship between the person and Coo.',
       tags: ['scope:affection', 'source:affinity', 'session:main'],
       timestamp: at,
@@ -2850,20 +3679,237 @@ export class HindsightMemory {
     });
   }
 
-  retainJournal(text: string, day: string): void {
-    const body = text.trim();
-    if (!body) return;
-    const safe = sanitizeForMemory(body);
-    if (!safe.text || safe.skip) return;
-    const documentId = `journal:${day}`;
-    this.persistUnknownDerivedArtifact({
-      artifactId: `journal-output:${documentId}`,
-      kind: 'relationship-journal',
-      target: documentId,
-      content: safe.text.slice(0, 6000),
-      operationId: documentId,
-      reason: 'Hindsight reflection output has no source mapping',
+  /** A committed daily operation can resume delivery without regenerating its text. */
+  journalDayRecorded(day: string): boolean {
+    const config = this.config;
+    if (!config || !this.outbox || !/^\d{4}-\d{2}-\d{2}$/.test(day)) return false;
+    const documentId = `journal:generated:${day}:${sha256(`journal-day:${day}`).slice(0, 16)}`;
+    const item = this.outbox.itemForDocument(documentId, config.bankId, config.apiUrl);
+    return !!item && ['pending', 'sending', 'sent', 'done', 'verified', 'failed'].includes(item.state)
+      && this.sourceVisible(documentId);
+  }
+
+  /**
+   * Queue a generated reflection with validated dependencies on its source documents.
+   * The local artifact and outbox row commit together. Retries reuse the same document identity,
+   * separate from imported `journal:YYYY-MM-DD` documents.
+   */
+  async retainJournal(
+    text: string,
+    day: string,
+    meta: { operationId?: string; sessionId?: string; generationId?: string; kind?: string; sourceIds?: readonly string[]; expectedEpoch?: string } = {},
+  ): Promise<'queued' | 'verified' | 'exists' | 'conflict' | 'full' | 'persistence-error' | 'read-only' | 'forgotten' | 'disabled' | 'empty' | 'sensitive' | 'source-unavailable'> {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return 'conflict';
+    if (!this.enabled() || !this.config || !this.outbox || !this.stateStore) return 'disabled';
+    if (this.config.readOnly) return 'read-only';
+    const safe = sanitizeForMemory(text.trim());
+    if (!safe.text) return safe.skip ? 'sensitive' : 'empty';
+    const operationId = meta.operationId ?? `journal-day:${day}`;
+    if (!/^[A-Za-z0-9:_.-]{1,160}$/.test(operationId)) return 'conflict';
+    const documentId = `journal:generated:${day}:${sha256(operationId).slice(0, 16)}`;
+    const config = this.config;
+    if (this.ledger?.forgotten(config.bankId, config.apiUrl, documentId)) return 'forgotten';
+    const expectedEpoch = meta.expectedEpoch ?? this.evidenceEpoch();
+    const sourceIds = [...new Set(meta.sourceIds ?? [])];
+    if (!expectedEpoch || sourceIds.length === 0 || sourceIds.includes(documentId)) return 'source-unavailable';
+    const evidence = await this.evidenceForSegments(safe.text, sourceIds.map((documentId) => ({
+      documentId, start: 0, end: safe.text.length, derived: true,
+    })));
+    if (evidence.length !== sourceIds.length || !this.sourceSetCurrent(evidence, expectedEpoch)) return 'source-unavailable';
+    const dependencies = evidence.map((source) => this.dependencyFromExposure(source, sha256(safe.text), operationId, expectedEpoch));
+    if (dependencies.some((source) => source.validationState !== 'validated')) return 'source-unavailable';
+    const saidAt = `${day}T00:00:00+08:00`;
+    const artifactId = `journal-output:${documentId}`;
+    const bodyDigest = sha256(safe.text);
+    const at = new Date().toISOString();
+    const metadata: Record<string, string> = {
+      ...sourceMetadata({ actor: 'coo', kind: 'reflection', status: 'candidate', saidAt, eventId: `generated-journal:${operationId}` }),
+      journal_operation_id: operationId,
+      journal_day: day,
+      journal_kind: meta.kind ?? 'relationship-daily',
+      journal_source: 'host-daily-task',
+    };
+    if (meta.sessionId) metadata.journal_session_id = meta.sessionId;
+    if (meta.generationId) metadata.journal_generation_id = meta.generationId;
+    const retainItem: RetainItem = {
+      content: safe.text,
+      documentId,
+      context: 'Coo generated this unverified reflection from the linked sources. Claims of actions or outcomes in it require independent execution receipts.',
+      tags: ['scope:affection', 'source:journal', 'journal:generated'],
+      timestamp: saidAt,
+      priority: 'normal',
+      metadata,
+    };
+    const expectedHash = requestHashFor({ ...retainItem, bankId: config.bankId, endpoint: config.apiUrl });
+    const existing = this.outbox.itemForDocument(documentId, config.bankId, config.apiUrl);
+    if (existing) {
+      if (existing.requestHash !== expectedHash) return 'conflict';
+      if (!this.derivedArtifactIsCurrent(artifactId, safe.text) || ['cancelled', 'dead', 'orphaned'].includes(existing.state)) return 'source-unavailable';
+      return existing.state === 'verified' ? 'verified' : 'exists';
+    }
+    let result: 'queued' | 'full' | 'persistence-error' = 'queued';
+    try {
+      this.stateStore.transaction(() => {
+        if (!this.sourceSetCurrent(evidence, expectedEpoch)) throw new Error('journal sources changed before commit');
+        const current = this.stateStore!.getDerivedArtifact(artifactId);
+        if (current && current.bodyDigest !== bodyDigest) throw new Error('journal artifact content conflicts with this operation');
+        if (!current) {
+          this.stateStore!.saveDerivedArtifact({
+            artifactId,
+            kind: 'relationship-journal',
+            target: documentId,
+            scope: memoryArtifactScope(config.bankId, config.apiUrl),
+            creatorSessionId: null,
+            creatorGenerationId: null,
+            creatorOperationId: operationId,
+            bodyDigest,
+            origin: 'model-derived',
+            reviewState: 'unknown',
+            lifecycleState: 'active',
+            lineageState: 'complete',
+            lineageReceiptDigest: sha256(JSON.stringify([config.bankId, config.apiUrl, documentId, bodyDigest, operationId])),
+            lineageValidatedAt: at,
+            statusReason: 'Unverified Coo reflection with current source dependencies',
+            createdAt: at,
+            updatedAt: at,
+            sources: dependencies,
+          });
+        }
+        const queued = this.enqueue(retainItem);
+        if (queued !== 'queued') throw new Error(`generated journal outbox: ${queued}`);
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('outbox: full')) result = 'full';
+      else if (message.includes('outbox: skipped')) return 'forgotten';
+      else result = 'persistence-error';
+      this.log?.warn('[memory] generated journal was not queued', { message });
+      return result;
+    }
+    this.invalidateCache();
+    return 'queued';
+  }
+
+  /**
+   * Records an Owner-confirmed imported journal as a primary, source-independent local source.
+   *
+   * The Bank document is already the exact file body; this artifact is the local proof that the
+   * journal may speak in Core, and it is what `sourceVisible('journal:…')` checks. It does not
+   * write the Bank, change a revision or grant any other source class.
+   */
+  async ensureImportedJournalArtifact(documentId: string): Promise<'registered' | 'exists' | 'invalid' | 'missing' | 'conflict' | 'disabled'> {
+    const config = this.config;
+    const store = this.stateStore;
+    if (!config || !store || !this.enabled()) return 'disabled';
+    if (!/^journal:\d{4}-\d{2}-\d{2}$/.test(documentId)) return 'invalid';
+    if (this.ledger?.forgotten(config.bankId, config.apiUrl, documentId)) return 'conflict';
+    let document;
+    try {
+      document = await this.client!.getDocument(config.bankId, documentId);
+    } catch (error) {
+      if (isMissing(error)) return 'missing';
+      throw error;
+    }
+    if (!document || document.id !== documentId || document.bank_id !== config.bankId
+      || typeof document.original_text !== 'string' || !document.original_text) return 'missing';
+    const metadata = document.document_metadata && typeof document.document_metadata === 'object'
+      ? document.document_metadata as Record<string, unknown>
+      : {};
+    if (metadata.source_actor !== 'coo' || metadata.kind !== 'event' || metadata.status !== 'completed'
+      || typeof metadata.source_event_id !== 'string' || !metadata.source_event_id.startsWith('local-journal:')) return 'invalid';
+    const artifactId = `journal-output:${documentId}`;
+    const bodyDigest = sha256(document.original_text);
+    const at = new Date().toISOString();
+    return store.transaction(() => {
+      const current = store.getDerivedArtifact(artifactId);
+      if (current) {
+        return current.bodyDigest === bodyDigest
+          && current.lifecycleState === 'active'
+          && current.lineageState === 'source-independent' ? 'exists' : 'conflict';
+      }
+      store.saveDerivedArtifact({
+        artifactId,
+        kind: 'relationship-journal',
+        target: documentId,
+        scope: memoryArtifactScope(config.bankId, config.apiUrl),
+        creatorSessionId: null,
+        creatorGenerationId: null,
+        creatorOperationId: documentId,
+        bodyDigest,
+        origin: 'model-derived',
+        reviewState: 'approved',
+        lifecycleState: 'active',
+        lineageState: 'source-independent',
+        lineageReceiptDigest: sha256(JSON.stringify([config.bankId, config.apiUrl, documentId, bodyDigest, metadata.source_event_id])),
+        lineageValidatedAt: at,
+        statusReason: 'Owner-confirmed imported local journal source',
+        createdAt: at,
+        updatedAt: at,
+        sources: [],
+      });
+      return 'registered';
     });
+  }
+
+  /**
+   * Import one historical journal entry as a primary Coo source.
+   *
+   * This is not a model generation and not a derived summary: the caller supplies the exact local
+   * file digest and path hash, and the Bank document records actor=coo / kind=event / source:journal.
+   * It goes through the same outbox, Forget fence and readback path as any other retain. The caller
+   * must ensure the Bank is in a no-LLM extraction mode (chunks) for private historical text.
+   */
+  async importHistoricalJournal(
+    text: string,
+    meta: { day: string; sourceDigest: string; pathHash: string },
+  ): Promise<'verified' | 'queued' | 'exists' | 'invalid' | 'empty' | 'sensitive' | 'forgotten' | 'disabled' | 'full' | 'persistence-error'> {
+    if (!this.enabled() || !this.outbox || !this.config || !this.ledger || this.ledger.damaged()) return 'disabled';
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(meta.day) || !/^[a-f0-9]{64}$/.test(meta.sourceDigest)
+      || !/^[a-f0-9]{16}$/.test(meta.pathHash)) return 'invalid';
+    const safe = sanitizeForMemory(text);
+    if (!safe.text) return safe.skip ? 'sensitive' : 'empty';
+    const documentId = `journal:${meta.day}`;
+    if (this.ledger.forgotten(this.config.bankId, this.config.apiUrl, documentId)) return 'forgotten';
+    try {
+      if (await this.hasSource(documentId)) {
+        await this.ensureImportedJournalArtifact(documentId);
+        return 'exists';
+      }
+    } catch {
+      // A readback failure is not proof of absence; the outbox identity check below still applies.
+    }
+    const saidAt = `${meta.day}T00:00:00+08:00`;
+    const queued = this.enqueue({
+      content: safe.text,
+      documentId,
+      context: 'Coo wrote this private daily journal for the relationship with the person. It is an imported local journal source, not a new model generation.',
+      tags: ['scope:affection', 'source:journal'],
+      timestamp: saidAt,
+      priority: 'normal',
+      metadata: sourceMetadata({
+        actor: 'coo',
+        kind: 'event',
+        status: 'completed',
+        saidAt,
+        eventId: `local-journal:${meta.pathHash}:${meta.sourceDigest}`,
+      }),
+    });
+    if (queued === 'full') return 'full';
+    if (queued === 'persistence-error') return 'persistence-error';
+    if (queued === 'skipped') return 'forgotten';
+    this.invalidateCache();
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      try {
+        if (await this.hasSource(documentId)) {
+          await this.ensureImportedJournalArtifact(documentId);
+          return 'verified';
+        }
+      } catch {
+        return 'queued';
+      }
+    }
+    return 'queued';
   }
 
   private enqueue(item: RetainItem): 'queued' | 'full' | 'persistence-error' | 'skipped' {
@@ -2884,10 +3930,13 @@ export class HindsightMemory {
       return 'full';
     }
     if (result === 'persistence-error') {
-      this.log?.warn('[memory] the event was not queued because the outbox could not be written', { documentId: item.documentId });
+      this.log?.warn('[memory] the event was not queued because the outbox could not be written', {
+        documentId: item.documentId,
+        reason: this.outbox.persistenceReason(),
+      });
       return 'persistence-error';
     }
-    void this.drain();
+    if (!this.config.readOnly) void this.drain();
     return 'queued';
   }
 
@@ -2924,11 +3973,13 @@ export class HindsightMemory {
     if (!asked) return { acceptance: 'not-found', local: 0, deleted: 0, pending: 0, failed: 0, activeContextInvalidated: false };
     this.forgetScanDepth += 1;
     this.invalidateCache();
+    this.sourceEpoch += 1;
     try {
       return await this.forgetMatching(asked);
     } finally {
       this.forgetScanDepth -= 1;
       this.invalidateCache();
+      this.sourceEpoch += 1;
     }
   }
 
@@ -3035,7 +4086,9 @@ export class HindsightMemory {
             .filter((id) => !target.documents.has(id));
           const outputDependents = frontier.flatMap((sourceId) => store.derivedArtifactsForSource(
             target.bankId, target.endpoint, sourceId,
-          )).filter((artifact) => artifact.kind === 'coo-output' && artifact.target.startsWith('coo:'))
+          )).filter((artifact) => (artifact.kind === 'coo-output' && artifact.target.startsWith('coo:'))
+            || (artifact.kind === 'coo-growth-candidate-source' && artifact.target.startsWith('coo-growth:'))
+            || (artifact.kind === 'relationship-journal' && artifact.target.startsWith('journal:generated:')))
             .map((artifact) => artifact.target).filter((id) => !target.documents.has(id));
           const dependents = [...new Set([...revisionDependents, ...outputDependents])];
           for (const dependent of dependents) target.documents.add(dependent);
@@ -3218,7 +4271,9 @@ export class HindsightMemory {
           .filter((id) => !seen.has(id));
         const outputDependents = frontier.flatMap((sourceId) => store.derivedArtifactsForSource(
           target.bankId, target.endpoint, sourceId,
-        )).filter((artifact) => artifact.kind === 'coo-output' && artifact.target.startsWith('coo:'))
+        )).filter((artifact) => (artifact.kind === 'coo-output' && artifact.target.startsWith('coo:'))
+          || (artifact.kind === 'coo-growth-candidate-source' && artifact.target.startsWith('coo-growth:'))
+            || (artifact.kind === 'relationship-journal' && artifact.target.startsWith('journal:generated:')))
           .map((artifact) => artifact.target).filter((id) => !seen.has(id));
         const dependents = [...new Set([...revisionDependents, ...outputDependents])];
         for (const dependent of dependents) seen.add(dependent);
@@ -3284,8 +4339,9 @@ export class HindsightMemory {
     return (await this.reflectDetailed(question, opts)).text;
   }
 
-  async reflectDetailed(question: string, opts: { tags?: string[]; tagsMatch?: 'any' | 'all' | 'any_strict' | 'all_strict' | 'exact'; timeoutMs?: number } = {}): Promise<MemoryTextRead> {
+  async reflectDetailed(question: string, opts: { tags?: string[]; tagsMatch?: 'any' | 'all' | 'any_strict' | 'all_strict' | 'exact'; timeoutMs?: number; requireSources?: boolean } = {}): Promise<MemoryTextRead> {
     if (!question.trim()) return { text: '', status: 'absent' };
+    if (this.config?.readOnly) return { text: '', status: 'unavailable' };
     if (this.forgetScanDepth > 0 || this.derivedBlocked()) return { text: '', status: 'fenced' };
     if (!this.canTry() || !await this.ensureStarted()) return { text: '', status: 'unavailable' };
     const config = this.config!;
@@ -3294,6 +4350,7 @@ export class HindsightMemory {
     try {
       const response = await this.client!.reflect(config.bankId, question.slice(0, 1200), {
         budget: 'mid',
+        ...(opts.requireSources ? { includeFacts: true, excludeMentalModels: true, factTypes: ['world', 'experience'] as Array<'world' | 'experience'> } : {}),
         ...(opts.tags ? { tags: opts.tags } : {}),
         ...(opts.tagsMatch ? { tagsMatch: opts.tagsMatch } : {}),
         signal: AbortSignal.timeout(opts.timeoutMs ?? 120_000),
@@ -3302,6 +4359,18 @@ export class HindsightMemory {
       // call makes the answer unusable: it may quote or summarise a fenced source.
       if (epoch !== this.cacheEpoch || fence !== this.visibilityEpoch()) return { text: '', status: 'fenced' };
       const text = response.text.trim();
+      if (text && opts.requireSources) {
+        const based = response.based_on;
+        const facts = based?.memories ?? [];
+        if (!facts.length || based?.mental_models?.length || based?.directives?.length
+          || facts.some((fact) => !fact.document_id || fact.type === 'observation')) return { text: '', status: 'unavailable' };
+        const sourceSegments = [...new Set(facts.map((fact) => fact.document_id!))]
+          .map((documentId) => ({ documentId, start: 0, end: text.length, derived: true as const }));
+        const evidence = await this.evidenceForSegments(text, sourceSegments);
+        if (evidence.length !== sourceSegments.length || epoch !== this.cacheEpoch || fence !== this.visibilityEpoch()
+          || evidence.some((source) => source.validationStatus !== 'validated' || source.revisionState !== 'current')) return { text: '', status: 'fenced' };
+        return { text, status: 'found', sourceSegments };
+      }
       return text ? { text, status: 'found' } : { text: '', status: 'absent' };
     } catch (err) {
       this.noteFailure('reflect', err);
@@ -3310,7 +4379,7 @@ export class HindsightMemory {
   }
 
   async refreshModel(id: string): Promise<void> {
-    if (!this.canTry() || !await this.ensureStarted()) return;
+    if (this.config?.readOnly || !this.canTry() || !await this.ensureStarted()) return;
     try {
       await this.client!.refreshMentalModel(this.config!.bankId, id);
       this.clearReadCache();
@@ -3326,6 +4395,7 @@ export class HindsightMemory {
     const store = this.stateStore;
     if (!documentId || !this.enabled() || !config || !ledger || !store || ledger.damaged()) return false;
     if (ledger.forgotten(config.bankId, config.apiUrl, documentId)) return false;
+    if (documentId.startsWith('coo-growth:')) return false;
     if (documentId.startsWith('coo:')) {
       const artifact = store.getDerivedArtifact(`coo-output:${documentId}`);
       if (!artifact || artifact.lifecycleState !== 'active') return false;
@@ -3338,8 +4408,13 @@ export class HindsightMemory {
     }
     if (documentId.startsWith('journal:')) {
       const artifact = store.getDerivedArtifact(`journal-output:${documentId}`);
-      return !!artifact && artifact.lifecycleState === 'active'
-        && (artifact.lineageState === 'complete' || artifact.lineageState === 'source-independent');
+      if (!artifact || artifact.lifecycleState !== 'active') return false;
+      if (artifact.lineageState === 'source-independent') return !documentId.startsWith('journal:generated:') && artifact.sources.length === 0;
+      return artifact.lineageState === 'complete' && artifact.sources.length > 0
+        && artifact.sources.every((source) => source.validationState === 'validated'
+          && source.bankId === config.bankId && source.endpoint === config.apiUrl
+          && !ledger.forgotten(source.bankId, source.endpoint, source.documentId)
+          && !store.supersededSources(source.bankId, source.endpoint).has(source.documentId));
     }
     return true;
   }
@@ -3353,19 +4428,31 @@ export class HindsightMemory {
     catch { return false; }
   }
 
+  /** The current ref replacing a frozen historical attachment's ref, if it was refreshed. */
+  private currentSourceRef(source: SourceExposureRef): SourceExposureRef {
+    return this.refreshedExposures.get(sourceRefKey(source)) ?? source;
+  }
+
+  canonicalEvidenceSource(source: SourceExposureRef): SourceExposureRef | null {
+    return this.sourceExposureCurrent([source]) ? this.currentSourceRef(source) : null;
+  }
+
   /** Rechecks a serialized source set against the active namespace and local Forget fence. */
   sourceExposureCurrent(sources: readonly SourceExposureRef[]): boolean {
     const config = this.config;
     const epoch = this.evidenceEpoch();
     if (!config || !epoch || !this.enabled() || this.ledger?.damaged() || sources.length === 0) return false;
-    const current = sources.every((source) => source.bankId === config.bankId
-      && source.endpoint === config.apiUrl
-      && source.validatedEpoch === epoch
-      && source.revisionState === 'current'
-      && source.validationStatus === 'validated'
-      && this.readBackProofs.get(sourceTupleKey(source)) === sourceProofKey(source)
-      && this.sourceVisible(source.documentId)
-      && this.sourceCurrentForContext(source.documentId));
+    const current = sources.every((candidate) => {
+      const source = this.currentSourceRef(candidate);
+      return source.bankId === config.bankId
+        && source.endpoint === config.apiUrl
+        && source.validatedEpoch === epoch
+        && source.revisionState === 'current'
+        && source.validationStatus === 'validated'
+        && this.readBackProofs.get(sourceTupleKey(source)) === sourceProofKey(source)
+        && this.sourceVisible(source.documentId)
+        && this.sourceCurrentForContext(source.documentId);
+    });
     return current && this.evidenceEpoch() === epoch;
   }
 
@@ -3379,11 +4466,12 @@ export class HindsightMemory {
         if (span.mappingState !== 'complete' || !span.exposedSources.length) return false;
         for (const source of span.exposedSources) {
           if (!this.sourceExposureCurrent([source])) return false;
-          const key = JSON.stringify([sourceTupleKey(source), sourceProofKey(source), span.digest]);
+          const currentSource = this.currentSourceRef(source);
+          const key = JSON.stringify([sourceTupleKey(currentSource), sourceProofKey(currentSource), span.digest]);
           if (span.origin === 'hindsight-source') {
             const range = span.sourceProof;
-            const proof = range && this.segmentProofs.get(range.token);
-            if (!range || !proof || proof.sourceTuple !== sourceTupleKey(source) || proof.sourceProof !== sourceProofKey(source)
+            const proof = range && (this.segmentProofs.get(range.token) ?? this.refreshedSegmentProofs.get(range.token));
+            if (!range || !proof || proof.sourceTuple !== sourceTupleKey(currentSource) || proof.sourceProof !== sourceProofKey(currentSource)
               || proof.sourceDigest !== source.contentDigest || proof.endUtf16 - proof.startUtf16 !== proof.text.length
               || !Number.isInteger(range.startUtf16) || !Number.isInteger(range.endUtf16)
               || range.startUtf16 < 0 || range.endUtf16 <= range.startUtf16 || range.endUtf16 > proof.text.length
@@ -3475,14 +4563,176 @@ export class HindsightMemory {
     }
   }
 
-  /** A process-local stamp for the bank namespace, read cache and persisted forget epoch. */
+  /** Reads the exact stored document body and its current namespace-bound source proof. */
+  async readExactSourceEvidence(documentId: string): Promise<ExactMemorySourceEvidence | null> {
+    const expectedEpoch = this.evidenceEpoch();
+    if (!documentId || !expectedEpoch) return null;
+    try {
+      const source = await this.readSourceExposure(documentId, expectedEpoch);
+      const config = this.config;
+      const ledger = this.ledger;
+      if (!source || !config || !ledger || source.attachment.validationStatus !== 'validated'
+        || source.attachment.revisionState !== 'current' || source.attachment.bankId !== config.bankId
+        || source.attachment.endpoint !== config.apiUrl || source.attachment.documentId !== documentId
+        || this.evidenceEpoch() !== expectedEpoch || ledger.damaged() || !this.sourceVisible(documentId)) return null;
+      const sourceEpoch = ledger.epoch(config.bankId, config.apiUrl);
+      if (!Number.isSafeInteger(sourceEpoch) || sourceEpoch < 0 || this.evidenceEpoch() !== expectedEpoch) return null;
+      return Object.freeze({
+        bankId: config.bankId,
+        endpoint: config.apiUrl,
+        endpointBinding: 'configured-client',
+        documentId,
+        storedText: source.originalText,
+        contentDigest: source.attachment.contentDigest,
+        revision: source.attachment.contentDigest,
+        sourceEpoch,
+        fenceEpoch: String(sourceEpoch),
+        evidenceEpoch: source.attachment.validatedEpoch,
+        validationReceipt: source.attachment.validationReceipt,
+        actor: source.actor,
+        kind: source.kind,
+        status: source.status,
+        saidAt: source.saidAt,
+        documentUpdatedAt: source.documentUpdatedAt,
+        sdkContentHash: source.sdkContentHash,
+        metadata: source.metadata,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  /** Discovers recent source identities from existing local indexes; never drains or retains. */
+  async discoverGrowthSources(since: Date, until: Date): Promise<ExactMemorySourceEvidence[]> {
+    const store = this.stateStore, config = this.config;
+    if (!this.enabled() || !store || !config) return [];
+    const epoch = this.evidenceEpoch();
+    const identities = store.listGrowthSourceIdentities(config.bankId, config.apiUrl, 64);
+    const result: ExactMemorySourceEvidence[] = [];
+    for (const id of identities) {
+      if (this.evidenceEpoch() !== epoch) return [];
+      const exact = await this.readExactSourceEvidence(id);
+      if (!exact) continue;
+      if (exact.saidAt && Date.parse(exact.saidAt) > until.getTime()) continue;
+      const date = Math.max(...[exact.saidAt, exact.documentUpdatedAt].map(value => Date.parse(value ?? '')).filter(value => Number.isFinite(value) && value <= until.getTime()));
+      if (Number.isFinite(date) && date >= since.getTime() && date <= until.getTime()) result.push(exact);
+    }
+    return this.evidenceEpoch() === epoch
+      ? result.sort((a, b) => (b.saidAt ?? b.documentUpdatedAt ?? '').localeCompare(a.saidAt ?? a.documentUpdatedAt ?? '') || a.documentId.localeCompare(b.documentId))
+      : [];
+  }
+
+  /** Reads a Growth source through this instance's configured SDK client without exposing it to Recall. */
+  async readExactCooGrowthSourceEvidence(documentId: string): Promise<ExactCooGrowthSourceEvidence | null> {
+    const expectedEpoch = this.evidenceEpoch();
+    if (!documentId || !documentId.startsWith('coo-growth:') || !expectedEpoch
+      || !this.canTry() || !await this.ensureStarted()) return null;
+    const config = this.config;
+    const client = this.client;
+    const ledger = this.ledger;
+    const store = this.stateStore;
+    if (!config || !client || !ledger || !store || ledger.damaged()
+      || ledger.forgotten(config.bankId, config.apiUrl, documentId)) return null;
+    const fenceEpoch = this.visibilityEpoch();
+    try {
+      const document = await client.getDocument(config.bankId, documentId, { signal: AbortSignal.timeout(5_000) });
+      const metadata = stringMetadata(document?.document_metadata);
+      const sourceKind = metadata.kind;
+      const candidateId = metadata.candidate_id;
+      const sourceEpoch = ledger.epoch(config.bankId, config.apiUrl);
+      if (!document || document.id !== documentId || document.bank_id !== config.bankId
+        || typeof document.original_text !== 'string' || !document.original_text
+        || !['plan', 'reflection'].includes(sourceKind ?? '') || metadata.source_actor !== 'coo'
+        || metadata.status !== 'candidate' || metadata.candidate_state !== 'candidate'
+        || !candidateId || !documentId.startsWith(`coo-growth:${candidateId}:`)
+        || metadata.source_body_sha256 !== createHash('sha256').update(document.original_text, 'utf8').digest('hex')
+        || this.evidenceEpoch() !== expectedEpoch || fenceEpoch !== this.visibilityEpoch()
+        || ledger.damaged() || ledger.forgotten(config.bankId, config.apiUrl, documentId)
+        || store.supersededSources(config.bankId, config.apiUrl).has(documentId)) return null;
+      const contentDigest = createHash('sha256').update(document.original_text, 'utf8').digest('hex');
+      const validationReceipt = createHash('sha256').update(JSON.stringify([
+        config.bankId, config.apiUrl, document.id, document.updated_at, document.content_hash,
+        contentDigest, expectedEpoch, sourceEpoch, metadata,
+      ])).digest('hex');
+      return Object.freeze({
+        bankId: config.bankId,
+        endpoint: config.apiUrl,
+        endpointBinding: 'configured-client',
+        documentId,
+        storedText: document.original_text,
+        contentDigest,
+        revision: contentDigest,
+        sourceEpoch,
+        fenceEpoch: String(sourceEpoch),
+        evidenceEpoch: expectedEpoch,
+        validationReceipt,
+        actor: metadata.source_actor,
+        kind: sourceKind ?? null,
+        status: metadata.status,
+        saidAt: metadata.said_at ?? null,
+        documentUpdatedAt: document.updated_at,
+        sdkContentHash: typeof document.content_hash === 'string' ? document.content_hash : null,
+        metadata,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  getCooGrowthCandidateClassification(exact: ExactCooGrowthSourceEvidence) {
+    const store = this.stateStore;
+    const evidence = this.cooGrowthIndexEvidence(exact);
+    if (!store || !evidence || exact.endpointBinding !== 'configured-client') return null;
+    const config = this.config;
+    if (!config || exact.bankId !== config.bankId || exact.endpoint !== config.apiUrl) return null;
+    return store.getCooGrowthCandidateClassification(exact.bankId, exact.endpoint, exact.documentId, evidence);
+  }
+
+  private cooGrowthIndexEvidence(exact: ExactCooGrowthSourceEvidence): CooGrowthCandidateSourceEvidence | null {
+    const metadata = exact.metadata;
+    const candidateType = metadata.candidate_type;
+    const sourceKind = exact.kind;
+    if (exact.actor !== 'coo' || exact.status !== 'candidate'
+      || (sourceKind !== 'plan' && sourceKind !== 'reflection')
+      || (candidateType !== 'growth_proposal_candidate' && candidateType !== 'experience_card_candidate')
+      || metadata.candidate_state !== 'candidate' || metadata.tool_permissions !== '[]'
+      || metadata.plan_executed !== 'false' || !metadata.candidate_id || !metadata.generation_id || !metadata.response_id
+      || !metadata.creator_operation_id
+      || !metadata.candidate_body_sha256 || !metadata.candidate_snapshot_sha256 || !metadata.source_body_sha256
+      || !metadata.generation_receipt_sha256 || !metadata.parent_set_sha256
+      || metadata.derived_artifact_id !== `coo-growth-candidate-source:${exact.documentId}`
+      || !['growth_proposal_candidate', 'experience_card_candidate'].includes(candidateType)) return null;
+    return {
+      bankId: exact.bankId,
+      endpoint: exact.endpoint,
+      documentId: exact.documentId,
+      content: exact.storedText,
+      sourceEpoch: exact.sourceEpoch,
+      sourceActor: 'coo',
+      sourceKind,
+      sourceStatus: 'candidate',
+      candidateId: metadata.candidate_id,
+      candidateType,
+      candidateState: 'candidate',
+      candidateBodyDigest: metadata.candidate_body_sha256,
+      candidateSnapshotDigest: metadata.candidate_snapshot_sha256,
+      sourceBodyDigest: metadata.source_body_sha256,
+      generationId: metadata.generation_id,
+      responseId: metadata.response_id,
+      creatorOperationId: metadata.creator_operation_id,
+      generationReceiptDigest: metadata.generation_receipt_sha256,
+      parentSetDigest: metadata.parent_set_sha256,
+    };
+  }
+
+  /** A process-local stamp for the bank namespace, read-back proofs and persisted forget epoch. */
   evidenceEpoch(): string | null {
     const config = this.config;
     const ledger = this.ledger;
     const store = this.stateStore;
     if (!config || !ledger || !store || this.storageError || ledger.damaged()) return null;
     try {
-      return `${this.cacheEpoch}:${ledger.epoch(config.bankId, config.apiUrl)}`;
+      return `${this.sourceEpoch}:${ledger.epoch(config.bankId, config.apiUrl)}`;
     } catch {
       return null;
     }
@@ -3516,7 +4766,10 @@ export class HindsightMemory {
       const localCurrent = store.currentRevisionSources(config.bankId, config.apiUrl).has(documentId);
       const superseded = store.supersededSources(config.bankId, config.apiUrl).has(documentId)
         || metadata.status === 'superseded';
-      const knownStatus = localCurrent || ['current', 'planned', 'completed'].includes(String(metadata.status));
+      const journalReflection = documentId.startsWith('journal:generated:') && metadata.source_actor === 'coo'
+        && metadata.kind === 'reflection' && metadata.status === 'candidate'
+        && await this.verifyDerivedArtifact(`journal-output:${documentId}`, document.original_text);
+      const knownStatus = localCurrent || journalReflection || ['current', 'planned', 'completed'].includes(String(metadata.status));
       const revisionState: EvidenceAttachment['revisionState'] = superseded ? 'superseded' : knownStatus ? 'current' : 'unknown';
       const validationStatus: EvidenceAttachment['validationStatus'] = superseded ? 'stale' : knownStatus ? 'validated' : 'unknown';
       const contentDigest = createHash('sha256').update(document.original_text, 'utf8').digest('hex');
@@ -3540,7 +4793,17 @@ export class HindsightMemory {
         this.readBackProofs.set(key, sourceProofKey(attachment));
         if (this.readBackProofs.size > 4096) this.readBackProofs.delete(this.readBackProofs.keys().next().value!);
       }
-      return { attachment, originalText: document.original_text };
+      return {
+        attachment,
+        originalText: document.original_text,
+        actor: typeof metadata.source_actor === 'string' ? metadata.source_actor : null,
+        kind: typeof metadata.kind === 'string' ? metadata.kind : null,
+        status: typeof metadata.status === 'string' ? metadata.status : null,
+        saidAt: typeof metadata.said_at === 'string' ? metadata.said_at : null,
+        documentUpdatedAt: document.updated_at,
+        sdkContentHash: typeof document.content_hash === 'string' ? document.content_hash : null,
+        metadata: stringMetadata(metadata),
+      };
     } catch (error) {
       if (isMissing(error) && this.evidenceEpoch() === expectedEpoch) {
         this.readBackProofs.delete(sourceTupleKey({ bankId: config.bankId, endpoint: config.apiUrl, documentId }));
@@ -3601,6 +4864,56 @@ export class HindsightMemory {
     return this.evidenceForSegments(read.text, segments);
   }
 
+  /**
+   * Re-reads persisted segment attachments before a restarted Core sends them again. Every
+   * document, original text, UTF-16 range, digest, epoch, revision and Forget/fence state must
+   * still match; success mints tokens in this process. Any mismatch returns null, so the caller
+   * leaves the old, unusable attachment in place and Core keeps the request closed.
+   */
+  async refreshEvidenceAttachments(
+    text: string,
+    attachments: readonly EvidenceAttachment[],
+  ): Promise<EvidenceAttachment[] | null> {
+    if (!text || !Array.isArray(attachments) || attachments.length === 0) return null;
+    const segments: MemoryEvidenceSegment[] = attachments.map((attachment) => ({
+      documentId: attachment.documentId,
+      start: attachment.segment.start,
+      end: attachment.segment.end,
+    }));
+    const refreshed = await this.evidenceForSegments(text, segments);
+    if (refreshed.length !== attachments.length) return null;
+    for (const [index, current] of refreshed.entries()) {
+      const previous = attachments[index]!;
+      if (current.bankId !== previous.bankId || current.endpoint !== previous.endpoint
+        || current.documentId !== previous.documentId || current.contentDigest !== previous.contentDigest
+        || current.validationStatus !== 'validated' || current.revisionState !== 'current'
+        || current.segment.start !== previous.segment.start || current.segment.end !== previous.segment.end
+        || current.segment.digest !== previous.segment.digest || !current.segment.sourceProof) return null;
+    }
+    for (const [index, current] of refreshed.entries()) {
+      const previous = attachments[index]!;
+      this.refreshedExposures.set(sourceRefKey(previous), current);
+      const oldToken = previous.segment.sourceProof?.token;
+      if (oldToken) {
+        this.refreshedSegmentProofs.set(oldToken, {
+          sourceTuple: sourceTupleKey(current),
+          sourceProof: sourceProofKey(current),
+          sourceDigest: current.contentDigest,
+          startUtf16: 0,
+          endUtf16: current.segment.end - current.segment.start,
+          text: text.slice(current.segment.start, current.segment.end),
+        });
+        if (this.refreshedSegmentProofs.size > 4096) {
+          this.refreshedSegmentProofs.delete(this.refreshedSegmentProofs.keys().next().value!);
+        }
+      }
+      if (this.refreshedExposures.size > 4096) {
+        this.refreshedExposures.delete(this.refreshedExposures.keys().next().value!);
+      }
+    }
+    return refreshed;
+  }
+
   async verifyExposureSources(sources: readonly SourceExposureRef[], expectedEpoch: string): Promise<boolean> {
     if (!expectedEpoch || sources.length === 0 || this.evidenceEpoch() !== expectedEpoch) return false;
     for (const source of sources) {
@@ -3649,7 +4962,14 @@ export class HindsightMemory {
         || attachment.revisionState !== 'current' || attachment.validationStatus !== 'validated') return null;
       current.push(attachment);
     }
-    return this.evidenceEpoch() === expectedEpoch ? current : null;
+    if (this.evidenceEpoch() !== expectedEpoch) return null;
+    for (const [index, source] of sources.entries()) {
+      this.refreshedExposures.set(sourceRefKey(source), current[index]!);
+      if (this.refreshedExposures.size > 4096) {
+        this.refreshedExposures.delete(this.refreshedExposures.keys().next().value!);
+      }
+    }
+    return current;
   }
 
   /** Re-reads persisted dependency clues without retaining source text. */
@@ -3807,6 +5127,7 @@ export class HindsightMemory {
       return 'long-term memory could not be fenced locally; the bank was not cleared';
     }
     this.invalidateCache();
+    this.sourceEpoch += 1;
     const cancelled = this.outbox?.cancelAll('the memory bank was cleared') ?? [];
     if (this.delivery) await this.delivery.cancelForget(cancelled);
     try { this.lifecycleHooks?.clearDerived(); }

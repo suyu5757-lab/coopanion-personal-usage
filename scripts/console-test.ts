@@ -13,15 +13,22 @@
  * `--reset` deletes the test home before starting. Ctrl-C stops both.
  */
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, realpathSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, request, type IncomingHttpHeaders } from 'node:http';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
-import { extname, join, resolve, sep } from 'node:path';
+import { dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('../', import.meta.url));
-const DATA = join(tmpdir(), 'coopanion-console-test');
+const requestedData = process.env.COOPANION_CONSOLE_TEST_DATA;
+const DATA = requestedData ? resolve(requestedData) : join(tmpdir(), 'coopanion-console-test');
+if (requestedData) {
+  let existing = DATA;
+  while (!existsSync(existing)) existing = dirname(existing);
+  const canonical = join(realpathSync(existing), relative(existing, DATA));
+  if (!canonical.startsWith(realpathSync(join(ROOT, 'scratch')) + sep)) throw new Error('Console test data must be inside this checkout scratch');
+}
 const HOME = join(DATA, 'home');
 const CORE_PORT = 17790;
 const PAGE_PORT = 17791;
@@ -55,6 +62,8 @@ const core = spawn(process.execPath, ['--import', 'tsx', join(ROOT, 'core', 'boo
   stdio: 'inherit',
   env: {
     ...process.env,
+    CORTICO_TEST_CHANNEL: '1',
+    COOPANION_LOCAL_PROVIDER_SIMULATOR: '1',
     CORTICO_HOME: HOME,
     CORTICO_EXTENSIONS_DIR: join(DATA, 'extensions'),
     // the pet window command exits at once, so no second pet appears

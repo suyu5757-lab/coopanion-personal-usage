@@ -519,12 +519,18 @@ describe('forget fences at handoff', () => {
     mkdirSync(workspace);
     const fenced = new Set(['user:main:42', 'touch:main:43']);
     const memoryText = '[memory] Past record.\n- (observation, 2026-10-01, source_id:user:main:42) A forgotten fact.';
+    // P4's delivery contract: a Recall summary enters the request only with traced segments and
+    // per-segment evidence. The fence still has to remove it from the handoff note below.
+    const memorySegments = [{ documentId: 'user:main:42', start: 0, end: memoryText.length }];
     const memory = memoryFor({
       sourceFenced: (sourceId: string) => fenced.has(sourceId),
       sourceCurrentForContext: () => true,
       setLifecycleHooks: () => {},
       retainUser: () => 'user:main:44',
-      recallForTurn: async () => ({ text: memoryText, route: 'standard', found: true, status: 'found' }),
+      recallForTurn: async () => ({
+        text: memoryText, route: 'standard', found: true, status: 'found',
+        trace: { format: { includedSourceDocumentIds: ['user:main:42'], sourceSegments: memorySegments } },
+      }),
     });
     const Persona = coopanionPersona(Cormini, { memory });
     const persona = new Persona({ memoryDir: workspace });

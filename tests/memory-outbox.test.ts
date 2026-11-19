@@ -166,6 +166,48 @@ describe('the retain outbox', () => {
     expect(status.lastError).toBe('service unavailable');
   });
 
+  it('preserves expired terminal operations in read-only validation mode', () => {
+    let now = new Date('2026-10-27T00:00:00.000Z');
+    const path = file();
+    const outbox = new MemoryOutbox(path, { now: () => now });
+    outbox.add(item({ documentId: 'verified-source' }));
+    const verified = outbox.due(now, 1)[0]!;
+    outbox.markDone(verified.id);
+    outbox.markVerified(verified.id);
+    outbox.add(item({ documentId: 'cancelled-source' }));
+    const cancelled = outbox.due(now, 1)[0]!;
+    outbox.cancelMatching((entry) => entry.id === cancelled.id, 'fixture');
+
+    now = new Date(now.getTime() + 8 * 86_400_000);
+    closeMemoryStateStores();
+    const reopened = new MemoryOutbox(path, { now: () => now, preserveFinished: true });
+
+    expect(reopened.get(verified.id)?.state).toBe('verified');
+    expect(reopened.get(cancelled.id)?.state).toBe('cancelled');
+    expect(reopened.stateStore?.loadOutbox()).toHaveLength(2);
+  });
+
+  it('preserves terminal delivery audit rows by default, not only in read-only mode', () => {
+    let now = new Date('2026-10-27T00:00:00.000Z');
+    const path = file();
+    const outbox = new MemoryOutbox(path, { now: () => now });
+    outbox.add(item({ documentId: 'verified-source' }));
+    const verified = outbox.due(now, 1)[0]!;
+    outbox.markDone(verified.id);
+    outbox.markVerified(verified.id);
+    outbox.add(item({ documentId: 'cancelled-source' }));
+    const cancelled = outbox.due(now, 1)[0]!;
+    outbox.cancelMatching((entry) => entry.id === cancelled.id, 'fixture');
+
+    now = new Date(now.getTime() + 8 * 86_400_000);
+    closeMemoryStateStores();
+    const reopened = new MemoryOutbox(path, { now: () => now });
+
+    expect(reopened.get(verified.id)?.state).toBe('verified');
+    expect(reopened.get(cancelled.id)?.state).toBe('cancelled');
+    expect(reopened.stateStore?.loadOutbox()).toHaveLength(2);
+  });
+
   it('keeps a dead critical fact with its payload past the audit window', () => {
     let now = new Date('2026-10-27T00:00:00.000Z');
     const path = file();
@@ -470,5 +512,108 @@ describe('recall routing', () => {
     const standard = planRecall('What should we do tomorrow?', { timeoutMs: 500, maxTokens: 300, budget: 'low' });
     expect(standard.timeoutMs).toBe(500);
     expect(standard.maxTokens).toBe(300);
+  });
+});
+
+
+describe('scoped delivery isolation and late callbacks', () => {
+  it('preserves held historical operations across restart without starving a new eligible write', async () => {
+    const path = file();
+    const outbox = new MemoryOutbox(path);
+    outbox.add(item({ documentId: 'historical-held' }));
+    const held = outbox.due(new Date(), 1)[0]!;
+    const before = structuredClone(outbox.get(held.id));
+    outbox.add(item({ documentId: 'new-eligible' }));
+    const delivered: string[] = [];
+    const operations: DeliveryOps = {
+      retain: async entry => { delivered.push(entry.documentId); return { async: false, operationId: entry.operationId }; },
+      status: async () => 'completed', verify: async () => true, retry: async () => {}, cancel: async () => {},
+    };
+    const options = { batch: 1, held: (entry: { operationId: string }) => entry.operationId === held.operationId };
+    const worker = new OutboxDelivery(outbox, operations, options);
+    expect((await worker.drainScoped({ documentId: held.documentId })).status).toBe('blocked');
+    await worker.drain();
+    expect(delivered).toEqual(['new-eligible']);
+    expect(outbox.get(held.id)).toEqual(before);
+    closeMemoryStateStores();
+    const reopened = new MemoryOutbox(path);
+    await new OutboxDelivery(reopened, operations, options).drain();
+    expect(reopened.get(held.id)).toEqual(before);
+    expect(delivered).toEqual(['new-eligible']);
+  });
+
+  it('serializes scoped work with the background worker and polls the same identity after restart', async () => {
+    const path = file();
+    const outbox = new MemoryOutbox(path);
+    outbox.add(item({ documentId: 'single-target' }));
+    const queued = outbox.due(new Date(), 1)[0]!;
+    let finish!: (value: { async: boolean; operationId: string | null }) => void;
+    let started!: () => void;
+    const began = new Promise<void>((resolve) => { started = resolve; });
+    const delivery = new OutboxDelivery(outbox, {
+      retain: async () => { started(); return new Promise((resolve) => { finish = resolve; }); },
+      status: async () => 'processing', verify: async () => false, retry: async () => {}, cancel: async () => {},
+    }, { target: () => ({ bankId: queued.bankId!, endpoint: queued.endpoint! }) });
+    const first = delivery.drainScoped({ documentId: queued.documentId });
+    await began;
+    expect((await delivery.drainScoped({ documentId: queued.documentId })).status).toBe('blocked');
+    expect(await delivery.drain()).toEqual({ submitted: 0, completed: 0, verified: 0, failed: 0 });
+    finish({ async: true, operationId: queued.operationId });
+    await first;
+    closeMemoryStateStores();
+    const reopened = new MemoryOutbox(path);
+    const calls: string[] = [];
+    const recovery = new OutboxDelivery(reopened, {
+      retain: async () => { throw new Error('must poll the persisted operation first'); },
+      status: async (entry) => { calls.push(entry.operationId); return 'completed'; },
+      verify: async () => true, retry: async () => {}, cancel: async () => {},
+    }, { target: () => ({ bankId: queued.bankId!, endpoint: queued.endpoint! }) });
+    expect((await recovery.drainScoped({ documentId: queued.documentId })).status).toBe('verified');
+    expect(calls).toEqual([queued.operationId]);
+  });
+
+  it('blocks a caller-selected endpoint that differs from the configured endpoint', async () => {
+    const outbox = new MemoryOutbox(file());
+    outbox.add(item({ documentId: 'other-target', endpoint: 'http://other.test' }));
+    const delivery = new OutboxDelivery(outbox, {
+      retain: async () => { throw new Error('wrong endpoint was contacted'); }, status: async () => 'completed',
+      verify: async () => true, retry: async () => {}, cancel: async () => {},
+    }, { target: () => ({ bankId: 'bank-test', endpoint: 'http://hindsight.test' }) });
+    expect((await delivery.drainScoped({ documentId: 'other-target', bankId: 'bank-test', endpoint: 'http://other.test' })).status).toBe('blocked');
+  });
+
+  it('retries a failed scoped extraction using the existing operation identity', async () => {
+    const outbox = new MemoryOutbox(file());
+    outbox.add(item({ documentId: 'failed-extraction' }));
+    const queued = outbox.due(new Date(), 1)[0]!;
+    outbox.markSent(queued.id, queued.operationId);
+    let recovered = false;
+    const retried: string[] = [];
+    const delivery = new OutboxDelivery(outbox, {
+      retain: async () => { throw new Error('must retry existing operation'); },
+      status: async () => recovered ? 'completed' : 'failed',
+      verify: async () => recovered,
+      retry: async (entry) => { retried.push(entry.operationId); recovered = true; }, cancel: async () => {},
+    }, { target: () => ({ bankId: 'bank-test', endpoint: 'http://hindsight.test' }) });
+    expect((await delivery.drainScoped({ documentId: queued.documentId })).status).toBe('sent');
+    expect((await delivery.drainScoped({ documentId: queued.documentId })).status).toBe('verified');
+    expect(retried).toEqual([queued.operationId]);
+  });
+
+  it.each(['status', 'verify'] as const)('does not report success after Forget during %s', async (phase) => {
+    const outbox = new MemoryOutbox(file());
+    outbox.add(item({ documentId: 'forget-race' }));
+    const queued = outbox.due(new Date(), 1)[0]!;
+    outbox.markSent(queued.id, queued.operationId);
+    const delivery = new OutboxDelivery(outbox, {
+      retain: async () => { throw new Error('already submitted'); },
+      status: async () => { if (phase === 'status') outbox.markCancelled(queued.id, 'synthetic Forget'); return 'completed'; },
+      verify: async () => { outbox.markCancelled(queued.id, 'synthetic Forget'); return true; },
+      retry: async () => {}, cancel: async () => {},
+    }, { target: () => ({ bankId: 'bank-test', endpoint: 'http://hindsight.test' }) });
+    const result = await delivery.drainScoped({ documentId: queued.documentId });
+    expect(result.status).toBe('forgotten');
+    expect(result.verified).toBe(false);
+    expect(outbox.get(queued.id)?.state).toBe('cancelled');
   });
 });

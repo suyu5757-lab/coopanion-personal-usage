@@ -9,6 +9,7 @@ const plural = (n: number, one: string, few: string, many: string) => {
 
 const ru: Translation<PetText> = {
   defaultUser: 'Напарник',
+  sessionArchived: "Предыдущий разговор сохранён в архиве. Начат новый разговор.",
 
   menu: {
     quit: 'Выйти',

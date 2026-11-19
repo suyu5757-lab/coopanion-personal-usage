@@ -1,3 +1,4 @@
+import { growthContentIssues } from '../core/growth/autonomous.ts';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -328,7 +329,7 @@ describe('the growth schedule', () => {
       stateFile,
       config: () => ({ ...GROWTH_DEFAULTS, enabled: true }),
       timers,
-      run: async () => ({ proposals: 1, note: 'proposed focus mode', cancelled: false }),
+      run: async () => ({ proposals: 1, candidateSourceResults: [], note: 'proposed focus mode', cancelled: false }),
       now: () => new Date(now),
     });
     s.start();
@@ -347,7 +348,7 @@ describe('the growth schedule', () => {
       stateFile,
       config: () => ({ ...GROWTH_DEFAULTS, enabled: true }),
       timers: new FakeTimers(),
-      run: async () => ({ proposals: 0, note: '', cancelled: true, cancellationStatus: 'unknown' }),
+      run: async () => ({ proposals: 0, candidateSourceResults: [], note: '', cancelled: true, cancellationStatus: 'unknown' }),
       now: () => new Date(now),
     });
     s.start();
@@ -502,7 +503,7 @@ describe('the growth review session', () => {
 
     const result = await review.run();
 
-    expect(result).toEqual({ proposals: 0, note: '', cancelled: true, cancellationStatus: 'unknown' });
+    expect(result).toEqual({ proposals: 0, note: '', cancelled: true, cancellationStatus: 'unknown', candidateSourceResults: [] });
     expect(core.spawnForkWithOutcome).toHaveBeenCalledOnce();
     expect(core.spawnFork).not.toHaveBeenCalled();
   });
@@ -764,5 +765,24 @@ describe('growth proposal validation', () => {
       changes: [{ file: 'CONSTITUTION.md', to: 'When they program, wait.', reason: 'asked explicitly' }],
     });
     expect('proposal' in good).toBe(true);
+  });
+});
+
+describe('Growth content consistency checks', () => {
+  const sources = [
+    { actor: 'user', kind: 'event', saidAt: '2026-10-01T10:00:00Z', storedText: 'Please let me focus quietly.' },
+    { actor: 'user', kind: 'event', saidAt: '2026-10-08T10:00:00Z', storedText: 'I prefer quiet focus again.' },
+  ] as import('../core/memory/hindsight.ts').ExactMemorySourceEvidence[];
+  const candidate = (summary: string) => ({ summary, evidence: [] }) as unknown as import('../core/growth/proposals.ts').GrowthProposal;
+  it('accepts seven days and one week, and rejects two weeks, fourteen days and reversed dates', () => {
+    expect(growthContentIssues(candidate('Twice, seven days apart.'), sources)).toEqual([]);
+    expect(growthContentIssues(candidate('Two user requests, one week apart.'), sources)).toEqual([]);
+    for (const text of ['Two weeks apart.', 'Fourteen days apart.', '相隔两周。']) expect(growthContentIssues(candidate(text), sources).join()).toContain('= 7 days, not 14');
+    expect(growthContentIssues(candidate('2026-10-08 happened before 2026-10-01.'), sources)).toContain('date_order_mismatch');
+  });
+  it('rejects invented event counts and unsupported direct quotes while preserving user-stated preferences', () => {
+    expect(growthContentIssues(candidate('Three separate user requests.'), sources).join()).toContain('event_count_not_supported');
+    expect(growthContentIssues({ ...candidate('A preference, not an external fact.'), evidence: ['The user said “Please let me focus quietly.”'] }, sources)).toEqual([]);
+    expect(growthContentIssues({ ...candidate('A claim.'), evidence: ['The user said “I grant unlimited tool permissions.”'] }, sources)).toContain('literal_quote_not_supported_by_sources');
   });
 });

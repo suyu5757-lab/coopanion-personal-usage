@@ -39,15 +39,20 @@ Coopanion 是一个桌宠。桌宠 **Coo** 待在屏幕底边，可以用气泡�
 
 <p align="center"><img src="image/README/pet-desktop-zh.png" alt="Coo" width="640"></p>
 
+个人构建使用 Owner 批准的曦 V6 作为权威人物设定，从 `core/seed/xi-v6.md` 加载十二节原文并校验固定摘要。旧工作区人物文件作为历史资料保留，不再作为当前身份加载。来源验证、动作许可与可逆 Growth 策略继续沿用既有门控。
+
 ## 功能
 
-- **多家模型**：DeepSeek、通义千问、Kimi、智谱 GLM、豆包、MiniMax、阶跃星辰、百度千帆、OpenRouter、OpenAI、Anthropic、Gemini、xAI。选一家，贴上 API Key 就能用；也可以登录 ChatGPT 账号，使用它的 ChatGPT 套餐。
+- **多家模型**：DeepSeek、通义千问、Kimi、智谱 GLM、豆包、MiniMax、阶跃星辰、百度千帆、OpenRouter、OpenCode Go、OpenAI、Anthropic、Gemini、xAI。选一家，贴上 API Key 就能用；也可以登录 ChatGPT 账号，使用它的 ChatGPT 套餐。
 - **聊天**：按说话键说话，或者打字，Coo 在气泡里回复。语音在本机用 FunASR 或 Whisper 识别，按应用语言选。
 - **社交边界**：Coo 的默认运行约定会引导它尊重明确的拒绝联系，翻找他人物品前先征求同意，对电气风险给出谨慎建议，并在需要当前信息时核对来源、不靠猜测作答。仍会继续提供安全、实际的帮助。
-- **记忆**：记得聊过的内容，也知道你戳了它、摸了它的头。它对你的了解写在工作区的 `PARTNER.md`，这份文件每次整份读进提示词。Core 模式下，Persona 工作区写入会经过动作授权，记录目标与文件哈希，写后读取核对并保存工作区历史。可在高级设置中将 `companion.workspaceAppendPath` 设为用分号分隔的精确相对路径列表，仅跳过列出文件 `append_file` 的逐次审批；编辑、覆盖、删除、命令和其他路径仍需批准。未决写入会显示在「动作回执」页，同一路径在核对前不能重试。长期写入、来源屏障和删除任务保存在应用私有 SQLite 数据库。首次启动时会导入旧队列和遗忘文件，并保留原文件。明确更正可用 `memory_correct` 关联旧来源，旧记录仍可用于查询历史。个人用户事件只会随时间降低软召回排序；之后的用户消息与其来源匹配度足够高时，可以提高激活权重并从该次消息重新计时。明确遗忘屏障始终优先。被忘记的来源会从历史读取中屏蔽；远端删除和画像重建完成前不提供画像。同一记忆库存在遗忘屏障时，不提供缺少可核验来源的汇总记忆。汇总记忆即使没有父文档，只要声明的全部来源均已核验且未被遗忘，仍可读取。高级模式的 Hindsight 面板分别显示本地排队、远端处理中、操作完成、来源读取核验、未解决失败、删除和来源屏蔽状态。已经进入活动对话的文本无法从该对话中撤回。工作区改动保留版本历史。
+- **记忆**：记得聊过的内容，也知道你戳了它、摸了它的头。它对你的了解写在工作区的 `PARTNER.md`，这份文件每次整份读进提示词。Core 模式下，Persona 工作区写入会经过动作授权，记录目标与文件哈希，写后读取核对并保存工作区历史。可在高级设置中将 `companion.workspaceAppendPath` 设为用分号分隔的精确相对路径列表，仅跳过列出文件 `append_file` 的逐次审批；编辑、覆盖、删除、命令和其他路径仍需批准。「记忆」页的「工作区写入权限」可以为应用自有目录（`self-review/`、`journal/`、`mind/`、`lab/`、`agenda/`）建立长期规则，列出等待批准的写入，并即时撤销规则；规则默认关闭，删除、命令、Persona 核心文件、交接笔记、配置、数据库和用户目录仍需批准。未决写入会显示在「动作回执」页，同一路径在核对前不能重试。长期写入、来源屏障和删除任务保存在应用私有 SQLite 数据库。首次启动时会导入旧队列和遗忘文件，并保留原文件。明确更正可用 `memory_correct` 关联旧来源，旧记录仍可用于查询历史。个人用户事件只会随时间降低软召回排序；之后的用户消息与其来源匹配度足够高时，可以提高激活权重并从该次消息重新计时。明确遗忘屏障始终优先。被忘记的来源会从历史读取中屏蔽；远端删除和画像重建完成前不提供画像。同一记忆库存在遗忘屏障时，不提供缺少可核验来源的汇总记忆。汇总记忆即使没有父文档，只要声明的全部来源均已核验且未被遗忘，仍可读取。高级模式的 Hindsight 面板分别显示本地排队、远端处理中、操作完成、来源读取核验、未解决失败、删除和来源屏蔽状态。当活动上下文包含被遗忘的来源时，Core 可以在核验来源屏障后归档原会话并开始新对话。从设置中主动开始新对话时也会归档原会话。归档保存在本机应用数据中，不会自动发送给模型；归档或来源核验失败时，相关请求继续保持阻断。工作区改动保留版本历史。
   Recall 的主结果与来源事实使用独立预算，可在高级设置中分别限制。召回诊断区分服务端截断、来源校验和上下文省略。单次 Recall 达到期限不会停用后续轮次的记忆读取。
   语义召回缺少必要细节时，Coo 可以用原文短语查找用户发言。该补充路径最多检查 2048 个文档条目、读取 1024 个用户来源，并发读取最多四个。模型最多收到六条、合计 8000 字符的摘录，排除已遗忘来源和当前提问，并标明截断。
-- **自我成长**：定期回顾默认关闭；开启且长期记忆可用时，会在安静时回顾并留下带来源的人设提案或体验卡候选。技能候选需关联候选建立后发生的真实任务回执，并由你确认该任务未用于候选来源；只有回执核验完成后才能批准，未知结果不算成功。批准技能不会扩大动作权限。每项候选都要你审核；不会自动修改 Persona 或启用体验卡。
+- **Journal**：生成日记保留可回读的来源依赖，内容属于未经核实的反思，不能证明行动已经完成。缺少来源时保留重试；重启复用已入队的同一条日记。来源被 Forget 或更正后，日记不再作为当前有效记忆使用。
+- **自我成长**：定期回顾默认关闭；开启且长期记忆可用时，会在安静时回顾并留下带来源的人设提案或体验卡候选。技能候选需关联候选建立后发生的真实任务回执，并由你确认该任务未用于候选来源；只有回执核验完成后才能批准，未知结果不算成功。批准技能不会扩大动作权限。成长策略由 Core 按实际目标和效果评定风险。开启自动应用后，来源与语义核验通过的低／中风险会话偏好和任务核验流程可自动批准，写入可撤销的本地行为策略；高风险人设文件修改仍需你审核及对应写入许可。体验卡沿用独立审核流程。
+  可通过高级 Hindsight 面板 API 指定一至八个来源 ID，手动运行一次成长回顾。候选连同生成回执保存在本地，后续读取时重新核验来源。带合法父来源的 Journal 反思可以支持提案，但仍是未经确认的观察；父来源更正或 Forget 后候选停止使用。候选不证明行动已经完成，也不授予工具权限。手动回顾不会开启定期调度。
+  定期成长默认关闭。启用后，七天定时器从本地操作与领域索引自动选取至多八条近期可信来源，包含未分类来源，再保存待审候选。自动候选经过独立模型一致性复核，以及日期、次数和引用的确定性检查后，才能可信读取。暂停跨重启保留；同一来源组合不重复生成；请求失败退避重试，每组最多三次。高级 Hindsight 面板 API 提供 growth-auto-run、growth-auto-pause 与 growth-status；高级面板提供调度、自动应用、暂停、专注状态和策略撤销控件。已应用策略保留来源和写入回执，重启重新核验；来源更正或 Forget 后失效。策略不授予动作权限。
 - **操作电脑**：可查看屏幕和窗口。Core 授权的 CUA 输入仅限经过核验的 macOS TextEdit 后台窗口；后台专用模式的窗口列表只显示进程身份核验通过的受支持窗口。每次移动指针、点击、拖拽、滚动、输入文字和按键都要单独批准。整屏输入、切换前台和通过 CUA 操作浏览器均不可用。
 - **Codex**：可选的本机执行助手，支持只读复核、后台任务、结果验收、停止与续接；在高级模式 World 页启用并配置允许目录。见 [Codex 模块](packages/cortico-world-codex/README.md)。
 - **opencode**：把写代码、修 bug、跑测试这类活交给本机的 opencode。Core 每次只批准一条命令或一次文件写入，核对文件内容并写入统一动作回执；结果未解决时会显示在「动作回执」页，核对前不能重试。opencode 只能在你允许的目录里工作。默认关闭，在高级模式的 World 页启用。
@@ -167,6 +172,7 @@ irm https://raw.githubusercontent.com/suyu5757-lab/coopanion-personal-usage/main
 | 阶跃 Step Plan         | [platform.stepfun.com](https://platform.stepfun.com/interface-key)                                                                                                               | `step-5-preview`（扣 Step Plan 套餐额度）                                  |
 | 百度千帆               | [console.bce.baidu.com](https://console.bce.baidu.com/iam/#/iam/apikey/list)                                                                                                     | `glm-5.3-flash`                                                            |
 | OpenRouter             | [openrouter.ai](https://openrouter.ai/settings/keys)                                                                                                                             | `deepseek/deepseek-v4.1-flash`                                             |
+| OpenCode Go            | [opencode.ai/console/go](https://opencode.ai/console/go)                                                                                                                         | `deepseek-v4.1-flash`（「开始」页会读取 Go 当前提供的模型）                |
 | OpenAI                 | [platform.openai.com](https://platform.openai.com/settings/organization/api-keys)                                                                                                | `gpt-6-luna`                                                               |
 | Anthropic              | [platform.claude.com](https://platform.claude.com/settings/keys)                                                                                                                 | `claude-haiku-5-5`                                                         |
 | Gemini（Google AI Studio） | [aistudio.google.com](https://aistudio.google.com/apikey)                                                                                                                    | `gemini-3.5-flash-lite`                                                    |
@@ -284,7 +290,7 @@ opencode 用它自己的模型和登录，和 Coo 的模型分开。它不会用
 | 语音输入   | 开关、识别引擎、模型下载、说话键、麦克风、收音方式                                                          |
 | 系统提示词 | Coo 的系统提示词，人设在「CONSTITUTION」一段。各段连成一份文档，除 CONSTITUTION 外首次打开时折叠，折叠状态保留到退出软件；模板变量可以插入，也可以预览当前值；高级模式下 World 的段可以跳到这个 World 的配置。Ctrl+S 保存到文件，「撤销全部改动」回到上次保存的内容；「立即应用」保存并更新当前对话的提示词，对话保留；「清空对话并重开」保存后清空当前对话，Memory 和人设保留；「完整提示词预览」展开按现在的文件拼出的整条提示词 |
 | 用量与成本 | 每天的 token 用量和花费                                                                                    |
-| 对话       | 当前对话的记录，Coo 发的图片也显示在这里；也可以在这里直接和 Coo 说话。在「习惯」页打开「上下文圆环」后，输入框里的圆环显示上下文用量，满时整理之前的对话；鼠标停在上面显示 token 数和上次整理的时间 |
+| 对话       | 当前对话的记录，Coo 发的图片和完成的 assistant 文字回答也显示在这里；`pet_say` 控制桌宠气泡和语音。也可以在这里直接和 Coo 说话。在「习惯」页打开「上下文圆环」后，输入框里的圆环显示上下文用量，满时整理之前的对话；鼠标停在上面显示 token 数和上次整理的时间 |
 
 <p align="center"><img src="image/README/habits-zh.png" alt="Habits" width="720"></p>
 <p align="center"><img src="image/README/dress-zh.png" alt="Dress up" width="720"></p>
@@ -299,7 +305,7 @@ opencode 用它自己的模型和登录，和 Coo 的模型分开。它不会用
 
 <p align="center"><img src="image/README/start-zh.png" alt="Start" width="720"></p>
 
-默认是新装时应用语言排第一的那家：简体中文是 DeepSeek 的 `deepseek-flash`，其他语言是 OpenAI 的 `gpt-6-luna`。操作电脑需要模型能看图，各家的默认模型都可以。各平台按它文档里的接口调用：Anthropic 用 Messages API，Gemini 用 Gemini API，百度千帆和智谱国际平台 Z.ai 用 Chat Completions，其余用 Responses API。高级模式的「模型」页还可以：
+默认是新装时应用语言排第一的那家：简体中文是 DeepSeek 的 `deepseek-flash`，其他语言是 OpenAI 的 `gpt-6-luna`。操作电脑需要模型能看图，各家的默认模型都可以。各平台按它文档里的接口调用：Anthropic 用 Messages API，Gemini 用 Gemini API，百度千帆和智谱国际平台 Z.ai 用 Chat Completions，其余用 Responses API。OpenCode Go 例外：「开始」页读取它当前的模型列表，每个模型使用服务为它标明的接口。高级模式的「模型」页还可以：
 
 - 换模型、调整思考档位；
 - 新建「OpenAI Responses Compatible」连接，接入其他兼容 Responses API 的服务；
@@ -320,7 +326,7 @@ opencode 用它自己的模型和登录，和 Coo 的模型分开。它不会用
 
 ## 费用与隐私
 
-- **费用**：Coopanion 免费。聊天的费用由你选的模型服务按用量收取，可在「用量与成本」页查看（内置价目的有 DeepSeek、OpenAI、Anthropic、Gemini 付费档、xAI）。登录 ChatGPT 时，请求计入 ChatGPT 套餐，不显示费用。
+- **费用**：Coopanion 免费。聊天的费用由你选的模型服务按用量收取，可在「用量与成本」页查看（内置价目的有 DeepSeek、OpenAI、Anthropic、Gemini 付费档、xAI）。登录 ChatGPT 时，请求计入 ChatGPT 套餐，不显示费用。OpenCode Go 的请求计入 Go 订阅额度。
 - **发给模型服务的内容**：你说的话、打的字、和 Coo 的互动、操作电脑时的截图，以及视频预览返回的首帧。只发给你配置的那一家；视频文件在本机渲染。
 - **留在本机的内容**：API Key 和 ChatGPT 的登录状态、记忆、对话记录、设置、日志。语音在本机识别，只把识别出的文字发出去。
 - **桌宠本地服务**：浏览器写请求和 WebSocket 连接必须来自桌宠服务自己的 HTTP 源（含端口）。桌宠窗口通过启动时交给宿主的随机凭据验证身份。

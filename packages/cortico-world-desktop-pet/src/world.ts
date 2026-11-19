@@ -22,12 +22,12 @@ import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import type {
-  BlobInput, EventEnvelope, Logger, OutputTap, RunPhase, ToolCallContext, ToolDef, ToolOutcome, TriggerMode, World, WorldWebUiDecl,
+  BlobInput, EventEnvelope, Logger, OutputTap, RunPhase, SourceMapSpan, ToolCallContext, ToolDef, ToolOutcome, TriggerMode, World, WorldWebUiDecl,
   WorldEnvPromptValue, WorldEnvPromptVars, WorldHost, WorldLamp, WorldPanelDecl, WorldStreamSocket,
 } from 'cortico/core/types.ts';
 import { digestText } from 'cortico/core/evidence.ts';
 import { nowIso, shortTime } from 'cortico/core/util.ts';
-import type { Language } from 'cortico/core/language.ts';
+import { LANGUAGES, type Language } from 'cortico/core/language.ts';
 import type { DeepPartial } from 'cortico/world.ts';
 import { CuaDriver, type CuaDriverOptions } from './cua/driver.ts';
 import {
@@ -49,7 +49,7 @@ import { comboLabel, hotkeyBadge, hotkeyLabel, parseHotkey, splitTaps, watchHotk
 import { joinSpeech, looksHallucinated, type TranscribeResult } from './asr/result.ts';
 import { toSimplified } from './asr/simplify.ts';
 import { estimateSeconds, parseActions, parseScript, vocabChange, vocabTable, type VocabWord } from './script.ts';
-import { ActivityGroup, ChatSockets, SELF_TYPE, chatHistory, chatItem, chatRefs, type ChatFigure } from './chat.ts';
+import { ActivityGroup, ChatSockets, SELF_TYPE, assistantReplyFromEvent, chatHistory, chatItem, chatRefs, type ChatFigure } from './chat.ts';
 import { ASK_OPTION_MAX, petToolDecls } from './tools.ts';
 import { COO, figurePacks, lookOf, modelName, nameIn, packFor, type FigurePack, type MoveTarget, type PackScan } from './packs.ts';
 import { moveChange, moveTable, readMove } from './moves.ts';
@@ -59,6 +59,74 @@ import type { Answer } from './cua/engine-ipc.ts';
 import { PackImporter } from './pack-import.ts';
 import { dressTable, planSettings, type SettingChange } from './self.ts';
 import { MODEL_TEXT, type ModelLanguage, type ModelText } from './model-text.ts';
+
+type GuideChoiceSnapshot = {
+  options: Array<Pick<PetDialogChoice, 'icon' | 'motion'>>;
+  more?: { options: Array<Pick<PetDialogChoice, 'icon' | 'motion'>> };
+};
+
+const GUIDE_LANGUAGE_NAMES: Readonly<Record<Language, string>> = {
+  zh: 'Simplified Chinese',
+  'zh-Hant': 'Traditional Chinese',
+  en: 'English',
+  ja: 'Japanese',
+  ko: 'Korean',
+  fr: 'French',
+  de: 'German',
+  'es-419': 'Latin American Spanish',
+  'pt-BR': 'Brazilian Portuguese',
+  it: 'Italian',
+  ru: 'Russian',
+};
+const GUIDE_PERSONA_NAMES: Readonly<Record<string, string>> = {
+  coo: 'Coo',
+  grail: 'Grail',
+  forge: 'Forge',
+  heart: 'Heart',
+  winter: 'Winter',
+  whale: 'the whale',
+};
+const GUIDE_ROAM_MEANINGS: Readonly<Record<NonNullable<PetDialogChoice['motion']>, string>> = {
+  still: 'Coo stays still',
+  walk: 'Coo strolls now and then',
+  run: 'Coo runs back and forth',
+};
+const GUIDE_WAKE_MEANINGS = [
+  'does not wake on pet touches',
+  'wakes on pokes',
+  'wakes on all pet touches',
+] as const;
+
+function snapshotGuideChoices(input: PetDialogInput | undefined): GuideChoiceSnapshot | undefined {
+  if (input?.kind !== 'choices') return undefined;
+  const snapshot = (choice: PetDialogChoice): Pick<PetDialogChoice, 'icon' | 'motion'> => ({
+    ...(choice.icon?.startsWith('persona_') ? { icon: choice.icon } : {}),
+    ...(choice.motion === undefined ? {} : { motion: choice.motion }),
+  });
+  return {
+    options: input.options.map(snapshot),
+    ...(input.more ? { more: { options: input.more.options.map(snapshot) } } : {}),
+  };
+}
+
+function guideChoiceMeaning(step: string, index: number, input?: GuideChoiceSnapshot): string | undefined {
+  const options = input ? [...input.options, ...(input.more?.options ?? [])] : [];
+  const option = options[index];
+  if (step === 'language' && input && !input.more && input.options.length === LANGUAGES.length) {
+    const language = LANGUAGES[index];
+    return language ? 'the app language is ' + GUIDE_LANGUAGE_NAMES[language] : undefined;
+  }
+  if (step === 'persona-pick') {
+    const id = option?.icon?.startsWith('persona_') ? option.icon.slice('persona_'.length) : undefined;
+    const name = id ? GUIDE_PERSONA_NAMES[id] : undefined;
+    return name ? "Coo's persona is " + name : undefined;
+  }
+  if (step === 'roam' && option?.motion) return GUIDE_ROAM_MEANINGS[option.motion];
+  if (step === 'wake' && input && !input.more && input.options.length === GUIDE_WAKE_MEANINGS.length) {
+    return GUIDE_WAKE_MEANINGS[index];
+  }
+  return undefined;
+}
 
 /** The console panels, titled in `language`. */
 function desktopPetPanelDecls(language: Language = 'zh'): WorldPanelDecl[] {
@@ -286,6 +354,7 @@ interface PendingAsk {
   id: string;
   question: string;
   options: string[];
+  allowOwn: boolean;
 }
 
 interface TouchBatch {
@@ -389,7 +458,12 @@ export class DesktopPetWorld implements World {
   private micState: { state: string; detail: string | null } = { state: 'off', detail: null };
   private devices: Array<{ id: string; label: string }> = [];
   private readonly confirms = new Map<string, PendingConfirm>();
-  private readonly dialogs = new Map<string, (a: PetDialogAnswer) => void>();
+  private readonly dialogs = new Map<string, { settle: (a: PetDialogAnswer) => void; accept: (a: PetDialogAnswer) => boolean; remember: (a: PetDialogAnswer) => void }>();
+  private readonly admittedDialogAnswers = new WeakMap<object, { text: string; input?: GuideChoiceSnapshot }>();
+  private readonly admittedAnswers = new WeakMap<object, SourceMapSpan[]>();
+  private readonly admittedAskReceipts = new WeakSet<object>();
+  private readonly admittedSayReceipts = new WeakMap<object, string>();
+  private readonly admittedActReceipts = new WeakMap<object, string>();
   /** The talk key is down (hold) or was switched on (toggle). */
   private talking = false;
   /** With `micOnPress`: the page keeps the microphone open from the talk key's press until MIC_RELEASE_MS after its release. */
@@ -415,6 +489,10 @@ export class DesktopPetWorld implements World {
   private phase: RunPhase | null = null;
   /** The person's messages (typed, spoken) not yet delivered to the bot, by cursor. */
   private readonly pendingChat = new Set<number>();
+  private readonly assistantResponseIds = new Set<string>();
+  private readonly pendingAssistantResponses: Array<{ responseId: string; text: string }> = [];
+  private readonly spokenThisTurn = new Set<string>();
+  private assistantFlush: Promise<void> = Promise.resolve();
   /** The first cursor of this run: Core queues this World's undelivered events from before it again at start. */
   private startCursor = 0;
   /** Text the bubble's expand button carried, until a chat page takes it. */
@@ -700,7 +778,7 @@ export class DesktopPetWorld implements World {
     this.micReleaseTimer = null;
     for (const c of this.confirms.values()) { clearTimeout(c.timer); c.resolve('unavailable'); }
     this.confirms.clear();
-    for (const d of this.dialogs.values()) d({ unavailable: true });
+    for (const d of this.dialogs.values()) d.settle({ unavailable: true });
     this.dialogs.clear();
     for (const w of this.walks.values()) { clearTimeout(w.timer); w.resolve(this.t.walkWorldStopped); }
     this.walks.clear();
@@ -737,19 +815,47 @@ export class DesktopPetWorld implements World {
   }
 
   outputTap(): OutputTap | undefined {
-    if (!this.server.petConnected) return undefined;
+    if (!this.server.petConnected && this.chat.size === 0) return undefined;
     return {
-      // the pet shows nothing of the stream itself; its tools act when they run
       externalizes: () => false,
-      onEvent: (event) => this.status.onEvent(event),
+      onEvent: (event) => {
+        this.status.onEvent(event);
+        const reply = assistantReplyFromEvent(event);
+        if (!reply || this.assistantResponseIds.has(reply.responseId)) return;
+        this.assistantResponseIds.add(reply.responseId);
+        if (this.assistantResponseIds.size > 1024) this.assistantResponseIds.delete(this.assistantResponseIds.values().next().value!);
+        this.pendingAssistantResponses.push(reply);
+      },
+      onAbort: () => {
+        for (const reply of this.pendingAssistantResponses) this.assistantResponseIds.delete(reply.responseId);
+        this.pendingAssistantResponses.length = 0;
+      },
     };
+  }
+
+  onSessionArchived(): void {
+    const text = this.ui.sessionArchived;
+    this.server.sendPet({ t: 'say', beats: [{ text, actions: [], anchors: [] }] });
+    void this.record({ kind: 'say', beats: [{ text }] }, text);
   }
 
   onRunPhase(phase: RunPhase): void {
     this.phase = phase;
     this.status.onPhase(phase);
     if (this.activity.observe(phase, Date.now())) this.chat.broadcast({ t: 'activity', steps: this.activity.steps, startedAt: this.activity.startedAt });
-    if (phase.state === 'idle') void this.closeActivity();
+    if (phase.state === 'idle') {
+      const replies = this.pendingAssistantResponses.splice(0);
+      const spoken = new Set(this.spokenThisTurn);
+      this.spokenThisTurn.clear();
+      void this.closeActivity();
+      const visible = replies.filter((reply) => !spoken.has(reply.text.trim()));
+      for (const reply of visible) {
+        this.server.sendPet({ t: 'say', beats: [{ text: reply.text, actions: [], anchors: [] }] });
+      }
+      if (visible.length > 0) this.assistantFlush = this.assistantFlush.then(async () => {
+        for (const reply of visible) await this.record({ kind: 'assistant', responseId: reply.responseId }, reply.text);
+      }).catch((err: unknown) => this.log?.warn(`回复没能保存:${(err as Error).message}`));
+    }
     this.chat.broadcast({ t: 'phase', phase });
   }
 
@@ -1138,12 +1244,15 @@ export class DesktopPetWorld implements World {
       }
       case 'control': return this.onControl(String(msg.action));
       case 'dialog': {
-        const settle = this.dialogs.get(String(msg.id));
-        if (!settle) return;
-        this.dialogs.delete(String(msg.id));
-        settle(typeof msg.index === 'number' ? { index: msg.index }
+        const dialog = this.dialogs.get(String(msg.id));
+        if (!dialog) return;
+        const answer: PetDialogAnswer = typeof msg.index === 'number' ? { index: msg.index }
           : typeof msg.text === 'string' ? { text: msg.text.slice(0, 2000) }
-          : msg.alt ? { alt: true } : msg.closed ? { closed: true } : { done: true });
+          : msg.alt ? { alt: true } : msg.closed ? { closed: true } : { done: true };
+        if (!dialog.accept(answer)) return;
+        dialog.remember(answer);
+        this.dialogs.delete(String(msg.id));
+        dialog.settle(answer);
         return;
       }
       case 'commit': return this.commitSpeech();
@@ -1190,10 +1299,29 @@ export class DesktopPetWorld implements World {
     let settle: (a: PetDialogAnswer) => void = () => {};
     const answer = new Promise<PetDialogAnswer>((resolve) => { settle = resolve; });
     if (!this.server.sendPet({ t: 'dialog', id, ...d, input, actions })) settle({ unavailable: true });
-    else this.dialogs.set(id, settle);
+    else {
+      const activeInput = input ? structuredClone(input) : undefined;
+      const closable = d.closable === true;
+      this.dialogs.set(id, { settle, accept: (a) => {
+        if ('closed' in a) return closable;
+        if ('index' in a) {
+          if (activeInput?.kind !== 'buttons' && activeInput?.kind !== 'choices') return false;
+          const count = activeInput.options.length + (activeInput.kind === 'choices' ? activeInput.more?.options.length ?? 0 : 0);
+          return Number.isInteger(a.index) && a.index >= 0 && a.index < count;
+        }
+        if ('text' in a) return activeInput?.kind === 'text';
+        if ('alt' in a) return activeInput?.kind === 'text' && !!activeInput.alt;
+        return 'done' in a && !activeInput;
+      }, remember: (a) => {
+        if ('index' in a) this.admittedDialogAnswers.set(a, { text: '[guide answer] The user selected option ' + (a.index + 1) + '.', input: snapshotGuideChoices(activeInput) });
+        else if ('text' in a && activeInput?.kind === 'text' && !activeInput.secret) {
+          this.admittedDialogAnswers.set(a, { text: '[guide answer] The user wrote: ' + a.text });
+        }
+      } });
+    }
     // a page that never reports back (a tab put to sleep) does not hold a line with nothing to answer forever
     if (!d.input && this.dialogs.has(id)) {
-      const timer = setTimeout(() => this.dialogs.get(id)?.({ done: true }), 5000 + d.text.length / DIALOG_CPS * 1000);
+      const timer = setTimeout(() => this.dialogs.get(id)?.settle({ done: true }), 5000 + d.text.length / DIALOG_CPS * 1000);
       void answer.finally(() => { clearTimeout(timer); this.dialogs.delete(id); });
     }
     return {
@@ -1203,7 +1331,7 @@ export class DesktopPetWorld implements World {
         const s = this.dialogs.get(id);
         this.dialogs.delete(id);
         this.server.sendPet({ t: 'dialog-close', id });
-        s?.({ done: true });
+        s?.settle({ done: true });
       },
     };
   }
@@ -1215,7 +1343,7 @@ export class DesktopPetWorld implements World {
 
   private onPageGone(): void {
     this.log?.info('桌宠页面断开');
-    for (const [id, d] of this.dialogs) { d({ unavailable: true }); this.dialogs.delete(id); }
+    for (const [id, d] of this.dialogs) { d.settle({ unavailable: true }); this.dialogs.delete(id); }
     for (const [id, w] of this.walks) { clearTimeout(w.timer); w.resolve(this.t.walkWindowGone); this.walks.delete(id); }
     for (const [id, c] of this.confirms) { clearTimeout(c.timer); c.resolve('unavailable'); this.confirms.delete(id); }
     this.segmenter.flush();
@@ -1226,22 +1354,21 @@ export class DesktopPetWorld implements World {
   private onAnswer(msg: Record<string, unknown>, from: 'pet' | 'chat'): void {
     const ask = this.ask;
     if (!ask || ask.id !== msg.askId) return;
-    const t = this.t;
     if (msg.dismissed) {
       this.setAsk(null);
-      void this.push('desktop-pet.answer', 'desktop-pet.answer', t.answerClosed(this.userName, ask.question), 'debounce', { meta: { askId: ask.id, dismissed: true } });
+      void this.push('desktop-pet.answer', 'desktop-pet.answer', '[answer] The user dismissed the question.', 'debounce', { meta: { askId: ask.id, dismissed: true } }, true);
       return;
     }
     const index = typeof msg.index === 'number' && ask.options[msg.index] !== undefined ? msg.index : null;
-    const text = typeof msg.text === 'string' ? msg.text.trim().slice(0, 500) : '';
+    const text = ask.allowOwn && typeof msg.text === 'string' ? msg.text.trim().slice(0, 500) : '';
     if (index === null && !text) return;
     this.setAsk(null);
     if (from === 'chat') this.server.sendPet({ t: 'ask-close', id: ask.id });
-    const line = index !== null
-      ? t.answerPicked(this.userName, ask.question, index + 1, ask.options[index]!)
-      : t.answerWrote(this.userName, ask.question, text);
+    const prefix = index !== null ? '[answer] The user selected option ' : '[answer] The user wrote: ';
+    const userValue = index !== null ? String(index + 1) : text;
+    const line = prefix + userValue + (index !== null ? '.' : '');
     void this.push('desktop-pet.answer', 'desktop-pet.answer', line, 'flush',
-      { meta: { askId: ask.id, ...(index !== null ? { index } : { text }) } });
+      { meta: { askId: ask.id, ...(index !== null ? { index } : { text }) } }, { start: prefix.length, end: prefix.length + userValue.length });
   }
 
   private onTouch(msg: PageMessage): void {
@@ -1308,16 +1435,85 @@ export class DesktopPetWorld implements World {
    * Delivers an event to the bot. `meta` carries what the chat page shows of it; the person's
    * messages stay pending on the page until Core reports them delivered.
    */
+  /** Publishes only a validated, non-secret answer received from the dialog page. */
+  publishDialogAnswer(answer: PetDialogAnswer, step = ''): boolean {
+    const admitted = this.admittedDialogAnswers.get(answer);
+    this.admittedDialogAnswers.delete(answer);
+    if (!admitted) return false;
+    const original = admitted.text;
+    const knownSteps = new Set(['language', 'hello', 'name', 'source', 'persona-pick', 'roam', 'wake',
+      'vendor', 'model', 'key', 'chatgpt', 'voice-download', 'talk', 'buttons', 'persona', 'finish']);
+    const subject = knownSteps.has(step) ? ` For ${step},` : '';
+    const selectedPrefix = '[guide answer] The user selected option ';
+    const typedPrefix = '[guide answer] The user wrote: ';
+    const selected = original.startsWith(selectedPrefix);
+    const value = selected ? original.slice(selectedPrefix.length, -1) : original.slice(typedPrefix.length);
+    if (!value || (!selected && !original.startsWith(typedPrefix))) return false;
+    const index = selected ? Number(value) - 1 : -1;
+    const prefix = `[guide answer]${subject} The user ${selected ? 'selected option ' : 'wrote: '}`;
+    const meaning = selected ? guideChoiceMeaning(step, index, admitted.input) : undefined;
+    const suffix = selected ? (meaning ? ' (' + meaning + ').' : '.') : '';
+    const text = prefix + value + suffix;
+    void this.push('desktop-pet.guide-answer', 'desktop-pet.guide-answer', text, 'debounce', {}, { start: prefix.length, end: prefix.length + value.length });
+    return true;
+  }
+
+  /** Admits only the one-time receipt from a spoken message the connected pet page accepted. */
+  admitSayReceipt(outcome: ToolOutcome): boolean {
+    const expected = this.admittedSayReceipts.get(outcome);
+    if (expected === undefined) return false;
+    this.admittedSayReceipts.delete(outcome);
+    return outcome.failed !== true && outcome.text === expected;
+  }
+
+  /** Admits the fixed receipt produced after the pet accepted a question. */
+  admitAskReceipt(outcome: ToolOutcome): boolean {
+    if (!this.admittedAskReceipts.has(outcome)) return false;
+    this.admittedAskReceipts.delete(outcome);
+    return outcome.text === '[pet_ask] Question displayed; the answer arrives as an event.';
+  }
+
+  /** Admits only the one-time receipt from a pet action that the page accepted. */
+  admitActReceipt(outcome: ToolOutcome): boolean {
+    const expected = this.admittedActReceipts.get(outcome);
+    if (expected === undefined) return false;
+    this.admittedActReceipts.delete(outcome);
+    return outcome.failed !== true && outcome.text === expected;
+  }
+
+  /** Admits only a pending question's validated, one-time UI answer. */
+  admitUserAnswer(event: object): false | SourceMapSpan[] {
+    const spans = this.admittedAnswers.get(event);
+    this.admittedAnswers.delete(event);
+    return spans ?? false;
+  }
+
   private async push(
     type: string, senderKey: string, text: string, trigger: TriggerMode,
     extra: { meta?: Record<string, unknown>; blobs?: BlobInput[] } = {},
+    admittedAnswer: false | true | { start: number; end: number } = false,
   ): Promise<EventEnvelope | null> {
     const host = this.host;
     if (!host) return null;
     try {
       const directUserInput = type === 'desktop-pet.message' || type === 'desktop-pet.speech' || type === 'desktop-pet.touch';
-      const e = await host.pushEvent({ type, source: this.id, senderKey, ts: nowIso(this.opts.timezone), text: this.stamp() + text,
-        ...(directUserInput ? { dependencyOrigin: 'user-input' as const } : {}), ...extra }, { trigger });
+      const stamp = this.stamp();
+      const event = { type, source: this.id, senderKey, ts: nowIso(this.opts.timezone), text: stamp + text,
+        ...(directUserInput || admittedAnswer ? { dependencyOrigin: 'user-input' as const } : {}), ...extra };
+      if (admittedAnswer) {
+        const range = admittedAnswer === true ? { start: 0, end: text.length } : admittedAnswer;
+        const start = stamp.length + range.start;
+        const end = stamp.length + range.end;
+        const spans: SourceMapSpan[] = [];
+        const add = (from: number, to: number, origin: 'user-input' | 'core-generated') => {
+          if (to > from) spans.push({ start: from, end: to, digest: digestText(event.text.slice(from, to)), origin });
+        };
+        add(0, start, 'core-generated');
+        add(start, end, 'user-input');
+        add(end, event.text.length, 'core-generated');
+        this.admittedAnswers.set(event, spans);
+      }
+      const e = await host.pushEvent(event, { trigger });
       const item = chatItem(e);
       if (!item) return e;
       const pending = item.kind === 'user' && e.contextDelivery === 'deliver';
@@ -1751,6 +1947,7 @@ export class DesktopPetWorld implements World {
     const spoken = beats.some((b) => b.text || b.actions.length || b.anchors.length);
     if (!spoken && shown.blobs.length === 0) return { text: this.t.sayEmpty, failed: true };
     if (spoken && !this.server.sendPet({ t: 'say', id: nextId('s'), beats })) return this.notConnected('pet_say');
+    if (spoken) for (const beat of beats) if (beat.text.trim()) this.spokenThisTurn.add(beat.text.trim());
     void this.closeActivity();
     void this.record({ kind: 'say', beats: beats.map((b) => ({ text: b.text, ...moodOf(b.actions, this.vocab()) })) }, beats.map((b) => b.text).join(''), shown.blobs);
     if (!spoken) return { text: this.t.imagesShown(shown.blobs.length, this.chat.size > 0) };
@@ -1760,7 +1957,13 @@ export class DesktopPetWorld implements World {
     this.busyUntil = Math.max(now, this.busyUntil) + selfSec * 1000;
     const replaced = this.ask?.question ?? null;
     if (this.ask) this.setAsk(null);
-    return { text: this.t.sayReceipt({ waitSec, selfSec, chatOpen: this.chat.size > 0, replaced, dropped, images: shown.blobs.length }) };
+    // The test channel has no trusted Assembly-side World tool-text policy yet; its receipt would
+    // otherwise enter the next round as unknown-derived tool text. Suppress only this test channel
+    // receipt; the speech itself and all source verification remain unchanged.
+    if (process.env.CORTICO_TEST_CHANNEL === '1') return { text: '' };
+    const receipt: ToolOutcome = { text: this.t.sayReceipt({ waitSec, selfSec, chatOpen: this.chat.size > 0, replaced, dropped, images: shown.blobs.length }) };
+    this.admittedSayReceipts.set(receipt, receipt.text);
+    return receipt;
   }
 
   /**
@@ -1791,11 +1994,13 @@ export class DesktopPetWorld implements World {
     if (options.length === 0 && !allowOwn) return { text: this.t.askNoWay, failed: true };
     const id = nextId('a');
     if (!this.server.sendPet({ t: 'ask', id, question, options, own: allowOwn })) return this.notConnected('pet_ask');
-    const replaced = this.ask?.question ?? null;
-    this.setAsk({ id, question, options });
+    this.setAsk({ id, question, options, allowOwn });
+    this.spokenThisTurn.add(question.trim());
     void this.closeActivity();
     void this.record({ kind: 'ask', askId: id, question, options, own: allowOwn }, question);
-    return { text: this.t.askReceipt({ replaced, cut: raw.length > 3, chatOpen: this.chat.size > 0 }) };
+    const receipt: ToolOutcome = { text: '[pet_ask] Question displayed; the answer arrives as an event.' };
+    this.admittedAskReceipts.add(receipt);
+    return receipt;
   }
 
   /**
@@ -1910,7 +2115,9 @@ export class DesktopPetWorld implements World {
     if (!actions.length) return { text: this.t.actNone(dropped), failed: true };
     if (!this.server.sendPet({ t: 'act', id: nextId('c'), actions })) return this.notConnected('pet_act');
     const lasting = actions.filter((a) => vocab.find((v) => v.id === a)?.lasting);
-    return { text: this.t.actReceipt(actions, lasting, dropped) };
+    const receipt: ToolOutcome = { text: this.t.actReceipt(actions, lasting, dropped) };
+    this.admittedActReceipts.set(receipt, receipt.text);
+    return receipt;
   }
 
   /* ---------- prompt ---------- */

@@ -5,8 +5,9 @@
  * with its own accounts, keys and base URL. Base URLs, protocols, starting models, key pages, image
  * input, context windows and thinking levels are from each service's own documentation (Chinese
  * services' mainland platforms read 2026-09-24, everything else 2026-10-08, starting models and GLM's
- * and OpenRouter's thinking levels checked again 2026-10-09, StepFun's Step Plan read 2026-10-20);
- * only DeepSeek, Anthropic and StepFun's Step Plan have been tried with a key.
+ * and OpenRouter's thinking levels checked again 2026-10-09, StepFun's Step Plan read 2026-10-20,
+ * OpenCode Go's catalogue and endpoints read 2026-11-11); only DeepSeek, Anthropic and StepFun's
+ * Step Plan have been tried with a key.
  *
  * This file imports nothing, so the browser console and the app's first-run seed can use it.
  */
@@ -48,6 +49,12 @@ export interface Site {
   keyUrl: string;
   /** Replaces `Vendor.effort` on this platform. */
   effort?: EffortMap;
+  /** A catalogue read at run time; its rows state the protocol and base URL of each model. */
+  catalog?: 'opencode-go';
+  /** Overrides the protocol's own key header: `bearer` instead of `x-api-key` or `x-goog-api-key`. */
+  auth?: 'bearer';
+  /** The URL of that catalogue, when it is not `<baseUrl>/models`. */
+  modelsUrl?: string;
 }
 
 export interface Vendor {
@@ -227,6 +234,19 @@ export const VENDORS: readonly Vendor[] = [
     modelEffort: { 'z-ai/glm-5.3-flash': { none: 'low' } },
     syntheticReasoning: false,
   },
+  {
+    // Go's catalogue names each model's API family and base URL; the model list is read at run time
+    // (https://opencode.ai/inference/go/v1/models, read 2026-11-11), not written out here.
+    id: 'opencode-go', names: brand('OpenCode Go'), keyHint: hint('oc_sk_'), secret: 'OPENCODE_GO_API_KEY',
+    sites: {
+      global: {
+        baseUrl: 'https://opencode.ai/inference/go/openai/v1', protocol: 'chat', auth: 'bearer',
+        catalog: 'opencode-go', modelsUrl: 'https://opencode.ai/inference/go/v1/models',
+        keyUrl: 'https://opencode.ai/console/go',
+      },
+    },
+    model: 'deepseek-v4.1-flash',
+  },
   OPENAI,
   {
     // thinking and effort are sent in the Messages API's own form (`thinkingParams` in anthropic/wire.ts)
@@ -286,6 +306,21 @@ export const vendorName = (v: Vendor, language: Language): string => localized(v
 
 const trimSlash = (url: string) => url.replace(/\/+$/, '');
 
+/** An official Go protocol base URL or its matching loopback simulator path. */
+export function isOpenCodeGoUrl(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false;
+  if (baseUrl !== baseUrl.trim()) return false;
+  let url: URL;
+  try { url = new URL(baseUrl); } catch { return false; }
+  if (url.username || url.password || url.search || url.hash || url.pathname.includes('%') || url.href !== baseUrl) return false;
+  const path = url.pathname.endsWith('/') ? url.pathname.slice(0, -1) : url.pathname;
+  if (!['/inference/go/openai/v1', '/inference/go/anthropic/v1', '/inference/go/google/v1beta'].includes(path)) return false;
+  const host = url.hostname.toLowerCase().replace('[', '').replace(']', '');
+  const official = url.protocol === 'https:' && host === 'opencode.ai' && !url.port;
+  const loopback = url.protocol === 'http:' && !!url.port && (host === '127.0.0.1' || host === '::1');
+  return official || loopback;
+}
+
 export interface Located {
   vendor: Vendor;
   /** Null for a service with one platform. */
@@ -297,6 +332,10 @@ export interface Located {
 export function locate(baseUrl: string | undefined): Located | null {
   if (!baseUrl) return null;
   const url = trimSlash(baseUrl.trim());
+  if (isOpenCodeGoUrl(url)) {
+    const vendor = VENDORS.find((item) => item.id === 'opencode-go')!;
+    return { vendor, region: null, site: siteOf(vendor, 'cn') };
+  }
   for (const vendor of VENDORS) {
     const sites: Array<[Region | null, Site]> = 'global' in vendor.sites ? [[null, vendor.sites.global]] : REGIONS.map((r) => [r, siteOf(vendor, r)]);
     for (const [region, site] of sites) if (url === site.baseUrl || url.startsWith(`${site.baseUrl}/`)) return { vendor, region, site };
@@ -310,8 +349,8 @@ export const vendorOf = (baseUrl: string | undefined): Vendor | null => locate(b
 /** Mainland China for Chinese, the international platforms for every other language. */
 export const defaultRegion = (language: Language): Region => (language === 'zh' ? 'cn' : 'intl');
 
-const ORDER_ZH = ['deepseek', 'qwen', 'kimi', 'glm', 'doubao', 'minimax', 'stepfun', 'stepfun-plan', 'qianfan', 'openrouter', 'openai', 'chatgpt', 'anthropic', 'gemini', 'xai'];
-const ORDER_OTHER = ['openai', 'chatgpt', 'anthropic', 'gemini', 'xai', 'openrouter', 'deepseek', 'kimi', 'qwen', 'minimax', 'glm'];
+const ORDER_ZH = ['deepseek', 'qwen', 'kimi', 'glm', 'doubao', 'minimax', 'stepfun', 'stepfun-plan', 'qianfan', 'openrouter', 'opencode-go', 'openai', 'chatgpt', 'anthropic', 'gemini', 'xai'];
+const ORDER_OTHER = ['openai', 'chatgpt', 'anthropic', 'gemini', 'xai', 'openrouter', 'opencode-go', 'deepseek', 'kimi', 'qwen', 'minimax', 'glm'];
 /** Services that take mainland China accounts only. */
 const MAINLAND_ONLY = ['doubao', 'qianfan', 'stepfun', 'stepfun-plan'];
 

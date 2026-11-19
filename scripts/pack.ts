@@ -21,7 +21,7 @@
  */
 import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -37,19 +37,28 @@ const run = (cmd: string, args: string[], cwd: string) => {
 const ARCH = process.env.PACK_ARCH || process.arch;
 const STEAM = process.env.COOPANION_CHANNEL === 'steam';
 const TEST = process.env.COOPANION_CHANNEL === 'test';
+const ACCEPTANCE = process.env.COOPANION_CHANNEL === 'acceptance';
 const TEST_RUN_ID = String(process.env.COOPANION_TEST_RUN_ID ?? '');
+const ACCEPTANCE_RUN_ID = String(process.env.COOPANION_ACCEPTANCE_RUN_ID ?? '');
 if (TEST && !/^[a-z0-9][a-z0-9-]{0,63}$/.test(TEST_RUN_ID)) {
   throw new Error('COOPANION_TEST_RUN_ID must be a short lowercase identifier');
+}
+if (ACCEPTANCE && !/^[a-z0-9][a-z0-9-]{0,63}$/.test(ACCEPTANCE_RUN_ID)) {
+  throw new Error('COOPANION_ACCEPTANCE_RUN_ID must be a short lowercase identifier');
 }
 const require = createRequire(import.meta.url);
 const { testIdentity } = require('../app/test-channel.cjs') as {
   testIdentity(runId: string): { productName: string; appId: string };
 };
+const { acceptanceIdentity } = require('../app/acceptance-channel.cjs') as {
+  acceptanceIdentity(runId: string): { productName: string; appId: string };
+};
 const TEST_IDENTITY = TEST ? testIdentity(TEST_RUN_ID) : null;
-const OUT = join(ROOT, 'build', TEST ? join('test-app', TEST_RUN_ID) : 'app');
-const TEST_OUTPUT = TEST ? join(ROOT, 'dist', 'test', TEST_RUN_ID) : null;
-if (TEST && (existsSync(OUT) || existsSync(TEST_OUTPUT!))) {
-  throw new Error(`Test App run ${TEST_RUN_ID} already has build output; choose a new runId`);
+const ACCEPTANCE_IDENTITY = ACCEPTANCE ? acceptanceIdentity(ACCEPTANCE_RUN_ID) : null;
+const OUT = join(ROOT, 'build', TEST ? join('test-app', TEST_RUN_ID) : ACCEPTANCE ? join('acceptance-app', ACCEPTANCE_RUN_ID) : 'app');
+const TEST_OUTPUT = TEST ? join(ROOT, 'dist', 'test', TEST_RUN_ID) : ACCEPTANCE ? join(ROOT, 'dist', 'acceptance', ACCEPTANCE_RUN_ID) : null;
+if ((TEST || ACCEPTANCE) && (existsSync(OUT) || existsSync(TEST_OUTPUT!))) {
+  throw new Error(`Run ${TEST ? TEST_RUN_ID : ACCEPTANCE_RUN_ID} already has build output; choose a new runId`);
 }
 const STEAM_APP_ID = Number(process.env.STEAM_APP_ID);
 if (STEAM && !(Number.isInteger(STEAM_APP_ID) && STEAM_APP_ID > 0)) {
@@ -148,6 +157,28 @@ function sha256(file: string): string {
   return createHash('sha256').update(readFileSync(file)).digest('hex');
 }
 
+/**
+ * A package the staged Cortico imports but npm does not install for the app (it is a dev
+ * dependency of the workspace). Copied with its resolved dependency tree from the frozen
+ * workspace install, flattened into the app's node_modules.
+ */
+function copyRuntimePackage(name: string, fromDir?: string, seen = new Set<string>()): void {
+  if (seen.has(name)) return;
+  seen.add(name);
+  const from = realpathSync(fromDir ?? join(ROOT, 'node_modules', name));
+  const to = join(OUT, 'node_modules', name);
+  rmSync(to, { recursive: true, force: true });
+  mkdirSync(dirname(to), { recursive: true });
+  cpSync(from, to, { recursive: true, dereference: true });
+  const pkg = JSON.parse(readFileSync(join(from, 'package.json'), 'utf8')) as { dependencies?: Record<string, string> };
+  for (const dependency of Object.keys(pkg.dependencies ?? {})) {
+    // A package may hide package.json from its exports; resolve its entry and walk to its root.
+    let dir = dirname(createRequire(join(from, 'package.json')).resolve(dependency));
+    while (!existsSync(join(dir, 'package.json')) && dirname(dir) !== dir) dir = dirname(dir);
+    copyRuntimePackage(dependency, dir, seen);
+  }
+}
+
 function packageInventory(root: string, rel = ''): Array<{ path: string; name: string; version: string }> {
   const abs = join(root, rel);
   return readdirSync(abs).sort().flatMap((name) => {
@@ -176,17 +207,19 @@ cpSync(join(ROOT, 'build', 'browser-agent.js'), join(OUT, 'build', 'browser-agen
 // the coopanion World's panel bundle (core/companion.ts registers it)
 cpSync(join(ROOT, 'build', 'panels'), join(OUT, 'build', 'panels'), { recursive: true, filter: (src) => !src.endsWith('.map') });
 writeFileSync(join(OUT, 'package.json'), JSON.stringify({
-  name: TEST ? 'coopanion-test' : rootPkg.name,
-  productName: TEST_IDENTITY?.productName ?? rootPkg.productName,
+  name: TEST ? 'coopanion-test' : ACCEPTANCE ? 'coopanion-acceptance' : rootPkg.name,
+  productName: TEST_IDENTITY?.productName ?? ACCEPTANCE_IDENTITY?.productName ?? rootPkg.productName,
   version: rootPkg.version, description: rootPkg.description,
   license: rootPkg.license, author: rootPkg.author, homepage: rootPkg.homepage, type: 'module', main: 'app/main.cjs',
   dependencies: DEPS,
   coopanion: TEST ? { channel: 'test', runId: TEST_RUN_ID, appId: TEST_IDENTITY!.appId }
-    : STEAM ? { channel: 'steam', steamAppId: STEAM_APP_ID }
-      : { channel: PORTABLE ? 'portable' : 'github' },
+    : ACCEPTANCE ? { channel: 'acceptance', runId: ACCEPTANCE_RUN_ID, appId: ACCEPTANCE_IDENTITY!.appId }
+      : STEAM ? { channel: 'steam', steamAppId: STEAM_APP_ID }
+        : { channel: PORTABLE ? 'portable' : 'github' },
 }, null, 2));
 run('npm', ['install', '--package-lock-only', '--ignore-scripts', '--no-audit', '--no-fund', '--loglevel=error', `--os=${process.platform}`, `--cpu=${ARCH}`], OUT);
 run('npm', ['ci', '--omit=dev', '--no-audit', '--no-fund', '--loglevel=error', `--os=${process.platform}`, `--cpu=${ARCH}`], OUT);
+copyRuntimePackage('tar-stream');
 if (STEAM) {
   // steamworks.js carries the Steam library of every platform; this build loads its own platform's
   const own = process.platform === 'win32' ? 'win64' : 'linux64';
@@ -205,27 +238,40 @@ if (TEST && (
 )) {
   throw new Error('The staged Test App identity does not match COOPANION_TEST_RUN_ID');
 }
+if (ACCEPTANCE && (
+  stagedPackage.productName !== ACCEPTANCE_IDENTITY?.productName
+  || stagedPackage.coopanion?.appId !== ACCEPTANCE_IDENTITY?.appId
+)) {
+  throw new Error('The staged Acceptance App identity does not match COOPANION_ACCEPTANCE_RUN_ID');
+}
 for (const name of WORKSPACE) {
   const from = join(ROOT, 'packages', name);
   cpSync(from, join(OUT, 'node_modules', name), { recursive: true, filter: skip(from) });
   // listed only now: npm must not fetch them, but electron-builder ships only listed dependencies
   stagedPackage.dependencies[name] = (JSON.parse(readFileSync(join(from, 'package.json'), 'utf8')) as { version: string }).version;
 }
+stagedPackage.dependencies['tar-stream'] = installedVersion('tar-stream');
 writeFileSync(join(OUT, 'package.json'), JSON.stringify(stagedPackage, null, 2));
 if (process.platform === 'win32') await addMinGit(join(OUT, 'mingit'));
 const packageLock = join(OUT, 'package-lock.json');
 const fileManifest = fileInventory(OUT);
-const sourceCommit = execFileSync('git', ['-C', ROOT, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-const sourceDirty = execFileSync('git', ['-C', ROOT, 'status', '--porcelain=v1'], { encoding: 'utf8' }).trim().length > 0;
+// A checkout whose Git metadata was offloaded by the filesystem cannot answer these two
+// questions without reading every tracked file. A release run may supply the already verified
+// values explicitly; otherwise the repository is asked as before.
+const explicitCommit = (process.env.COOPANION_BUILD_COMMIT ?? '').trim();
+const explicitDirty = (process.env.COOPANION_BUILD_DIRTY ?? '').trim();
+const sourceCommit = explicitCommit || execFileSync('git', ['-C', ROOT, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+const sourceDirty = explicitDirty ? explicitDirty === '1'
+  : execFileSync('git', ['-C', ROOT, 'status', '--porcelain=v1'], { encoding: 'utf8' }).trim().length > 0;
 const driverBinary = '/Applications/CuaDriver.app/Contents/MacOS/cua-driver';
 const buildManifest = {
   schemaVersion: 1,
   createdAt: new Date().toISOString(),
-  channel: TEST ? 'test' : STEAM ? 'steam' : PORTABLE ? 'portable' : 'github',
-  ...(TEST ? { runId: TEST_RUN_ID } : {}),
+  channel: TEST ? 'test' : ACCEPTANCE ? 'acceptance' : STEAM ? 'steam' : PORTABLE ? 'portable' : 'github',
+  ...(TEST ? { runId: TEST_RUN_ID } : ACCEPTANCE ? { runId: ACCEPTANCE_RUN_ID } : {}),
   source: { commit: sourceCommit, worktreeDirty: sourceDirty },
   platform: { os: process.platform, architecture: ARCH, node: process.version, electron: rootPkg.devDependencies?.electron ?? null },
-  app: { productName: stagedPackage.productName, version: stagedPackage.version, appId: TEST ? TEST_IDENTITY!.appId : 'ai.pal.coopanion' },
+  app: { productName: stagedPackage.productName, version: stagedPackage.version, appId: TEST ? TEST_IDENTITY!.appId : ACCEPTANCE ? ACCEPTANCE_IDENTITY!.appId : 'ai.pal.coopanion' },
   signature: process.platform === 'darwin' ? 'ad-hoc (identity -); not notarized' : 'platform default; not attested',
   npmResolvedLockSha256: existsSync(packageLock) ? sha256(packageLock) : null,
   directRuntimeDependencies: Object.fromEntries(Object.entries(stagedPackage.dependencies).sort(([a], [b]) => a.localeCompare(b))),
@@ -241,13 +287,14 @@ writeFileSync(join(OUT, 'build-manifest.json'), JSON.stringify(buildManifest, nu
 console.log(`app directory ready: ${relative(ROOT, OUT)}`);
 
 const target = process.platform === 'darwin' ? '--mac' : process.platform === 'linux' ? '--linux' : '--win';
-run(join(ROOT, 'node_modules', '.bin', process.platform === 'win32' ? 'electron-builder.cmd' : 'electron-builder'), [target, ...PORTABLE ? ['zip'] : [], `--${ARCH}`, ...STEAM ? ['--dir'] : [], ...(TEST ? ['--projectDir', OUT, '--config', join(ROOT, 'electron-builder.test.cjs')] : []), '--publish', 'never', ...process.argv.slice(2)], TEST ? OUT : ROOT);
+run(join(ROOT, 'node_modules', '.bin', process.platform === 'win32' ? 'electron-builder.cmd' : 'electron-builder'), [target, ...PORTABLE ? ['zip'] : [], `--${ARCH}`, ...STEAM ? ['--dir'] : [], ...(TEST ? ['--projectDir', OUT, '--config', join(ROOT, 'electron-builder.test.cjs')] : ACCEPTANCE ? ['--projectDir', OUT, '--config', join(ROOT, 'electron-builder.acceptance.cjs')] : []), '--publish', 'never', ...process.argv.slice(2)], TEST || ACCEPTANCE ? OUT : ROOT);
 
-if (TEST && process.platform === 'darwin') {
+if ((TEST || ACCEPTANCE) && process.platform === 'darwin') {
+  const identity = (TEST ? TEST_IDENTITY : ACCEPTANCE_IDENTITY)!;
   const appOutDir = join(TEST_OUTPUT!, `mac-${ARCH}`);
-  const appPath = join(appOutDir, `${TEST_IDENTITY!.productName}.app`);
+  const appPath = join(appOutDir, `${identity.productName}.app`);
   const verified = spawnSync('codesign', ['--verify', '--deep', '--strict', appPath], { encoding: 'utf8' });
-  if (verified.status !== 0) throw new Error(`Test App signature verification failed: ${verified.stderr || verified.stdout}`);
+  if (verified.status !== 0) throw new Error(`Isolated app signature verification failed: ${verified.stderr || verified.stdout}`);
   const artifactPaths = readdirSync(TEST_OUTPUT!)
     .filter((name) => name.endsWith('.dmg') || name.endsWith('.zip'))
     .sort()
@@ -259,7 +306,7 @@ if (TEST && process.platform === 'darwin') {
     signatureVerified: true,
   });
   const inventory = finalManifest.appInventory as { fileCount: number; filesSha256: string };
-  console.log(`Final Test App manifest: ${relative(ROOT, manifestPath)} (${inventory.fileCount} files, ${inventory.filesSha256})`);
+  console.log(`Final isolated app manifest: ${relative(ROOT, manifestPath)} (${inventory.fileCount} files, ${inventory.filesSha256})`);
 }
 
 if (STEAM) {

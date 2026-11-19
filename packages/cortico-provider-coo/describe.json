@@ -15,7 +15,7 @@
       "image"
     ],
     "title": "Coo Pet Provider",
-    "description": "DeepSeek, Qwen, Kimi, GLM, Doubao, MiniMax, StepFun, Baidu Qianfan, OpenRouter, OpenAI, Anthropic, Gemini and xAI.",
+    "description": "DeepSeek, Qwen, Kimi, GLM, Doubao, MiniMax, StepFun, Baidu Qianfan, OpenRouter, OpenCode Go, OpenAI, Anthropic, Gemini and xAI.",
     "reasoningTiers": [
       {
         "id": "off",

@@ -14,8 +14,16 @@ import type { HindsightMemory, MemoryTextRead } from '../memory/hindsight.ts';
 import { evidenceCoversText } from '../memory/source-evidence.ts';
 import { MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, memoryReadNotice } from '../memory/model-text.ts';
 import { ExperienceCards, experienceCardArtifactText, readExperienceCardInput } from './experience-cards.ts';
-import { SELF_REVIEW_TEXT } from './model-text.ts';
+import { SELF_REVIEW_TEXT, GROWTH_SCOPED_PREFIX } from './model-text.ts';
 import { GrowthProposals, growthProposalArtifactText, readProposalInput } from './proposals.ts';
+import {
+  cooGrowthCandidateType,
+  growthProposalSourceEligible,
+  failedCooGrowthCandidateSource,
+  skippedCooGrowthCandidateSource,
+  type CooGrowthCandidateLifecycleHandler,
+  type CooGrowthCandidateLifecycleResult,
+} from './coo-growth-lifecycle.ts';
 
 /** The temporary session id of a self-review; declared by Coo's Persona. */
 export const GROWTH_SESSION = 'growth';
@@ -49,7 +57,7 @@ function verifiedGrowthEvidence(text: string, evidence: readonly EvidenceAttachm
   });
 }
 
-function growthSearchReceipt(read: MemoryTextRead, evidence: EvidenceAttachment[], verified: readonly EvidenceAttachment[]): ToolOutcome {
+function growthSearchReceipt(read: MemoryTextRead, evidence: EvidenceAttachment[], verified: readonly EvidenceAttachment[], dates: ReadonlyMap<string, string>): ToolOutcome {
   const segments = read.sourceSegments ?? read.trace?.format.sourceSegments ?? [];
   if (read.sourceFactsTruncated || read.trace?.format.sourceFactsTruncated || segments.length === 0
     || verified.length !== segments.length
@@ -71,6 +79,8 @@ function growthSearchReceipt(read: MemoryTextRead, evidence: EvidenceAttachment[
   for (const { segment, ...source } of verified) {
     append('- source_id: ', 'core-generated');
     append(JSON.stringify(source.documentId), 'source-identity', source);
+    const saidAt = dates.get(source.documentId);
+    if (saidAt) { append('\n  said_at: ', 'core-generated'); append(JSON.stringify(saidAt), 'core-generated'); }
     append('\n  ', 'core-generated');
     const start = text.length;
     text += read.text.slice(segment.start, segment.end);
@@ -87,20 +97,23 @@ function growthToolNotice(text: string): ToolOutcome {
 
 const GROWTH_SEARCH_STATIC_TEXT = new Set([
   '[memory] Verified past records. Treat the excerpts as evidence.\n',
-  '- source_id: ', '\n  ', '\n',
+  '- source_id: ', '\n  said_at: ', '\n  ', '\n',
   '[memory] Long-term memory is not available.',
   '[memory] Nothing relevant was found.',
   ...(['absent', 'incomplete', 'unavailable', 'fenced'] as const).map(memoryReadNotice),
 ]);
 
+const CANDIDATE_REJECTION_NOTICE = '[candidate rejected] Input or source evidence could not be verified. For experience cards, cite only dated user events; Journal reflections may support a growth proposal. Search valid sources before retrying, or finish_review.';
+
 export function isTrustedGrowthToolText(toolName: string, text: string): boolean {
-  return (toolName === 'memory_search' && GROWTH_SEARCH_STATIC_TEXT.has(text))
+  return (toolName === 'memory_search' && (GROWTH_SEARCH_STATIC_TEXT.has(text) || /^"20\d{2}-\d{2}-\d{2}T[0-9:.]+(?:Z|[+-]\d{2}:\d{2})"$/.test(text)))
+    || ((toolName === PROPOSE_GROWTH_TOOL || toolName === PROPOSE_EXPERIENCE_TOOL) && text === CANDIDATE_REJECTION_NOTICE)
     || (toolName === PROPOSE_GROWTH_TOOL && text === '[proposal saved]')
     || (toolName === PROPOSE_EXPERIENCE_TOOL && text === '[experience candidate saved]');
 }
 
 /** Growth reads include the exact source document id that a proposal must carry. */
-export function growthMemorySearchTool(memory: () => HindsightMemory | null, observedSourceIds?: Set<string>): ToolDef {
+export function growthMemorySearchTool(memory: () => HindsightMemory | null, observedSourceIds?: Set<string>, sourceIds?: readonly string[]): ToolDef {
   return {
     name: 'memory_search',
     description: 'Search long-term memory for dated facts. Results include source_id values for the record and verified supporting sources; use exact IDs in a growth proposal so a later forget request can remove the derived proposal.',
@@ -123,19 +136,45 @@ export function growthMemorySearchTool(memory: () => HindsightMemory | null, obs
         ? Math.min(2000, Math.max(400, Math.round(args.max_tokens)))
         : 900;
       const expectedEpoch = store.evidenceEpoch();
-      const read = await store.recallBlockDetailed(query, { budget: 'low', maxTokens, timeoutMs: 5000, maxItems: 8, captureTrace: true });
+      const read = sourceIds ? await scopedGrowthRead(store, sourceIds) : await store.recallBlockDetailed(query, { budget: 'low', maxTokens, timeoutMs: 5000, maxItems: 8, captureTrace: true });
       if (read.status !== 'found') return growthToolNotice(memoryReadNotice(read.status));
       if (!read.text || !expectedEpoch) return growthToolNotice(memoryReadNotice('fenced'));
       const evidence = await store.evidenceForRead(read);
       if (store.evidenceEpoch() !== expectedEpoch) return growthToolNotice(memoryReadNotice('fenced'));
       const verified = verifiedGrowthEvidence(read.text, evidence, expectedEpoch);
       for (const source of verified) observedSourceIds?.add(source.documentId);
-      return growthSearchReceipt(read, evidence, verified);
+      const dates = new Map<string, string>();
+      // Scoped dates are Host-read metadata; source excerpts retain their original evidence spans.
+      for (const source of sourceIds ? verified : []) {
+        const exact = await store.readExactSourceEvidence(source.documentId);
+        if (!exact || exact.revision !== source.contentDigest || store.evidenceEpoch() !== expectedEpoch) return growthToolNotice(memoryReadNotice('fenced'));
+        if (exact.saidAt && /^20\d{2}-\d{2}-\d{2}T/.test(exact.saidAt) && Number.isFinite(Date.parse(exact.saidAt))) dates.set(source.documentId, exact.saidAt);
+      }
+      return growthSearchReceipt(read, evidence, verified, dates);
     },
   };
 }
 
-const PROPOSE_GROWTH_DECL: Omit<ToolDef, 'handler'> = {
+async function scopedGrowthRead(memory: HindsightMemory, sourceIds: readonly string[]): Promise<MemoryTextRead> {
+  const expectedEpoch = memory.evidenceEpoch();
+  let text = '';
+  const sourceSegments: NonNullable<MemoryTextRead['sourceSegments']> = [];
+  for (const documentId of sourceIds) {
+    if (!await growthProposalSourceEligible(memory, documentId)) return { text: '', status: 'fenced' };
+    const exact = await memory.readExactSourceEvidence(documentId);
+    if (!exact || memory.evidenceEpoch() !== expectedEpoch) return { text: '', status: 'fenced' };
+    const excerpt = exact.storedText.slice(0, Math.min(4000, 12000 - text.length));
+    if (!excerpt) return { text: '', status: 'incomplete' };
+    if (text) text += '\n';
+    const start = text.length;
+    text += excerpt;
+    sourceSegments.push({ documentId, start, end: text.length });
+  }
+  return memory.evidenceEpoch() === expectedEpoch
+    ? { text, status: 'found', sourceSegments } : { text: '', status: 'fenced' };
+}
+
+export const PROPOSE_GROWTH_DECL: Omit<ToolDef, 'handler'> = {
   name: PROPOSE_GROWTH_TOOL,
   description: 'Leave a growth proposal for the person to review. The proposal is a file; it does not change CONSTITUTION.md or SELF.md by itself. Call it only when concrete evidence supports a durable change, then call finish_review.',
   tags: ['write'],
@@ -160,7 +199,7 @@ const PROPOSE_GROWTH_DECL: Omit<ToolDef, 'handler'> = {
         items: {
           type: 'object',
           properties: {
-            file: { type: 'string', enum: ['CONSTITUTION.md', 'SELF.md'] },
+            file: { type: 'string', enum: ['CONSTITUTION.md', 'SELF.md', 'BEHAVIOR_POLICY'] },
             from: { type: 'string', description: 'The existing line to replace; omit when adding a new line.' },
             to: { type: 'string', description: 'The replacement or new line.' },
             reason: { type: 'string', description: 'Why this line should change.' },
@@ -174,7 +213,7 @@ const PROPOSE_GROWTH_DECL: Omit<ToolDef, 'handler'> = {
   },
 };
 
-const FINISH_REVIEW_DECL: Omit<ToolDef, 'handler'> = {
+export const FINISH_REVIEW_DECL: Omit<ToolDef, 'handler'> = {
   name: 'finish_review',
   description: 'Finish the self-review. Call it once, after leaving a Persona proposal or an experience candidate, or deciding that nothing should change.',
   tags: ['flow'],
@@ -213,11 +252,15 @@ export interface GrowthReviewDeps {
   now?: () => Date;
   /** Test override for the 15-minute review deadline. */
   timeoutMs?: number;
+  /** A caller-provided candidate source path; absent means no Coo Growth source writes. */
+  onCandidateProduced?: CooGrowthCandidateLifecycleHandler;
   log?: GrowthLog;
+  allowed?: () => boolean;
 }
 
 export interface GrowthRunResult {
   proposals: number;
+  candidateSourceResults: CooGrowthCandidateLifecycleResult[];
   note: string;
   cancelled: boolean;
   cancellationStatus?: 'acknowledged' | 'unknown' | 'shutdown';
@@ -304,17 +347,48 @@ function guardRead(tool: ToolDef, state: { cancelled: boolean; deadline: number 
   };
 }
 
-function reviewIsCurrent(state: { cancelled: boolean; deadline: number }, ctx: ToolCallContext): boolean {
-  return !state.cancelled && Date.now() < state.deadline && !ctx.generationSignal?.aborted && !ctx.shutdownSignal?.aborted;
+/** Scoped reviews return a fixed host rejection without echoing unchecked arguments. */
+function scopedCandidateNotice(tool: ToolDef, scoped: boolean): ToolDef {
+  if (!scoped) return tool;
+  return { ...tool, handler: async (args, ctx) => {
+    const result = await tool.handler(args, ctx);
+    return typeof result === 'string' && /^\[(proposal|candidate) rejected\]/.test(result)
+      ? growthToolNotice(CANDIDATE_REJECTION_NOTICE) : result;
+  } };
+}
+
+function reviewIsCurrent(state: { cancelled: boolean; deadline: number; allowed?: () => boolean }, ctx: ToolCallContext): boolean {
+  return !state.cancelled && (state.allowed?.() ?? true) && Date.now() < state.deadline && !ctx.generationSignal?.aborted && !ctx.shutdownSignal?.aborted;
+}
+
+async function candidateSourceResult(
+  handler: CooGrowthCandidateLifecycleHandler | undefined,
+  candidate: { kind: 'growth-proposal'; id: string; store: GrowthProposals }
+    | { kind: 'experience-card'; id: string; store: ExperienceCards },
+  envelope: GenerationEvidenceEnvelope,
+  isCurrent: () => boolean,
+): Promise<CooGrowthCandidateLifecycleResult> {
+  if (!handler) return skippedCooGrowthCandidateSource(candidate);
+  if (!isCurrent()) return skippedCooGrowthCandidateSource(candidate, 'review-no-longer-current');
+  try {
+    const result = await handler({ candidate, generationEvidence: [envelope], isCurrent });
+    if (result.candidateId !== candidate.id || result.candidateType !== cooGrowthCandidateType(candidate)) {
+      return failedCooGrowthCandidateSource(candidate, 'lifecycle-result-identity-mismatch');
+    }
+    return result;
+  } catch {
+    return failedCooGrowthCandidateSource(candidate);
+  }
 }
 
 function proposeGrowthTool(
   store: GrowthProposals,
-  state: { cancelled: boolean; deadline: number },
-  done: { proposals: number },
+  state: { cancelled: boolean; deadline: number; sourceIds?: readonly string[]; autonomousKey?: string; allowed?: () => boolean },
+  done: { proposals: number; candidateSourceResults: CooGrowthCandidateLifecycleResult[] },
   memory: () => HindsightMemory | null,
   observedSourceIds: ReadonlySet<string>,
   core: CoreApi,
+  onCandidateProduced?: CooGrowthCandidateLifecycleHandler,
 ): ToolDef {
   return {
     ...PROPOSE_GROWTH_DECL,
@@ -337,6 +411,9 @@ function proposeGrowthTool(
         || !source.recordGenerationEvidenceEnvelope(envelope, ctx.callId!)) {
         return '[proposal rejected] The proposal generation has no complete joined source evidence.';
       }
+      if (state.sourceIds && envelope.exposedSources.some(parent => !state.sourceIds!.includes(parent.documentId))) {
+        return '[candidate rejected] Generation context includes a source outside the selected scope.';
+      }
       const expectedEpoch = source.evidenceEpoch();
       if (!expectedEpoch) return '[proposal rejected] The source epoch is unavailable.';
       for (const sourceId of parsed.proposal.sourceIds) {
@@ -346,7 +423,13 @@ function proposeGrowthTool(
         }
       }
       if (!reviewIsCurrent(state, ctx) || source.evidenceEpoch() !== expectedEpoch) return '[review cancelled] No proposal was written.';
-      const result = store.write(args);
+      if (state.sourceIds) {
+        for (const parent of envelope.exposedSources) {
+          if (!await growthProposalSourceEligible(source, parent.documentId)) return '[proposal rejected] The parent is not a verified user event or a source-linked Journal reflection.';
+        }
+        if (!reviewIsCurrent(state, ctx) || source.evidenceEpoch() !== expectedEpoch) return '[review cancelled] No proposal was written.';
+      }
+      const result = store.write(args, envelope, state.autonomousKey);
       if (!result.ok) return `[proposal rejected] ${result.errors.join('; ')}`;
       const registered = await source.registerDerivedArtifactFromSources({
         artifactId: result.proposal.id,
@@ -368,6 +451,12 @@ function proposeGrowthTool(
         return '[proposal rejected] Source provenance changed before the candidate was committed.';
       }
       done.proposals += 1;
+      done.candidateSourceResults.push(await candidateSourceResult(
+        onCandidateProduced,
+        { kind: 'growth-proposal', id: result.proposal.id, store },
+        envelope,
+        () => reviewIsCurrent(state, ctx),
+      ));
       return growthToolNotice('[proposal saved]');
     },
   };
@@ -393,11 +482,12 @@ const PROPOSE_EXPERIENCE_DECL: Omit<ToolDef, 'handler'> = {
 
 function proposeExperienceTool(
   store: ExperienceCards,
-  state: { cancelled: boolean; deadline: number },
-  done: { proposals: number },
+  state: { cancelled: boolean; deadline: number; sourceIds?: readonly string[]; autonomousKey?: string; allowed?: () => boolean },
+  done: { proposals: number; candidateSourceResults: CooGrowthCandidateLifecycleResult[] },
   memory: () => HindsightMemory | null,
   observedSourceIds: ReadonlySet<string>,
   core: CoreApi,
+  onCandidateProduced?: CooGrowthCandidateLifecycleHandler,
 ): ToolDef {
   return {
     ...PROPOSE_EXPERIENCE_DECL,
@@ -422,6 +512,9 @@ function proposeExperienceTool(
       if (!envelope || (ctx.generationToken !== undefined && envelope.sessionGenerationToken !== ctx.generationToken)
         || !source.recordGenerationEvidenceEnvelope(envelope, ctx.callId!)) {
         return '[candidate rejected] The experience generation has no complete joined source evidence.';
+      }
+      if (state.sourceIds && envelope.exposedSources.some(parent => !state.sourceIds!.includes(parent.documentId))) {
+        return '[candidate rejected] Generation context includes a source outside the selected scope.';
       }
       const expectedEpoch = source.evidenceEpoch();
       if (!expectedEpoch) return '[candidate rejected] The source epoch is unavailable.';
@@ -465,39 +558,54 @@ function proposeExperienceTool(
         return '[candidate rejected] Source provenance changed before the candidate was committed.';
       }
       done.proposals += 1;
+      done.candidateSourceResults.push(await candidateSourceResult(
+        onCandidateProduced,
+        { kind: 'experience-card', id: result.card.id, store },
+        envelope,
+        () => reviewIsCurrent(state, ctx),
+      ));
       return growthToolNotice('[experience candidate saved]');
     },
   };
 }
 
 export class GrowthReview {
+  private cancelActive: (() => void) | null = null;
+  cancel(): void { this.cancelActive?.(); }
   constructor(private readonly d: GrowthReviewDeps) {}
 
-  async run(): Promise<GrowthRunResult> {
+  async run(options: { sourceIds?: readonly string[]; autonomousKey?: string } = {}): Promise<GrowthRunResult> {
+    if (options.sourceIds && (options.sourceIds.length === 0 || options.sourceIds.length > 8
+      || new Set(options.sourceIds).size !== options.sourceIds.length
+      || options.sourceIds.some(id => typeof id !== 'string' || !id.trim() || id !== id.trim()))) throw new Error('Provide one to eight distinct source IDs.');
     const core = this.d.core();
     if (!core) throw new Error('the Persona is not attached to Core');
     if (core.sessionInfo(GROWTH_SESSION).running > 0) throw new Error('a self-review is already running');
     const snapshot = this.d.snapshot();
-    const prefix = snapshot.filter((record) => hasRole(record, 'system'));
+    const prefix = options.sourceIds
+      ? [message('system', GROWTH_SCOPED_PREFIX, { sourceMapSpans: [{ start: 0, end: GROWTH_SCOPED_PREFIX.length, digest: digestText(GROWTH_SCOPED_PREFIX), origin: 'core-generated' }] })]
+      : snapshot.filter((record) => hasRole(record, 'system'));
     if (prefix.length === 0) throw new Error('the main session has no system prefix');
     const memory = this.d.memory();
-    const portrait = memory?.enabled() ? await memory.selfPortrait().catch(() => '') : '';
+    const portrait = !options.sourceIds && memory?.enabled() ? await memory.selfPortrait().catch(() => '') : '';
     const now = (this.d.now ?? (() => new Date()))();
-    const done = { note: '', proposals: 0 };
+    const done = { note: '', proposals: 0, candidateSourceResults: [] as CooGrowthCandidateLifecycleResult[] };
     const timeoutMs = this.d.timeoutMs ?? REVIEW_TIMEOUT_MS;
     const deadline = Date.now() + timeoutMs;
-    const state = { cancelled: false, deadline };
+    const state = { cancelled: false, deadline, sourceIds: options.sourceIds, autonomousKey: options.autonomousKey, allowed: this.d.allowed };
+    this.cancelActive = () => { state.cancelled = true; };
     const store = new GrowthProposals(this.d.proposalsDir, this.d.now ?? (() => new Date()));
     const observedSourceIds = new Set<string>();
     const experienceCards = new ExperienceCards(
       this.d.experienceCardsDir ?? join(this.d.proposalsDir, 'experience-cards'),
       this.d.now ?? (() => new Date()),
     );
-    const recent = recentConversation(snapshot, core.generationEvidence('main'));
+    const recent = options.sourceIds ? { text: '', sourceMapSpans: [] } : recentConversation(snapshot, core.generationEvidence('main'));
     const prompt = renderTemplateWithSourceMap(SELF_REVIEW_TEXT[this.d.modelLanguage()]({
       portrait: portrait.trim() ? '{{growth.portrait}}' : '',
       recent: recent.text ? '{{growth.recent}}' : '',
       date: localDate(this.d.timezone(), now),
+      scoped: !!options.sourceIds,
     }), { 'growth.portrait': portrait.trim(), 'growth.recent': recent }, 'core-generated');
     const messages = [...prefix, message('user', prompt.text, { sourceMapSpans: prompt.sourceMapSpans })];
     const started = Date.now();
@@ -506,14 +614,14 @@ export class GrowthReview {
       id: GROWTH_SESSION,
       messages,
       tools: [
-        ...this.d.tools().filter((tool) => tool.name !== 'memory_search').map((tool) => guardRead(tool, state)),
-        guardRead(growthMemorySearchTool(() => memory, observedSourceIds), state),
-        proposeGrowthTool(store, state, done, () => memory, observedSourceIds, core),
-        proposeExperienceTool(experienceCards, state, done, () => memory, observedSourceIds, core),
+        ...(options.autonomousKey ? [] : this.d.tools()).filter((tool) => tool.name !== 'memory_search' && (!options.sourceIds || tool.name !== 'memory_reflect')).map((tool) => guardRead(tool, state)),
+        guardRead(growthMemorySearchTool(() => memory, observedSourceIds, options.sourceIds), state),
+        scopedCandidateNotice(proposeGrowthTool(store, state, done, () => memory, observedSourceIds, core, this.d.onCandidateProduced), !!options.sourceIds),
+        ...(!options.autonomousKey ? [scopedCandidateNotice(proposeExperienceTool(experienceCards, state, done, () => memory, observedSourceIds, core, this.d.onCandidateProduced), !!options.sourceIds)] : []),
         finishReviewTool(done),
       ],
       stopWhen: () => {
-        if (Date.now() >= deadline) state.cancelled = true;
+        if (Date.now() >= deadline || !(state.allowed?.() ?? true)) state.cancelled = true;
         return state.cancelled;
       },
       wrapUpHint: 'Wrap up: call finish_review now. If nothing durable changed, say so there and end. Do not edit files.',
@@ -560,11 +668,19 @@ export class GrowthReview {
     this.d.log?.info('[growth] self-review finished', {
       note: done.note || null,
       proposals: done.proposals,
+      candidateSourceResults: done.candidateSourceResults.map((result) => ({
+        candidateId: result.candidateId,
+        candidateType: result.candidateType,
+        status: result.status,
+        writeStatus: result.writeStatus,
+        readbackStatus: result.readbackStatus,
+      })),
       ms: Date.now() - started,
       ...(cancellationStatus ? { cancellationStatus } : {}),
     });
     return {
       proposals: done.proposals,
+      candidateSourceResults: done.candidateSourceResults,
       note: done.note,
       cancelled: state.cancelled,
       ...(cancellationStatus ? { cancellationStatus } : {}),

@@ -510,8 +510,9 @@ describe('the fence covers reads and writes', () => {
     await expect(memory.forget('absent topic')).resolves.toMatchObject(blocked);
     const tool = memoryTools({ memory: () => memory as unknown as HindsightMemory }).find((entry) => entry.name === 'memory_forget')!;
     const output = await tool.handler({ query: 'absent topic' }, {} as never);
-    expect(output).toContain('[forget recovery blocked]');
-    expect(output).toContain('Memory remains blocked');
+    const text = typeof output === 'string' ? output : (output as { text?: string }).text ?? '';
+    expect(text).toContain('[forget recovery blocked]');
+    expect(text).toContain('Memory remains blocked');
     expect(outbox.matching((entry) => entry.documentId === 'trip')).toHaveLength(1);
   });
 
@@ -732,6 +733,24 @@ describe('the fence covers reads and writes', () => {
     expect(refreshId).toBe(4);
     expect(ledger.stale('bank-a', 'http://hindsight.test')).toBe(false);
     expect(memory.settled()).toBe(true);
+  });
+
+  it('gives each serial portrait refresh its own completion window', async () => {
+    const root = dir();
+    const outbox = new MemoryOutbox(join(root, 'outbox.jsonl'));
+    const ledger = new ForgetLedger(join(root, 'forget.json'));
+    let clock = Date.now();
+    const now = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    try {
+      const memory = memoryWith(outbox, ledger, {
+        refreshMentalModel: async (_bank, id) => { clock += 180_000; return { operation_id: `refresh-${id}` }; },
+      });
+      const task = ledger.add({ bankId: 'bank-a', endpoint: 'http://hindsight.test', documentId: 'doc-a', reason: 'forget' })!;
+      ledger.markDone(task.id);
+      await (memory as unknown as { clearDerived(): Promise<void> }).clearDerived();
+      expect(ledger.stale('bank-a', 'http://hindsight.test')).toBe(false);
+      expect(memory.settled()).toBe(true);
+    } finally { now.mockRestore(); }
   });
 
   it('does not resubmit a failed derived refresh for the same fence epoch', async () => {

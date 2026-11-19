@@ -1,8 +1,11 @@
 import { sanitizeForMemory } from './policy.ts';
+import { recallDateContext, recallDateQuery, type RecallDateContext } from './recall-date.ts';
 
 export interface RecallQueryPlan {
   sourcePhrases: string[];
   supplementalQueries: string[];
+  /** Present when the question names one calendar day that has an indexed date arm. */
+  dateContext?: RecallDateContext;
 }
 
 export type SourceMatchType = 'query_prefix' | 'literal_phrase' | 'semantic_candidate';
@@ -192,6 +195,7 @@ export function planRecallQueries(input: string): RecallQueryPlan {
   const safe = sanitizeForMemory(input);
   if (safe.skip || !safe.text) return { sourcePhrases: [], supplementalQueries: [] };
   const text = boundedQueryText(safe.text.trim());
+  const dateContext = recallDateContext(text) ?? undefined;
   const clauses = text.split(CLAUSE_BOUNDARY).map((part) => part.trim()).filter(Boolean);
   const focusText = clauses.at(-1) ?? text;
   const nearbyClauses = clauses.slice(Math.max(0, clauses.length - 3), -1);
@@ -354,8 +358,17 @@ export function planRecallQueries(input: string): RecallQueryPlan {
     addQuery(complementaryTokens.slice(0, 8).join(' '));
   }
 
+  if (dateContext) {
+    // The generic compactor removes separators, so `2026-10-25` can become three unrelated
+    // numbers. Add the untouched calendar date before the other supplemental candidates.
+    supplementalQueries.unshift(recallDateQuery(dateContext));
+    if (dateContext.recordKind === 'journal') supplementalQueries.splice(1, 0, `${dateContext.date} diary`);
+    while (supplementalQueries.length > MAX_SUPPLEMENTAL_QUERIES) supplementalQueries.pop();
+  }
+
   return {
     sourcePhrases: selected.map((candidate) => candidate.text),
     supplementalQueries: supplementalQueries.slice(0, MAX_SUPPLEMENTAL_QUERIES),
+    ...(dateContext ? { dateContext } : {}),
   };
 }

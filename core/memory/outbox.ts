@@ -39,6 +39,10 @@ export interface OutboxItem extends RetainItem {
   lastError?: string;
   createdAt: string;
   updatedAt: string;
+  /** Set only by an authorized local reconciliation after an external exact readback. */
+  reconciledAt?: string;
+  /** Digest of the external receipt used for that reconciliation. */
+  reconcileReceipt?: string;
 }
 
 export interface OutboxLog {
@@ -73,7 +77,7 @@ export type AddResult = 'queued' | 'full' | 'persistence-error';
 const MAX_ACTIVE = 512;
 const MAX_TOTAL = 2048;
 const MAX_ATTEMPTS = 8;
-const KEEP_FINISHED_MS = 7 * 86_400_000;
+const RECEIPT_DIGEST = /^[a-f0-9]{64}$/;
 
 const iso = (date: Date) => date.toISOString();
 
@@ -111,6 +115,8 @@ function parseItem(value: unknown): OutboxItem | null {
     ...(typeof item.nextPollAt === 'string' ? { nextPollAt: item.nextPollAt } : {}),
     ...(typeof item.nextVerifyAt === 'string' ? { nextVerifyAt: item.nextVerifyAt } : {}),
     ...(typeof item.lastError === 'string' ? { lastError: item.lastError } : {}),
+    ...(typeof item.reconciledAt === 'string' ? { reconciledAt: item.reconciledAt } : {}),
+    ...(typeof item.reconcileReceipt === 'string' ? { reconcileReceipt: item.reconcileReceipt } : {}),
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
   };
@@ -194,6 +200,7 @@ export class MemoryOutbox {
   private readonly log?: OutboxLog;
   private readonly maxActive: number;
   private readonly maxTotal: number;
+  private readonly preserveFinished: boolean;
   private loaded = false;
   private persistenceError: string | null = null;
   private readError = false;
@@ -202,12 +209,13 @@ export class MemoryOutbox {
   private readonly polledAt = new Map<string, number>();
   readonly stateStore: MemoryStateStore | null;
 
-  constructor(fileOrStore: string | MemoryStateStore, opts: { now?: () => Date; newId?: () => string; log?: OutboxLog; maxActive?: number; maxTotal?: number } = {}) {
+  constructor(fileOrStore: string | MemoryStateStore, opts: { now?: () => Date; newId?: () => string; log?: OutboxLog; maxActive?: number; maxTotal?: number; preserveFinished?: boolean } = {}) {
     this.now = opts.now ?? (() => new Date());
     this.newId = opts.newId ?? (() => randomUUID());
     this.log = opts.log;
     this.maxActive = Math.max(1, opts.maxActive ?? MAX_ACTIVE);
     this.maxTotal = Math.max(this.maxActive, opts.maxTotal ?? MAX_TOTAL);
+    this.preserveFinished = opts.preserveFinished === true;
     try {
       this.stateStore = typeof fileOrStore === 'string' ? openMemoryStateStore(fileOrStore) : fileOrStore;
       if (typeof fileOrStore === 'string' && extname(fileOrStore) === '.jsonl' && !this.stateStore.imported('outbox-v1')) {
@@ -244,10 +252,15 @@ export class MemoryOutbox {
       return;
     }
     const before = new Map(this.items);
-    this.dropExpiredFinished();
-    if (this.items.size !== before.size && !this.persistAll()) {
-      this.items.clear();
-      for (const [id, item] of before) this.items.set(id, item);
+    const dropped = this.preserveFinished ? [] : this.dropExpiredFinished();
+    if (dropped.length > 0) {
+      try {
+        this.stateStore.removeOutbox(dropped);
+      } catch (err) {
+        this.items.clear();
+        for (const [id, item] of before) this.items.set(id, item);
+        this.persistenceError = `could not prune finished retain metadata: ${err instanceof Error ? err.message : String(err)}`;
+      }
     }
   }
 
@@ -290,6 +303,24 @@ export class MemoryOutbox {
     if (!this.append(queued)) return 'persistence-error';
     this.items.set(queued.id, queued);
     return 'queued';
+  }
+
+  /** State of the source event already recorded for this document on the same target. */
+  stateForDocument(documentId: string, bankId: string, endpoint: string): OutboxState | null {
+    return this.itemForDocument(documentId, bankId, endpoint)?.state ?? null;
+  }
+
+  /** The source event already recorded for this document on the same target, or null when ambiguous. */
+  itemForDocument(documentId: string, bankId: string, endpoint: string): OutboxItem | null {
+    const matches = this.itemsForDocument(documentId, bankId, endpoint);
+    return matches.length === 1 ? matches[0]! : null;
+  }
+
+  /** Every local identity matching this exact target; used to fail closed on duplicate identities. */
+  itemsForDocument(documentId: string, bankId: string, endpoint: string): OutboxItem[] {
+    this.load();
+    return [...this.items.values()].filter((entry) => entry.documentId === documentId
+      && entry.bankId === bankId && entry.endpoint === endpoint);
   }
 
   /** Promote the source event already recorded for the current user message. */
@@ -386,6 +417,98 @@ export class MemoryOutbox {
     return this.update(id, (item) => ({
       ...item, state: 'verified', content: '', metadata: undefined, nextVerifyAt: undefined, lastError: undefined,
     }), ['done']);
+  }
+
+  /**
+   * Records an already-delivered source after an authorized external reconciliation. This only
+   * changes local state; it never contacts the Bank or runs delivery. The exact request hash and
+   * target must match, and only one item is touched.
+   */
+  reconcileVerifiedDelivery(input: {
+    documentId: string;
+    bankId: string;
+    endpoint: string;
+    requestHash: string;
+    receipt: string;
+  }): 'updated' | 'already' | 'not-found' | 'conflict' {
+    this.load();
+    if (!RECEIPT_DIGEST.test(input.receipt)) return 'conflict';
+    const item = this.itemForDocument(input.documentId, input.bankId, input.endpoint);
+    if (!item) return 'not-found';
+    if (item.requestHash !== input.requestHash) return 'conflict';
+    if (item.state === 'verified') return 'already';
+    if (!['pending', 'sent', 'done'].includes(item.state)) return 'conflict';
+    if (!this.stateStore) return 'conflict';
+    const next = this.reconciledItem(item, input.receipt);
+    const changed = this.stateStore.updateOutboxRecord(next);
+    if (changed) this.items.set(item.id, next);
+    return changed ? 'updated' : 'conflict';
+  }
+
+  private reconciledItem(item: OutboxItem, receipt: string): OutboxItem {
+    return {
+      ...item,
+      state: 'verified',
+      content: '',
+      metadata: undefined,
+      nextVerifyAt: undefined,
+      lastError: undefined,
+      reconciledAt: iso(this.now()),
+      reconcileReceipt: receipt,
+      updatedAt: iso(this.now()),
+    };
+  }
+
+  /**
+   * Applies one authorized reconciliation in a single SQLite transaction. Every target must have
+   * an exact identity and request hash; any mismatch rolls the whole batch back. Already-verified
+   * rows are counted without a write. This never calls replaceOutbox, delivery or the Bank.
+   */
+  reconcileVerifiedDeliveries(inputs: ReadonlyArray<{
+    documentId: string;
+    bankId: string;
+    endpoint: string;
+    requestHash: string;
+    receipt: string;
+  }>): { updated: number; already: number } {
+    this.load();
+    if (!this.stateStore || this.items.size === 0) throw new Error('the memory database is unavailable');
+    const prepared: Array<{ id: string; already: boolean; receipt: string }> = [];
+    const identities = new Set<string>();
+    for (const input of inputs) {
+      if (!RECEIPT_DIGEST.test(input.receipt)) throw new Error('the reconciliation receipt is not a SHA-256 digest');
+      const matches = this.itemsForDocument(input.documentId, input.bankId, input.endpoint);
+      if (matches.length === 0) throw new Error('a reconciliation target is missing');
+      if (matches.length > 1) throw new Error('a reconciliation target is ambiguous');
+      const item = matches[0]!;
+      if (item.requestHash !== input.requestHash) throw new Error('a reconciliation target request hash does not match');
+      const identity = JSON.stringify([input.bankId, input.endpoint, input.documentId]);
+      if (identities.has(identity)) throw new Error('a reconciliation target is duplicated');
+      identities.add(identity);
+      if (item.state === 'verified') prepared.push({ id: item.id, already: true, receipt: input.receipt });
+      else if (['pending', 'sent', 'done'].includes(item.state)) prepared.push({ id: item.id, already: false, receipt: input.receipt });
+      else throw new Error('a reconciliation target is not in a reconcilable state');
+    }
+    const before = new Map(this.items);
+    let updated = 0, already = 0;
+    try {
+      this.stateStore.transaction(() => {
+        for (const entry of prepared) {
+          if (entry.already) { already += 1; continue; }
+          const current = this.items.get(entry.id);
+          if (!current) throw new Error('a reconciliation row disappeared');
+          const next = this.reconciledItem(current, entry.receipt);
+          if (!this.stateStore!.updateOutboxRecord(next)) throw new Error('a reconciliation row could not be updated');
+          this.items.set(entry.id, next);
+          updated += 1;
+        }
+      });
+    } catch (error) {
+      this.items.clear();
+      for (const [id, item] of before) this.items.set(id, item);
+      throw error;
+    }
+    return { updated, already };
   }
 
   noteVerificationRetry(id: string, error: string): boolean {
@@ -523,6 +646,11 @@ export class MemoryOutbox {
       : { content: '', metadata: undefined };
   }
 
+  /** Why the last queue write or load failed; null when the queue is healthy or no attempt failed. */
+  persistenceReason(): string | null {
+    return this.persistenceError;
+  }
+
   get(id: string): OutboxItem | null {
     this.load();
     return this.items.get(id) ?? null;
@@ -585,7 +713,7 @@ export class MemoryOutbox {
     this.load();
     if (!this.loaded) return false;
     const before = new Map(this.items);
-    this.dropExpiredFinished();
+    if (!this.preserveFinished) this.dropExpiredFinished();
     try {
       if (!this.stateStore) throw new Error(this.initializationError ?? 'memory database is unavailable');
       this.stateStore.replaceOutbox([...this.items.values()]);
@@ -626,16 +754,14 @@ export class MemoryOutbox {
     }
   }
 
-  private dropExpiredFinished(): void {
-    const cutoff = this.now().getTime() - KEEP_FINISHED_MS;
-    for (const [id, item] of this.items) {
-      if (Date.parse(item.updatedAt) >= cutoff) continue;
-      if (item.state === 'done' || item.state === 'verified' || item.state === 'cancelled' || item.state === 'dead') {
-        // An unresolved critical fact stays until the person or the console ends it explicitly.
-        if (this.retained(item) || item.state === 'done') continue;
-        this.items.delete(id);
-      }
-    }
+  /**
+   * Delivery rows are the local audit trail for retain, verification and cancellation. A load
+   * must not delete a verified or cancelled row merely because it is old: it is the only local
+   * proof that the event was delivered once, and the W3 incident showed that losing it invites a
+   * second delivery. Explicit console/Forget cleanup owns any later removal.
+   */
+  private dropExpiredFinished(): string[] {
+    return [];
   }
 
   private update(id: string, change: (item: OutboxItem) => OutboxItem, allowed?: readonly OutboxState[]): boolean {

@@ -16,6 +16,10 @@ export function clip(text: string, max: number): string {
 }
 
 function when(result: RecallResult): string {
+  // A journal document is named by its local day; its UTC `mentioned_at` can fall on the
+  // previous date, which would make a dated diary question look like the wrong day.
+  const journal = /^journal:(\d{4}-\d{2}-\d{2})$/u.exec(result.document_id ?? '');
+  if (journal) return journal[1]!;
   const date = result.occurred_start ?? result.mentioned_at ?? '';
   return date ? date.slice(0, 10) : 'undated';
 }
@@ -149,6 +153,8 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
   captureTrace?: boolean;
   coverageWeight?: number;
   activationInfluence?: number;
+  /** Keep a direct source body's original whitespace so its spans remain exact read-backs. */
+  preserveDirectText?: boolean;
 } = {}): FormattedRecallBlock {
   const maxChars = opts.maxChars ?? 6000;
   const maxItems = opts.maxItems ?? 12;
@@ -169,8 +175,11 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
   const seenCandidates = new Set<string>();
   for (let inputIndex = 0; inputIndex < results.length; inputIndex += 1) {
     const result = results[inputIndex]!;
-    const rawText = String(result.text ?? '').replace(/\s+/g, ' ').trim();
-    if (!rawText) continue;
+    const rawText = opts.preserveDirectText === true
+      ? String(result.text ?? '').trim()
+      : String(result.text ?? '').replace(/\s+/g, ' ').trim();
+    // A fact-only result carries no parent summary; its exact source facts are the content.
+    if (!rawText && !(result.sourceFacts?.length)) continue;
     const key = recallDuplicateKey(result, rawText);
     if (seenCandidates.has(key)) {
       if (captureTrace) deduplicatedResultIndexes.push(inputIndex);
@@ -258,7 +267,9 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
   for (const candidate of rankedCandidates) {
     const { result, inputIndex } = candidate;
     if (lines.length >= maxItems) break;
-    const rawText = String(result.text ?? '').replace(/\s+/g, ' ').trim();
+    const rawText = opts.preserveDirectText === true
+      ? String(result.text ?? '').trim()
+      : String(result.text ?? '').replace(/\s+/g, ' ').trim();
     const type = result.type ?? 'memory';
     const source = typeof result.document_id === 'string' && result.document_id && !result.sourceFacts?.length && !result.sourceFactsIncomplete
       ? `, source_id:${result.document_id}`
@@ -284,19 +295,21 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
     const notice = '  Supporting source facts are incomplete for this result.';
     const noticeLength = notice.length + 1;
     const fullFactsLength = factLines.reduce((total, fact) => total + fact.line.length + 1, 0);
-    const fullTextBudget = remaining - linePrefix.length - fullFactsLength;
+    // A fact-only result omits the parent label line entirely; its body budget is zero.
+    const bodyPrefixLength = rawText ? linePrefix.length : 0;
+    const fullTextBudget = remaining - bodyPrefixLength - fullFactsLength;
     const reserveNotice = result.sourceFactsIncomplete || (factLines.length > 0 && fullTextBudget < 1) ? noticeLength : 0;
     const firstFactLength = factLines[0] ? factLines[0].line.length + 1 : 0;
-    let textBudget = remaining - linePrefix.length - fullFactsLength - reserveNotice;
+    let textBudget = remaining - bodyPrefixLength - fullFactsLength - reserveNotice;
     if (textBudget < 1 && firstFactLength > 0) {
-      textBudget = remaining - linePrefix.length - firstFactLength - reserveNotice;
+      textBudget = remaining - bodyPrefixLength - firstFactLength - reserveNotice;
     }
     if (textBudget < 1) {
-      textBudget = remaining - linePrefix.length - reserveNotice;
+      textBudget = remaining - bodyPrefixLength - reserveNotice;
     }
-    if (textBudget < 1) continue;
+    if (textBudget < 1 && rawText) continue;
 
-    const baseLine = `${linePrefix}${clip(rawText, textBudget)}`;
+    const baseLine = rawText ? `${linePrefix}${clip(rawText, textBudget)}` : '';
     let contentLength = baseLine.length;
     const includedFacts: typeof factLines = [];
     let omittedSourceFact = false;
@@ -323,7 +336,7 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
       }
     }
 
-    const entry = [baseLine, ...(contextLine ? [contextLine] : []), ...includedFacts.map((fact) => fact.line)];
+    const entry = [...(baseLine ? [baseLine] : []), ...(contextLine ? [contextLine] : []), ...includedFacts.map((fact) => fact.line)];
     if (result.sourceFactsIncomplete || omittedSourceFact) {
       entry.push(notice);
       contentLength += noticeLength;
@@ -342,7 +355,9 @@ export function formatRecallDetailed(results: readonly FormattedRecallResult[], 
       }
       const lineOffset = used + separator;
       if (includedFacts.length > 0) {
-        let sourceLineOffset = lineOffset + baseLine.length + 1 + (contextLine ? contextLine.length + 1 : 0);
+        let sourceLineOffset = lineOffset;
+        if (baseLine) sourceLineOffset += baseLine.length + 1;
+        if (contextLine) sourceLineOffset += contextLine.length + 1;
         for (const fact of includedFacts) {
           const start = sourceLineOffset + fact.line.length - fact.text.length;
           sourceSegments.push({ documentId: fact.documentId, sourceFactId: fact.id, start, end: start + fact.text.length });

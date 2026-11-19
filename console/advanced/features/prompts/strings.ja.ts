@@ -36,6 +36,12 @@ export const S: Partial<typeof en> = {
   undoAll: "すべての編集を戻す",
   undoAllHint: "最後に保存した内容に戻します。この操作も元に戻せます。",
   saveToFile: "保存",
+  attestLocal: "ローカル設定を確認",
+  attestTitle: "現在のローカル設定を確認",
+  attestBody: "現在のローカル人格設定ファイルの内容ダイジェストと時刻を、設定画面での確認として記録します。会話で言ったことにはならず、長期記憶にも書き込みません。後でファイルを変更した場合は再確認が必要です。",
+  attestDone: (n: number) => `${n} 件のローカル設定を確認しました。`,
+  attestNone: "確認が必要なローカル設定はありません。現在は組み込み版です。",
+  attestFailed: (msg: string) => `確認に失敗しました：${msg}`,
   // index.ts
   title: 'システムプロンプト',
   introDesc: "Ctrl+S でテンプレートを保存し、「今すぐ適用」で現在の会話のプロンプトを更新します。自動生成のセクションは読み取り専用です。",

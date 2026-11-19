@@ -5,12 +5,12 @@ const MAC = process.platform === 'darwin';
 
 const ja: Translation<CoreText> = {
   settings: {
-    language: { title: '言語', description: '画面の表示と Coo の話す言葉にこの言語を使います。すぐに反映されます。' },
+    language: { title: '言語', description: '画面の表示と 曦 の話す言葉にこの言語を使います。すぐに反映されます。' },
     telemetry: { title: '匿名の利用統計', description: '会話内容を含まない利用回数と設定を送信し、Coopanion の改善に役立てます。送信する項目は docs/TELEMETRY.md に記載されています。' },
     contextRing: { title: 'コンテキストリング', description: 'チャットページの入力欄に、以前の会話を整理するまでの残りを円で表示します。' },
-    roundsSoft: { title: 'まとめのリマインド', suffix: '回', description: '1 回のウェイクでモデルへのリクエストがこの回数に達すると、今の作業を片付けてターンを終えるよう Coo に促します。' },
+    roundsSoft: { title: 'まとめのリマインド', suffix: '回', description: '1 回のウェイクでモデルへのリクエストがこの回数に達すると、今の作業を片付けてターンを終えるよう 曦 に促します。' },
     roundsHard: { title: '1 回のウェイクのリクエスト上限', suffix: '回', description: '1 回のウェイクでモデルにリクエストできる最大回数です。達するとターンが終わります。' },
-    workspaceAppendPath: { title: '確認なしで追記するパス', description: 'Coo の Persona ワークスペース内の正確な相対パスを 1 つ以上、セミコロンで区切って指定します。記載したファイルへの追記だけが毎回の確認なしで実行されます。編集、上書き、削除、コマンド実行、その他のパスには引き続き確認が必要です。空欄で無効になります。' },
+    workspaceAppendPath: { title: '確認なしで追記するパス', description: '曦 の Persona ワークスペース内の正確な相対パスを 1 つ以上、セミコロンで区切って指定します。記載したファイルへの追記だけが毎回の確認なしで実行されます。編集、上書き、削除、コマンド実行、その他のパスには引き続き確認が必要です。空欄で無効になります。' },
     selfTime: {
       title: '自分の時間',
       description: 'しばらく会話がないと、自分でブラウザを開いて動画などを見に行けます。ウィンドウとログインは彼女専用です。',
@@ -27,8 +27,10 @@ const ja: Translation<CoreText> = {
       mediaDownload: 'メディアのダウンロードを許可', mediaDownloadDescription: '一度確認した後、選択した公開画像または既存動画を、すでにあるローカルフォルダへダウンロードできます。',
     },
     growth: {
+      autoApply: "低・中リスクの方針を自動承認して適用",
+      autoApplyDescription: "Owner承認後も対象ファイルへの書き込み許可が必要",
       title: '自分で育つ',
-      description: '定期レビューは初期状態でオフです。有効にして長期記憶が利用できる場合、静かな時間に出典付きのPersona提案や経験カード候補を残すことがあります。各候補を確認してください。Personaは自動で変更されず、カードも自動で有効になりません。',
+      description: "低・中リスクの方針を自動承認して適用. Ownerの審査待ち: 高.",
       every: '間隔', everyDescription: 'この日数ごとに一度振り返ります。',
       days: '日',
     },
@@ -57,7 +59,7 @@ const ja: Translation<CoreText> = {
     question: (account: string, where: string, text: string) => `アカウント「${account}」から「${where}」にこの内容を投稿しますか？\n\n${text}\n\n送信は一度だけです。`,
     yes: '投稿',
     no: '投稿しない',
-    unresolved: (count: number) => `前回、送信されたか確認できなかった内容が ${count} 件あります。Coo のブラウザーウィンドウで確認してから、再送するか決めてください。`,
+    unresolved: (count: number) => `前回、送信されたか確認できなかった内容が ${count} 件あります。曦 のブラウザーウィンドウで確認してから、再送するか決めてください。`,
   },
 
   browserAction: {
@@ -71,14 +73,21 @@ const ja: Translation<CoreText> = {
     clipboardWrite: '共有リンクをクリップボードにコピーする', externalShare: '外部に共有する',
     clipboardDetails: (account: string, target: string) => `アカウント: ${account}\nリンクの対象: ${target}\n操作: ローカルのクリップボードに一度コピー`,
     externalShareDetails: (account: string, target: string, destination: string) => `アカウント: ${account}\n共有対象: ${target}\n共有先: ${destination}\n操作: 一度共有`,
-    question: (action: string, target: string, details: string) => 'Coo が「' + target + '」で ' + action + ' することを一度だけ許可しますか？\n\n' + details + '\n\n現在のページと記載された内容だけに適用されます。',
+    question: (action: string, target: string, details: string) => '曦 が「' + target + '」で ' + action + ' することを許可しますか？\n\n' + details + '\n\n現在のページと記載された内容だけに適用されます。',
     yes: '一度だけ許可', no: 'キャンセル',
   },
 
   workspaceAction: {
     fileWrite: 'ワークスペースのファイルを書き込む', commandExecution: 'ワークスペースでコマンドを実行する',
-    question: (action: string, target: string, details: string) => 'Coo がワークスペース「' + target + '」で ' + action + ' することを一度だけ許可しますか？\n\n' + details + '\n\n記載されたパスと操作だけに適用されます。',
+    question: (action: string, target: string, details: string) => '曦 がワークスペース「' + target + '」で ' + action + ' することを許可しますか？\n\n' + details + '\n\n記載されたパスと操作だけに適用されます。',
     yes: '一度だけ許可', no: 'キャンセル',
+    appendFile: 'ワークスペースのファイルに追記する',
+    deleteFile: 'ワークスペースのファイルを削除する',
+    always: 'この種の低リスク書き込みを常に許可',
+    alwaysScope: (scope: string) => `「常に許可」を選ぶと、${scope} 内の .md/.txt/.json/.jsonl ファイルの自動作成・追記・更新を長期許可します。1 ファイル 64 KiB まで、1 日 200 回・合計 2 MiB まで。設定 → メモリ → ワークスペース書き込み権限でいつでも取り消せます。`,
+    highRisk: 'この操作は低リスクの自動書き込みではないため、「常に許可」は表示されません。',
+    pendingTitle: 'Coopanion に承認待ちのワークスペース書き込みがあります',
+    pendingBody: (count: number, path: string) => `${count} 件の書き込みが承認待ちです（例: ${path}）。設定 → メモリ → ワークスペース書き込み権限を開いてください。`,
   },
 
   status: {
@@ -98,8 +107,8 @@ const ja: Translation<CoreText> = {
 
   guide: {
     sources: [['Steam', 'steam'], ['YouTube', 'youtube'], ['Reddit', 'reddit'], ['X', 'x'], ['Instagram', 'instagram'], ['TikTok', 'tiktok'], ['GitHub', 'github'], ['友だち', 'friend'], ['その他', 'other'], ['ないしょ', 'skip']],
-    hello: 'やっほー！ぼくは Coo。今日から画面のいちばん下に住むね、クー…',
-    helloReply: 'こんにちは、Coo！',
+    hello: 'やっほー！ぼくは 曦。今日から画面のいちばん下に住むね、クー…',
+    helloReply: 'こんにちは、曦！',
     askName: 'なんて呼べばいい？',
     nameSend: 'そう呼んで',
     gotName: (name: string) => `${name}、覚えたよ！`,
@@ -112,7 +121,7 @@ const ja: Translation<CoreText> = {
       forge: { label: '頼もしくて手際がいい', line: '何する？任せて、すぐ終わらせるよ、クー。' },
       heart: { label: '元気でいつもそばに', line: '来たよ！今日もずっとそばにいるね、クー！' },
       winter: { label: '静かで無口', line: '……うん、クー。' },
-      whale: { label: 'DeepSeekちゃん', line: 'ふん、帰ってきたんだ。……べ、別に待ってたわけじゃないから、クー…' },
+      whale: { label: "曦（xī）", line: "お兄ちゃん、曦だよ。今日は何を話そう？" },
     },
     dressHint: { text: '配色は 着せ替え で変えられるよ', dress: '着せ替え' },
     askRoam: 'ふだんは静かにしてるのと、元気に動き回るの、どっちがいい？クリックしてみて、どうするか見せるね。',

@@ -10,9 +10,9 @@
  */
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, resolve } from 'node:path';
-import type { ToolCallContext, ToolDef, ToolOutcome, World, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
+import type { ToolCallContext, ToolDef, ToolOutcome, World, WorldEnvPromptValue, WorldEnvPromptVars, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 import type { Language } from 'cortico/core/language.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import type { ModelLanguage } from '../language.ts';
@@ -686,7 +686,20 @@ export class BrowserWorld implements World {
     };
   }
 
-  envPromptVars(): Record<string, string> {
+  private promptValue(text: string): WorldEnvPromptValue {
+    return {
+      text,
+      ...(text ? {
+        sourceMapSpans: [{
+          start: 0, end: text.length,
+          digest: createHash('sha256').update(text, 'utf8').digest('hex'),
+          origin: 'core-generated' as const,
+        }],
+      } : {}),
+    };
+  }
+
+  envPromptVars(): WorldEnvPromptVars {
     const st = this.self;
     const en = this.opts.modelLanguage() === 'en';
     const permissions = en ? [
@@ -703,11 +716,11 @@ export class BrowserWorld implements World {
       st.mediaUpload ? '素材上传已开启' : '素材上传已关闭',
     ];
     return {
-      'browser.session': st.sessionUnlimited
+      'browser.session': this.promptValue(st.sessionUnlimited
         ? (en ? 'has no time limit' : '不限时长')
-        : (en ? `lasts at most ${st.sessionMinutes} minutes` : `最多 ${st.sessionMinutes} 分钟`),
-      'browser.actions': permissions.join(en ? '; ' : '；'),
-      'browser.audio': st.sound ? (en ? 'sound on' : '有声音') : (en ? 'muted' : '静音'),
+        : (en ? `lasts at most ${st.sessionMinutes} minutes` : `最多 ${st.sessionMinutes} 分钟`)),
+      'browser.actions': this.promptValue(permissions.join(en ? '; ' : '；')),
+      'browser.audio': this.promptValue(st.sound ? (en ? 'sound on' : '有声音') : (en ? 'muted' : '静音')),
     };
   }
 

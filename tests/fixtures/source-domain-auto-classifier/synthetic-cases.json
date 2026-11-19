@@ -1,0 +1,146 @@
+{
+  "fixtureVersion": "synthetic-source-domain-auto-classifier/v1",
+  "note": "Pure synthetic text. No user memory, no real Bank, no network and no model call.",
+  "cases": [
+    {
+      "caseId": "POS-UR-01",
+      "label": "APPROVED_RULE / FAKE_PROVIDER_ONLY",
+      "sourceActor": "user",
+      "sourceKind": "event",
+      "sourceStatus": "completed",
+      "content": "以后回答先给结论，再给证据。我不喜欢你用亲昵称呼。",
+      "expectedState": "assigned",
+      "expectedDomains": ["user-relationship"],
+      "suggestions": [
+        {
+          "domainId": "user-relationship",
+          "ruleId": "UR-01",
+          "evidenceQuote": "以后回答先给结论，再给证据",
+          "confidence": 0.9,
+          "claimVerification": "user_verified"
+        }
+      ]
+    },
+    {
+      "caseId": "POS-PF-01",
+      "label": "APPROVED_RULE / FAKE_PROVIDER_ONLY",
+      "sourceActor": "user",
+      "sourceKind": "event",
+      "sourceStatus": "completed",
+      "content": "这次项目验收先完成接口对账，周五前冻结 v5 版本。",
+      "expectedState": "assigned",
+      "expectedDomains": ["project-functional"],
+      "suggestions": [
+        {
+          "domainId": "project-functional",
+          "ruleId": "PF-01",
+          "evidenceQuote": "这次项目验收先完成接口对账",
+          "confidence": 0.9,
+          "claimVerification": "user_verified"
+        }
+      ]
+    },
+    {
+      "caseId": "POS-SM-01",
+      "label": "APPROVED_RULE / FAKE_PROVIDER_ONLY",
+      "sourceActor": "user",
+      "sourceKind": "event",
+      "sourceStatus": "completed",
+      "content": "排查记忆问题时，先核对来源身份，再比较事件时间，最后检查撤回记录。",
+      "expectedState": "assigned",
+      "expectedDomains": ["skill-methods"],
+      "suggestions": [
+        {
+          "domainId": "skill-methods",
+          "ruleId": "SM-01",
+          "evidenceQuote": "先核对来源身份，再比较事件时间，最后检查撤回记录",
+          "confidence": 0.9,
+          "claimVerification": "user_verified"
+        }
+      ]
+    },
+    {
+      "caseId": "POS-SC-01",
+      "label": "APPROVED_RULE / FAKE_PROVIDER_ONLY",
+      "sourceActor": "user",
+      "sourceKind": "event",
+      "sourceStatus": "completed",
+      "content": "多人会议里，先确认谁在发言，再复述观点，最后询问是否同意记录。",
+      "expectedState": "assigned",
+      "expectedDomains": ["social-context"],
+      "suggestions": [
+        {
+          "domainId": "social-context",
+          "ruleId": "SC-01",
+          "evidenceQuote": "多人会议里，先确认谁在发言，再复述观点，最后询问是否同意记录",
+          "confidence": 0.9,
+          "claimVerification": "user_verified"
+        }
+      ]
+    },
+    {
+      "caseId": "POS-SG-01",
+      "label": "APPROVED_RULE / FAKE_PROVIDER_ONLY / COO_SELF_REFLECTION",
+      "sourceActor": "coo",
+      "sourceKind": "reflection",
+      "sourceStatus": "completed",
+      "content": "复盘发现我在版本冻结前没有核对来源，下次先做检查再放行。",
+      "expectedState": "assigned",
+      "expectedDomains": ["self-growth"],
+      "suggestions": [
+        {
+          "domainId": "self-growth",
+          "ruleId": "SG-01",
+          "evidenceQuote": "复盘发现我在版本冻结前没有核对来源，下次先做检查再放行",
+          "confidence": 0.9,
+          "claimVerification": "external_unverified"
+        }
+      ]
+    },
+    {
+      "caseId": "POS-MULTI-01",
+      "label": "APPROVED_RULE / FAKE_PROVIDER_ONLY / MULTI_DOMAIN",
+      "sourceActor": "user",
+      "sourceKind": "event",
+      "sourceStatus": "completed",
+      "content": "项目周报请先列阻塞项，并按来源核对、差异比较、放行的顺序写。",
+      "expectedState": "assigned",
+      "expectedDomains": ["project-functional", "skill-methods"],
+      "suggestions": [
+        {
+          "domainId": "project-functional",
+          "ruleId": "PF-01",
+          "evidenceQuote": "项目周报请先列阻塞项",
+          "confidence": 0.9,
+          "claimVerification": "user_verified"
+        },
+        {
+          "domainId": "skill-methods",
+          "ruleId": "SM-01",
+          "evidenceQuote": "按来源核对、差异比较、放行的顺序写",
+          "confidence": 0.9,
+          "claimVerification": "user_verified"
+        }
+      ]
+    },
+    {
+      "caseId": "POS-UTF16-01",
+      "label": "APPROVED_RULE / FAKE_PROVIDER_ONLY / NON_BMP_SPAN",
+      "sourceActor": "user",
+      "sourceKind": "event",
+      "sourceStatus": "completed",
+      "content": "周末前完成😀表情兼容检查，这是项目验收项。",
+      "expectedState": "assigned",
+      "expectedDomains": ["project-functional"],
+      "suggestions": [
+        {
+          "domainId": "project-functional",
+          "ruleId": "PF-01",
+          "evidenceQuote": "完成😀表情兼容检查",
+          "confidence": 0.9,
+          "claimVerification": "user_verified"
+        }
+      ]
+    }
+  ]
+}

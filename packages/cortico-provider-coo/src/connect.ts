@@ -5,7 +5,7 @@
  * through the `chatgpt` module's WebUI panel methods. `call` is the caller's way to reach the WebUI routes (fetch in the Core, the
  * settings window's own api in the browser); nothing here imports Node or the DOM.
  */
-import { CHATGPT, CHATGPT_MODULE, chatgptEntry, connectionVendor, endpointName, vendorEntry, type Region, type Vendor } from './vendors.ts';
+import { CHATGPT, CHATGPT_MODULE, chatgptEntry, connectionVendor, endpointName, siteOf, vendorEntry, type Protocol, type Region, type Vendor } from './vendors.ts';
 
 /** GET when `body` is left out, POST otherwise; throws on an error status. */
 export type WebUiCall = <T>(path: string, body?: unknown) => Promise<T>;
@@ -21,6 +21,16 @@ export interface Connection {
 }
 
 export interface ConnectResult { ok: boolean; why: string | null; ms: number | null }
+
+/** What a catalogue-driven service adds to a saved endpoint: the selected model's protocol and effort. */
+export interface VendorConnectOptions {
+  protocol?: Protocol;
+  thinking?: boolean;
+  reasoningEffort?: string;
+  /** Whether the selected model reads images; a catalogue service states it per model. */
+  multimodal?: boolean;
+  contextWindow?: number;
+}
 
 interface Status { modelConnection?: { ready: boolean; model: string | null; module?: string; baseUrl?: string } | null }
 interface Detail { name: string; entry: Record<string, unknown>; revision: string }
@@ -52,7 +62,7 @@ export async function testEndpoint(call: WebUiCall, name: string): Promise<Conne
  * `model` keeps the endpoint's model, or takes the service's default for a new endpoint. `region`
  * matters only for a service with a platform per region.
  */
-export async function connectVendor(call: WebUiCall, vendor: Vendor, key: string, model = '', region: Region = 'cn'): Promise<ConnectResult> {
+export async function connectVendor(call: WebUiCall, vendor: Vendor, key: string, model = '', region: Region = 'cn', settings: VendorConnectOptions = {}): Promise<ConnectResult> {
   const secretValue = key.trim() || undefined;
   const typed = model.trim();
   const name = endpointName(vendor, region);
@@ -61,13 +71,29 @@ export async function connectVendor(call: WebUiCall, vendor: Vendor, key: string
     if (list.providers.some((p) => p.name === name)) {
       const d = await call<Detail>(`/api/providers/${encodeURIComponent(name)}`);
       const entry = { ...d.entry };
-      if (typed) {
-        entry.spec = { ...(d.entry.spec as Record<string, unknown> | undefined), model: typed };
-        entry.multimodal = (vendor.vision ?? []).includes(typed);
-      }
+      const spec = { ...(d.entry.spec as Record<string, unknown> | undefined) };
+      if (typed) spec.model = typed;
+      if (settings.thinking !== undefined) spec.thinking = settings.thinking;
+      if (settings.reasoningEffort !== undefined) spec.reasoningEffort = settings.reasoningEffort;
+      else if (settings.thinking === false) delete spec.reasoningEffort;
+      if (settings.contextWindow !== undefined) spec.contextWindow = settings.contextWindow;
+      entry.spec = spec;
+      if (typed && settings.multimodal === undefined) entry.multimodal = (vendor.vision ?? []).includes(typed);
+      if (settings.multimodal !== undefined) entry.multimodal = settings.multimodal;
+      if (settings.protocol) entry.options = { ...(entry.options as Record<string, unknown> | undefined), protocol: settings.protocol };
       await call(`/api/providers/${encodeURIComponent(name)}/save`, { name: d.name, entry, expectedRevision: d.revision, secretValue });
     } else {
-      await call('/api/providers', { name, entry: vendorEntry(vendor, typed || vendor.model, region), secretValue });
+      const entry = vendorEntry(vendor, typed || vendor.model, region);
+      if (settings.protocol) entry.options = { protocol: settings.protocol };
+      if (settings.multimodal !== undefined) entry.multimodal = settings.multimodal;
+      if (settings.thinking !== undefined) entry.spec.thinking = settings.thinking;
+      if (settings.reasoningEffort !== undefined) entry.spec.reasoningEffort = settings.reasoningEffort;
+      else if (settings.thinking === false) delete (entry.spec as { reasoningEffort?: string }).reasoningEffort;
+      if (settings.contextWindow !== undefined) (entry.spec as { contextWindow?: number }).contextWindow = settings.contextWindow;
+      await call('/api/providers', { name, entry, secretValue });
+    }
+    if (siteOf(vendor, region).catalog) {
+      await call(`/api/providers/${encodeURIComponent(name)}/models`, {});
     }
   } catch (err) {
     return { ok: false, ms: null, why: errText(err) };

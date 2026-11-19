@@ -46,7 +46,7 @@ export const S: Partial<typeof en> = {
       default: return `${b}은(는) 땅에 세게 떨어져 잠시 기절했습니다`;
     }
   },
-  figure: (kind: string, name: string, b: string): string => (kind === 'figure' ? `${b}을(를) '${name}'(으)로 바꿨습니다` : kind === 'dress' ? `${b}의 꾸미기를 바꿨습니다` : `'${name}'을(를) 표시하지 못해 Coo로 바꿨습니다`),
+  figure: (kind: string, name: string, b: string): string => (kind === 'figure' ? `${b}을(를) '${name}'(으)로 바꿨습니다` : kind === 'dress' ? `${b}의 꾸미기를 바꿨습니다` : `'${name}'을(를) 표시하지 못해 曦로 바꿨습니다`),
 };
 
 export const STEP: Partial<typeof stepEn> = {

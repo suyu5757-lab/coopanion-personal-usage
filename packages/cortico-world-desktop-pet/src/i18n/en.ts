@@ -9,6 +9,7 @@ import type { PetText } from './index.ts';
 const en: PetText = {
   /** What events and bubbles call the person while no name is set. */
   defaultUser: 'Pal',
+  sessionArchived: "The previous conversation was archived. A new conversation has started.",
 
   /** The pet's menu and bubbles. */
   menu: {

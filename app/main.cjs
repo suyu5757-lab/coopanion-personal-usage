@@ -47,6 +47,7 @@ const { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmdirSy
 const { delimiter, dirname, extname, join, resolve, sep } = require('node:path');
 const { dataDirIn, locateData, readRecord, writeRecord } = require('./data-dir.cjs');
 const { testChannelConfig } = require('./test-channel.cjs');
+const { acceptanceChannelConfig } = require('./acceptance-channel.cjs');
 
 const MAC = process.platform === 'darwin';
 const LINUX = process.platform === 'linux';
@@ -66,26 +67,58 @@ const APP_PACKAGE = JSON.parse(readFileSync(join(APP_ROOT, 'package.json'), 'utf
 const BUILD = APP_PACKAGE.coopanion ?? {};
 const TEST_APP = testChannelConfig(APP_PACKAGE, app.getPath('appData'));
 const TEST = TEST_APP !== null;
-const RUN_ID = TEST_APP?.runId ?? `app-${process.pid}`;
-const APP_NAME = TEST_APP?.appName ?? 'Coopanion';
-const APP_ID = TEST_APP?.appId ?? 'ai.pal.coopanion';
-const CUA_DRIVER_BIN = TEST
+const ACCEPTANCE_APP = acceptanceChannelConfig(APP_PACKAGE, app.getPath('appData'));
+const ACCEPTANCE = ACCEPTANCE_APP !== null;
+/** A run whose own data root and profiles must be isolated from the installed app. */
+const ISOLATED = TEST || ACCEPTANCE;
+const RUN_ID = TEST_APP?.runId ?? ACCEPTANCE_APP?.runId ?? `app-${process.pid}`;
+const APP_NAME = TEST_APP?.appName ?? ACCEPTANCE_APP?.appName ?? 'Coopanion';
+const APP_ID = TEST_APP?.appId ?? ACCEPTANCE_APP?.appId ?? 'ai.pal.coopanion';
+// Chromium builds request headers as Latin-1; a Chinese product name in the fallback user agent
+// makes every settings-window load fail before the page is requested.
+if (ACCEPTANCE) app.userAgentFallback = app.userAgentFallback.replace(/[^\x20-\x7e]/g, '');
+const CUA_DRIVER_BIN = ISOLATED
   ? (MAC && existsSync('/Applications/CuaDriver.app/Contents/MacOS/cua-driver') ? '/Applications/CuaDriver.app/Contents/MacOS/cua-driver' : '')
   : process.env.CORTICO_CUA_DRIVER_BIN || (MAC && existsSync('/Applications/CuaDriver.app/Contents/MacOS/cua-driver') ? '/Applications/CuaDriver.app/Contents/MacOS/cua-driver' : '');
-const CUA_DRIVER_SOCKET = TEST ? join('/tmp', `cua-${RUN_ID}.sock`) : process.env.CORTICO_CUA_DRIVER_SOCKET || join('/tmp', `cua-${RUN_ID}.sock`);
-const CUA_DRIVER_SESSION = TEST ? `r-${RUN_ID.slice(0, 24)}-${randomUUID().slice(0, 6)}` : process.env.CORTICO_CUA_DRIVER_SESSION || `r-${RUN_ID.slice(0, 24)}-${randomUUID().slice(0, 6)}`;
+const CUA_DRIVER_SOCKET = ISOLATED ? join('/tmp', `cua-${RUN_ID}.sock`) : process.env.CORTICO_CUA_DRIVER_SOCKET || join('/tmp', `cua-${RUN_ID}.sock`);
+const CUA_DRIVER_SESSION = ISOLATED ? `r-${RUN_ID.slice(0, 24)}-${randomUUID().slice(0, 6)}` : process.env.CORTICO_CUA_DRIVER_SESSION || `r-${RUN_ID.slice(0, 24)}-${randomUUID().slice(0, 6)}`;
 const STEAM = BUILD.channel === 'steam';
 const PORTABLE = BUILD.channel === 'portable';
 const PET_HOST = process.argv.includes('--pet-host');
 /** The Windows installed build, whose data directory data-dir.cjs finds from the program's directory. */
-const INSTALLED = app.isPackaged && process.platform === 'win32' && !TEST && !STEAM && !PORTABLE && !process.env.CORTICO_COMPANION_DATA;
+const INSTALLED = app.isPackaged && process.platform === 'win32' && !ISOLATED && !STEAM && !PORTABLE && !process.env.CORTICO_COMPANION_DATA;
 const PROGRAM_DIR = dirname(process.execPath);
 const BESIDE = join(PROGRAM_DIR, 'data');
-const DATA_RECORD = !TEST && process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Coopanion', 'data-location.json') : null;
+const DATA_RECORD = !ISOLATED && process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Coopanion', 'data-location.json') : null;
 const located = INSTALLED && DATA_RECORD ? locateData({ programDir: PROGRAM_DIR, record: readRecord(DATA_RECORD) }) : null;
-const DATA = TEST_APP ? TEST_APP.dataDir : process.env.CORTICO_COMPANION_DATA
+const DATA = TEST_APP ? TEST_APP.dataDir : ACCEPTANCE_APP ? ACCEPTANCE_APP.dataDir : process.env.CORTICO_COMPANION_DATA
   || (!app.isPackaged ? join(APP_ROOT, 'build', 'data')
     : MAC || LINUX || STEAM ? join(app.getPath('appData'), 'Coopanion') : located?.use ?? BESIDE);
+/** The Core's deployment home. In a production acceptance window this is the production root. */
+const CORE_HOME = join(DATA, 'home');
+/** Electron profile, logs, temp and locks stay under the candidate root even in production mode. */
+const PROFILE = ACCEPTANCE_APP?.profileDir ?? DATA;
+
+/**
+ * The development settings window is opt-in and source-only. Its data root is checked before
+ * `app.setPath('userData', DATA)`: a rejected path must not become the Electron profile, the
+ * Core data root, or any writer. `scratch/` is the only allowed parent.
+ */
+const DEV_OPEN_SETTINGS = process.env.COOPANION_DEV_OPEN_SETTINGS === '1';
+if (DEV_OPEN_SETTINGS && !TEST && !app.isPackaged) {
+  try {
+    require('./dev-data-guard.cjs').assertDevDataRoot({
+      dataRoot: process.env.CORTICO_COMPANION_DATA,
+      scratchRoot: process.env.COOPANION_DEV_SETTINGS_SCRATCH,
+      appScratch: join(APP_ROOT, 'scratch'),
+      productionRoot: join(app.getPath('appData'), 'Coopanion'),
+    });
+  } catch (error) {
+    console.error(`[dev-data-guard] ${error instanceof Error ? error.message : String(error)}`);
+    app.exit(1);
+    return;
+  }
+}
 
 /**
  * Asks which data to use when none is beside the program (data-dir.cjs) and binds the record to this program
@@ -204,25 +237,25 @@ function restoreStrandedData() {
 const askStranded = INSTALLED && !PET_HOST && DATA === BESIDE && restoreStrandedData();
 
 // before anything asks Electron for a path: the single-instance lock and the profile live in userData
-if (TEST) mkdirSync(DATA, { recursive: true });
-app.setPath('userData', DATA);
-if (TEST) {
-  const sessionData = join(DATA, 'session');
-  mkdirSync(join(DATA, 'Crashpad'), { recursive: true });
+if (ISOLATED) mkdirSync(PROFILE, { recursive: true });
+app.setPath('userData', PROFILE);
+if (ISOLATED) {
+  const sessionData = join(PROFILE, 'session');
+  mkdirSync(join(PROFILE, 'Crashpad'), { recursive: true });
   mkdirSync(sessionData, { recursive: true });
   app.setPath('sessionData', sessionData);
 }
-app.setPath('crashDumps', join(DATA, 'Crashpad'));
-process.env.TEMP = process.env.TMP = process.env.TMPDIR = join(DATA, 'tmp');
+app.setPath('crashDumps', join(PROFILE, 'Crashpad'));
+process.env.TEMP = process.env.TMP = process.env.TMPDIR = join(PROFILE, 'tmp');
 mkdirSync(process.env.TEMP, { recursive: true });
 
 /* ---------- pet window mode ---------- */
 if (PET_HOST) {
   const arg = (name) => { const hit = process.argv.find((a) => a.startsWith(`--${name}=`)); return hit ? hit.slice(name.length + 3) : ''; };
   const petData = join(app.getPath('userData'), 'pet-window');
-  if (TEST) mkdirSync(petData, { recursive: true });
+  if (ISOLATED) mkdirSync(petData, { recursive: true });
   app.setPath('userData', petData);
-  if (TEST) {
+  if (ISOLATED) {
     const sessionData = join(petData, 'session');
     mkdirSync(join(petData, 'Crashpad'), { recursive: true });
     mkdirSync(sessionData, { recursive: true });
@@ -251,7 +284,7 @@ const { createBrowserHost } = require('./browser.cjs');
 const { configuredLanguage, systemLanguage, textOf } = require('./i18n/index.cjs');
 const { RELEASES_URL, canUpdate, startUpdater } = require('./updater.cjs');
 /** Steam updates its build, and the portable one is updated by hand: only the others run the updater. */
-const SELF_UPDATE = !TEST && !STEAM && !PORTABLE && canUpdate();
+const SELF_UPDATE = !ISOLATED && !STEAM && !PORTABLE && canUpdate();
 
 const userData = app.getPath('userData');
 const shimDir = join(__dirname, 'shims');
@@ -266,7 +299,7 @@ const petHost = app.isPackaged ? [process.execPath, '--pet-host'] : [process.exe
  */
 function dataHoldsLinks() {
   if (process.platform !== 'win32') return true;
-  const probe = join(DATA, 'tmp', `link-probe-${process.pid}`);
+  const probe = join(PROFILE, 'tmp', `link-probe-${process.pid}`);
   try {
     symlinkSync(DATA, probe, 'junction');
   } catch {
@@ -276,7 +309,7 @@ function dataHoldsLinks() {
   return true;
 }
 const LINKS = dataHoldsLinks();
-const PNPM_DIR = TEST || LINKS ? join(DATA, 'pnpm') : join(process.env.LOCALAPPDATA ?? app.getPath('temp'), 'Coopanion', 'pnpm');
+const PNPM_DIR = ISOLATED || LINKS ? join(PROFILE, 'pnpm') : join(process.env.LOCALAPPDATA ?? app.getPath('temp'), 'Coopanion', 'pnpm');
 
 const core = new CoreHost({
   appRoot: APP_ROOT,
@@ -285,8 +318,8 @@ const core = new CoreHost({
   resolveProxy: (url) => session.defaultSession.resolveProxy(url),
   env: {
     ...process.env,
-    CORTICO_HOME: join(userData, 'home'),
-    CORTICO_EXTENSIONS_DIR: join(userData, 'extensions'),
+    CORTICO_HOME: CORE_HOME,
+    CORTICO_EXTENSIONS_DIR: join(PROFILE, 'extensions'),
     CORTICO_TEST_CHANNEL: TEST ? '1' : '0',
     CORTICO_CUA_DRIVER_BIN: CUA_DRIVER_BIN,
     CORTICO_CUA_DRIVER_SOCKET: CUA_DRIVER_SOCKET,
@@ -307,10 +340,11 @@ const core = new CoreHost({
     CORTICO_NODE_EXE: process.execPath,
     CORTICO_PNPM_CJS: join(APP_ROOT, 'node_modules', 'pnpm', 'bin', 'pnpm.cjs'),
     ...(TEST_APP?.coreEnvironment ?? {}),
+    ...(ACCEPTANCE_APP?.coreEnvironment ?? {}),
     // reported with the usage statistics (core/telemetry.ts)
     COOPANION_VERSION: app.getVersion(),
     // the introduction offers the whale's persona outside Steam (core/guide.ts)
-    COOPANION_CHANNEL: TEST ? 'test' : STEAM ? 'steam' : 'github',
+    COOPANION_CHANNEL: TEST ? 'test' : ACCEPTANCE ? 'acceptance' : STEAM ? 'steam' : 'github',
   },
 });
 
@@ -318,7 +352,7 @@ const core = new CoreHost({
 const browser = createBrowserHost({
   appRoot: APP_ROOT,
   icon: WINDOW_ICON,
-  partition: TEST_APP?.browserPartition,
+  partition: TEST_APP?.browserPartition ?? ACCEPTANCE_APP?.browserPartition,
   log: console,
   send: (msg) => core.send(msg),
   mediaDir: () => core.dataDir ? join(core.dataDir, 'video', 'media') : null,
@@ -369,7 +403,7 @@ const settingsUrl = (path = '') => consoleUrl(`coopanion/${path}`);
  * is, unfollowed. WebSockets do not pass through here; keepRemoteOut keeps the session's other traffic on
  * this machine, apart from the release check and the extension market's images, and its frames too.
  */
-const SETTINGS_PARTITION = TEST_APP?.settingsPartition ?? 'persist:coopanion-settings';
+const SETTINGS_PARTITION = TEST_APP?.settingsPartition ?? ACCEPTANCE_APP?.settingsPartition ?? 'persist:coopanion-settings';
 const WINDOW_DIR = join(APP_ROOT, 'build', 'console');
 const WINDOW_PREFIX = '/coopanion/';
 const WINDOW_TYPES = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.map': 'application/json' };
@@ -445,9 +479,12 @@ const MARKET_IMAGES = ['https://raw.githubusercontent.com/Pal-AI-Lab/cortico-ext
 const isLocal = (url) => /^(https?|wss?):\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?\//.test(url);
 /** Requests of the settings session leave the machine only for the release check and the market's images. */
 function keepRemoteOut(ses) {
+  // A dev-source profile is local-only: its page may not reach the release check or the market.
+  const devLocalOnly = ACCEPTANCE || (DEV_OPEN_SETTINGS && !TEST && !app.isPackaged);
   ses.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*', 'ws://*/*', 'wss://*/*'] }, (details, answer) => {
     const marketImage = details.resourceType === 'image' && MARKET_IMAGES.some((prefix) => details.url.startsWith(prefix));
-    answer({ cancel: !(isLocal(details.url) || details.url === RELEASE_CHECK || marketImage) });
+    const allowed = isLocal(details.url) || (!devLocalOnly && (details.url === RELEASE_CHECK || marketImage));
+    answer({ cancel: !allowed });
   });
 }
 
@@ -569,15 +606,15 @@ async function ensurePet() {
  * Windows reads `openAtLogin` back only for the value named after the app's id and with the same arguments;
  * the portable build names its value after its folder, so each copy has its own, and reads it from `launchItems`.
  */
-const AUTOSTART = join(app.getPath('home'), '.config', 'autostart', TEST ? `coopanion-test-${RUN_ID}.desktop` : 'coopanion.desktop');
+const AUTOSTART = join(app.getPath('home'), '.config', 'autostart', TEST ? `coopanion-test-${RUN_ID}.desktop` : ACCEPTANCE ? `coopanion-acceptance-${RUN_ID}.desktop` : 'coopanion.desktop');
 const LOGIN_ARGS = ['--background'];
 const LOGIN_NAME = PORTABLE ? `Coopanion ${PROGRAM_DIR}` : undefined;
 const loginItem = {
-  get: () => TEST ? false : (LINUX ? existsSync(AUTOSTART)
+  get: () => ISOLATED ? false : (LINUX ? existsSync(AUTOSTART)
     : LOGIN_NAME ? app.getLoginItemSettings().launchItems.some((item) => item.name === LOGIN_NAME)
       : app.getLoginItemSettings({ args: LOGIN_ARGS }).openAtLogin),
   set(on) {
-    if (TEST) return;
+    if (ISOLATED) return;
     if (!LINUX) { app.setLoginItemSettings({ openAtLogin: on, args: LOGIN_ARGS, ...LOGIN_NAME ? { name: LOGIN_NAME } : {} }); return; }
     if (!on) { rmSync(AUTOSTART, { force: true }); return; }
     const exe = process.env.APPIMAGE || process.execPath;
@@ -598,7 +635,7 @@ function refreshTray() {
     { label: t.trayOpenSettings, click: () => openSettings() },
     { label: t.trayShowPet, enabled: core.state === 'running', click: () => void showPet().catch(() => { /* Core went away meanwhile */ }) },
     { type: 'separator' },
-    { label: t.trayLaunchAtLogin, type: 'checkbox', checked: login, enabled: app.isPackaged && !TEST, click: (item) => { loginItem.set(item.checked); noteAutostart(); refreshTray(); } },
+    { label: t.trayLaunchAtLogin, type: 'checkbox', checked: login, enabled: app.isPackaged && !ISOLATED, click: (item) => { loginItem.set(item.checked); noteAutostart(); refreshTray(); } },
     { label: t.trayRestart, click: () => void core.restart() },
     { label: t.trayQuit, click: () => app.quit() },
   ]));
@@ -651,6 +688,12 @@ core.on('state', (state, exit) => {
   if (state === 'failed') dialog.showErrorBox(APP_NAME, detail);
 });
 
+core.on('notify', (note) => {
+  if (!Notification.isSupported()) return;
+  const notification = new Notification({ title: note.title || APP_NAME, body: note.body, icon: WINDOW_ICON });
+  notification.on('click', () => openSettings(''));
+  notification.show();
+});
 core.on('open', (path) => openSettings(path));
 // the introduction runs again on the desktop, where Coo is
 core.on('hide', () => settings?.close());
@@ -713,6 +756,14 @@ app.whenReady().then(() => {
   buildTray();
   noteAutostart();
   void core.start();
+  // A Test App's window is opened by this run, not by the tray: no candidate run depends on
+  // macOS accessibility automation to reach a window it must observe.
+  // Source runs can opt into the real settings window only with an explicit data root.
+  const openSettingsForSource = !TEST && !app.isPackaged
+    && !!process.env.CORTICO_COMPANION_DATA && DEV_OPEN_SETTINGS;
+  if (ACCEPTANCE || (TEST && process.env.COOPANION_TEST_OPEN_SETTINGS === '1') || openSettingsForSource) {
+    openSettings(TEST ? process.env.COOPANION_TEST_SETTINGS_PATH ?? '' : '');
+  }
   if (SELF_UPDATE) updater = startUpdater({
     logDir: join(userData, 'logs'),
     tell: (step) => {

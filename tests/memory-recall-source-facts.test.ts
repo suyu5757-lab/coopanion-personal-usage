@@ -1,11 +1,11 @@
 import { createServer, type Server } from 'node:http';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { HindsightClient } from '@vectorize-io/hindsight-client';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { HindsightMemory, type MemoryTextRead } from '../core/memory/hindsight.ts';
 import { DEFAULT_ACTIVATION_RANK_INFLUENCE } from '../core/memory/format.ts';
 import { growthMemorySearchTool } from '../core/growth/review.ts';
@@ -20,6 +20,7 @@ const servers: Server[] = [];
 afterEach(async () => {
   closeMemoryStateStores();
   await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+  vi.unstubAllEnvs();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -66,6 +67,88 @@ async function hindsightServer(response: unknown, includeSourceDocuments = false
         res.writeHead(404);
         res.end();
       }
+    });
+  });
+  servers.push(server);
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address() as AddressInfo;
+  return { baseUrl: `http://127.0.0.1:${address.port}`, requests };
+}
+
+async function fencedFallbackHindsightServer(primary: unknown, supplemental: unknown, documents: Record<string, {
+  text: string;
+  metadata: Record<string, string>;
+}>): Promise<{ baseUrl: string; requests: Array<{ method: string; path: string }> }> {
+  const requests: Array<{ method: string; path: string }> = [];
+  let recalls = 0;
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+      requests.push({ method: req.method ?? 'GET', path });
+      if (req.method === 'POST' && path.endsWith('/memories/recall')) {
+        recalls += 1;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(recalls === 1 ? primary : supplemental));
+        return;
+      }
+      const match = /\/documents\/([^/]+)$/.exec(path);
+      if (req.method === 'GET' && match) {
+        const documentId = decodeURIComponent(match[1]!);
+        const source = documents[documentId];
+        if (!source) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          id: documentId,
+          bank_id: 'bank-test',
+          original_text: source.text,
+          content_hash: createHash('sha256').update(source.text, 'utf8').digest('hex'),
+          created_at: '2026-01-10T00:00:00.000Z',
+          updated_at: '2026-01-10T00:00:00.000Z',
+          document_metadata: source.metadata,
+        }));
+        return;
+      }
+      if (req.method === 'GET' && path.endsWith('/documents')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ items: [], total: 0, limit: 250, offset: 0 }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+  });
+  servers.push(server);
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address() as AddressInfo;
+  return { baseUrl: `http://127.0.0.1:${address.port}`, requests };
+}
+
+async function readOnlyHindsightServer(): Promise<{ baseUrl: string; requests: Array<{ method: string; path: string }> }> {
+  const requests: Array<{ method: string; path: string }> = [];
+  const server = createServer((req, res) => {
+    req.resume();
+    req.once('end', () => {
+      const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+      requests.push({ method: req.method ?? 'GET', path });
+      if (req.method === 'GET' && path.endsWith('/config')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ bank_id: 'bank-test', reflect_mission: 'fixture' }));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
     });
   });
   servers.push(server);
@@ -159,6 +242,184 @@ function historicalEventResponse(at: string, actor = 'user', semanticScore = 0.9
 }
 
 describe('Hindsight source-fact recall', () => {
+  it('rebuilds a deep baseline only from complete exact source readbacks', async () => {
+    const originalText = 'The person said the project review settled on the coral folder.';
+    const primary = {
+      results: [{ id: 'observation-primary', text: 'unsafe generated summary', type: 'observation', document_id: 'doc-primary', source_fact_ids: ['missing-primary-fact'] }],
+      source_facts: {},
+      source_facts_truncated: false,
+    };
+    const supplemental = {
+      results: [{ id: 'observation-supplemental', text: 'A verified source supports the project history.', type: 'observation', document_id: 'doc-supplemental', source_fact_ids: ['fact-project'] }],
+      source_facts: {
+        'fact-project': { id: 'fact-project', text: 'Project review result.', type: 'world', document_id: 'doc-project', metadata: { source_actor: 'user', kind: 'event', status: 'completed' } },
+      },
+      source_facts_truncated: false,
+    };
+    const api = await fencedFallbackHindsightServer(primary, supplemental, {
+      'doc-project': { text: originalText, metadata: { source_actor: 'user', kind: 'event', status: 'completed', said_at: '2026-01-10T00:00:00.000Z' } },
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-recall-exact-fallback-'));
+    roots.push(root);
+    const { memory, ledger } = await configuredMemory(api.baseUrl, root);
+    memory.config.recall.timeoutMs = 5000;
+    ledger.add({ bankId: 'bank-test', endpoint: api.baseUrl, documentId: 'unrelated-forget-fence', reason: 'fixture' });
+
+    const recalled = await (memory as unknown as HindsightMemory).recallForTurn(
+      '之前我们讨论过 Coopanion 项目的哪些决定和经历？',
+      { captureTrace: true, activationEnabled: false },
+    );
+    const segments = recalled.trace?.format.sourceSegments ?? [];
+    const evidence = await (memory as unknown as HindsightMemory).evidenceForSegments(recalled.text, segments);
+
+    expect(recalled.status).toBe('found');
+    expect(recalled.text).toContain(originalText);
+    expect(recalled.text).not.toContain('unsafe generated summary');
+    expect(segments).toHaveLength(1);
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]).toMatchObject({ documentId: 'doc-project', validationStatus: 'validated', revisionState: 'current' });
+    expect(evidence[0]?.segment.sourceProof).toBeDefined();
+  });
+
+  it('filters Coo output without current derived lineage before constructing a Recall baseline', async () => {
+    const originalText = 'The person said the project version is 5.';
+    const cooText = 'An old Coo output says the project version is 4.';
+    const response = {
+      results: [
+        {
+          id: 'coo-output-without-lineage',
+          text: 'Unverified Coo output about an older project version.',
+          type: 'world',
+          document_id: 'coo:legacy-output',
+          metadata: { source_actor: 'coo', kind: 'event', status: 'current' },
+          source_fact_ids: [],
+        },
+        {
+          id: 'observation-mixed-coo',
+          text: 'The old Coo output and the user version are summarized together.',
+          type: 'observation',
+          document_id: 'observation-mixed-project-version',
+          source_fact_ids: ['fact-coo-output', 'fact-user-project-version'],
+        },
+        {
+          id: 'observation-user-project',
+          text: 'The project version is 5.',
+          type: 'observation',
+          document_id: 'observation-project-version',
+          source_fact_ids: ['fact-user-project-version'],
+        },
+      ],
+      source_facts: {
+        'fact-coo-output': {
+          id: 'fact-coo-output',
+          text: cooText,
+          type: 'world',
+          document_id: 'coo:legacy-output',
+          metadata: { source_actor: 'coo', kind: 'event', status: 'current' },
+        },
+        'fact-user-project-version': {
+          id: 'fact-user-project-version',
+          text: originalText,
+          type: 'world',
+          document_id: 'doc-user-project-version',
+          metadata: { source_actor: 'user', kind: 'event', status: 'completed' },
+        },
+      },
+      source_facts_truncated: false,
+    };
+    const api = await hindsightServer(response, true);
+    const root = mkdtempSync(join(tmpdir(), 'coo-recall-derived-lineage-'));
+    roots.push(root);
+    const { memory } = await configuredMemory(api.baseUrl, root);
+    const runtime = memory as unknown as HindsightMemory;
+
+    const recalled = await runtime.recallForTurn(
+      'What did we decide about Coopanion project versions?',
+      { captureTrace: true, activationEnabled: false },
+    );
+    const segments = recalled.trace?.format.sourceSegments ?? [];
+    const evidence = await runtime.evidenceForSegments(recalled.text, segments);
+
+    expect(recalled.status).toBe('found');
+    expect(recalled.text).toContain(originalText);
+    expect(recalled.text).not.toContain('Unverified Coo output');
+    expect(recalled.text).not.toContain(cooText);
+    expect(recalled.trace?.search.items).toContainEqual(expect.objectContaining({
+      resultId: 'coo-output-without-lineage',
+      disposition: 'filtered',
+      reason: 'derived-source-lineage-unavailable',
+    }));
+    expect(recalled.trace?.search.items).toContainEqual(expect.objectContaining({
+      resultId: 'observation-mixed-coo',
+      disposition: 'filtered',
+      reason: 'derived-source-lineage-unavailable',
+    }));
+    expect(segments).toHaveLength(1);
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]).toMatchObject({
+      documentId: 'doc-user-project-version',
+      validationStatus: 'validated',
+      revisionState: 'current',
+    });
+  });
+
+  it('keeps a tombstoned supplemental source fenced', async () => {
+    const primary = {
+      results: [{ id: 'observation-primary', text: 'unsafe generated summary', type: 'observation', document_id: 'doc-primary', source_fact_ids: ['missing-primary-fact'] }],
+      source_facts: {},
+      source_facts_truncated: false,
+    };
+    const supplemental = {
+      results: [{ id: 'observation-supplemental', text: 'A verified source supports the project history.', type: 'observation', document_id: 'doc-supplemental', source_fact_ids: ['fact-project'] }],
+      source_facts: {
+        'fact-project': { id: 'fact-project', text: 'Project review result.', type: 'world', document_id: 'doc-project', metadata: { source_actor: 'user', kind: 'event', status: 'completed' } },
+      },
+      source_facts_truncated: false,
+    };
+    const api = await fencedFallbackHindsightServer(primary, supplemental, {
+      'doc-project': { text: 'The person said the project review settled on the coral folder.', metadata: { source_actor: 'user', kind: 'event', status: 'completed' } },
+    });
+    const root = mkdtempSync(join(tmpdir(), 'coo-recall-tombstone-fallback-'));
+    roots.push(root);
+    const { memory, ledger } = await configuredMemory(api.baseUrl, root);
+    memory.config.recall.timeoutMs = 5000;
+    ledger.add({ bankId: 'bank-test', endpoint: api.baseUrl, documentId: 'unrelated-forget-fence', reason: 'fixture' });
+    ledger.add({ bankId: 'bank-test', endpoint: api.baseUrl, documentId: 'doc-project', reason: 'fixture' });
+
+    const recalled = await (memory as unknown as HindsightMemory).recallForTurn(
+      '之前我们讨论过 Coopanion 项目的哪些决定和经历？',
+      { captureTrace: true, activationEnabled: false },
+    );
+
+    expect(recalled.status).toBe('fenced');
+    expect(recalled.text).toBe('');
+    expect(recalled.trace?.format.sourceSegments ?? []).toEqual([]);
+    expect(api.requests.some((request) => request.method === 'GET' && request.path.endsWith('/documents/doc-project'))).toBe(false);
+  });
+
+  it('keeps the live API read-only while local chat events are queued', async () => {
+    const api = await readOnlyHindsightServer();
+    const root = mkdtempSync(join(tmpdir(), 'coo-hindsight-readonly-'));
+    roots.push(root);
+    writeFileSync(join(root, 'hindsight.json'), JSON.stringify({
+      enabled: true,
+      apiUrl: api.baseUrl,
+      bankId: 'bank-test',
+      autostart: false,
+      recall: { timeoutMs: 1000 },
+    }));
+    vi.stubEnv('COOPANION_HINDSIGHT_READ_ONLY', '1');
+    const memory = new HindsightMemory();
+    memory.configure(root, { warn: () => {} });
+    await memory.bootstrap();
+    const sourceId = memory.retainUser('A local validation chat message.', { cursor: 1 });
+    const reflection = await memory.reflectDetailed('This must not call a model.');
+
+    expect(memory.enabled()).toBe(true);
+    expect(sourceId).toBeTruthy();
+    expect(reflection.status).toBe('unavailable');
+    expect(api.requests).toEqual([{ method: 'GET', path: '/v1/default/banks/bank-test/config' }]);
+  });
   it('passes visible observations with their context and source facts to the memory reader', async () => {
     const api = await hindsightServer({
       results: [{
@@ -507,6 +768,7 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
       apiUrl: string;
       apiToken: string;
       bankId: string;
+      domainSupplement: { enabled: boolean; queryTimeoutMs: number };
       recall: { maxTokens: number; budget: 'low'; timeoutMs: number; types: string[] };
       retain: { async: boolean };
       portrait: { maxTokens: number };
@@ -531,6 +793,7 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
       apiUrl: string;
       apiToken: string;
       bankId: string;
+      domainSupplement: { enabled: boolean; queryTimeoutMs: number };
       recall: { maxTokens: number; budget: 'low'; timeoutMs: number; types: string[] };
       retain: { async: boolean };
       portrait: { maxTokens: number };
@@ -550,6 +813,7 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
     apiUrl: baseUrl,
     apiToken: '',
     bankId,
+    domainSupplement: { enabled: false, queryTimeoutMs: 8000 },
     recall: { maxTokens: 900, budget: 'low', timeoutMs: 800, types: ['observation'] },
     retain: { async: true },
     portrait: { maxTokens: 500 },
@@ -968,7 +1232,9 @@ async function configuredMemory(baseUrl: string, root: string, bankId = 'bank-te
     const read = await memory.recallBlockDetailed('What relationship was recorded?');
 
     expect(read.status).toBe('found');
-    expect(read.text).toContain('A supported relationship.');
+    // A parentless observation's derived summary is never emitted on its own; its verified
+    // source fact is, and the unsupported source-free claim is still withheld.
+    expect(read.text).toContain('A verified source event.');
     expect(read.text).not.toContain('An unsupported source-free claim.');
   });
 

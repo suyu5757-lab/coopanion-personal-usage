@@ -7,10 +7,12 @@
  * limited to the newest delivered batch (`sinceLastDelivery`), and images in tool results move to a
  * user message right after the results, since Chat takes images in user messages only.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { NativeChatMessage } from 'cortico/providers/transport/native-types.ts';
 import type { Logger, ModelSpec, ToolSchema } from 'cortico/core/types.ts';
-import type { GenerateOptions } from 'cortico/core/generation.ts';
+import type { GenerateOptions, Generation } from 'cortico/core/generation.ts';
 import type { Request } from 'cortico/protocol/open-responses/index.ts';
+import type { ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import { nullLogger } from 'cortico/core/util.ts';
 import { OpenAIHttpClient } from 'cortico/providers/transport/chat.ts';
 import { dropPastThinking, mapTools, renderMessagesWithMedia, type CompatMediaOptions } from 'cortico/providers/transport/history.ts';
@@ -28,12 +30,28 @@ export interface VendorChatOptions {
   effort?: (model: string) => EffortMap | undefined;
   /** With thinking on, the service rejects a tool call after the newest user message that has no reasoning (`Vendor.syntheticReasoning`). */
   syntheticReasoning?: boolean;
+  /** Headers every request carries. */
+  extraHeaders?: Record<string, string>;
+  /** Headers that depend on the request, such as a conversation's session id. */
+  requestHeaders?: (options: GenerateOptions) => Record<string, string> | undefined;
+  /** Validates the URL assembled for this request before the transport runs. */
+  requestUrlGuard?: (url: string, request: Request, options: GenerateOptions) => void;
 }
 
 /** Text of a tool result that held images only, once they move to the next user message. */
 const IMAGE_RESULT = '[image]';
 
 export type Message = Record<string, unknown>;
+
+function requestMappedChatContext(request: Request, context: readonly ContextRecord[]): readonly ContextRecord[] {
+  const inputs = request.input;
+  if (!Array.isArray(inputs) || inputs.length !== context.length) return context;
+  return context.map((entry, index) => {
+    const input = inputs[index];
+    if (entry.item.type !== 'reasoning' || !input || typeof input !== 'object' || input.type !== 'reasoning') return entry;
+    return { ...entry, item: structuredClone(input) as ContextRecord['item'] };
+  });
+}
 
 /** How a protocol writes tool results, their text and image parts, and a user message. */
 export interface ResultFormat {
@@ -96,12 +114,22 @@ function roundReasoning(messages: readonly NativeChatMessage[], opts: { keepThin
 }
 
 export class VendorChat extends OpenAIHttpClient {
+  private readonly requestHeaders = new AsyncLocalStorage<Record<string, string>>();
+
   constructor(private readonly opts: VendorChatOptions) {
     super(opts.baseUrl, opts.log ?? nullLogger());
   }
 
+  /** Pins a request's own headers to its async call chain, so concurrent conversations keep their sessions apart. */
+  override respond(request: Request, options: GenerateOptions = {}): Promise<Generation> {
+    this.opts.requestUrlGuard?.(this.baseUrl + this.chatPath, request, options);
+    const headers = this.opts.requestHeaders?.(options);
+    return headers ? this.requestHeaders.run(headers, () => super.respond(request, options)) : super.respond(request, options);
+  }
+
   protected override buildResponseBody(request: Request, options: GenerateOptions): Record<string, unknown> {
-    return super.buildResponseBody(request, options.context ? { ...options, context: sinceLastDelivery(options.context) } : options);
+    const context = options.context ? sinceLastDelivery(options.context) : undefined;
+    return super.buildResponseBody(request, context ? { ...options, context: requestMappedChatContext(request, context) } : options);
   }
 
   protected buildBody(spec: ModelSpec, messages: NativeChatMessage[], tools?: ToolSchema[]): Record<string, unknown> {
@@ -122,6 +150,11 @@ export class VendorChat extends OpenAIHttpClient {
   }
 
   protected headers(): Record<string, string> {
-    return { 'Content-Type': 'application/json', ...(this.opts.apiKey ? { Authorization: `Bearer ${this.opts.apiKey}` } : {}) };
+    return {
+      'Content-Type': 'application/json',
+      ...this.opts.extraHeaders,
+      ...this.requestHeaders.getStore(),
+      ...(this.opts.apiKey ? { Authorization: `Bearer ${this.opts.apiKey}` } : {}),
+    };
   }
 }

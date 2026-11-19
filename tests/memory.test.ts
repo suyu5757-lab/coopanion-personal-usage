@@ -39,6 +39,21 @@ describe('Hindsight config', () => {
     expect(config.affection.dailyPositive).toBe(1);
   });
 
+  it('uses a process-only read-only validation switch', () => {
+    const previous = process.env.COOPANION_HINDSIGHT_READ_ONLY;
+    delete process.env.COOPANION_HINDSIGHT_READ_ONLY;
+    try {
+      expect(loadHindsightConfig(workspace()).readOnly).toBe(false);
+      process.env.COOPANION_HINDSIGHT_READ_ONLY = '1';
+      expect(loadHindsightConfig(workspace()).readOnly).toBe(true);
+      process.env.COOPANION_HINDSIGHT_READ_ONLY = '0';
+      expect(loadHindsightConfig(workspace()).readOnly).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.COOPANION_HINDSIGHT_READ_ONLY;
+      else process.env.COOPANION_HINDSIGHT_READ_ONLY = previous;
+    }
+  });
+
   it('lets the config page override the file and environment defaults', () => {
     const dir = workspace();
     writeFileSync(join(dir, 'hindsight.json'), JSON.stringify({ enabled: false, bankId: 'from-file' }));
@@ -68,6 +83,10 @@ describe('Hindsight config', () => {
       'hindsight.recall.maxTokens',
       'hindsight.recall.maxSourceFactsTokens',
       'hindsight.recall.timeoutMs',
+      'hindsight.domainSupplement.enabled',
+      'hindsight.domainSupplement.maxSupplementSources',
+      'hindsight.domainSupplement.maxSupplementChars',
+      'hindsight.domainSupplement.timeoutMs',
       'hindsight.affection.enabled',
     ]);
     expect(group.schema.properties['hindsight.enabled'].title).toContain('长期记忆');

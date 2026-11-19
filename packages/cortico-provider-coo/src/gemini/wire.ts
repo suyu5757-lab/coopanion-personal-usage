@@ -15,6 +15,7 @@ import { standardUsage, unknownMeters, type GenerateOptions, type TokenMeters } 
 import type { ModelSpec } from 'cortico/core/types.ts';
 import { requestContext, requestSpec } from 'cortico/providers/transport/native-input.ts';
 import type { CompatMediaOptions } from 'cortico/providers/transport/history.ts';
+import type { EffortMap } from '../vendors.ts';
 
 export interface GeminiPart {
   text?: string;
@@ -169,13 +170,15 @@ const legacy = (model: string): boolean => /^gemini-2\./.test(model);
 const MINIMAL = /flash-lite/;
 
 /** Gemini 3 levels. Gemini 3 cannot turn thinking off: `thinking: false` sends the lowest level the model takes. */
-export function thinkingConfig(spec: ModelSpec): Record<string, unknown> {
+export function thinkingConfig(spec: ModelSpec, map?: EffortMap): Record<string, unknown> {
+  const mapped = spec.reasoningEffort && map ? map[spec.reasoningEffort as keyof EffortMap] : spec.reasoningEffort;
+  const effort = mapped === null ? undefined : mapped ?? spec.reasoningEffort;
   if (legacy(spec.model)) {
-    const budget = !spec.thinking ? 0 : spec.reasoningEffort === 'high' || spec.reasoningEffort === 'max' ? 24576
-      : spec.reasoningEffort === 'medium' ? 8192 : spec.reasoningEffort === 'low' ? 1024 : -1;
+    const budget = !spec.thinking ? 0 : effort === 'high' || effort === 'max' ? 24576
+      : effort === 'medium' ? 8192 : effort === 'low' ? 1024 : -1;
     return { includeThoughts: budget !== 0, thinkingBudget: budget };
   }
-  const level = !spec.thinking ? (MINIMAL.test(spec.model) ? 'minimal' : 'low') : spec.reasoningEffort === 'max' || spec.reasoningEffort === 'xhigh' ? 'high' : spec.reasoningEffort ?? 'low';
+  const level = !spec.thinking ? (MINIMAL.test(spec.model) ? 'minimal' : 'low') : effort === 'max' || effort === 'xhigh' ? 'high' : effort ?? 'low';
   return { includeThoughts: true, thinkingLevel: level };
 }
 
@@ -191,9 +194,9 @@ function toolConfig(choice: Request['tool_choice']): Record<string, unknown> | u
 }
 
 /** The inner `GenerateContentRequest`; function parameters pass through as JSON Schema. */
-export function geminiRequest(request: Request, options: GenerateOptions, opts: { media?: CompatMediaOptions; keepThinking?: () => boolean } = {}): Record<string, unknown> {
+export function geminiRequest(request: Request, options: GenerateOptions, opts: { media?: CompatMediaOptions; keepThinking?: () => boolean; effort?: EffortMap } = {}): Record<string, unknown> {
   const spec = requestSpec(request, options);
-  const generationConfig: Record<string, unknown> = { thinkingConfig: thinkingConfig(spec) };
+  const generationConfig: Record<string, unknown> = { thinkingConfig: thinkingConfig(spec, opts.effort) };
   // Gemini 3 deprecates the sampling parameters; only 2.x models receive them.
   if (legacy(spec.model)) {
     if (spec.temperature !== undefined) generationConfig.temperature = spec.temperature;

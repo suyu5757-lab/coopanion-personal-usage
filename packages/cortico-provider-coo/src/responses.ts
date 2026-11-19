@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { ResponsesProvider, type ResponsesProviderOptions } from 'cortico/providers/openai-responses-compat/native.ts';
 import type { ResponseAssembly } from 'cortico/providers/transport/response-assembly.ts';
 import type { GenerateOptions, Generation } from 'cortico/core/generation.ts';
@@ -13,6 +14,10 @@ export interface VendorQuirks {
   lenientReasoning?: true;
   nonStreamingResponses?: true;
   toolOutputText?: true;
+  /** Headers that depend on the request, such as a conversation's session id. */
+  requestHeaders?: (options: GenerateOptions) => Record<string, string> | undefined;
+  /** Validates the URL assembled for this request before the transport runs. */
+  requestUrlGuard?: (url: string, request: Request, options: GenerateOptions) => void;
 }
 
 const RESPONSES_RESULTS: ResultFormat = {
@@ -26,13 +31,22 @@ const RESPONSES_RESULTS: ResultFormat = {
  * results send their images in a user message after them, as on Chat.
  */
 export class VendorResponses extends ResponsesProvider {
+  private readonly requestHeaders = new AsyncLocalStorage<Record<string, string>>();
+
   constructor(opts: ResponsesProviderOptions, private readonly quirks: VendorQuirks) {
     super(opts);
   }
 
   /** Fallback for premature item.done events and terminal item revisions: Core executes only the full response's tools. */
   override respond(request: Request, options: GenerateOptions = {}): Promise<Generation> {
-    return super.respond(request, this.quirks.nonStreamingResponses ? { ...options, onEvent: undefined } : options);
+    this.quirks.requestUrlGuard?.(this.baseUrl + this.chatPath, request, options);
+    const headers = this.quirks.requestHeaders?.(options);
+    const send = () => super.respond(request, this.quirks.nonStreamingResponses ? { ...options, onEvent: undefined } : options);
+    return headers ? this.requestHeaders.run(headers, send) : send();
+  }
+
+  protected override headers(): Record<string, string> {
+    return { ...super.headers(), ...this.requestHeaders.getStore() };
   }
 
   protected override buildResponseBody(request: Request, options: GenerateOptions): Record<string, unknown> {

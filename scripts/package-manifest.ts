@@ -40,11 +40,11 @@ export function createFinalPackageManifest(options: FinalPackageManifestOptions)
     signature?: string;
     content?: { scope?: string; filesSha256?: string };
   };
-  if (staged.channel !== 'test' || typeof staged.runId !== 'string' || !staged.runId) {
-    throw new Error(`Expected a Test App build manifest at ${buildManifestPath}`);
+  if ((staged.channel !== 'test' && staged.channel !== 'acceptance') || typeof staged.runId !== 'string' || !staged.runId) {
+    throw new Error(`Expected an isolated app build manifest at ${buildManifestPath}`);
   }
-  if (options.signatureVerified !== true) throw new Error('The Test App signature was not verified');
-  if (!options.artifactPaths.length) throw new Error('The Test App has no installer artifacts to record');
+  if (options.signatureVerified !== true) throw new Error('The isolated app signature was not verified');
+  if (!options.artifactPaths.length) throw new Error('The isolated app has no installer artifacts to record');
 
   const artifacts = options.artifactPaths.map((rawPath) => {
     const path = resolve(rawPath);

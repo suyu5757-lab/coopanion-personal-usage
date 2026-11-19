@@ -6,6 +6,7 @@ import { asRecord, InvalidState, readState, writeState } from '../state-file.ts'
 
 export interface GrowthConfig {
   enabled: boolean;
+  autoApply?: boolean;
   /** Days between self-reviews. */
   everyDays: number;
 }
@@ -75,5 +76,6 @@ export function readGrowth(config: unknown): GrowthConfig {
   return {
     enabled: typeof raw?.enabled === 'boolean' ? raw.enabled : GROWTH_DEFAULTS.enabled,
     everyDays,
+    ...(raw?.autoApply === true ? { autoApply: true } : {}),
   };
 }

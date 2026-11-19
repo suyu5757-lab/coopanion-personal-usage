@@ -136,6 +136,8 @@ class CoreHost extends EventEmitter {
         this.emit('update-install');
       } else if (msg?.type === 'companion:releases') {
         this.emit('releases');
+      } else if (msg?.type === 'companion:notify' && typeof msg.body === 'string') {
+        this.emit('notify', { title: typeof msg.title === 'string' ? msg.title : '', body: msg.body });
       } else if (msg?.type === 'companion:browse' && typeof msg.url === 'string') {
         this.emit('browse', msg.url);
       } else if (msg?.type === 'companion:browser' && typeof msg.id === 'number') {

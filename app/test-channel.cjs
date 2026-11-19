@@ -24,6 +24,16 @@ function testChannelConfig(appPackage, appData) {
     throw new Error('The Test App bundle identifier is invalid');
   }
 
+  // A Test App stays memory-off unless the operator names a loopback Hindsight stub
+  // and a test bank for this run. Nothing here can point at a real bank.
+  const hindsightOn = process.env.COOPANION_TEST_HINDSIGHT === '1';
+  const hindsightUrl = hindsightOn ? String(process.env.COOPANION_TEST_HINDSIGHT_URL ?? '').trim() : '';
+  const hindsightBank = hindsightOn ? String(process.env.COOPANION_TEST_HINDSIGHT_BANK ?? '').trim() : '';
+  if (hindsightOn && (!/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(hindsightUrl)
+    || !/^coopanion-test:/.test(hindsightBank))) {
+    throw new Error('The Test App Hindsight stub needs a loopback URL and a coopanion-test bank');
+  }
+
   return {
     runId,
     appName: 'Coopanion Test',
@@ -35,10 +45,17 @@ function testChannelConfig(appPackage, appData) {
     coreEnvironment: {
       CORTICO_TEST_CHANNEL: '1',
       COOPANION_TEST_CHANNEL: '1',
-      COOPANION_HINDSIGHT: '0',
-      COOPANION_HINDSIGHT_URL: 'http://127.0.0.1:18888',
-      COOPANION_HINDSIGHT_TOKEN: '',
-      COOPANION_HINDSIGHT_BANK: `coopanion-test:${runId}`,
+      ...(hindsightOn ? {
+        COOPANION_HINDSIGHT: '1',
+        COOPANION_HINDSIGHT_URL: hindsightUrl,
+        COOPANION_HINDSIGHT_TOKEN: '',
+        COOPANION_HINDSIGHT_BANK: hindsightBank,
+      } : {
+        COOPANION_HINDSIGHT: '0',
+        COOPANION_HINDSIGHT_URL: 'http://127.0.0.1:18888',
+        COOPANION_HINDSIGHT_TOKEN: '',
+        COOPANION_HINDSIGHT_BANK: `coopanion-test:${runId}`,
+      }),
       COOPANION_TTS_URL: 'http://127.0.0.1:19881/v1/audio/speech',
     },
   };

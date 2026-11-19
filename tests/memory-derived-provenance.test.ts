@@ -99,7 +99,7 @@ function expectLegacyRowsUnchanged(path: string, version: LegacyMemorySchemaVers
   finally { db.close(); }
 }
 
-describe('SQLite v4 migration (B01-B06)', () => {
+describe('SQLite v4/v5 migration (B01-B06)', () => {
   it('B01 upgrades the historical v3 schema and retains every durable row', () => {
     const path = databasePath();
     createLegacyMemoryStateDatabase(path, 3);
@@ -109,7 +109,7 @@ describe('SQLite v4 migration (B01-B06)', () => {
 
     openMemoryStateStore(path);
 
-    expect(versionOf(path)).toBe(4);
+    expect(versionOf(path)).toBe(5);
     expectLegacyRowsUnchanged(path, 3, before);
     expectIntegrity(path);
   });
@@ -123,7 +123,7 @@ describe('SQLite v4 migration (B01-B06)', () => {
 
     openMemoryStateStore(path);
 
-    expect(versionOf(path)).toBe(4);
+    expect(versionOf(path)).toBe(5);
     expectLegacyRowsUnchanged(path, 2, before);
     expectIntegrity(path);
   });
@@ -158,12 +158,12 @@ describe('SQLite v4 migration (B01-B06)', () => {
 
     openMemoryStateStore(path);
 
-    expect(versionOf(path)).toBe(4);
+    expect(versionOf(path)).toBe(5);
     expect(schemaSnapshot(path)).toBe(firstSchema);
     expectIntegrity(path);
   });
 
-  it('B05 rolls back a failed v3-to-v4 migration and succeeds on retry', () => {
+  it('B05 rolls back a failed v3-to-v5 migration and succeeds on retry', () => {
     const path = databasePath();
     createLegacyMemoryStateDatabase(path, 3);
     const old = openLegacyMemoryStateDatabase(path);
@@ -185,7 +185,7 @@ describe('SQLite v4 migration (B01-B06)', () => {
     } finally { afterRollback.close(); }
 
     openMemoryStateStore(path);
-    expect(versionOf(path)).toBe(4);
+    expect(versionOf(path)).toBe(5);
     expectLegacyRowsUnchanged(path, 3, before);
     expectIntegrity(path);
   });
@@ -215,7 +215,7 @@ describe('SQLite v4 migration (B01-B06)', () => {
     } finally { afterRollback.close(); }
 
     openMemoryStateStore(path);
-    expect(versionOf(path)).toBe(4);
+    expect(versionOf(path)).toBe(5);
     expectLegacyRowsUnchanged(path, 3, before);
     expectIntegrity(path);
   });
@@ -379,7 +379,7 @@ describe('SQLite v4 fail-closed schema checks (B12)', () => {
     expect(versionOf(path)).toBe(0);
   });
 
-  it('rejects a partial v3 schema without writing v4 tables', () => {
+  it('rejects a partial v3 schema without writing v4 or v5 tables', () => {
     const path = databasePath();
     createLegacyMemoryStateDatabase(path, 3);
     const db = new DatabaseSync(path);
@@ -395,7 +395,7 @@ describe('SQLite v4 fail-closed schema checks (B12)', () => {
     } finally { after.close(); }
   });
 
-  it('rejects a database version newer than v4', () => {
+  it('rejects a database version newer than v5', () => {
     const path = databasePath();
     const db = new DatabaseSync(path);
     db.exec('PRAGMA user_version = 99');

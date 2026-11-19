@@ -77,10 +77,10 @@ function stepHint(doc: Document, step: UpdateStep): HTMLElement {
 
 /** 把版本行放进字标容器;有更新的情况时把那一行交给 `onUpdate`,之后的变化原地替换。 */
 export function mountRelease(doc: Document, brand: Element, onUpdate: (hint: HTMLElement) => void, signal: AbortSignal): void {
-  const repo = link(doc, 'companion-version', `v${APP_VERSION} · GitHub`, REPO_URL);
+  const repo = link(doc, 'companion-version', `v${APP_VERSION} · ${APP_CHANNEL === 'acceptance' ? '验收' : 'GitHub'}`, REPO_URL);
   repo.title = S.repoHint;
   brand.appendChild(repo);
-  if (APP_CHANNEL === 'steam') return;
+  if (APP_CHANNEL === 'steam' || APP_CHANNEL === 'acceptance') return;
   const updater = doc.defaultView?.coopanionUpdate;
   if (updater) {
     let shown: HTMLElement | null = null;

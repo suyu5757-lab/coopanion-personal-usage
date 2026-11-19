@@ -655,15 +655,15 @@ describe('N3 local source and workspace validation', () => {
         '来源摘要候选：原始记忆据称记录用户选择 B 方案。',
       ].join('\n'));
 
-      const draft = String(await project.run('read_file', { path: 'lab/项目草稿.md' }));
-      const unsupportedHistory = String(await project.run('read_file', { path: 'lab/混合资料.md' }));
-      const mixedSearch = String(await project.run('grep_files', { pattern: '方案', path: 'lab' }));
+      const draft = toolText(await project.run('read_file', { path: 'lab/项目草稿.md' }));
+      const unsupportedHistory = toolText(await project.run('read_file', { path: 'lab/混合资料.md' }));
+      const mixedSearch = toolText(await project.run('grep_files', { pattern: '方案', path: 'lab' }));
       await project.run('edit_file', {
         path: 'lab/项目草稿.md',
         old_string: '下一步准备研究 A 方案。',
         new_string: '下一步准备研究 A 方案，并补充风险分析。',
       });
-      const editedDraft = String(await project.run('read_file', { path: 'lab/项目草稿.md' }));
+      const editedDraft = toolText(await project.run('read_file', { path: 'lab/项目草稿.md' }));
 
       expect(draft).toContain('historicalEvidence=unverified');
       expect(draft).toContain('下一步准备研究 A 方案。');
@@ -706,7 +706,7 @@ describe('N3 local source and workspace validation', () => {
       });
 
       const memoryTool = await project.run('memory_search', { query: 'confirmed option B', sources: true });
-      const oldDraft = String(await project.run('read_file', { path: 'agenda/now.md' }));
+      const oldDraft = toolText(await project.run('read_file', { path: 'agenda/now.md' }));
       const linkedPartnerSummary = toolText(await project.run('read_file', { path: PARTNER_FILE }));
       expect(toolText(memoryTool)).toContain('source_id:source-option-b');
       expect(toolText(memoryTool)).toContain(sourceText);
@@ -723,8 +723,8 @@ describe('N3 local source and workspace validation', () => {
       }], 'Synthetic forget fence');
       const fencedSearch = await project.run('memory_search', { query: 'confirmed option B', sources: true });
       const staleDerivedSummary = toolText(await project.run('read_file', { path: PARTNER_FILE }));
-      const oldDraftAfterFence = String(await project.run('read_file', { path: 'agenda/now.md' }));
-      expect(String(fencedSearch)).toContain('Historical memory is restricted');
+      const oldDraftAfterFence = toolText(await project.run('read_file', { path: 'agenda/now.md' }));
+      expect(toolText(fencedSearch)).toContain('Historical memory is restricted');
       expect(staleDerivedSummary).not.toContain('chose option B');
       expect(oldDraftAfterFence).toContain('historicalEvidence=unverified');
       expect(oldDraftAfterFence).toContain('采用 A 方案');

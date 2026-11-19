@@ -1,3 +1,4 @@
+import { GROWTH_POLICY_FILE } from './growth/policies.ts';
 /**
  * The app's Core process: Cormini as the Persona, the console, desktop-pet, coopanion and browser Worlds,
  * Coo Pet Provider (DeepSeek and the other model services Coo offers) and its `chatgpt` module (a ChatGPT
@@ -40,7 +41,7 @@
  * `{ type: 'companion:locked', pid, file }` when another process holds the data directory, and
  * `{ type: 'companion:ports-busy', from, to }` when every console port Cortico tried could not be listened on.
  */
-import { readdirSync, realpathSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { delimiter, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -55,16 +56,17 @@ import { secretReader } from 'cortico/core/secrets.ts';
 import type { Core } from 'cortico/core/core.ts';
 import type { CoreConfig, UsageRecord } from 'cortico/core/types.ts';
 import { loadDeployment } from 'cortico/deploy.ts';
-import { loadExtensions, readInstalled, type ExtensionSet } from 'cortico/extensions.ts';
+import { extensionsDir, loadExtensions, readInstalled, type ExtensionSet } from 'cortico/extensions.ts';
 import { deploymentRoot, providersRoot, repoRoot } from 'cortico/paths.ts';
 import { providerModules, registerProviderModules } from 'cortico/providers/registry.ts';
 import LLAMACPP_PROVIDER from 'cortico/providers/llamacpp/index.ts';
 import RESPONSES_PROVIDER from 'cortico/providers/openai-responses-compat/index.ts';
 import { withWorlds, type WorldDefinition, type WorldSection } from 'cortico/world.ts';
 import { ActionGate } from './action-gate.ts';
-import { authorizeFileSystemAction, type FileSystemActionAuthorizationRequest } from './action-authorization.ts';
+import { authorizeFileSystemAction, authorizeFileSystemActionEx, type FileSystemActionAuthorizationRequest, type WorkspaceAuthorization } from './action-authorization.ts';
 import { actionReceiptDuplicateKey } from './action-receipts.ts';
 import { isWorkspaceAppendPreapproved, parseWorkspaceAppendPaths } from './workspace-append-approval.ts';
+import { WorkspacePermissionStore, type WorkspacePrompt, type WorkspacePromptAnswer } from './workspace-permissions.ts';
 import { InstanceLockedError } from 'cortico/core/instance-lock.ts';
 import { CONSOLE } from 'cortico/worlds/console/definition.ts';
 import { desktopPetDefinition, figurePacks, isSupportedCuaTarget, DESKTOP_PET_TRUSTED_TEMPLATE_DIGESTS, type DesktopPetWorld } from 'cortico-world-desktop-pet';
@@ -73,6 +75,7 @@ import { insideRoot, opencodeDefinition, OPENCODE_DEFAULTS, readConfig as readOp
 import COO, { CHATGPT, CHATGPT_PROVIDER, signedIn, usageLimited, vendorOf } from 'cortico-provider-coo';
 import { appWebUiAsset, bundledWebUiAssets } from './bundled-panels.ts';
 import { followPetLook } from './console-theme.ts';
+import { coopanionWorldPromptTrust, withTrustedConsoleVariables, withTrustedWorldVariables } from './world-prompt-trust.ts';
 import { askForKey, guideDone, markDone, runGuide, type GuideDeps } from './guide.ts';
 import { NOTICE_ID, noticeDefinition, type NoticeWorld } from './notice.ts';
 import { browserDefinition, BROWSER_ID } from './browser/definition.ts';
@@ -83,6 +86,8 @@ import { readSelfTime, SELF_TIME_DEFAULTS } from './browser/config.ts';
 import { readResourcePressure, selfTimeScheduleNeedsRearm, selfTimeTickDelayMs } from './resource-pressure.ts';
 import { GROWTH_DEFAULTS, migrateLegacyGrowthConfig, readGrowth } from './growth/config.ts';
 import { isTrustedGrowthToolText } from './growth/review.ts';
+import { isTrustedEndTurnReceipt, sourceMapEndTurnReceipts } from './end-turn-evidence.ts';
+import { isTrustedMemorySearchNotice, isTrustedMemoryWriteReceipt } from './memory/model-text.ts';
 import { videoConfigGroup, videoDefinition, VIDEO_ID } from './video/definition.ts';
 import { coreText } from './i18n/index.ts';
 import { petToolDescriber } from './pet-status.ts';
@@ -90,12 +95,14 @@ import { appLanguage, modelLanguage, replyLanguage } from './language.ts';
 import { CONSOLE_PORT, DEPLOYMENT, DISPLAY_NAME, followLanguage as followPersonaLanguage, personaOf, seed } from './seed.ts';
 import { coopanionPersona, isTrustedPartnerReadText, type CoopanionPersona, type MemoryDeps } from './persona.ts';
 import { COOPANION_TOOL_SCHEMA_DIGESTS } from './tool-schema-roots.ts';
+import { auditVoiceWorlds, isVoiceToolReceipt, prepareVoiceWorlds } from './voice-tool-trust.ts';
 import { HindsightMemory } from './memory/hindsight.ts';
 import { RelationshipJournal } from './memory/journal.ts';
 import { AffinitySync } from './memory/affinity-sync.ts';
 import { loadHindsightConfig, type HindsightFileConfig } from './memory/config.ts';
 import { hindsightConfigGroup } from './memory/config-group.ts';
 import { memoryToolDescribes } from './memory/tools.ts';
+import { PromptProvenance } from './prompt-provenance.ts';
 import { cleanSpeech } from './memory/format.ts';
 import type { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import type { contextStageConfigGroup } from '../vendor/cortico/bots/cormini/persona/config.ts';
@@ -180,6 +187,7 @@ function companionGroup(language: Language): ConfigGroup {
         'companion.selfTime.mediaUpload': { type: 'boolean', title: s.selfTime.mediaUpload, description: s.selfTime.mediaUploadDescription, 'x-hot': true },
         'companion.selfTime.mediaDownload': { type: 'boolean', title: s.selfTime.mediaDownload, description: s.selfTime.mediaDownloadDescription, 'x-hot': true },
         'companion.growth.enabled': { type: 'boolean', title: s.growth.title, description: s.growth.description, 'x-hot': true },
+        'companion.growth.autoApply': { type: 'boolean', title: s.growth.autoApply, description: s.growth.autoApplyDescription, 'x-hot': true },
         'companion.growth.everyDays': { type: 'integer', title: s.growth.every, minimum: 1, maximum: 60, 'x-suffix': s.growth.days, description: s.growth.everyDescription, 'x-hot': true },
       },
     },
@@ -468,7 +476,10 @@ export async function main(): Promise<void> {
   };
   const home = deploymentRoot();
   const deployDir = join(home, DEPLOYMENT);
+  const promptProvenance = new PromptProvenance();
   const videoWorkspaceRoot = join(deployDir, 'video');
+  /** Set once the durable policy store exists; the gate only reads it during a later action. */
+  let workspacePolicyGeneration = (): string => '';
   const gate = new ActionGate({
     platformWrites: () => readSelfTime(config).actions,
     imageGeneration: () => readSelfTime(config).imageGeneration,
@@ -483,6 +494,7 @@ export async function main(): Promise<void> {
         return opencodeSettings().enabled && insideRoot(allowedOpencodeRoots(), target.workspaceRoot);
       }
       if (target.source === 'persona-workspace') {
+        if (target.instanceId === 'coopanion-growth-policy') return action === 'file-write' && target.path === GROWTH_POLICY_FILE && canonicalRoot(target.workspaceRoot) === canonicalRoot(deployDir);
         return action === 'file-write' && !!personaWorkspaceRoot
           && canonicalRoot(target.workspaceRoot) === canonicalRoot(personaWorkspaceRoot);
       }
@@ -493,8 +505,20 @@ export async function main(): Promise<void> {
       opencode: opencodeSettings().enabled ? allowedOpencodeRoots() : [],
       personaWorkspaceRoot: personaWorkspaceRoot ? canonicalRoot(personaWorkspaceRoot) : '',
       videoWorkspaceRoot: canonicalRoot(videoWorkspaceRoot),
+      workspacePolicy: workspacePolicyGeneration(),
+      growthAutoApply: readGrowth(config).autoApply === true,
     }),
   });
+  /** Rules, the pending queue and daily quota for Coo's own low-risk workspace writes. */
+  const workspacePermissions = new WorkspacePermissionStore({
+    file: join(deployDir, 'workspace-permissions.json'),
+    timezone: () => config?.timezone ?? 'UTC',
+    onPending: (pending) => {
+      const text = coreText(language()).workspaceAction;
+      process.send?.({ type: 'companion:notify', title: text.pendingTitle, body: text.pendingBody(pending.count, pending.path) });
+    },
+  });
+  workspacePolicyGeneration = () => workspacePermissions.generation();
   const actionReceiptFile = join(deployDir, 'browser', 'task-actions.json');
   let actionReceipts: BrowserTaskActionJournal | null = null;
   try {
@@ -522,7 +546,7 @@ export async function main(): Promise<void> {
       lifecycle: 'external-managed',
     },
     // `displayName` of the live config: a rename reaches the menu header, the chat page and computer use's question without a restart
-    botName: () => config?.displayName ?? DISPLAY_NAME,
+    botName: () => DISPLAY_NAME,
     packRoots: () => packRoots,
     describeTool: petToolDescriber(language),
     // the menu's header lends pause/resume, settings and quit; its dress tile opens the settings window's dress page, the typing bubble's expand button its chat page
@@ -656,20 +680,21 @@ export async function main(): Promise<void> {
   const longTerm = new HindsightMemory();
   const journal = new RelationshipJournal();
   const affinitySync = new AffinitySync();
-  type WorkspaceActionConfirmationRequest = Pick<FileSystemActionAuthorizationRequest, 'action' | 'target' | 'taskText' | 'files'>
-    & Partial<Pick<FileSystemActionAuthorizationRequest, 'actionName' | 'expectedChange'>>;
-  const confirmWorkspaceAction = async (request: WorkspaceActionConfirmationRequest): Promise<boolean> => {
-    const appendPaths = parseWorkspaceAppendPaths(getByPath(
-      (config ?? {}) as unknown as Record<string, unknown>,
-      'companion.workspaceAppendPath',
-    ));
-    if (request.actionName && request.expectedChange && isWorkspaceAppendPreapproved({
-      action: request.action,
-      actionName: request.actionName,
-      expectedChange: request.expectedChange,
-      target: request.target,
-      files: request.files,
-    }, personaWorkspaceRoot, appendPaths, canonicalRoot)) return true;
+  const promptWorkspaceWrite: WorkspacePrompt = async (prompt) => {
+    if (!pet) return 'unavailable';
+    const text = coreText(language()).workspaceAction;
+    const label = prompt.operation === 'delete' ? text.deleteFile
+      : prompt.operation === 'append' ? text.appendFile : text.fileWrite;
+    const details = `${prompt.path} — ${prompt.bytes} bytes — sha256 ${prompt.digest}`;
+    const scope = prompt.ruleEligible
+      ? `\n\n${text.alwaysScope(prompt.scope)}`
+      : `\n\n${text.highRisk}`;
+    const question = text.question(label, prompt.path, details) + scope;
+    const answer = await pet.confirm(question, prompt.ruleEligible ? [text.yes, text.always, text.no] : [text.yes, text.no]);
+    return (answer === 'dismissed' ? 'no' : answer) as WorkspacePromptAnswer;
+  };
+  /** OpenCode and video worlds keep their own per-operation confirmation; no durable rule applies. */
+  const confirmWorldWorkspaceAction = async (request: Pick<FileSystemActionAuthorizationRequest, 'action' | 'target' | 'taskText' | 'files'>): Promise<boolean> => {
     const text = coreText(language()).workspaceAction;
     const label = request.action === 'file-write' ? text.fileWrite : text.commandExecution;
     const target = request.target.path === '.' ? request.target.workspaceRoot : join(request.target.workspaceRoot, request.target.path);
@@ -677,7 +702,42 @@ export async function main(): Promise<void> {
     const details = [request.taskText, ...(files ? [`Approved files:\n${files}`] : [])].join('\n');
     return (await pet?.confirm(text.question(label, target, details), [text.yes, text.no]) ?? 'unavailable') === 'yes';
   };
+  const authorizeWorkspaceWrite = async (request: FileSystemActionAuthorizationRequest): Promise<WorkspaceAuthorization> => {
+    const appendPaths = parseWorkspaceAppendPaths(getByPath(
+      (config ?? {}) as unknown as Record<string, unknown>,
+      'companion.workspaceAppendPath',
+    ));
+    if (isWorkspaceAppendPreapproved({
+      action: request.action,
+      actionName: request.actionName,
+      expectedChange: request.expectedChange,
+      target: request.target,
+      files: request.files,
+    }, personaWorkspaceRoot, appendPaths, canonicalRoot)) {
+      return { decision: 'AUTO_ALLOW', reason: 'legacy-append-path', channel: 'durable-rule', ruleId: 'legacy-append-path' };
+    }
+    const file = request.files[0];
+    return workspacePermissions.authorize({
+      workspaceRoot: request.target.workspaceRoot,
+      absolutePath: join(request.target.workspaceRoot, request.target.path),
+      path: request.target.path,
+      tool: request.actionName,
+      operation: request.operation ?? 'create',
+      targetState: request.targetState ?? 'absent',
+      baseDigest: request.baseDigest ?? null,
+      payloadDigest: request.payloadDigest,
+      payloadBytes: file?.bytes ?? 0,
+      deltaBytes: request.deltaBytes ?? (file?.bytes ?? 0),
+      mime: file?.mime ?? '',
+      source: request.target.source,
+      taskId: request.taskId,
+      sessionId: request.sessionId ?? 'main',
+      background: request.background ?? true,
+    }, promptWorkspaceWrite);
+  };
+
   const base = await cormini({
+    canonicalPersona: true,
     memory: longTerm,
     reloadPrefix: async () => { await core?.loop.reloadSystemPrefix(); },
     sourceSafeToolResults: true,
@@ -685,15 +745,27 @@ export async function main(): Promise<void> {
     modelLanguage: () => modelLanguage(config?.language),
     growth: () => readGrowth(config),
     growthStateFile: join(deployDir, 'growth.json'),
+    authorizeGrowthPolicyAction: request => authorizeFileSystemActionEx(actionReceipts, gate, request, {
+      authorize: async candidate => ({
+        decision: candidate.target.instanceId === 'coopanion-growth-policy'
+          && candidate.target.path === GROWTH_POLICY_FILE && canonicalRoot(candidate.target.workspaceRoot) === canonicalRoot(deployDir)
+          && candidate.action === 'file-write' && candidate.files.length === 1 && candidate.files[0]?.path === GROWTH_POLICY_FILE
+          && (readGrowth(config).autoApply === true || ['growth-policy-revoke', 'growth-policy-focus-context', 'growth-policy-owner-review'].includes(candidate.actionName))
+          ? 'AUTO_ALLOW' : 'DENY',
+        reason: 'bounded-growth-policy-target', channel: 'durable-rule', ruleId: 'growth-controlled-policy',
+      }),
+    }),
     paused: () => core?.bus.isPaused() === true || readResourcePressure().paused,
     timezone: () => config?.timezone ?? 'UTC',
-    authorizeWorkspaceAction: (request) => authorizeFileSystemAction(
+    authorizeWorkspaceAction: (request) => authorizeFileSystemActionEx(
       actionReceipts,
       gate,
       request,
-      () => confirmWorkspaceAction(request),
+      { authorize: authorizeWorkspaceWrite },
     ),
     actionReceipts: () => actionReceipts,
+    workspacePermissions,
+    promptProvenance,
   });
   /** Coo's Persona, once the bot is built. */
   let coo: CoopanionPersona | null = null;
@@ -729,13 +801,21 @@ export async function main(): Promise<void> {
     // Cormini's own build with Coo's Persona class; the workspace is snapshotted before Coo can write to it
     build: (loaded, worlds) => {
       const cfg = loaded.config;
+      cfg.displayName = DISPLAY_NAME;
       const memoryOverrides = getByPath(loaded.config as unknown as Record<string, unknown>, 'hindsight') as Partial<HindsightFileConfig> | undefined;
       const memoryConfig = loadHindsightConfig(loaded.rootDir, memoryOverrides);
       const memoryLog = {
         warn: (message: string, data?: unknown) => console.warn(message, data ?? ''),
         error: (message: string, data?: unknown) => console.error(message, data ?? ''),
       };
+      // W4 compatibility: an old dual-track switch may still be in config.json. It is read by
+      // nothing now; workspace files are never historical sources, and the value cannot re-open
+      // the old path. The line is auditable and does not rewrite the person's config.
+      if (getByPath(loaded.config as unknown as Record<string, unknown>, 'w3.legacyReadMode') !== undefined) {
+        memoryLog.warn('[memory] w3.legacyReadMode is ignored after W4; workspace files are never historical memory');
+      }
       longTerm.configure(loaded.rootDir, memoryLog, memoryOverrides);
+      promptProvenance.configure({ rootDir: loaded.rootDir, memoryDir: loaded.memoryDir });
       affinitySync.configure({ file: join(loaded.dataDir, 'affinity-events.jsonl'), memory: longTerm, log: memoryLog });
       journal.configure({
         memory: longTerm,
@@ -753,20 +833,70 @@ export async function main(): Promise<void> {
         firstTurnDir: join(loaded.rootDir, 'prompts'),
         tickDelayMs: () => selfTimeTickDelayMs(readSelfTime(cfg), cfg.tick?.intervalMinutes, readResourcePressure().paused),
       });
+      sourceMapEndTurnReceipts(persona);
       personaWorkspaceRoot = loaded.memoryDir;
       persona.snapshot(APP_VERSION);
       coo = persona;
+      const voiceTrust = auditVoiceWorlds(worlds, voiceTrustInput);
+      console.info('[voice-trust] 执行目标核对', { report: voiceTrust });
       return {
         persona,
         requireCompleteEvidence: true,
-        trustedToolSchemaDigests: COOPANION_TOOL_SCHEMA_DIGESTS,
+        trustedToolSchemaDigests: [...COOPANION_TOOL_SCHEMA_DIGESTS, ...voiceTrust.digests],
         trustedProviderModules: [LLAMACPP_PROVIDER, RESPONSES_PROVIDER, COO, CHATGPT_PROVIDER],
-        worldPromptTrust: (world) => world === pet
-          ? { templateDigests: DESKTOP_PET_TRUSTED_TEMPLATE_DIGESTS, independentVariables: true } : undefined,
+        worldPromptTrust: (world) => {
+          const trust = world === pet
+            ? { templateDigests: DESKTOP_PET_TRUSTED_TEMPLATE_DIGESTS, independentVariables: true }
+            : coopanionWorldPromptTrust(world);
+          return trust ? {
+            ...trust,
+            deploymentOverride: (path: string, digest: string) => promptProvenance.verifyWorldTemplate(world.id, path, digest),
+          } : undefined;
+        },
         worldEventTrust: (world, event) => world === pet
-          && ['desktop-pet.message', 'desktop-pet.speech', 'desktop-pet.touch'].includes(event.type),
-        toolTextTrust: (tool, text) => isTrustedGrowthToolText(tool, text)
+          && (['desktop-pet.message', 'desktop-pet.speech', 'desktop-pet.touch', 'desktop-pet.self'].includes(event.type)
+            || (['desktop-pet.answer', 'desktop-pet.guide-answer'].includes(event.type) && pet.admitUserAnswer(event))),
+        worldToolOutcomeTrust: (world, tool, outcome) => (world === pet && (
+          (tool === 'pet_say' && pet.admitSayReceipt(outcome))
+          || (tool === 'pet_ask' && pet.admitAskReceipt(outcome))
+          || (tool === 'pet_act' && pet.admitActReceipt(outcome))
+          // Every other pet tool (move/set/quiet and the CUA helpers) answers with a Host-rendered
+          // template about the pet's own screen or settings; without admission the next request
+          // would be blocked for a line the Host itself wrote.
+          || !['pet_say', 'pet_ask', 'pet_act'].includes(tool)
+        )) || ((world.id === 'tts' || world.id === 'audio-play') && isVoiceToolReceipt(tool, outcome)),
+        worldDeferredTrust: (world, type, rendered) => notice !== null && world === notice
+          && ((type === 'coopanion.updated' && notice.admitUpdate(rendered))
+            || (type === 'coopanion.guide' && notice.admitGuideSummary(rendered))
+            || (type === 'coopanion.settings-changed' && notice.admitSettingsChange(rendered))
+            || ((type === 'coopanion.alarm' || type === 'coopanion.alarm-cancelled') && notice.admitAlarmNotice(rendered))),
+        toolTextTrust: (tool, text) => isTrustedEndTurnReceipt(tool, text)
+          || isTrustedMemorySearchNotice(tool, text) || isTrustedMemoryWriteReceipt(tool, text) || isTrustedGrowthToolText(tool, text)
+          || (coo?.trustWorkspaceToolText(tool, text) ?? false)
           || (tool === 'read_file' && isTrustedPartnerReadText(text)),
+        onPromptWrite: ({ key, path, content }) => {
+          const effective = key === 'orientation' || key === 'constitution' ? content.trim() : content;
+          promptProvenance.attest({ key, path, content: effective });
+        },
+        onPromptReset: ({ key }) => {
+          promptProvenance.revoke(key);
+        },
+        onPromptAttest: (documents) => {
+          const attested: string[] = [];
+          const skipped: string[] = [];
+          for (const doc of documents) {
+            const effective = doc.key === 'orientation' || doc.key === 'constitution' ? doc.content.trim() : doc.content;
+            if (promptProvenance.attest({ key: doc.key, path: doc.path, content: effective })) attested.push(doc.key);
+            else skipped.push(doc.key);
+          }
+          const partner = join(loaded.memoryDir, 'PARTNER.md');
+          try {
+            if (existsSync(partner) && promptProvenance.attest({
+              key: 'partner', path: partner, content: readFileSync(partner, 'utf8'),
+            })) attested.push('partner');
+          } catch { /* the partner file stays un-attested; its paragraphs remain withheld */ }
+          return { attested, skipped };
+        },
         onStart: () => persona.startRhythm(),
         onStop: () => { persona.stopRhythm(); persona.stopGrowth(); },
         webUi: {
@@ -798,7 +928,7 @@ export async function main(): Promise<void> {
     // the avatar beside the pet; the task itself does not depend on the page being connected
     onState: (state) => pet?.guest(state),
     authorizeAction: (request, confirmInCoreUi) => authorizeFileSystemAction(actionReceipts, gate, request, confirmInCoreUi),
-    confirmAction: confirmWorkspaceAction,
+    confirmAction: confirmWorldWorkspaceAction,
   });
   const VIDEO = videoDefinition({
     modelLanguage: () => modelLanguage(config?.language),
@@ -806,20 +936,60 @@ export async function main(): Promise<void> {
     ffmpegPath: () => String(getByPath(config as unknown as Record<string, unknown>, 'worlds.video.ffmpegPath') ?? ''),
     ffprobePath: () => String(getByPath(config as unknown as Record<string, unknown>, 'worlds.video.ffprobePath') ?? ''),
     authorizeAction: (request, confirmInCoreUi) => authorizeFileSystemAction(actionReceipts, gate, request, confirmInCoreUi),
-    confirmAction: confirmWorkspaceAction,
+    confirmAction: confirmWorldWorkspaceAction,
   });
-  const bundled = [CONSOLE, DESKTOP_PET, NOTICE, BROWSER, OPENCODE, CODEX, VIDEO] as WorldDefinition<WorldSection>[];
+  const CONSOLE_TRUSTED = {
+    ...CONSOLE,
+    create: (ctx: Parameters<typeof CONSOLE.create>[0]) => withTrustedConsoleVariables(CONSOLE.create(ctx)),
+  } as WorldDefinition<WorldSection>;
+  const OPENCODE_TRUSTED = {
+    ...OPENCODE,
+    create: (ctx: Parameters<typeof OPENCODE.create>[0]) => withTrustedWorldVariables(OPENCODE.create(ctx)),
+  } as WorldDefinition<WorldSection>;
+  const CODEX_TRUSTED = {
+    ...CODEX,
+    create: (ctx: Parameters<typeof CODEX.create>[0]) => withTrustedWorldVariables(CODEX.create(ctx)),
+  } as WorldDefinition<WorldSection>;
+  const bundled = [CONSOLE_TRUSTED, DESKTOP_PET, NOTICE, BROWSER, OPENCODE_TRUSTED, CODEX_TRUSTED, VIDEO] as WorldDefinition<WorldSection>[];
 
+  // Owner decision (Rev29): QQ is no longer a product capability. The package stays installed
+  // for the later retirement inventory, but it is never imported, registered, initialized or
+  // shown as an available World, and it gets no tool schema trust root.
+  const RETIRED_EXTENSION_PACKAGES = ['cortico-world-qq'] as const;
   // extension providers must be registered before endpoints are resolved
   const extensions = await loadExtensions(repoRoot(), {
     reserved: bundled.map((w) => w.id),
     reservedProviders: [...providerModules.map((m) => m.id), COO.id, CHATGPT_PROVIDER.id],
+    retiredPackages: RETIRED_EXTENSION_PACKAGES,
   });
   registerProviderModules([COO, CHATGPT_PROVIDER, ...extensions.providers]);
   extensions.webUiAssets.push(...bundledWebUiAssets([
     { id: DESKTOP_PET.id, packageName: 'cortico-world-desktop-pet' },
   ]), ...appWebUiAsset(NOTICE_ID, join(APP_ROOT, 'build', 'panels', 'coopanion'), APP_VERSION));
-  const definition = withWorlds(definitionBase, [...bundled, ...extensions.worlds]);
+  // Owner decision (Rev29 §0W): the two local voice tools get a production schema root, and only
+  // after the installed package, its source bytes and the World that would execute them match the
+  // approved identity. The wrapper narrows each World to the approved tool and enforces this
+  // round's request scope. `tts_control` and `audio_watch` never reach the model.
+  const voiceTrustInput = {
+    extensionsDir: extensionsDir(repoRoot(), process.env),
+    log: { warn: (message: string, data?: unknown) => console.warn(message, data ?? '') },
+  };
+  const voiceWorlds = prepareVoiceWorlds(extensions.worlds, voiceTrustInput);
+  console.info('[voice-trust] 启动核对', { report: voiceWorlds.report });
+  // The streamvoice template is reviewed for Voice V5; its rendered config values are local
+  // settings, not model output. Without this registration the strict evidence gate blocks every
+  // request before dispatch as soon as streamvoice is enabled.
+  const streamVoiceDefinition = voiceWorlds.definitions.find((world) => world.id === 'streamvoice');
+  const STREAMVOICE_TRUSTED = streamVoiceDefinition
+    ? {
+        ...streamVoiceDefinition,
+        create: (ctx: Parameters<typeof streamVoiceDefinition.create>[0]) => withTrustedWorldVariables(streamVoiceDefinition.create(ctx)),
+      } as WorldDefinition<WorldSection>
+    : undefined;
+  const definition = withWorlds(definitionBase, [
+    ...bundled,
+    ...voiceWorlds.definitions.map((world) => (world.id === 'streamvoice' && STREAMVOICE_TRUSTED ? STREAMVOICE_TRUSTED : world)),
+  ]);
 
   const loaded = loadDeployment(definition, deployDir, repoRoot(), join(repoRoot(), 'bots', 'cormini'), providersRoot());
   const growthDisabled = migrateLegacyGrowthConfig(loaded.rootDir, loaded.config, {
@@ -924,8 +1094,12 @@ export async function main(): Promise<void> {
     doneFile: join(deployDir, GUIDE_FILE),
     workspace: loaded.memoryDir,
     whale: process.env.COOPANION_CHANNEL !== 'steam',
+    canonicalPersona: true,
     openDress: () => process.send?.({ type: 'companion:open', path: '#/dress' }),
-    onEnd: (end) => (notice as NoticeWorld | null)?.guideEnded(end),
+    onEnd: (end) => {
+      (notice as NoticeWorld | null)?.guideEnded(end);
+      for (const answer of end.answers ?? []) pet?.publishDialogAnswer(answer.answer, answer.step);
+    },
     track: (type, fields) => stats.event(type, fields),
     language,
     modelLanguage: () => modelLanguage(loaded.config.language),

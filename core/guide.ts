@@ -115,6 +115,7 @@ export interface GuideDeps {
   workspace: string;
   /** The whale's persona is offered (the GitHub build). */
   whale: boolean;
+  canonicalPersona?: boolean;
   /** The language of the record's own words (who said a line, a close, a key typed in); Chinese when absent. */
   modelLanguage?: () => ModelLanguage;
 }
@@ -128,6 +129,8 @@ export interface GuideEnd {
   step: number;
   /** Coo's lines and the person's answers, in order, as they were shown. */
   transcript: string[];
+  /** Answers retain their identity until the trusted pet consumes them. */
+  answers?: Array<{ answer: PetDialogAnswer; step: string }>;
 }
 
 /** Ended with the close button: the rest is skipped. */
@@ -145,7 +148,10 @@ export function noteStep(d: PetDialog, a: PetDialogAnswer, language: ModelLangua
   const lines = [r.coo(d.text)];
   const input = d.input;
   if ('closed' in a) lines.push(r.closed);
-  else if ('index' in a && (input?.kind === 'buttons' || input?.kind === 'choices')) lines.push(r.person(String(input.options[a.index]?.label ?? a.index)));
+  else if ('index' in a && (input?.kind === 'buttons' || input?.kind === 'choices')) {
+    const options = input.kind === 'choices' ? [...input.options, ...(input.more?.options ?? [])] : input.options;
+    lines.push(r.person(String(options[a.index]?.label ?? a.index)));
+  }
   else if ('text' in a) lines.push(r.person(input?.kind === 'text' && input.secret ? r.key : a.text));
   else if ('alt' in a && input?.kind === 'text' && input.alt) lines.push(r.person(input.alt));
   return lines;
@@ -300,11 +306,13 @@ export async function runGuide(deps: GuideDeps): Promise<void> {
   let at = '';
   let name: string | null = null;
   const transcript: string[] = [];
+  const answers: Array<{ answer: PetDialogAnswer; step: string }> = [];
   const step = (n: number, line: string, d: PetDialog): Promise<PetDialogAnswer> => {
     if (n > reached) { reached = n; deps.track?.('guide_step', { step: n }); }
     at = line;
     // step 0, the language page, is the first dot; the numbers the statistics count (guide_step) stay as they were
     return t.show({ ...d, step: [n + 1, STEPS], closable: true }).then((a) => {
+      answers.push({ answer: a, step: line });
       transcript.push(...noteStep(d, a, deps.modelLanguage?.() ?? 'zh'));
       if ('closed' in a) throw new Closed();
       return a;
@@ -352,9 +360,9 @@ export async function runGuide(deps: GuideDeps): Promise<void> {
 
     // 2 who Coo is, while its self-description is still one the app ships: each card dresses Coo in its colours and
     // has it say a line in that persona's voice; the pick becomes the self-description and the look
-    const shipped = personaOf(deps.workspace);
+    const shipped = deps.canonicalPersona ? 'whale' : personaOf(deps.workspace);
     if (shipped) {
-      const ids = PERSONAS.filter((id) => id !== 'whale' || deps.whale);
+      const ids: readonly PersonaId[] = deps.canonicalPersona ? ['whale'] : PERSONAS.filter((id) => id !== 'whale' || deps.whale);
       const p = await step(2, 'persona-pick', {
         text: S.askPersona, actions: ['thinking'],
         input: {
@@ -450,7 +458,7 @@ export async function runGuide(deps: GuideDeps): Promise<void> {
     const end = await step(7, 'finish', { text: S.finish, actions: ['happy'], input: { kind: 'buttons', options: [{ label: S.go, primary: true }, { label: S.dress }] } });
     markDone(deps.doneFile);
     deps.track?.('guide_finished', {});
-    deps.onEnd?.({ finished: true, name, step: reached, transcript });
+    deps.onEnd?.({ finished: true, name, step: reached, transcript, answers });
     if ('index' in end && end.index === 1) deps.openDress();
   } catch (err) {
     if (!(err instanceof Closed)) throw err;
@@ -459,7 +467,7 @@ export async function runGuide(deps: GuideDeps): Promise<void> {
     const closed = lines(deps.language()).closed;
     await t.show({ text: closed, actions: ['nod'] });
     transcript.push(RECORD_TEXT[deps.modelLanguage?.() ?? 'zh'].coo(closed));
-    deps.onEnd?.({ finished: false, name, step: reached, transcript });
+    deps.onEnd?.({ finished: false, name, step: reached, transcript, answers });
   } finally {
     running = false;
   }

@@ -1,3 +1,6 @@
+import { GrowthPolicies, assessGrowthImpact } from './growth/policies.ts';
+import { AutonomousGrowth, GROWTH_VALIDATION_SESSION } from './growth/autonomous.ts';
+import { createLocalGrowthCandidateLifecycle, readLocalGrowthProposal } from './growth/coo-growth-lifecycle.ts';
 /**
  * Coo's Persona: Cortico's Cormini with four changes for the desktop pet.
  *
@@ -21,19 +24,27 @@ import { execFileSync } from 'node:child_process';
 import { appendFileSync, closeSync, existsSync, fstatSync, fsyncSync, lstatSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, statfsSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { freemem, totalmem } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { LOG_SCHEME, blobScheme } from 'cortico/core/blobs.ts';
 import type { CoreApi, ContextEvidenceInspection, ContextHandoffPrepareContext, ContextHandoffSourceExcerpt, EvidenceAttachment, EventEnvelope, HandoffCommitCheck, PersonaWebUiDecl, PreparedContextHandoff, PrefixSegment, SessionDecl, SessionOpeningReason, SourceDependencyRecovery, SourceExposureRef, SourceMapSpan, StoragePart, SystemPrefixContext, ToolCallContext, ToolDef, ToolOutcome, WorldLifecycleEvent } from 'cortico/core/types.ts';
 import { message, withText, type ContextRecord } from 'cortico/protocol/open-responses/context.ts';
 import { textOf } from 'cortico/protocol/open-responses/context-helpers.ts';
 import type { Language } from 'cortico/core/language.ts';
-import { HANDOFF_DIR, type Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
+import { repoRoot } from 'cortico/paths.ts';
+import type { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import type { GitAuthor, WorkspaceGit } from '../vendor/cortico/bots/cormini/persona/workspaceGit.ts';
 import { memoryTools } from './memory/tools.ts';
-import type { HindsightMemory, MemoryEvidenceSegment, PartnerSourceStatus } from './memory/hindsight.ts';
+import type { DomainSupplementOptions, DomainSupplementReceipt, HindsightMemory, MemoryEvidenceSegment, PartnerSourceStatus, TurnRecall, TurnRecallStatus } from './memory/hindsight.ts';
+import { baselineSourceExcerpts, consumeDomainRelevantMemory, type CoreMemoryConsumption, type DomainRelevantConsumeResult } from './memory/domain-relevant-consume.ts';
 import type { DerivedArtifact } from './memory/state-store.ts';
-import { evidenceCoversText } from './memory/source-evidence.ts';
+import { evidenceCoversSegments, evidenceCoversText } from './memory/source-evidence.ts';
 import { isMemoryForgetRequest } from './memory/router.ts';
 import { memoryStorageText } from './memory/strings.ts';
+import type { WorkspacePermissionStore } from './workspace-permissions.ts';
+import { WorkspaceToolTextLedger, workspaceToolOutcome } from './workspace-tool-text.ts';
+import { workspaceReadLabel, workspaceJournalSourceId, workspaceReadFencedLabel } from './workspace-read.ts';
+import { canonicalOperatingText, canonicalPersonaText, isShippedOrientation, isShippedPersonaDescription } from './seed.ts';
+import type { PromptProvenance } from './prompt-provenance.ts';
 import {
   filterPartnerMarkdown,
   markPartnerDerivedStale,
@@ -55,13 +66,19 @@ import { EXPERIENCE_CONTEXT_HEADER, ExperienceCards, experienceCardArtifactText,
 import { GrowthProposals, growthProposalArtifactText, type GrowthProposal } from './growth/proposals.ts';
 import { GROWTH_CHECK_MS, GrowthSchedule } from './growth/schedule.ts';
 import { readResourcePressure } from './resource-pressure.ts';
-import { MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, memoryReadNotice } from './memory/model-text.ts';
+import { MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, SOURCE_CONTEXT_POLICY, memoryReadNotice } from './memory/model-text.ts';
 import type { ModelLanguage } from './language.ts';
-import type { FileSystemActionAuthorization, FileSystemActionAuthorizationRequest } from './action-authorization.ts';
+import type { FileSystemActionAuthorization, FileSystemActionAuthorizationRequest, FileSystemActionRefusal } from './action-authorization.ts';
 import type { ActionReceiptLedger, ActionReceiptReviewDecision } from './action-receipts.ts';
 import type { FileSystemTargetEvidence } from './task-grants.ts';
 import { writeState } from './state-file.ts';
-import { HANDOFF_NOTE_TYPE, handoffNoteStamp, renderHandoffNote } from '../vendor/cortico/bots/cormini/persona/handoffNote.ts';
+
+// The app runs the staged Cortico; a source checkout's vendor path is only a type source.
+// Handoff constants and rendering come from whichever tree repoRoot() names.
+const handoffPersona = (await import(pathToFileURL(join(repoRoot(), 'bots', 'cormini', 'persona', 'persona.ts')).href)) as typeof import('../vendor/cortico/bots/cormini/persona/persona.ts');
+const { HANDOFF_DIR } = handoffPersona;
+const handoffNote = (await import(pathToFileURL(join(repoRoot(), 'bots', 'cormini', 'persona', 'handoffNote.ts')).href)) as typeof import('../vendor/cortico/bots/cormini/persona/handoffNote.ts');
+const { HANDOFF_NOTE_TYPE, handoffNoteStamp, renderHandoffNote } = handoffNote;
 
 /** The workspace file that goes into the prefix as Coo's notes on the person. */
 export const PARTNER_FILE = 'PARTNER.md';
@@ -82,7 +99,6 @@ export const SNAPSHOT_TAG = (version: string) => `start-${version}`;
 /** How long after a line a "don't remember that" still refers to it. */
 const FORGET_WINDOW_MS = 10 * 60_000;
 const MEMORY_TOOL_NAMES = new Set(['memory_search', 'memory_remember', 'memory_correct', 'memory_forget', 'memory_reflect']);
-const HANDOFF_DISCOVERY = 'Use list_files with dir handoffs to find handoff notes; verify a note and its current sources before using it.';
 /** Core's reserved synthetic call that carries an external event frame; mirrored read-only. */
 const EXTERNAL_EVENT_FRAME = 'external_event_frame';
 const WORKSPACE_READ_PATHS: Record<string, string> = {
@@ -106,6 +122,156 @@ interface PartnerSyncResult {
   stale: number;
   failed: number;
 }
+
+interface ForgottenHandoffReset {
+  phase: 'awaiting-block' | 'reset-ready';
+  rawContext?: true;
+  eventCutoff?: number;
+  forgottenIds: string[];
+  sourceRefs: SourceExposureRef[];
+  artifactIds: string[];
+  expectedEpoch: string;
+  candidateSnapshotId?: string;
+  resetCandidateSnapshotId?: string;
+  expectedGeneration?: string;
+  resolveBlocked: () => void;
+}
+
+interface CleanHandoffRebuild {
+  expectedEpoch: string;
+  forgottenIds: string[];
+  sourceRefs: SourceExposureRef[];
+  inputs: Array<{ text: string; attachment: EvidenceAttachment }>;
+}
+
+function handoffSourceIdentity(source: Pick<SourceExposureRef, 'bankId' | 'endpoint' | 'documentId' | 'contentDigest'>): string {
+  return JSON.stringify([source.bankId, source.endpoint, source.documentId, source.contentDigest]);
+}
+
+function handoffSourceProofIdentity(source: SourceExposureRef): string {
+  return JSON.stringify([source.bankId, source.endpoint, source.documentId, source.validatedEpoch,
+    source.revisionState, source.validationStatus, source.validationReceipt, source.contentDigest]);
+}
+
+function sourceRefFromAttachment(attachment: EvidenceAttachment): SourceExposureRef {
+  const { segment: _segment, ...source } = attachment;
+  return source;
+}
+
+/** Result of the opt-in path: either a fully proven supplement or an ordinary baseline fallback. */
+type DomainSupplementOutcome =
+  | {
+    kind: 'finalized';
+    text: string;
+    evidence: EvidenceAttachment[];
+    segments: MemoryEvidenceSegment[];
+    result: DomainRelevantConsumeResult;
+  }
+  | {
+    kind: 'fallback';
+    reason: string;
+    result: DomainRelevantConsumeResult | null;
+  };
+
+/**
+ * Content-free diagnostics for the opt-in supplement. Source text, query hashes, document and bank
+ * identities, proofs and provider details stay out of this shape.
+ */
+export interface DomainSupplementDiagnostics {
+  available: boolean;
+  enabled: boolean;
+  receiptState: 'disabled' | 'unavailable' | 'no_receipt' | 'in_progress' | 'settled';
+  receiptPresent: boolean;
+  turnActive: boolean;
+  /** Persona-side finalization only; never Core dispatch or model use. */
+  status: 'finalized' | 'fallback' | 'skipped' | null;
+  fallbackReason: string | null;
+  baselineStatus: TurnRecallStatus | null;
+  candidateCount: number | null;
+  verifiedCount: number | null;
+  consumedCount: number | null;
+  addedSourceCount: number | null;
+  withheldCount: number | null;
+  fallbackCount: number | null;
+  finalizedSegmentCount: number | null;
+  queryCalls: number | null;
+  readbackCalls: number | null;
+  finalReadbackCalls: number | null;
+  supplementalChars: number | null;
+  elapsedMs: number | null;
+  rssDeltaBytes: number | null;
+  receiptAgeMs: number | null;
+  scope: 'persona-domain-supplement';
+  core: {
+    requestState: 'UNKNOWN';
+    actualEvidenceUsed: 'UNKNOWN';
+    evidenceObserved: false;
+  };
+}
+
+const DOMAIN_SUPPLEMENT_RECEIPT_STATUSES: readonly string[] = ['finalized', 'fallback', 'skipped'];
+const TURN_RECALL_STATUSES: readonly string[] = ['found', 'absent', 'incomplete', 'unavailable', 'fenced', 'skipped'];
+const DOMAIN_SUPPLEMENT_FALLBACK_REASONS: readonly string[] = [
+  'baseline_absent', 'baseline_incomplete', 'baseline_unavailable', 'baseline_fenced', 'baseline_skipped',
+  'baseline_identity_unavailable', 'baseline_evidence_incomplete',
+  'memory_unavailable', 'accessors_unavailable', 'consume_exception', 'exception',
+  'invalid_limits', 'invalid_input', 'source_epoch_unavailable', 'query_unavailable', 'query_fenced',
+  'cancelled', 'index_blocked', 'source_limit', 'readback_budget', 'output_budget', 'query_truncated',
+  'no_candidates', 'supplement_source_limit', 'supplement_output_budget', 'final_readback_budget',
+  'final_epoch_changed', 'delivery_failed', 'delivery_count', 'delivery_mismatch',
+  'baseline_not_preserved', 'supplement_budget', 'consumed_source_mismatch', 'no_new_segments',
+  'source_namespace_mismatch', 'supplement_span_mismatch', 'duplicate_supplement_span',
+  'segment_count_mismatch', 'supplement_segment_invalid', 'segment_span_mismatch',
+  'raw_attachment_mismatch', 'finalize_incomplete', 'finalize_invalid', 'epoch_changed',
+  'baseline_only', 'fenced', 'unavailable',
+];
+const DOMAIN_SUPPLEMENT_CORE_UNKNOWN = Object.freeze({
+  requestState: 'UNKNOWN' as const,
+  actualEvidenceUsed: 'UNKNOWN' as const,
+  evidenceObserved: false as const,
+});
+
+function safeDomainSupplementStatus(value: unknown): 'finalized' | 'fallback' | 'skipped' | null {
+  return typeof value === 'string' && DOMAIN_SUPPLEMENT_RECEIPT_STATUSES.includes(value)
+    ? value as 'finalized' | 'fallback' | 'skipped'
+    : null;
+}
+
+function safeTurnRecallStatus(value: unknown): TurnRecallStatus | null {
+  return typeof value === 'string' && TURN_RECALL_STATUSES.includes(value) ? value as TurnRecallStatus : null;
+}
+
+function safeDomainSupplementFallbackReason(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  return typeof value === 'string' && DOMAIN_SUPPLEMENT_FALLBACK_REASONS.includes(value) ? value : 'other';
+}
+
+function nonNegativeCount(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+}
+
+const DOMAIN_SUPPLEMENT_EMPTY = Object.freeze({
+  receiptPresent: false,
+  turnActive: false,
+  status: null,
+  fallbackReason: null,
+  baselineStatus: null,
+  candidateCount: null,
+  verifiedCount: null,
+  consumedCount: null,
+  addedSourceCount: null,
+  withheldCount: null,
+  fallbackCount: null,
+  finalizedSegmentCount: null,
+  queryCalls: null,
+  readbackCalls: null,
+  finalReadbackCalls: null,
+  supplementalChars: null,
+  elapsedMs: null,
+  rssDeltaBytes: null,
+  receiptAgeMs: null,
+} satisfies Omit<DomainSupplementDiagnostics,
+  'available' | 'enabled' | 'receiptState' | 'scope' | 'core'>);
 
 /** Fixed labels a PARTNER read may carry; anything else in a tool result needs a source. */
 export function isTrustedPartnerReadText(text: string): boolean {
@@ -135,15 +301,31 @@ function partnerEvidenceText(result: PartnerTextResult): string {
 }
 
 function workspaceReadResult(path: string, result: unknown): string | ToolOutcome {
-  const label = `[workspace artifact; path=${JSON.stringify(path)}; historicalEvidence=unverified] This content may support the current workspace task. It has no verified source link for a past decision or shared event.`;
+  const label = workspaceReadLabel(path);
+  const span = (text: string, start: number): { start: number; end: number; digest: string; origin: 'core-generated' } => ({
+    start, end: start + text.length, digest: sha256(text), origin: 'core-generated',
+  });
   if (typeof result === 'string') {
+    // A fixed tool status line is not file material.
     if (/^\[(?:not found|read failed|search failed|workspace read failed)/iu.test(result)) return result;
-    return `${label}\n${result}`;
+    const text = `${label}\n${result}`;
+    return { text, sourceMapSpans: [span(label, 0), span(result, label.length + 1)] };
   }
   if (!result || typeof result !== 'object' || Array.isArray(result)) return String(result ?? '');
   const record = result as Record<string, unknown>;
   if (typeof record.text !== 'string') return String(result);
-  return { ...record, text: `${label}${record.text ? `\n${record.text}` : ''}` } as ToolOutcome;
+  const body = record.text ? `\n${record.text}` : '';
+  const text = `${label}${body}`;
+  return {
+    ...record,
+    text,
+    sourceMapSpans: [span(label, 0), ...(body ? [span(record.text, label.length + 1)] : [])],
+  } as ToolOutcome;
+}
+
+function withWorkspaceSourceMap(value: string | ToolOutcome): ToolOutcome {
+  if (typeof value === 'string') return workspaceToolOutcome(value);
+  return value.sourceMapSpans?.length ? value : { ...value, sourceMapSpans: workspaceToolOutcome(value.text).sourceMapSpans };
 }
 
 function isWorkspaceGitMetadataPath(root: string, candidate: unknown): boolean {
@@ -181,6 +363,18 @@ const WRITES: Record<string, { ok: string; verb: string }> = {
 
 const sha256 = (value: string | Uint8Array): string => createHash('sha256').update(value).digest('hex');
 const HANDOFF_OWNER_PREFIX = 'handoff-owner-v1:';
+/** The fixed sentence `injectMemoryContext` appends when a Recall status notice is used. */
+const MEMORY_READ_SUFFIX = ' If you are not sure, say so; do not invent dates, names or past events.';
+const MEMORY_STATUS_NOTICES = ['absent', 'incomplete', 'unavailable', 'fenced'] as const;
+
+/** Fixed memory status text carries no historical content and may be re-proved after a restart. */
+function isFixedMemoryStatusNotice(text: string): boolean {
+  if (text === MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE) return true;
+  return MEMORY_STATUS_NOTICES.some((status) => {
+    const notice = memoryReadNotice(status);
+    return text === notice || text === `${notice}${MEMORY_READ_SUFFIX}`;
+  });
+}
 
 /** True when the span is one whole part of a rendered handoff note, not an arbitrary substring. */
 function handoffNotePartOf(body: string, segment: string): boolean {
@@ -314,6 +508,8 @@ ${readFileSync(join(dir, name), 'utf8')}`, 'utf8');
 
 /** Coo's Persona class on `Base`, Cormini as the staged Cortico has it. */
 export interface MemoryDeps {
+  /** Use the Owner-approved canonical character instead of legacy workspace self-descriptions. */
+  canonicalPersona?: boolean;
   memory?: HindsightMemory;
   /** Rebuild the live system prefix after a user save changed PARTNER provenance. */
   reloadPrefix?: () => Promise<void>;
@@ -325,13 +521,18 @@ export interface MemoryDeps {
   growth?: () => GrowthConfig;
   /** Where the next review is recorded; null turns the review off for this Persona. */
   growthStateFile?: string;
+  authorizeGrowthPolicyAction?: (request: FileSystemActionAuthorizationRequest) => Promise<FileSystemActionAuthorization | FileSystemActionRefusal | null>;
   /** True while the app is paused; a paused app starts no background review. */
   paused?: () => boolean;
   timezone?: () => string;
   /** Core authorizes one workspace file change through the shared action receipt ledger. */
-  authorizeWorkspaceAction?: (request: FileSystemActionAuthorizationRequest) => Promise<FileSystemActionAuthorization | null>;
+  authorizeWorkspaceAction?: (request: FileSystemActionAuthorizationRequest) => Promise<FileSystemActionAuthorization | FileSystemActionRefusal | null>;
   /** Core owns the shared Browser, CUA and filesystem action receipts shown in Persona settings. */
   actionReceipts?: () => ActionReceiptLedger | null;
+  /** Core owns the durable workspace-write rules and the pending approval queue. */
+  workspacePermissions?: WorkspacePermissionStore | null;
+  /** Host records of local prompt files the person saved or confirmed in the settings window. */
+  promptProvenance?: PromptProvenance | null;
 }
 
 export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
@@ -348,15 +549,39 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     private readonly timezoneNow = deps.timezone ?? (() => 'UTC');
     private readonly authorizeWorkspaceAction = deps.authorizeWorkspaceAction ?? null;
     private readonly actionReceiptsNow = deps.actionReceipts ?? (() => null);
+    private readonly workspacePermissions = deps.workspacePermissions ?? null;
+    private readonly promptProvenance = deps.promptProvenance ?? null;
+    /** Lines this Host's workspace tool actually emitted; shape alone never earns trust. */
+    private readonly workspaceIssuedText = new WorkspaceToolTextLedger();
+    private growthReview: GrowthReview | null = null;
+    private growthPolicies: GrowthPolicies | null = null;
+    private autonomousGrowth: AutonomousGrowth | null = null;
+    private autonomousPaused = false;
     private growthSchedule: GrowthSchedule | null = null;
     private growthCheck: ReturnType<typeof setInterval> | null = null;
     private lastUserMemory: { documentId: string; at: number } | null = null;
+    private domainSupplementTurn = 0;
+    private domainSupplementAbort: AbortController | null = null;
+    /** When the newest supplement turn started; a receipt older than it belongs to an earlier turn. */
+    private domainSupplementTurnStartedAt: number | null = null;
+    /** The turn that wrote the receipt; timestamps alone cannot separate a same-millisecond earlier turn. */
+    private domainSupplementReceiptTurn: number | null = null;
+    private domainSupplementReceiptAt: string | null = null;
     private readonly memoryContextBlocks = new Set<string>();
     private readonly partnerArtifacts = new Set<string>();
     private partnerArtifactEpoch: string | null = null;
     private partnerSourceStates = new Map<string, PartnerSourceStatus>();
     private partnerSourceStatesKey: string | null = null;
     private partnerRecoveryAt = 0;
+    private readonly sourceSpanDiagnostics = new Set<string>();
+    private sourceRecoveryHandoffPending = false;
+    private pendingForgottenHandoffReset: ForgottenHandoffReset | null = null;
+    private pendingCleanHandoffRebuild: CleanHandoffRebuild | null = null;
+    private lastForgottenHandoffBlock: {
+      status: 'blocked'; candidateSnapshotId: string;
+      mappingState: ContextEvidenceInspection['mappingState'];
+      reason: 'original-memory-source-dependency-unverified';
+    } | null = null;
     private attachedCore: CoreApi | null = null;
     private pendingOpening: string | null = null;
 
@@ -381,17 +606,17 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             catch (error) { sidecarError = error; }
             this.partnerSourceStatesKey = null;
           }
-          const forgotten = new Set(ids);
+          void this.growthPolicies?.refresh().catch(error => this.core?.log.warn('[growth] policy revocation failed', { error: String(error) }));
+        const forgotten = new Set(ids);
+          this.pendingCleanHandoffRebuild = null;
+          let handoffRecovery = false;
+          try { handoffRecovery = this.requestHandoffAfterDeliveredNoteForget(ids); }
+          catch { /* The source fence remains authoritative; handoff maintenance must not block Forget. */ }
           const proposals = this.growthProposals()?.list().filter((proposal) => proposal.sourceIds.some((id) => forgotten.has(id))) ?? [];
           const policies = this.experienceCards()?.list().filter((card) => card.sourceIds.some((id) => forgotten.has(id))) ?? [];
-          if (proposals.length + policies.length > 0) {
-            const titles = policies.map((card) => card.title).slice(0, 8);
-            const proposalTitles = proposals.map((proposal) => proposal.title).slice(0, 8);
-            const detail = [...proposalTitles, ...titles].length ? ` Withdraw these proposals or policies: ${[...proposalTitles, ...titles].join('; ')}.` : '';
-            this.injectMemoryContext(`[memory] A source was forgotten. Do not use any linked proposal or experience policy.${detail}`);
+          if (!handoffRecovery && proposals.length + policies.length > 0) {
+            this.injectMemoryContext('[memory] A source was forgotten. Do not use any linked proposal or experience policy.');
           }
-          try { this.requestHandoffAfterDeliveredNoteForget(ids); }
-          catch { /* The source fence remains authoritative; handoff maintenance must not block Forget. */ }
           if (this.hasApprovedExperienceCards()) void this.reloadSystemPrefixSafely();
           if (sidecarError) throw sidecarError;
         },
@@ -418,7 +643,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         info: (message: string, data?: unknown) => this.core?.log.info(message, data),
         warn: (message: string, data?: unknown) => this.core?.log.warn(message, data),
       };
-      const review = new GrowthReview({
+      const review = this.growthReview = new GrowthReview({
         core: () => this.core,
         snapshot: () => this.growthSnapshot(),
         tools: () => this.growthTools(),
@@ -427,15 +652,32 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         experienceCardsDir: join(dirname(this.growthStateFile), 'experience-cards'),
         modelLanguage: () => this.modelLang(),
         timezone: this.timezoneNow,
+        allowed: () => !this.pausedNow() && !this.autonomousPaused && !this.autonomousGrowth?.isPaused() && (this.core?.sessionInfo('main').running ?? 0) === 0,
+        onCandidateProduced: this.longTerm ? createLocalGrowthCandidateLifecycle(this.longTerm) : undefined,
         log,
       });
+      this.growthPolicies = this.longTerm && deps.authorizeGrowthPolicyAction ? new GrowthPolicies({
+        rootDir: dirname(this.growthStateFile), proposals: new GrowthProposals(join(dirname(this.growthStateFile), 'growth-proposals')),
+        memory: this.longTerm, enabled: () => this.growthNow().autoApply === true,
+        authorize: deps.authorizeGrowthPolicyAction, receipts: this.actionReceiptsNow,
+        changed: () => { void this.reloadSystemPrefixSafely(); },
+      }) : null;
+      const automatic = this.autonomousGrowth = this.longTerm ? new AutonomousGrowth({
+        stateFile: join(dirname(this.growthStateFile), 'growth-autonomous.json'),
+        proposals: new GrowthProposals(join(dirname(this.growthStateFile), 'growth-proposals')),
+        memory: this.longTerm, review, core: () => this.core,
+        onCandidatesReady: (ids, current) => this.growthPolicies?.reconcile(ids, current) ?? Promise.resolve(),
+        allowed: () => this.growthNow().enabled && !this.pausedNow() && !this.autonomousPaused
+          && (this.core?.sessionInfo('main').running ?? 0) === 0,
+      }) : null;
       this.growthSchedule = new GrowthSchedule({
         stateFile: this.growthStateFile,
         config: this.growthNow,
         timers: core.timers,
-        run: () => review.run(),
-        paused: this.pausedNow,
-        forkRunning: () => (this.core?.sessionInfo(GROWTH_SESSION).running ?? 0) > 0,
+        run: () => automatic ? automatic.run() : Promise.reject(new Error('Automatic Growth sources are unavailable')),
+        cancel: () => automatic?.cancel(),
+        paused: () => this.pausedNow() || this.autonomousPaused || (this.autonomousGrowth?.isPaused() ?? false),
+        forkRunning: () => (this.core?.sessionInfo(GROWTH_SESSION).running ?? 0) > 0 || (this.core?.sessionInfo(GROWTH_VALIDATION_SESSION).running ?? 0) > 0,
         allowed: () => this.longTerm?.enabled() ?? false,
         log,
       });
@@ -457,12 +699,136 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
 
     /** Stops the periodic check; the persistent timer is left for the next start to reconcile. */
     stopGrowth(): void {
+      this.autonomousGrowth?.cancel();
       if (this.growthCheck) clearInterval(this.growthCheck);
       this.growthCheck = null;
     }
 
+    canonicalizeEvidenceSource(source: SourceExposureRef): SourceExposureRef | null {
+      return this.longTerm?.canonicalEvidenceSource(source) ?? null;
+    }
+
     override validateEvidenceForRequest(sources: readonly SourceExposureRef[], inspection?: ContextEvidenceInspection): boolean {
-      return sources.length === 0 || (!!inspection && this.longTerm?.sourceEvidenceCurrent(inspection) === true);
+      const current = sources.length === 0 || (!!inspection && this.longTerm?.sourceEvidenceCurrent(inspection) === true);
+      const incompleteMemory = !current && inspection?.items.some((item) =>
+        item.disposition === 'unknown-derived-incomplete'
+        && item.spans.some((span) => span.origin === 'hindsight-source' && span.mappingState === 'complete')
+        && item.spans.some((span) => span.origin === 'generation-derived' && span.mappingState === 'unverified'
+          && span.generationEvidenceId === undefined)) === true;
+      if (incompleteMemory) this.sourceRecoveryHandoffPending = true;
+      this.logSourceSpanDiagnostic(sources, inspection, { allowed: current, recoveryHandoffPending: this.sourceRecoveryHandoffPending });
+      return current;
+    }
+
+    override onBatchEnd(): void {
+      super.onBatchEnd();
+      if (!this.sourceRecoveryHandoffPending || !this.attachedCore) return;
+      this.sourceRecoveryHandoffPending = false;
+      this.attachedCore.requestContextHandoff();
+    }
+
+    private logSourceSpanDiagnostic(
+      sources: readonly SourceExposureRef[],
+      inspection: ContextEvidenceInspection | undefined,
+      metadata: {
+        allowed?: boolean;
+        providerGenerationId?: string | null;
+        providerAttemptId?: string | null;
+        requestState?: string;
+        requestBlockReason?: string | null;
+        responseJoinState?: string;
+        recoveryHandoffPending?: boolean;
+      } = {},
+    ): void {
+      if (!inspection || (process.env.COOPANION_TEST_CHANNEL !== '1' && process.env.CORTICO_TEST_CHANNEL !== '1')) return;
+      const diagnosticKey = `${inspection.serializedBodyDigest ?? ''}:${metadata.allowed ?? 'unknown'}:${metadata.requestBlockReason ?? ''}`;
+      if (this.sourceSpanDiagnostics.has(diagnosticKey)) return;
+      this.sourceSpanDiagnostics.add(diagnosticKey);
+      if (this.sourceSpanDiagnostics.size > 128) this.sourceSpanDiagnostics.delete(this.sourceSpanDiagnostics.values().next().value!);
+      const records = this.attachedCore?.sessionInfo('main').snapshot ?? [];
+      const ref = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 12);
+      const sourceIdentityHash = (source: SourceExposureRef): string => ref([source.bankId, source.endpoint, source.documentId]);
+      const items = inspection.items.map((item) => {
+        const messageIndex = records.findIndex((record) => record.item.id === item.itemId);
+        const record = records[messageIndex];
+        const text = record?.item.type === 'function_call'
+          ? record.item.arguments
+          : record ? textOf(record) : '';
+        const covered = new Uint8Array(text.length);
+        const origins: Record<string, number> = {};
+        const states: Record<string, number> = {};
+        for (const span of item.spans) {
+          origins[span.origin] = (origins[span.origin] ?? 0) + 1;
+          states[span.mappingState] = (states[span.mappingState] ?? 0) + 1;
+          if (span.mappingState !== 'complete') continue;
+          for (let offset = Math.max(0, span.start); offset < Math.min(text.length, span.end); offset += 1) covered[offset] = 1;
+        }
+        let firstUncovered: { start: number; end: number } | null = null;
+        for (let offset = 0; offset < text.length; offset += 1) {
+          if (/\s/u.test(text[offset]!) || covered[offset]) continue;
+          const start = offset;
+          while (offset < text.length && !/\s/u.test(text[offset]!) && !covered[offset]) offset += 1;
+          firstUncovered = { start, end: offset };
+          break;
+        }
+        const spans = item.spans
+          .filter((span) => span.origin !== 'core-generated' || span.mappingState !== 'complete'
+            || span.sourceProof !== undefined || span.generationEvidenceId !== undefined)
+          .map((span) => ({
+            startUtf16: span.start,
+            endUtf16: span.end,
+            digest: span.digest,
+            origin: span.origin,
+            mappingState: span.mappingState,
+            sourceIdentityHashes: span.exposedSources.map(sourceIdentityHash),
+            sourceProof: span.sourceProof ? { startUtf16: span.sourceProof.startUtf16, endUtf16: span.sourceProof.endUtf16 } : null,
+            generationEvidenceRef: span.generationEvidenceId ? ref(span.generationEvidenceId) : null,
+            serializedRanges: span.serializedRanges.map((range) => ({ field: range.field, start: range.start, end: range.end })),
+          }));
+        return {
+          messageIndex,
+          itemRef: ref(item.itemId),
+          role: record?.item.type === 'message' ? record.item.role : null,
+          segmentType: record?.item.type ?? null,
+          toolName: record?.item.type === 'function_call' ? record.item.name : null,
+          textLengthUtf16: text.length,
+          mappingState: item.mappingState,
+          disposition: item.disposition,
+          nonWhitespaceFullyCovered: firstUncovered === null,
+          firstUncovered,
+          spanCount: item.spans.length,
+          spanOrigins: origins,
+          spanStates: states,
+          spans,
+        };
+      });
+      this.attachedCore?.log.info('source span dispatch diagnostic', {
+        event: 'source-span-dispatch-diagnostic',
+        data: {
+          serializedBodyDigest: inspection.serializedBodyDigest ?? null,
+          mappingState: inspection.mappingState,
+          ...metadata,
+          exposedSourceCount: sources.length,
+          sourceIdentityHashes: sources.map(sourceIdentityHash),
+          items,
+        },
+      });
+    }
+
+    private logRecentSourceSpanDiagnostics(): void {
+      if (process.env.COOPANION_TEST_CHANNEL !== '1' && process.env.CORTICO_TEST_CHANNEL !== '1') return;
+      const core = this.attachedCore;
+      if (!core) return;
+      for (const entry of core.generationEvidence('main').slice(-6)) {
+        this.logSourceSpanDiagnostic(entry.exposedSources, entry, {
+          allowed: entry.requestState === 'sent' && entry.mappingState === 'complete',
+          providerGenerationId: entry.providerGenerationId ?? null,
+          providerAttemptId: entry.providerAttemptId ?? null,
+          requestState: entry.requestState,
+          requestBlockReason: entry.requestBlockReason ?? null,
+          responseJoinState: entry.responseJoinState,
+        });
+      }
     }
 
     private growthSnapshot(): ContextRecord[] {
@@ -704,6 +1070,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     override declareSessions(): SessionDecl[] {
       return [
         ...super.declareSessions(),
+        { id: GROWTH_VALIDATION_SESSION, label: 'growth-validation', rounds: () => ({ soft: 5, hard: 8 }), persistent: false, receivesEvents: false, tools: () => [] },
         {
           id: GROWTH_SESSION,
           label: 'growth',
@@ -726,6 +1093,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
 
     /** With time of her own on, the quiet line offers the browser as well as speaking first. */
     protected override tickText(quietSeconds: number): string {
+      if (this.growthPolicies?.quietFocus()) return '';
       const self = this.selfTimeNow();
       if (self?.enabled && readResourcePressure().paused) {
         return '[system] Background exploration is paused because system memory pressure is high. Do not open the browser or start a self-review; end_turn.';
@@ -829,21 +1197,45 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       }
     }
 
+    private partnerFileVerified(source?: string): boolean {
+      try {
+        const file = this.partnerDocFile();
+        const content = source ?? readFileSync(file, 'utf8');
+        return this.promptProvenance?.verify({ key: 'partner', path: file, content })?.ok === true;
+      } catch {
+        return false;
+      }
+    }
+
     private partnerProvenanceResult(source?: string) {
       const file = this.partnerDocFile();
       if (!existsSync(file) || !statSync(file).isFile() || !insidePath(realpathSync(this.memoryDir), realpathSync(file))) {
         return filterPartnerMarkdown('', { status: 'missing' }, this.longTerm?.sourceScopeDigest() ?? null, () => false);
       }
       source ??= readFileSync(file, 'utf8');
+      const userConfig = this.partnerFileVerified(source);
       const sidecar = this.partnerProvenanceFile();
       const provenance = sidecar ? readPartnerProvenance(sidecar, partnerWorkspaceDigest(this.memoryDir)) : { status: 'missing' as const };
-      const filtered = filterPartnerMarkdown(source, provenance, this.longTerm?.sourceScopeDigest() ?? null,
-        (sourceId) => this.longTerm?.sourceCurrentForContext(sourceId) === true);
-      if (filtered.status !== 'ok' || provenance.status !== 'ok') return filtered;
-      const entries = new Map(provenance.file.entries.map((entry) => [entry.segmentDigest, entry]));
+      const rawSegments = partnerSegments(source);
+      // A confirmed whole file with no sidecar is a user-authored workspace note: there are no
+      // derived paragraphs to distinguish. Any invalid/scope-mismatched sidecar still fails closed.
+      const filtered = provenance.status === 'missing' && userConfig
+        ? {
+            text: rawSegments.map((segment) => segment.text).join('\n\n'),
+            status: 'ok' as const,
+            includedSegments: rawSegments.length,
+            withheldSegments: 0,
+            segments: rawSegments.map((segment) => ({ text: segment.text, origin: 'user-authored' as const, sourceIds: [] })),
+          }
+        : filterPartnerMarkdown(source, provenance, this.longTerm?.sourceScopeDigest() ?? null,
+            (sourceId) => this.longTerm?.sourceCurrentForContext(sourceId) === true);
+      if (filtered.status !== 'ok' || (provenance.status !== 'ok' && !(provenance.status === 'missing' && userConfig))) return filtered;
+      const entries = provenance.status === 'ok'
+        ? new Map(provenance.file.entries.map((entry) => [entry.segmentDigest, entry]))
+        : new Map();
       const epochCurrent = !!this.longTerm && this.partnerArtifactEpoch === this.longTerm.evidenceEpoch();
       const segments = filtered.segments.filter((segment) => {
-        if (segment.origin === 'user-authored') return false;
+        if (segment.origin === 'user-authored') return userConfig;
         const entry = entries.get(partnerSegmentDigest(segment.text));
         return !!entry && epochCurrent && this.partnerArtifacts.has(entry.id)
           && this.longTerm?.derivedArtifactIsCurrent(`partner:${entry.id}`, partnerSegmentContextText(segment)) === true;
@@ -1137,6 +1529,24 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return super.writeGuard(op, path, role);
     }
 
+    protected override prefixVars(ctx: SystemPrefixContext): Record<string, string> {
+      const values = super.prefixVars(ctx);
+      if (deps.canonicalPersona) {
+        values['persona.constitution'] = canonicalPersonaText();
+        values['persona.orientation'] = canonicalOperatingText();
+      }
+      return values;
+    }
+
+    override promptVarValues(ctx?: { now: Date; timezone: string }): Record<string, string> {
+      const values = super.promptVarValues(ctx);
+      if (deps.canonicalPersona) {
+        values['persona.constitution'] = canonicalPersonaText();
+        values['persona.orientation'] = canonicalOperatingText();
+      }
+      return values;
+    }
+
     protected override partnerDoc(): string {
       const file = this.partnerDocFile();
       let source = '';
@@ -1160,10 +1570,82 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return `${PARTNER_NOTE}\n\n${body}${notice ? `\n\n${notice}` : ''}`;
     }
 
+    /** The shipped top-level prefix template; a changed template makes every literal span unproven. */
+    private trustedPrefixTemplate(): boolean {
+      try {
+        return sha256(readFileSync(this.templateFile('PREFIX.md'), 'utf8'))
+          === 'e92413a71e3006506de51d0ec863cab3738448862801f400778b5edb9e8fce8e';
+      } catch {
+        return false;
+      }
+    }
+
+    /**
+     * Map one editable value inside its prefix segment. The surrounding literal text is
+     * `core-generated` only when the prefix template is the shipped one; the value itself is
+     * `user-config` only when the Host attestation matches the exact file content.
+     */
+    private localConfigSegmentSpans(
+      segment: PrefixSegment,
+      value: string,
+      key: 'orientation' | 'constitution',
+      file: string,
+      trustedPrefix: boolean,
+    ): SourceMapSpan[] | undefined {
+      if (!value || !segment.text.endsWith(value)) return undefined;
+      const start = segment.text.length - value.length;
+      if (segment.text.indexOf(value) !== start) return undefined;
+      const verified = this.promptProvenance?.verify({ key, path: file, content: value });
+      if (!verified?.ok) return undefined;
+      const spans: SourceMapSpan[] = [];
+      if (start > 0) {
+        if (!trustedPrefix) return undefined;
+        spans.push({
+          start: 0, end: start, digest: sha256(segment.text.slice(0, start)), origin: 'core-generated',
+        });
+      }
+      spans.push({
+        start, end: segment.text.length, digest: sha256(value), origin: 'user-config',
+      });
+      return spans;
+    }
+
     override async systemSegments(ctx: SystemPrefixContext): Promise<PrefixSegment[]> {
       await this.syncPartnerUserDocument(false);
       await this.ensurePartnerArtifacts();
       const segments = await super.systemSegments(ctx);
+      // Cormini trusts its own stock seeds only. Coopanion ships its ORIENTATION and every persona
+      // self-description in `core/seed/`; an unedited deployment copy is identified by exact seed
+      // text, not by the runtime file hashing itself. The trailing/leading whitespace belongs to
+      // the trusted prefix template and carries no other content.
+      const orientation = segments.find((segment) => segment.title === 'ORIENTATION');
+      if (orientation && ((deps.canonicalPersona && this.trustedPrefixTemplate() && orientation.text.trim() === canonicalOperatingText().trim()) || isShippedOrientation(orientation.text.trim()))) {
+        orientation.sourceMapSpans = [{
+          start: 0, end: orientation.text.length, digest: sha256(orientation.text), origin: 'core-generated',
+        }];
+      }
+      const constitution = segments.find((segment) => segment.title === 'CONSTITUTION');
+      if (constitution && ((deps.canonicalPersona && this.trustedPrefixTemplate() && constitution.text.trim() === canonicalPersonaText()) || isShippedPersonaDescription(constitution.text.trim()))) {
+        constitution.sourceMapSpans = [{
+          start: 0, end: constitution.text.length, digest: sha256(constitution.text), origin: 'core-generated',
+        }];
+      }
+      // A deployment copy the person edited is not a shipped seed. It becomes `user-config` only
+      // when the Host recorded that exact file after a settings save or confirmation; any doubt
+      // leaves the segment unmapped and the strict-evidence gate blocks the request.
+      const trustedPrefix = this.trustedPrefixTemplate();
+      if (orientation && !orientation.sourceMapSpans?.length) {
+        let value = '';
+        try { value = readFileSync(this.orientationSource(), 'utf8').trim(); } catch { value = ''; }
+        const spans = this.localConfigSegmentSpans(orientation, value, 'orientation', this.orientationSource(), trustedPrefix);
+        if (spans) orientation.sourceMapSpans = spans;
+      }
+      if (constitution && !constitution.sourceMapSpans?.length) {
+        let value = '';
+        try { value = readFileSync(join(this.memoryDir, CONSTITUTION_FILE), 'utf8').trim(); } catch { value = ''; }
+        const spans = this.localConfigSegmentSpans(constitution, value, 'constitution', join(this.memoryDir, CONSTITUTION_FILE), trustedPrefix);
+        if (spans) constitution.sourceMapSpans = spans;
+      }
       const partner = segments.find((segment) => segment.title === 'PARTNER');
       if (partner) {
         const partnerText = this.partnerDoc();
@@ -1174,18 +1656,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           : partner.text ? [{ start: 0, end: partner.text.length, digest: sha256(partner.text), origin: 'unknown-derived' }] : [];
       }
       const workspace = segments.find((segment) => segment.title === 'WORKSPACE');
-      const listing = this.prefixWorkspaceListing();
-      if (workspace) {
-        const start = listing ? workspace.text.indexOf(listing) : -1;
-        const unique = start >= 0 && workspace.text.indexOf(listing, start + listing.length) < 0;
-        const constitution = segments.find((segment) => segment.title === 'CONSTITUTION');
-        const seedConstitution = !!constitution?.sourceMapSpans?.some((span) => span.start === 0
-          && span.end === constitution.text.length && span.origin === 'core-generated'
-          && span.digest === sha256(constitution.text));
-        if (unique) {
-          workspace.sourceMapSpans = this.workspaceListingSourceMap(listing, seedConstitution)
-            .map((span) => ({ ...span, start: span.start + start, end: span.end + start }));
-        }
+      if (workspace?.text) {
+        // The W4 prefix line is generated by this Host and names no file; it carries no workspace
+        // content, so the whole segment is Core text.
+        workspace.sourceMapSpans = [{ start: 0, end: workspace.text.length, digest: sha256(workspace.text), origin: 'core-generated' }];
       }
       // Reviewed Experience text is a Persona rendering, not a user event. Its exact text,
       // boundaries and digests travel through the system-prefix source map. Skip the async
@@ -1194,16 +1668,32 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         const experience = await this.experiencePrefixSegment();
         if (experience) segments.push(experience);
       }
+      segments.push({
+        title: 'SOURCE_POLICY', text: SOURCE_CONTEXT_POLICY,
+        sourceMapSpans: [{ start: 0, end: SOURCE_CONTEXT_POLICY.length, digest: sha256(SOURCE_CONTEXT_POLICY), origin: 'core-generated' }],
+      });
+      const policies = await this.growthPolicies?.prefix();
+      if (policies) segments.push(policies);
       return segments;
     }
 
     async revalidateGenerationProofSources(sources: readonly SourceExposureRef[]): Promise<readonly SourceExposureRef[] | null> {
-      return this.longTerm?.revalidateSourceExposures(sources) ?? null;
+      const refreshed = await this.longTerm?.revalidateSourceExposures(sources);
+      return refreshed ? sources : null;
     }
 
     async revalidateSourceDependencies(records: readonly ContextRecord[], events: readonly EventEnvelope[] = []): Promise<SourceDependencyRecovery[]> {
       const memory = this.longTerm;
       if (!memory) return [];
+      // A restarted Core has no in-process source tokens. Historical memory attachments are
+      // re-read here, before the first dispatch, and only a full identity/content/epoch match
+      // registers a current proof under the persisted token.
+      const refreshedEvidence = new WeakSet<ContextRecord>();
+      for (const record of records) {
+        const attachments = record.context.evidence;
+        if (!Array.isArray(attachments) || attachments.length === 0) continue;
+        if (await memory.refreshEvidenceAttachments(textOf(record), attachments)) refreshedEvidence.add(record);
+      }
       await this.recoverHandoffFiles();
       const handoffFiles = memory.listHandoffArtifacts().flatMap((artifact) => {
         // A forgotten source marks the mixed note stale. Its still-current parts may be
@@ -1249,13 +1739,34 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             const noticeRecord = record.item.type === 'message' && record.item.role === 'user'
               && !record.context.frame?.events?.length && !record.context.evidence?.length
               && !record.context.sourceIndependentSpans?.length && !record.context.sourceMapSpans?.length;
-            const deliveryNotice = noticeRecord && /^\[system\] \d+ new events?\.$/.test(segment);
+            const deliveryNotice = record.item.type === 'message' && record.item.role === 'user'
+              && (noticeRecord || !!record.context.frame?.events?.length || refreshedEvidence.has(record))
+              && /^\[system\] \d+ new events?\.$/.test(segment);
+            // After a restart the same user message may combine this fixed notice with a memory
+            // block whose attachments were just re-read. The delivery count still carries no
+            // historical content; only that restart path admits it beside refreshed evidence.
+            const restartDeliveryNotice = refreshedEvidence.has(record) && record.item.type === 'message'
+              && record.item.role === 'user' && /^\[system\] \d+ new events?\.$/.test(segment);
+            const memoryStatusNotice = record.item.type === 'message' && record.item.role === 'user'
+              && isFixedMemoryStatusNotice(segment);
             const belongsToHandoff = (record.context.frame?.events ?? []).some((event) =>
               event.type === HANDOFF_NOTE_TYPE && event.start < span.end && event.start + event.chars > span.start);
             const notePart = belongsToHandoff && handoffFiles.some((file) =>
               file.sourceFree && handoffNotePartOf(file.text, segment));
+            // `injectMemoryContext` runs inside the delivery hook, where the Core marks the
+            // injected block with the delivered events' source set. For a memory block that set
+            // is empty even though the block's source-bearing slices carry separate evidence
+            // attachments. Treat the block as source-free only when those attachments were just
+            // re-read successfully; their spans, not this label, carry the source dependency.
+            const memoryInjection = record.item.type === 'message' && record.item.role === 'user'
+              && refreshedEvidence.has(record) && segment.startsWith('[memory] ');
+            // `onOpening` sets this fixed line before any source-bearing delivery. It carries no
+            // historical content; a restarted session repeats the other fixed variant.
+            const sessionOpening = segment === '[system] The session has started.'
+              || segment === '[system] The app restarted; the session carries on.';
             if (staticNotice('handoffs/') || (this.lastHandoffFile && staticNotice(this.lastHandoffFile))
-              || (fileInText && staticNotice(fileInText)) || deliveryNotice || notePart) {
+              || (fileInText && staticNotice(fileInText)) || deliveryNotice || restartDeliveryNotice
+              || notePart || memoryInjection || memoryStatusNotice || sessionOpening) {
               sourceFree.push({ proofId: span.proofId, digest: span.digest, persistedSources: [], currentSources: [] });
             }
             continue;
@@ -1301,28 +1812,6 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       }] : [])];
     }
 
-    private workspaceListingSourceMap(
-      text: string,
-      seedConstitution: boolean,
-    ): SourceMapSpan[] {
-      const heading = 'Files in your workspace:';
-      if (!text.startsWith(`${heading}\n`)) return [];
-      const spans: SourceMapSpan[] = [{ start: 0, end: heading.length, digest: sha256(heading), origin: 'core-generated' }];
-      let start = heading.length + 1;
-      for (const line of text.slice(start).split('\n')) {
-        if (seedConstitution && line === `- ${CONSTITUTION_FILE}`) {
-          spans.push({ start, end: start + line.length, digest: sha256(line), origin: 'core-generated' });
-        } else if (line === `- ${HANDOFF_DISCOVERY}` && start + line.length === text.length) {
-          spans.push({ start, end: start + line.length, digest: sha256(line), origin: 'core-generated' });
-        } else if (line === `- ${PARTNER_FILE}`) {
-          spans.push({ start, end: start + 2, digest: sha256('- '), origin: 'core-generated' });
-          spans.push({ start: start + 2, end: start + line.length, digest: sha256(PARTNER_FILE), origin: 'core-generated' });
-        }
-        start += line.length + 1;
-      }
-      return spans;
-    }
-
     private async partnerPrefixSourceMap(text: string): Promise<SourceMapSpan[]> {
       const unknown = (): SourceMapSpan[] => text
         ? [{ start: 0, end: text.length, digest: sha256(text), origin: 'unknown-derived' }]
@@ -1355,6 +1844,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         || '(No partner paragraphs have current provenance.)';
       const expected = `${PARTNER_NOTE}\n\n${body}${notice ? `\n\n${notice}` : ''}`;
       if (expected !== text) return unknown();
+      const userConfig = this.partnerFileVerified(source);
       const sidecar = this.partnerProvenanceFile();
       const provenance = sidecar ? readPartnerProvenance(sidecar, partnerWorkspaceDigest(this.memoryDir)) : { status: 'missing' as const };
       const entries = provenance.status === 'ok'
@@ -1395,7 +1885,9 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
               ? { start, end, digest: sha256(entry.text), origin: 'artifact-derived', exposedSources }
               : { start, end, digest: sha256(entry.text), origin: 'unknown-derived' });
           } else {
-            spans.push({ start, end, digest: sha256(entry.text), origin: 'unknown-derived' });
+            spans.push(userConfig
+              ? { start, end, digest: sha256(entry.text), origin: 'user-config' }
+              : { start, end, digest: sha256(entry.text), origin: 'unknown-derived' });
           }
           at = end;
           if (index + 1 < renderedSegments.length) {
@@ -1458,13 +1950,13 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           ...tool,
           handler: async (args: Record<string, unknown>, ctx: ToolCallContext) => {
             if (isWorkspaceGitMetadataPath(this.memoryDir, args[pathArgument])) {
-              return `[workspace read failed] Git metadata is not available through workspace tools.`;
+              return this.trustedWorkspaceRead(tool.name, workspaceToolOutcome('[workspace read failed] Git metadata is not available through workspace tools.'));
             }
             const path = this.workspaceRelativePath(args[pathArgument]);
             const resolved = path && (tool.name === 'read_file' || tool.name === 'grep_files')
               ? this.workspaceResolvedReadPath(path) : path;
             if (path && resolved === null) {
-              return '[workspace read failed] The resolved path is unavailable through workspace tools.';
+              return this.trustedWorkspaceRead(tool.name, workspaceToolOutcome('[workspace read failed] The resolved path is unavailable through workspace tools.'));
             }
             if (tool.name === 'read_file' && (path === PARTNER_FILE || resolved === PARTNER_FILE)) {
               await this.syncPartnerUserDocument(false, false, true);
@@ -1473,19 +1965,25 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             }
             if (tool.name === 'read_file' && (path?.startsWith(HANDOFF_DIR) || resolved?.startsWith(HANDOFF_DIR))) {
               await this.recoverHandoffFiles();
-              return '[read failed] This workspace area is withheld until its content has provenance sidecar entries.';
+              return this.trustedWorkspaceRead(tool.name, workspaceToolOutcome('[read failed] This workspace area is withheld until its content has provenance sidecar entries.'));
             }
             if (tool.name === 'read_file' && (path?.startsWith(`${PARTNER_DIR}/`) || resolved?.startsWith(`${PARTNER_DIR}/`))) {
-              return '[read failed] This workspace area is withheld until its content has provenance sidecar entries.';
+              return this.trustedWorkspaceRead(tool.name, workspaceToolOutcome('[read failed] This workspace area is withheld until its content has provenance sidecar entries.'));
             }
             if (tool.name === 'grep_files' && (this.searchMayIncludeProvenance(path) || this.searchMayIncludeProvenance(resolved))) {
-              return '[search failed] The requested scope may include partner or handoff notes; read only eligible files directly.';
+              return this.trustedWorkspaceRead(tool.name, workspaceToolOutcome('[search failed] The requested scope may include partner or handoff notes; read only eligible files directly.'));
             }
             if (tool.name === 'grep_files' && path && this.workspaceSearchContainsLinks(path)) {
-              return '[search failed] The requested directory contains links whose contents cannot be verified; search an eligible file directly.';
+              return this.trustedWorkspaceRead(tool.name, workspaceToolOutcome('[search failed] The requested directory contains links whose contents cannot be verified; search an eligible file directly.'));
+            }
+            if (tool.name === 'read_file') {
+              const documentId = workspaceJournalSourceId(path ?? resolved ?? '');
+              if (documentId && this.longTerm?.historySourceStatus(documentId) === 'forgotten') {
+                return this.trustedWorkspaceRead(tool.name, workspaceToolOutcome(workspaceReadFencedLabel(path ?? resolved ?? '')));
+              }
             }
             const result = await tool.handler(args, ctx);
-            return workspaceReadResult(path ?? '.', result);
+            return this.trustedWorkspaceRead(tool.name, workspaceReadResult(path ?? '.', result));
           },
         };
       });
@@ -1546,7 +2044,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       };
     }
 
-    private workspaceActionPlan(name: string, args: Record<string, unknown>, role: string): WorkspaceActionPlan | { error: string; failurePrefix: string } {
+    private workspaceActionPlan(name: string, args: Record<string, unknown>, role: string, sessionId: string, background: boolean): WorkspaceActionPlan | { error: string; failurePrefix: string } {
       const failurePrefix = name === 'save_blob' ? '[save failed] '
         : name === 'append_file' ? '[append failed] '
           : name === 'edit_file' ? '[edit failed] '
@@ -1554,8 +2052,8 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       const rawPath = String(args.path ?? '').trim();
       if (!rawPath) return { error: 'path 不能为空', failurePrefix };
 
-      const operation = name === 'append_file' ? 'append' : name === 'delete_file' ? 'delete' : 'write';
-      const denied = this.writeGuard(operation, rawPath, role);
+      const guardOperation = name === 'append_file' ? 'append' : name === 'delete_file' ? 'delete' : 'write';
+      const denied = this.writeGuard(guardOperation, rawPath, role);
       if (denied) return { error: denied, failurePrefix };
 
       let effectivePath = rawPath;
@@ -1620,6 +2118,12 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
 
       const expectedBytes = name === 'delete_file' ? pathState.bytes! : finalBytes!;
       const digest = sha256(expectedBytes);
+      const operation = name === 'delete_file' ? 'delete'
+        : name === 'append_file' ? 'append'
+          : pathState.bytes === null ? 'create' : 'update';
+      const deltaBytes = name === 'delete_file' ? 0
+        : name === 'append_file' ? expectedBytes.byteLength - (pathState.bytes?.byteLength ?? 0)
+          : expectedBytes.byteLength;
       const file = { path: pathState.relativePath, digest, bytes: expectedBytes.byteLength, mime };
       const verb = name === 'delete_file' ? 'delete'
         : name === 'append_file' ? 'append'
@@ -1643,8 +2147,67 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         files: [file],
         expiresInMs: 30_000,
         maxSteps: 1,
+        operation,
+        targetState: pathState.bytes === null ? 'absent' : 'present',
+        baseDigest: pathState.bytes ? sha256(pathState.bytes) : null,
+        deltaBytes,
+        sessionId,
+        background,
       };
       return { request, path: pathState, finalBytes: name === 'delete_file' ? null : finalBytes, failurePrefix };
+    }
+
+    /**
+     * Self-time and other internal turns inject a `[system]` event as the last user message. A
+     * chat turn carries a user-input span, so its writes may ask in the bubble.
+     */
+    private backgroundTurn(role: string): boolean {
+      if (role !== 'main') return true;
+      try {
+        const records = this.core?.sessionInfo('main').snapshot ?? [];
+        let lastUserInput = -1;
+        let lastAssistant = -1;
+        for (const [index, record] of records.entries()) {
+          const userInput = (record.context.sourceIndependentSpans ?? []).some((span) => span.origin === 'user-input');
+          if (userInput && (record.item.type === 'function_call_output'
+            || (record.item.type === 'message' && record.item.role === 'user'))) lastUserInput = index;
+          if (record.item.type === 'message' && record.item.role === 'assistant') lastAssistant = index;
+        }
+        return !(lastUserInput >= 0 && lastUserInput > lastAssistant);
+      } catch {
+        return true;
+      }
+    }
+
+    /**
+     * True only for a workspace result line this Host emitted from the named tool. The Core asks
+     * this before it marks text as Core-generated, so a World, a model or a file cannot supply a
+     * `[written] path`-shaped line and have it pass for a Host receipt.
+     */
+    trustWorkspaceToolText(tool: string, text: string): boolean {
+      return this.workspaceIssuedText.trust(tool, text) || this.workspaceIssuedText.trustRead(tool, text);
+    }
+
+    /**
+     * Marks a workspace read the Host itself composed. The read result is ordinary local
+     * material, not a historical source; its label says so. Attesting the exact bytes is what
+     * lets the next provider request show what the Host actually read instead of blocking it.
+     */
+    private trustedWorkspaceRead(tool: string, value: string | ToolOutcome): string | ToolOutcome {
+      if (typeof value === 'string') {
+        // A fixed Host status line is not file material, but it still has to be mapped or the
+        // next request is blocked. The text is written by this wrapper, not by the file.
+        return /^\[(?:not found|read failed|search failed|workspace read failed)/iu.test(value)
+          ? workspaceToolOutcome(value)
+          : value;
+      }
+      if (!value.sourceMapSpans?.length) return value;
+      const spans = value.sourceMapSpans.map((span) => {
+        const text = value.text.slice(span.start, span.end);
+        this.workspaceIssuedText.issueRead(tool, text);
+        return { ...span, origin: 'core-generated' as const };
+      });
+      return { ...value, sourceMapSpans: spans };
     }
 
     /** The tool, authorized before dispatch and committed after a matching read-back. */
@@ -1652,6 +2215,12 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return {
         ...base,
         handler: async (args, ctx) => {
+          // Core's loop supplies a call id; direct callers in tests do not, and keep the old string form.
+          const trusted = ctx.callId !== undefined || ctx.generationToken !== undefined;
+          const line = (text: string): string | ToolOutcome => {
+            this.workspaceIssuedText.issue(base.name, text);
+            return trusted ? workspaceToolOutcome(text) : text;
+          };
           if (!this.authorizeWorkspaceAction) {
             // The standalone Persona retains its existing local behavior when Core has not supplied a gate.
             this.git.ensureRepo();
@@ -1665,10 +2234,19 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             return out;
           }
 
-          const planned = this.workspaceActionPlan(base.name, args, ctx.role);
-          if ('error' in planned) return `${planned.failurePrefix}${planned.error}`;
+          const planned = this.workspaceActionPlan(base.name, args, ctx.role, ctx.sessionId ?? ctx.role, this.backgroundTurn(ctx.role));
+          if ('error' in planned) return line(`${planned.failurePrefix}${planned.error}`);
+          // A retry of the same bytes at the same version needs no second write, approval or receipt.
+          if (planned.finalBytes !== null && planned.path.bytes !== null && planned.finalBytes.equals(planned.path.bytes)) {
+            return line(`${ok}${planned.path.relativePath} (unchanged)`);
+          }
           const authorization = await this.authorizeWorkspaceAction(planned.request);
-          if (!authorization) return `${planned.failurePrefix}Core did not authorize this workspace action`;
+          if (!authorization) return line(`${planned.failurePrefix}Core did not authorize this workspace action`);
+          if (!('consume' in authorization)) {
+            return line(authorization.status === 'deferred'
+              ? `${planned.failurePrefix}this write is waiting for approval in Settings → Memory → Workspace permissions (${authorization.reason}); it was not written. Do not retry it; continue with other work.`
+              : `${planned.failurePrefix}the workspace policy refused this write (${authorization.reason}); it was not written.`);
+          }
 
           let dispatched = false;
           try {
@@ -1677,22 +2255,24 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             const current = this.workspacePathState(planned.path.relativePath, planned.request.target.instanceId);
             if (current.path.snapshotId !== planned.path.snapshotId) {
               authorization.revoke();
-              return `${planned.failurePrefix}the workspace file changed before dispatch`;
+              return line(`${planned.failurePrefix}the workspace file changed before dispatch`);
             }
             if (!authorization.consume(current.target, planned.request.expectedChange, planned.request.files)) {
               authorization.revoke();
-              return `${planned.failurePrefix}the workspace grant expired or no longer matches`;
+              return line(`${planned.failurePrefix}the workspace grant expired or no longer matches`);
             }
 
             dispatched = true;
             const out = await base.handler(args, ctx);
+            this.workspaceIssuedText.issue(base.name, typeof out === 'string' ? out : out.text);
+            const outcome = trusted ? withWorkspaceSourceMap(out) : out;
             if (typeof out !== 'string' || !out.startsWith(ok)) {
               authorization.complete({
                 phase: 'unknown', dispatchState: 'unknown', outcome: 'unknown',
                 note: 'the workspace tool did not confirm whether it changed the file',
                 evidence: { source: 'persona-workspace-tool', status: 'unknown', observedAt: Date.now() },
               });
-              return out;
+              return outcome;
             }
 
             let observed: WorkspacePathState;
@@ -1704,7 +2284,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
                 note: `workspace read-back failed: ${error instanceof Error ? error.message : String(error)}`,
                 evidence: { source: 'persona-workspace-readback', status: 'unavailable', observedAt: Date.now() },
               });
-              return `${planned.failurePrefix}workspace read-back could not verify the result`;
+              return line(`${planned.failurePrefix}workspace read-back could not verify the result`);
             }
             const matches = planned.finalBytes === null
               ? observed.bytes === null
@@ -1718,7 +2298,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
                   ...(observed.bytes ? { digest: sha256(observed.bytes) } : {}), observedAt: Date.now(),
                 },
               });
-              return `${planned.failurePrefix}workspace read-back differed from the approved result`;
+              return line(`${planned.failurePrefix}workspace read-back differed from the approved result`);
             }
 
             authorization.complete({
@@ -1733,7 +2313,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             const run = () => this.git.commitAllAsync(message, AUTHOR_COO);
             this.commits = this.commits.then(run, run);
             await this.commits;
-            return out;
+            return outcome;
           } catch (error) {
             if (dispatched) {
               try {
@@ -1748,7 +2328,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             } else {
               authorization.revoke();
             }
-            return `${planned.failurePrefix}${error instanceof Error ? error.message : String(error)}`;
+            return line(`${planned.failurePrefix}${error instanceof Error ? error.message : String(error)}`);
           }
         },
       };
@@ -1756,13 +2336,22 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
 
     override webUi(language: Language = 'zh'): PersonaWebUiDecl {
       const decl = super.webUi(language);
-      const storage: StoragePart[] = [...(decl.memory?.storage ?? [])];
-      const panels = [...(decl.memory?.panels ?? [])];
       const t = memoryStorageText(language);
+      // W4 split: workspace browsing is ordinary file work, so it lives on the Persona page. The
+      // Memory page keeps long-term memory, receipts and workspace-write permissions only.
+      const workspacePanels = (decl.memory?.panels ?? []).filter((panel) => panel.id === 'workspace' || panel.id === 'history');
+      const personaPanels = [...(decl.panels ?? []), ...workspacePanels];
+      const storage: StoragePart[] = (decl.memory?.storage ?? []).map((part) => part.key === 'workspace'
+        ? { ...part, label: t.workspaceFilesLabel, note: t.workspaceFilesNote }
+        : part);
+      const panels = (decl.memory?.panels ?? []).filter((panel) => panel.id !== 'workspace' && panel.id !== 'history');
       if (this.longTerm || this.growthStateFile) {
         panels.push({ id: 'hindsight', title: t.hindsightLabel, description: t.hindsightPanelDesc });
       }
       panels.push({ id: 'action-receipts', title: t.actionReceiptsLabel, description: t.actionReceiptsPanelDesc });
+      if (this.workspacePermissions) {
+        panels.push({ id: 'workspace-permissions', title: t.workspacePermissionLabel, description: t.workspacePermissionPanelDesc });
+      }
       if (this.longTerm?.enabled()) {
         storage.push({
           key: 'hindsight',
@@ -1780,6 +2369,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       const invoke = async (panel: string, method: string, args: unknown[]): Promise<unknown> => {
         if (panel === 'hindsight') return this.hindsightInvoke(method, args);
         if (panel === 'action-receipts') return this.actionReceiptsInvoke(method, args);
+        if (panel === 'workspace-permissions') return this.workspacePermissionsInvoke(method, args);
         if (!baseInvoke) throw new Error(`No handler for panel ${panel}`);
         const result = await baseInvoke(panel, method, args) as { ok?: boolean; revision?: string } | null;
         const from = args[0];
@@ -1800,6 +2390,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           if (!verified) return { ...result, memoryRegistration: 'failed' };
           try {
             const registration = await this.registerPartnerUserDocument();
+            try {
+              const partner = this.partnerDocFile();
+              this.promptProvenance?.attest({ key: 'partner', path: partner, content: readFileSync(partner, 'utf8') });
+            } catch { /* the save stands; only the local-configuration attestation is missing */ }
             return {
               ...result,
               memoryRegistration: registration.status,
@@ -1817,9 +2411,37 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       };
       return {
         ...decl,
+        promptDocs: deps.canonicalPersona ? (decl.promptDocs ?? []).filter(doc => doc.key !== 'constitution' && doc.key !== 'orientation') : decl.promptDocs,
+        panels: personaPanels,
         invoke,
         ...(decl.memory ? { memory: { ...decl.memory, panels, storage } } : { memory: { panels, storage } }),
       };
+    }
+
+    private workspacePermissionsInvoke(method: string, args: unknown[]): unknown {
+      const permissions = this.workspacePermissions;
+      if (!permissions) return { available: false, error: 'unavailable' };
+      if (method === 'list') return permissions.snapshot();
+      if (method === 'enableDefaults') return permissions.enableDefaults();
+      if (method === 'clearSettled') return { ok: true, cleared: permissions.clearSettled() };
+      if (method === 'setPaused') {
+        if (typeof args[0] !== 'boolean') return { ok: false, error: 'invalid' };
+        permissions.setPaused(args[0]);
+        return { ok: true };
+      }
+      if (method === 'revokeRule') {
+        const id = typeof args[0] === 'string' ? args[0] : '';
+        return id && permissions.revokeRule(id) ? { ok: true } : { ok: false, error: 'missing' };
+      }
+      if (method === 'resolvePending') {
+        const id = typeof args[0] === 'string' ? args[0] : '';
+        const action = args[1];
+        if (!id || (action !== 'allow-once' && action !== 'always' && action !== 'deny' && action !== 'dismiss')) {
+          return { ok: false, error: 'invalid' };
+        }
+        return permissions.resolvePending(id, action);
+      }
+      throw new Error(`Unknown workspace permission method: ${method}`);
     }
 
     private actionReceiptsInvoke(method: string, args: unknown[]): unknown {
@@ -1865,26 +2487,167 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       throw new Error(`Unknown action receipt method: ${method}`);
     }
 
+    /**
+     * Returns the last settled supplement receipt without source text or identifiers. The method
+     * is read-only and is reached only through the local Memory panel's invoke path.
+     */
+    private domainSupplementDiagnostics(): DomainSupplementDiagnostics {
+      const base = { scope: 'persona-domain-supplement' as const, core: DOMAIN_SUPPLEMENT_CORE_UNKNOWN };
+      const memory = this.longTerm;
+      if (!memory) {
+        return Object.freeze({ ...base, available: false, enabled: false, receiptState: 'unavailable' as const, ...DOMAIN_SUPPLEMENT_EMPTY });
+      }
+
+      let enabled = false;
+      try {
+        const options = typeof memory.domainSupplementOptions === 'function' ? memory.domainSupplementOptions() : null;
+        enabled = memory.enabled() && options?.enabled === true;
+      } catch {
+        return Object.freeze({ ...base, available: true, enabled: false, receiptState: 'unavailable' as const, ...DOMAIN_SUPPLEMENT_EMPTY });
+      }
+      if (!enabled) {
+        // A previous ON receipt stays in memory for the next ON turn but is not shown while off.
+        return Object.freeze({ ...base, available: true, enabled: false, receiptState: 'disabled' as const, ...DOMAIN_SUPPLEMENT_EMPTY });
+      }
+      if (this.domainSupplementAbort) {
+        // A newer turn owns the context; the previous receipt must not read as this turn's result.
+        return Object.freeze({
+          ...base, available: true, enabled: true, receiptState: 'in_progress' as const,
+          ...DOMAIN_SUPPLEMENT_EMPTY, turnActive: true,
+        });
+      }
+
+      let receipt: DomainSupplementReceipt | null;
+      try {
+        receipt = memory.lastDomainSupplementReceipt();
+      } catch {
+        return Object.freeze({ ...base, available: true, enabled: true, receiptState: 'unavailable' as const, ...DOMAIN_SUPPLEMENT_EMPTY });
+      }
+      if (!receipt) {
+        return Object.freeze({ ...base, available: true, enabled: true, receiptState: 'no_receipt' as const, ...DOMAIN_SUPPLEMENT_EMPTY });
+      }
+
+      const status = safeDomainSupplementStatus(receipt.status) ?? 'fallback';
+      const parsedAt = typeof receipt.at === 'string' ? Date.parse(receipt.at) : Number.NaN;
+      // A turn that failed before delivery records no receipt. The last receipt in memory then still
+      // belongs to the previous successful round, so it must not read as this turn's result.
+      const receiptTurn = this.domainSupplementReceiptAt === receipt.at ? this.domainSupplementReceiptTurn : null;
+      if (receiptTurn !== null) {
+        if (receiptTurn !== this.domainSupplementTurn) {
+          return Object.freeze({ ...base, available: true, enabled: true, receiptState: 'no_receipt' as const, ...DOMAIN_SUPPLEMENT_EMPTY });
+        }
+      } else {
+        // A receipt can also be supplied without going through this Persona (for example a test or a
+        // diagnostic injection); fall back to the timestamp rule when no turn owns it.
+        const startedAt = this.domainSupplementTurnStartedAt;
+        if (startedAt !== null && (!Number.isFinite(parsedAt) || parsedAt < startedAt)) {
+          return Object.freeze({ ...base, available: true, enabled: true, receiptState: 'no_receipt' as const, ...DOMAIN_SUPPLEMENT_EMPTY });
+        }
+      }
+      return Object.freeze({
+        ...base,
+        available: true,
+        enabled: true,
+        receiptState: 'settled' as const,
+        receiptPresent: true,
+        turnActive: false,
+        status,
+        fallbackReason: status === 'finalized'
+          ? null : safeDomainSupplementFallbackReason(receipt.fallbackReason) ?? 'other',
+        baselineStatus: safeTurnRecallStatus(receipt.baselineStatus),
+        candidateCount: nonNegativeCount(receipt.candidateCount),
+        verifiedCount: nonNegativeCount(receipt.verifiedCount),
+        consumedCount: nonNegativeCount(receipt.consumedCount),
+        addedSourceCount: nonNegativeCount(receipt.addedSourceCount),
+        withheldCount: nonNegativeCount(receipt.withheldCount),
+        fallbackCount: nonNegativeCount(receipt.fallbackCount),
+        finalizedSegmentCount: nonNegativeCount(receipt.finalizedSegmentCount),
+        queryCalls: nonNegativeCount(receipt.queryCalls),
+        readbackCalls: nonNegativeCount(receipt.readbackCalls),
+        finalReadbackCalls: nonNegativeCount(receipt.finalReadbackCalls),
+        supplementalChars: nonNegativeCount(receipt.supplementalChars),
+        elapsedMs: nonNegativeCount(receipt.elapsedMs),
+        rssDeltaBytes: nonNegativeCount(receipt.rssDeltaBytes),
+        receiptAgeMs: Number.isFinite(parsedAt) ? Math.max(0, Date.now() - parsedAt) : null,
+      });
+    }
+
     private async hindsightInvoke(method: string, args: unknown[]): Promise<unknown> {
       if (method === 'system-health') return this.systemHealth();
+      if (method === 'domain-supplement-diagnostics') return this.domainSupplementDiagnostics();
+      if (method === 'growth-policy-revoke') {
+        if (!this.growthPolicies) throw new Error('Growth policies are unavailable.');
+        await this.growthPolicies.revoke(String(args[0] ?? ''));
+        return this.growthPolicies.status();
+      }
+      if (method === 'growth-policy-focus') {
+        if (!this.growthPolicies || typeof args[0] !== 'boolean') throw new Error('A focus-context boolean is required.');
+        await this.growthPolicies.setFocus(args[0]);
+        await this.growthPolicies.refresh();
+        return { ...this.growthPolicies.status(), proactiveTickSuppressed: this.tickText(1800) === '' };
+      }
+      if (method === 'growth-policy-reconcile') {
+        await this.growthPolicies?.reconcile();
+        return this.growthPolicies?.status() ?? null;
+      }
+      if (method === 'growth-auto-pause') {
+        if (typeof args[0] !== 'boolean') throw new Error('A pause boolean is required.');
+        this.autonomousPaused = args[0];
+        this.autonomousGrowth?.pause(args[0]);
+        return { paused: this.autonomousPaused };
+      }
+      if (method === 'growth-auto-run') {
+        if (!this.autonomousGrowth) throw new Error('Automatic Growth is unavailable.');
+        if ((this.core?.sessionInfo(GROWTH_SESSION).running ?? 0) > 0 || (this.core?.sessionInfo(GROWTH_VALIDATION_SESSION).running ?? 0) > 0) throw new Error('A Growth fork is already running.');
+        return this.autonomousGrowth.run('manual');
+      }
+      if (method === 'growth-review') {
+        if (this.autonomousGrowth?.status().running || (this.core?.sessionInfo(GROWTH_VALIDATION_SESSION).running ?? 0) > 0) throw new Error('Automatic Growth is still running.');
+        if (!this.growthReview || !this.longTerm?.enabled()) throw new Error('Growth review is unavailable.');
+        if (!Array.isArray(args[0]) || args[0].some(id => typeof id !== 'string')) throw new Error('A source ID list is required.');
+        return this.growthReview.run({ sourceIds: args[0] as string[] });
+      }
+      if (method === 'growth-local-candidates') {
+        const memory = this.longTerm, proposals = this.growthProposals();
+        if (!memory || !proposals) return [];
+        return Promise.all(proposals.list('candidate').map(proposal => readLocalGrowthProposal(memory, proposals, proposal.id)));
+      }
       if (method === 'growth-status') {
+        await this.growthPolicies?.refresh();
         return {
           schedule: this.growthSchedule?.status() ?? null,
-          proposals: this.growthProposals()?.list() ?? [],
+          autonomous: this.autonomousGrowth?.status() ?? null,
+          autoApply: this.growthNow().autoApply === true,
+          config: this.growthNow(),
+          proposalAssessments: Object.fromEntries((this.growthProposals()?.list() ?? []).map(proposal => [proposal.id, assessGrowthImpact(proposal)])),
+          policies: this.growthPolicies?.status() ?? null,
+          proposals: await this.hindsightInvoke('growth-proposals', []),
           experiences: this.experienceCards()?.list() ?? [],
           browser: this.systemHealth().browser,
         };
       }
       if (method === 'growth-proposals') {
-        const memory = this.longTerm;
-        return this.growthProposals()?.list().filter((proposal) =>
-          memory?.derivedArtifactIsCurrent(proposal.id, growthProposalArtifactText(proposal)) === true) ?? [];
+        const memory = this.longTerm, store = this.growthProposals();
+        if (!memory || !store) return [];
+        const proposals = await Promise.all(store.list().map(async proposal => {
+          if (!memory.derivedArtifactIsCurrent(proposal.id, growthProposalArtifactText(proposal))
+            || !await memory.verifyDerivedArtifact(proposal.id, growthProposalArtifactText(proposal))) return null;
+          if (proposal.state === 'candidate' && proposal.generationProof
+            && (await readLocalGrowthProposal(memory, store, proposal.id)).status !== 'candidate') return null;
+          return proposal;
+        }));
+        return proposals.filter((proposal): proposal is GrowthProposal => proposal !== null);
       }
       if (method === 'growth-proposal-review') {
         const id = String(args[0] ?? ''), action = String(args[1] ?? '');
         if (action !== 'approved' && action !== 'rejected') throw new Error('Review action must be approved or rejected.');
         const store = this.growthProposals();
         const current = store?.get(id);
+        if (current && this.growthPolicies && assessGrowthImpact(current).coreRisk === 'high') {
+          await this.growthPolicies.reconcile([id]);
+          await this.growthPolicies.reviewOwner(id, action === 'approved', String(args[2] ?? ''));
+          return current;
+        }
         if (action === 'approved') {
           const memory = this.longTerm;
           if (!current || !memory?.enabled() || !await this.verifiedMemorySources(current.sourceIds)) {
@@ -1893,6 +2656,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           if (!await memory.verifyDerivedArtifact(current.id, growthProposalArtifactText(current))) {
             throw new Error('The proposal provenance is missing, stale or no longer matches its sources.');
           }
+          if (current.autonomousKey && (await readLocalGrowthProposal(memory, store!, current.id)).status !== 'candidate') throw new Error('The automatic candidate consistency review is missing or stale.');
           if (current.state !== 'candidate') throw new Error('The proposal is no longer a candidate. Refresh the list.');
         }
         const proposal = store?.transition(id, action, String(args[2] ?? ''));
@@ -2151,23 +2915,375 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       this.core?.injectInternal(`[system] The World "${event.label}" ${what}.`, 'notice');
     }
 
-    /**
-     * A handoff note already present in the Core session is a frozen record. When a source it
-     * depends on is forgotten, request the existing safe context-handoff maintenance so the next
-     * batch waits for a rebuilt working context; the EventStore and the old artifact stay intact.
-     */
-    private requestHandoffAfterDeliveredNoteForget(forgottenIds: readonly string[]): void {
-      const forgotten = new Set(forgottenIds);
-      const bankId = this.longTerm?.bankId();
-      if (forgotten.size === 0) return;
-      const snapshot = this.attachedCore?.sessionInfo('main').snapshot;
-      if (!snapshot?.length) return;
-      const affected = snapshot.some((record) =>
-        (record.context.frame?.events ?? []).some((event) => event.type === HANDOFF_NOTE_TYPE)
-        && (record.context.sourceDependencySpans ?? []).some((span) =>
-          span.exposedSources.some((source) => (!bankId || source.bankId === bankId)
-            && forgotten.has(source.documentId))));
-      if (affected) this.attachedCore?.requestContextHandoff();
+    private requestHandoffAfterDeliveredNoteForget(forgottenIds: readonly string[]): boolean {
+      const memory = this.longTerm;
+      const core = this.attachedCore;
+      const forgotten = [...new Set(forgottenIds.filter(Boolean))];
+      if (!memory || !core || forgotten.length === 0) return false;
+      const bankId = memory.bankId();
+      const endpoint = memory.endpoint();
+      const snapshot = core.sessionInfo('main').snapshot;
+      if (!bankId || !endpoint || !snapshot?.length) return false;
+      const forgottenSet = new Set(forgotten);
+      const affectedSources = new Map<string, SourceExposureRef>();
+      for (const record of snapshot) {
+        const noteEvents = (record.context.frame?.events ?? []).filter((event) => event.type === HANDOFF_NOTE_TYPE);
+        if (noteEvents.length === 0) continue;
+        for (const span of record.context.sourceDependencySpans ?? []) {
+          const coversNote = noteEvents.some((event) => span.start < event.start + event.chars && span.end > event.start);
+          if (!coversNote || !span.exposedSources.some((source) =>
+            source.bankId === bankId && source.endpoint === endpoint && forgottenSet.has(source.documentId))) continue;
+          for (const source of span.exposedSources) {
+            if (source.bankId === bankId && source.endpoint === endpoint) {
+              affectedSources.set(handoffSourceProofIdentity(source), source);
+            }
+          }
+        }
+      }
+      let rawContext = false;
+      if (affectedSources.size === 0) {
+        for (const record of snapshot) {
+          const refs = [
+            ...(record.context.evidence ?? []).map(sourceRefFromAttachment),
+            ...(record.context.generationEvidenceProof?.exposedSources ?? []),
+            ...(record.context.sourceDependencySpans ?? []).flatMap((span) => span.exposedSources),
+            ...(record.context.sourceMapSpans ?? []).flatMap((span) => span.exposedSources ?? []),
+          ];
+          if (!refs.some((source) => source.bankId === bankId && source.endpoint === endpoint
+            && forgottenSet.has(source.documentId))) continue;
+          for (const source of refs) {
+            if (source.bankId === bankId && source.endpoint === endpoint) {
+              affectedSources.set(handoffSourceProofIdentity(source), source);
+            }
+          }
+        }
+        rawContext = affectedSources.size > 0;
+      }
+      if (affectedSources.size === 0) return false;
+
+      const sourceRefs = [...affectedSources.values()];
+      const identities = new Set(sourceRefs.map(handoffSourceIdentity));
+      const artifactIds = memory.listHandoffArtifacts().filter((artifact) => artifact.kind === 'handoff-note'
+        && artifact.lifecycleState === 'stale' && artifact.statusReason === 'source-forgotten'
+        && artifact.sources.length > 0
+        && artifact.sources.some((source) => forgottenSet.has(source.documentId))
+        && artifact.sources.every((source) => identities.has(handoffSourceIdentity({
+          bankId: source.bankId, endpoint: source.endpoint, documentId: source.documentId,
+          contentDigest: source.contentDigest ?? '',
+        })))).map((artifact) => artifact.artifactId);
+      if (artifactIds.length === 0 && !rawContext) return false;
+
+      const current = this.pendingForgottenHandoffReset;
+      if (current) {
+        if (current.rawContext) {
+          const cursor = core.latestEventCursor?.();
+          if (!Number.isSafeInteger(cursor) || cursor! < 0) {
+            this.pendingForgottenHandoffReset = null;
+            return false;
+          }
+          current.eventCutoff = Math.max(current.eventCutoff ?? 0, cursor!);
+        }
+        for (const id of forgotten) if (!current.forgottenIds.includes(id)) current.forgottenIds.push(id);
+        for (const source of sourceRefs) {
+          if (!current.sourceRefs.some((entry) => handoffSourceProofIdentity(entry) === handoffSourceProofIdentity(source))) {
+            current.sourceRefs.push(source);
+          }
+        }
+        for (const id of artifactIds) if (!current.artifactIds.includes(id)) current.artifactIds.push(id);
+        current.expectedEpoch = memory.evidenceEpoch() ?? current.expectedEpoch;
+        return true;
+      }
+
+      const expectedEpoch = memory.evidenceEpoch();
+      if (!expectedEpoch) return false;
+      const eventCutoff = rawContext ? core.latestEventCursor?.() : undefined;
+      if (rawContext && (!Number.isSafeInteger(eventCutoff) || eventCutoff! < 0)) return false;
+      let resolveBlocked!: () => void;
+      const blocked = new Promise<void>((resolve) => { resolveBlocked = resolve; });
+      const reset: ForgottenHandoffReset = {
+        phase: 'awaiting-block',
+        ...(rawContext ? { rawContext: true as const, eventCutoff } : {}),
+        forgottenIds: forgotten,
+        sourceRefs,
+        artifactIds,
+        expectedEpoch,
+        resolveBlocked,
+      };
+      this.pendingForgottenHandoffReset = reset;
+      void this.runForgottenHandoffReset(reset, blocked);
+      return true;
+    }
+
+    private async runForgottenHandoffReset(reset: ForgottenHandoffReset, blocked: Promise<void>): Promise<void> {
+      const core = this.attachedCore;
+      if (!core) {
+        if (this.pendingForgottenHandoffReset === reset) this.pendingForgottenHandoffReset = null;
+        return;
+      }
+      const waitMs = 10;
+      const memory = this.longTerm;
+      const settleDeadline = Date.now() + 10_000;
+      while (this.pendingForgottenHandoffReset === reset && Date.now() < settleDeadline) {
+        const generation = core.sessionInfo('main').generation;
+        if (!generation || generation.status !== 'current') break;
+        const settledEpoch = memory?.settled() ? memory.evidenceEpoch() : null;
+        if (settledEpoch) {
+          reset.expectedEpoch = settledEpoch;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+      if (this.pendingForgottenHandoffReset !== reset || !memory?.settled() || !memory.evidenceEpoch()) {
+        if (this.pendingForgottenHandoffReset === reset) this.pendingForgottenHandoffReset = null;
+        return;
+      }
+      reset.expectedEpoch = memory.evidenceEpoch()!;
+      if (reset.rawContext) {
+        const generation = core.sessionInfo('main').generation;
+        if (!generation || generation.status !== 'current'
+          || !reset.forgottenIds.every((id) => memory.sourceFenced(id))) {
+          if (this.pendingForgottenHandoffReset === reset) this.pendingForgottenHandoffReset = null;
+          return;
+        }
+        reset.expectedGeneration = generation.token;
+        reset.phase = 'reset-ready';
+        const deadline = Date.now() + 5_000;
+        while (this.pendingForgottenHandoffReset === reset && Date.now() < deadline) {
+          const current = core.sessionInfo('main').generation;
+          if (!current || current.status !== 'current' || current.token !== reset.expectedGeneration
+            || !memory.settled() || memory.evidenceEpoch() !== reset.expectedEpoch) break;
+          if (core.requestContextHandoff()) return;
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+        }
+        if (this.pendingForgottenHandoffReset === reset) this.pendingForgottenHandoffReset = null;
+        return;
+      }
+      const oldBlockDeadline = Date.now() + 5_000;
+      while (this.pendingForgottenHandoffReset === reset && !reset.candidateSnapshotId && Date.now() < oldBlockDeadline) {
+        core.requestContextHandoff();
+        await Promise.race([blocked, new Promise((resolve) => setTimeout(resolve, waitMs))]);
+      }
+      if (this.pendingForgottenHandoffReset !== reset || !reset.candidateSnapshotId || !reset.expectedGeneration) {
+        if (this.pendingForgottenHandoffReset === reset) this.pendingForgottenHandoffReset = null;
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const oldOutcome = core.handoffOutcome();
+      if (oldOutcome?.status === 'blocked' && oldOutcome.candidateSnapshotId === reset.candidateSnapshotId
+        && oldOutcome.reason === 'original-memory-source-dependency-unverified') {
+        this.lastForgottenHandoffBlock = {
+          status: 'blocked',
+          candidateSnapshotId: oldOutcome.candidateSnapshotId,
+          mappingState: oldOutcome.mappingState,
+          reason: oldOutcome.reason,
+        };
+      }
+      reset.phase = 'reset-ready';
+      const resetDeadline = Date.now() + 5_000;
+      while (this.pendingForgottenHandoffReset === reset && Date.now() < resetDeadline) {
+        const generation = core.sessionInfo('main').generation;
+        if (!generation || generation.status !== 'current' || generation.token !== reset.expectedGeneration) break;
+        if (core.requestContextHandoff()) return;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+      if (this.pendingForgottenHandoffReset === reset) this.pendingForgottenHandoffReset = null;
+    }
+
+    private signalForgottenHandoffBlocked(ctx: ContextHandoffPrepareContext): void {
+      const reset = this.pendingForgottenHandoffReset;
+      if (!reset || reset.phase !== 'awaiting-block') return;
+      reset.candidateSnapshotId = ctx.candidateSnapshotId;
+      reset.expectedGeneration = ctx.expectedGeneration;
+      reset.resolveBlocked();
+    }
+
+    private prepareForgottenContextReset(
+      snapshot: ContextRecord[],
+      ctx: ContextHandoffPrepareContext,
+      reset: ForgottenHandoffReset,
+    ): PreparedContextHandoff {
+      const memory = this.longTerm;
+      const core = this.attachedCore;
+      const expectedEpoch = memory?.evidenceEpoch() ?? null;
+      const tail = this.handoffTail(snapshot, reset.rawContext ? reset.eventCutoff : undefined);
+      const tailEvidence = ctx.inspectCandidate(tail);
+      const validResetTail = tailEvidence.mappingState === 'complete' && tailEvidence.exposedSources.length === 0;
+      const commitGuard = (): HandoffCommitCheck => {
+        const generation = core?.sessionInfo(ctx.sessionId).generation;
+        if (!generation || generation.status !== 'current' || generation.token !== ctx.expectedGeneration
+          || ctx.candidateSnapshotId !== reset.resetCandidateSnapshotId
+          || ctx.expectedGeneration !== reset.expectedGeneration) return { status: 'stale', reason: 'generation-changed' };
+        if (this.pendingForgottenHandoffReset !== reset || reset.phase !== 'reset-ready') {
+          return { status: 'blocked', reason: 'forgotten-handoff-reset-expired' };
+        }
+        if (!memory || !expectedEpoch || !memory.enabled() || !memory.settled()
+          || memory.evidenceEpoch() !== expectedEpoch || reset.expectedEpoch !== expectedEpoch) {
+          return { status: 'blocked', reason: 'forget-epoch-changed-during-reset' };
+        }
+        if (!reset.forgottenIds.every((id) => memory.sourceFenced(id))) {
+          return { status: 'blocked', reason: 'forget-fence-not-current' };
+        }
+        if (!reset.artifactIds.every((id) => memory.derivedArtifact(id)?.lifecycleState === 'stale'
+          && memory.derivedArtifact(id)?.statusReason === 'source-forgotten')) {
+          return { status: 'blocked', reason: 'old-handoff-is-not-stale' };
+        }
+        const checked = ctx.inspectCandidate(tail);
+        if (!validResetTail || checked.mappingState !== 'complete' || checked.exposedSources.length !== 0) {
+          return { status: 'blocked', reason: 'reset-tail-is-not-source-independent' };
+        }
+        return { status: 'allow' };
+      };
+      return {
+        result: { tail },
+        candidate: { snapshotId: ctx.candidateSnapshotId, records: tail, sourceExcerpts: [], content: '', injections: [] },
+        protected: true,
+        archiveOriginal: true,
+        commitGuard,
+        commit: () => {
+          if (this.pendingForgottenHandoffReset === reset) this.pendingForgottenHandoffReset = null;
+          this.pendingCleanHandoffRebuild = null;
+          this.memoryContextBlocks.clear();
+          this.pressureWarned = false;
+          this.pressureSplitAt = null;
+          queueMicrotask(() => { void this.rebuildCleanHandoffAfterReset(reset); });
+        },
+        discard: () => {
+          if (this.pendingForgottenHandoffReset === reset) this.pendingForgottenHandoffReset = null;
+        },
+        injections: [],
+      };
+    }
+
+    private async rebuildCleanHandoffAfterReset(reset: ForgottenHandoffReset): Promise<void> {
+      const memory = this.longTerm;
+      const core = this.attachedCore;
+      if (!memory?.enabled() || !memory.settled() || !core || !reset.expectedGeneration) return;
+      const isGenerationCurrent = (): boolean => {
+        const generation = core.sessionInfo('main').generation;
+        return !!generation && generation.status === 'current' && generation.token === reset.expectedGeneration;
+      };
+      if (!isGenerationCurrent()) return;
+      const expectedEpoch = memory.evidenceEpoch();
+      const bankId = memory.bankId();
+      const endpoint = memory.endpoint();
+      if (!expectedEpoch || !bankId || !endpoint) return;
+      const inputs: CleanHandoffRebuild['inputs'] = [];
+      const sourceRefs: SourceExposureRef[] = [];
+      const seen = new Set<string>();
+      for (const previous of reset.sourceRefs) {
+        if (reset.forgottenIds.includes(previous.documentId)
+          || previous.bankId !== bankId || previous.endpoint !== endpoint
+          || memory.sourceFenced(previous.documentId) || !memory.sourceVisible(previous.documentId)
+          || !memory.sourceCurrentForContext(previous.documentId)) continue;
+        const tuple = JSON.stringify([previous.bankId, previous.endpoint, previous.documentId]);
+        if (seen.has(tuple)) continue;
+        seen.add(tuple);
+        const exact = await memory.readExactSourceEvidence(previous.documentId);
+        if (!isGenerationCurrent()) return;
+        if (!exact || exact.endpointBinding !== 'configured-client'
+          || exact.bankId !== previous.bankId || exact.endpoint !== previous.endpoint
+          || exact.documentId !== previous.documentId
+          || !/^[a-f0-9]{64}$/.test(exact.contentDigest)
+          || exact.revision !== exact.contentDigest
+          || createHash('sha256').update(exact.storedText, 'utf8').digest('hex') !== exact.contentDigest
+          || !Number.isSafeInteger(exact.sourceEpoch) || exact.sourceEpoch < 0
+          || exact.fenceEpoch !== String(exact.sourceEpoch) || exact.evidenceEpoch !== expectedEpoch
+          || memory.evidenceEpoch() !== expectedEpoch || memory.sourceFenced(previous.documentId)
+          || !memory.sourceVisible(previous.documentId) || !memory.sourceCurrentForContext(previous.documentId)) return;
+        const [attachment] = await memory.evidenceForSegments(exact.storedText, [
+          { documentId: exact.documentId, start: 0, end: exact.storedText.length },
+        ]);
+        if (!isGenerationCurrent()) return;
+        if (!attachment || attachment.bankId !== exact.bankId || attachment.endpoint !== exact.endpoint
+          || attachment.documentId !== exact.documentId || attachment.validatedEpoch !== exact.evidenceEpoch
+          || attachment.revisionState !== 'current' || attachment.validationStatus !== 'validated'
+          || attachment.validationReceipt !== exact.validationReceipt
+          || attachment.contentDigest !== exact.contentDigest
+          || attachment.segment.start !== 0 || attachment.segment.end !== exact.storedText.length
+          || attachment.segment.digest !== exact.contentDigest || !attachment.segment.sourceProof
+          || memory.evidenceEpoch() !== expectedEpoch) return;
+        inputs.push({ text: exact.storedText, attachment });
+        sourceRefs.push(sourceRefFromAttachment(attachment));
+      }
+      if (inputs.length === 0 || memory.evidenceEpoch() !== expectedEpoch
+        || !await memory.verifyExposureSources(sourceRefs, expectedEpoch)
+        || !isGenerationCurrent() || memory.evidenceEpoch() !== expectedEpoch) return;
+
+      const plan: CleanHandoffRebuild = {
+        expectedEpoch,
+        forgottenIds: [...reset.forgottenIds],
+        sourceRefs,
+        inputs,
+      };
+      this.pendingCleanHandoffRebuild = plan;
+      for (const input of inputs) this.injectMemoryContext(input.text, [input.attachment]);
+
+      const deadline = Date.now() + 5_000;
+      while (this.pendingCleanHandoffRebuild === plan && Date.now() < deadline) {
+        if (!isGenerationCurrent() || memory.evidenceEpoch() !== expectedEpoch || !memory.settled()) {
+          this.pendingCleanHandoffRebuild = null;
+          return;
+        }
+        const snapshot = core.sessionInfo('main').snapshot ?? [];
+        if (this.cleanHandoffSourceExcerpts(snapshot, plan)) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      if (this.pendingCleanHandoffRebuild !== plan) return;
+      if (!isGenerationCurrent() || memory.evidenceEpoch() !== expectedEpoch) {
+        this.pendingCleanHandoffRebuild = null;
+        return;
+      }
+      const snapshot = core.sessionInfo('main').snapshot ?? [];
+      if (!this.cleanHandoffSourceExcerpts(snapshot, plan)) {
+        this.pendingCleanHandoffRebuild = null;
+        return;
+      }
+
+      const requestDeadline = Date.now() + 5_000;
+      while (this.pendingCleanHandoffRebuild === plan && Date.now() < requestDeadline) {
+        if (!isGenerationCurrent() || memory.evidenceEpoch() !== expectedEpoch) {
+          this.pendingCleanHandoffRebuild = null;
+          return;
+        }
+        if (core.requestContextHandoff()) return;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      if (this.pendingCleanHandoffRebuild === plan) this.pendingCleanHandoffRebuild = null;
+    }
+
+    private cleanHandoffSourceExcerpts(
+      snapshot: readonly ContextRecord[],
+      plan: CleanHandoffRebuild,
+    ): ContextHandoffSourceExcerpt[] | null {
+      if (this.longTerm?.evidenceEpoch() !== plan.expectedEpoch) return null;
+      const forgotten = new Set(plan.forgottenIds);
+      const expected = new Map(plan.inputs.map((input) => [JSON.stringify(input.attachment), input]));
+      const found = new Map<string, ContextHandoffSourceExcerpt>();
+      for (const record of snapshot) {
+        if (record.item.type === 'message' && record.item.role === 'system') continue;
+        if ((record.context.frame?.events ?? []).some((event) => event.type === HANDOFF_NOTE_TYPE)) return null;
+        for (const attachment of record.context.evidence ?? []) {
+          if (forgotten.has(attachment.documentId)) return null;
+          const input = expected.get(JSON.stringify(attachment));
+          if (!input) return null;
+          const text = textOf(record);
+          const { start, end, digest } = attachment.segment;
+          if (!record.item.id || start < 0 || end <= start || end > text.length
+            || text.slice(start, end) !== input.text
+            || digest !== createHash('sha256').update(input.text, 'utf8').digest('hex')) return null;
+          const key = handoffSourceProofIdentity(sourceRefFromAttachment(attachment));
+          if (found.has(key)) return null;
+          found.set(key, { sourceRecordId: record.item.id, attachment });
+        }
+        for (const span of record.context.sourceDependencySpans ?? []) {
+          if (span.exposedSources.some((source) => forgotten.has(source.documentId))) return null;
+        }
+        for (const span of record.context.sourceMapSpans ?? []) {
+          if (span.exposedSources?.some((source) => forgotten.has(source.documentId))) return null;
+        }
+      }
+      const result = plan.inputs.map((input) => found.get(handoffSourceProofIdentity(sourceRefFromAttachment(input.attachment))));
+      return result.every((entry): entry is ContextHandoffSourceExcerpt => !!entry) ? result : null;
     }
 
     /**
@@ -2209,6 +3325,8 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
 
     /** Cormini's delivery: the heartbeat's quiet time starts over, and one line counts the events. */
     override async onDelivery(ctx: { events: EventEnvelope[] }): Promise<void> {
+      await this.growthPolicies?.refresh();
+      this.logRecentSourceSpanDiagnostics();
       const isolatedHandoffs = await this.isolateInvalidHandoffNotes(ctx.events);
       await this.syncPartnerUserDocument(false);
       if (this.pendingOpening) {
@@ -2272,19 +3390,420 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       }
 
       if (!latest || !this.longTerm?.enabled()) return;
-      const recalled = await this.longTerm.recallForTurn(latest, {
-        ...(latestUserDocumentId ? { userEventDocumentId: latestUserDocumentId } : {}),
-        captureTrace: true,
-      });
-      if (recalled.text) {
+      const supplementOptions = typeof this.longTerm.domainSupplementOptions === 'function'
+        ? this.longTerm.domainSupplementOptions()
+        : null;
+      // A newer user message retires the older turn before either baseline finishes, so a
+      // slow older baseline cannot acquire a newer turn number and inject after the new one.
+      const supplementTurn = supplementOptions?.enabled ? this.beginDomainSupplementTurn() : null;
+      try {
+        const recalled = await this.longTerm.recallForTurn(latest, {
+          ...(latestUserDocumentId ? { userEventDocumentId: latestUserDocumentId } : {}),
+          captureTrace: true,
+        });
         const sourceSegments = recalled.trace?.format.sourceSegments ?? [];
-        const evidence = await this.longTerm.evidenceForSegments(recalled.text, sourceSegments);
-        const complete = sourceSegments.length > 0 && evidenceCoversText(recalled.text, evidence);
-        this.injectMemoryContext(complete ? recalled.text : `${recalled.text}\n${MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE}`, evidence);
+        const baselineEvidence = recalled.text
+          ? await this.longTerm.evidenceForSegments(recalled.text, sourceSegments)
+          : [];
+        // Every traced source body must be present, current, validated and digest-matched.
+        // The fixed `[memory]` header, result labels and the incomplete-facts notice are Core
+        // formatting, not historical content, so they are not required to carry a source span.
+        const complete = sourceSegments.length > 0
+          && evidenceCoversSegments(recalled.text, sourceSegments, baselineEvidence);
+        if (recalled.text && !complete) {
+          // A summary without full evidence cannot enter the request; the opt-in consumer can still try exact indexed sources.
+          if (!supplementOptions?.enabled) {
+            this.injectMemoryContext(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE);
+            return;
+          }
+          if (!supplementTurn || supplementTurn.turn !== this.domainSupplementTurn) return;
+          const withheldBaseline = { text: '', route: recalled.route, found: false, status: 'absent' as const };
+          await this.deliverWithDomainSupplement(
+            latest, withheldBaseline, '', [],
+            supplementOptions, supplementTurn, MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE,
+          );
+          return;
+        }
+        const baselineText = recalled.text;
+        if (!supplementOptions?.enabled) {
+          if (recalled.text) this.injectMemoryContext(baselineText, baselineEvidence);
+          else if (recalled.route === 'deep' && recalled.status !== 'skipped') {
+            this.injectMemoryContext(`${memoryReadNotice(recalled.status)} If you are not sure, say so; do not invent dates, names or past events.`);
+          }
+          return;
+        }
+        if (!supplementTurn || supplementTurn.turn !== this.domainSupplementTurn) return;
+        await this.deliverWithDomainSupplement(latest, recalled, baselineText, baselineEvidence, supplementOptions, supplementTurn);
+      } finally {
+        // A failure before delivery must not leave the diagnostic surface stuck "in progress".
+        if (supplementTurn && this.domainSupplementAbort === supplementTurn.controller) {
+          this.domainSupplementAbort = null;
+        }
       }
+    }
+
+    /** Injects the ordinary baseline exactly as the default-off path would. */
+    private injectBaselineMemory(recalled: TurnRecall, baselineText: string, baselineEvidence: EvidenceAttachment[]): void {
+      if (recalled.text) this.injectMemoryContext(baselineText, baselineEvidence);
       else if (recalled.route === 'deep' && recalled.status !== 'skipped') {
         this.injectMemoryContext(`${memoryReadNotice(recalled.status)} If you are not sure, say so; do not invent dates, names or past events.`);
       }
+    }
+
+    /** Starts the turn that owns the opt-in supplement and retires the previous one. */
+    private beginDomainSupplementTurn(): { turn: number; controller: AbortController } {
+      const turn = ++this.domainSupplementTurn;
+      this.domainSupplementTurnStartedAt = Date.now();
+      this.domainSupplementAbort?.abort();
+      const controller = new AbortController();
+      this.domainSupplementAbort = controller;
+      return { turn, controller };
+    }
+
+    /**
+     * Runs the opt-in domain supplement after the baseline recall proof, then injects once.
+     * A per-turn controller and turn counter keep a late query or finalization from leaking
+     * into a newer turn. Any failure keeps the ordinary baseline or the incomplete-evidence notice.
+     */
+    private async deliverWithDomainSupplement(
+      query: string,
+      recalled: TurnRecall,
+      baselineText: string,
+      baselineEvidence: EvidenceAttachment[],
+      options: DomainSupplementOptions,
+      supplementTurn: { turn: number; controller: AbortController },
+      baselineWithheldNotice?: string,
+    ): Promise<void> {
+      const { turn, controller } = supplementTurn;
+      if (turn !== this.domainSupplementTurn) return;
+      const timer = setTimeout(() => controller.abort(), options.timeoutMs);
+      timer.unref?.();
+      const startedAt = Date.now();
+      const rssBefore = process.memoryUsage().rss;
+      try {
+        const outcome = await this.consumeDomainSupplement(query, recalled, baselineText, baselineEvidence, options, controller.signal);
+        if (turn !== this.domainSupplementTurn) return;
+        const receipt = this.domainSupplementReceipt(startedAt, rssBefore, recalled, outcome);
+        this.longTerm?.recordDomainSupplement(receipt);
+        this.domainSupplementReceiptTurn = turn;
+        this.domainSupplementReceiptAt = receipt.at;
+        if (process.env.COOPANION_MEMORY_DIAGNOSTICS === '1') {
+          this.core?.log.info(`[memory] domain supplement receipt ${JSON.stringify(receipt)}`);
+        }
+        if (outcome.kind === 'finalized') {
+          const notice = baselineWithheldNotice ? `${baselineWithheldNotice}\n` : '';
+          const evidence = notice
+            ? outcome.evidence.map((attachment) => ({
+              ...attachment,
+              segment: {
+                ...attachment.segment,
+                start: attachment.segment.start + notice.length,
+                end: attachment.segment.end + notice.length,
+              },
+            }))
+            : outcome.evidence;
+          this.injectMemoryContext(`${notice}${outcome.text}`, evidence);
+        } else if (baselineWithheldNotice) {
+          this.injectMemoryContext(baselineWithheldNotice);
+        } else {
+          this.injectBaselineMemory(recalled, baselineText, baselineEvidence);
+        }
+      } catch (error) {
+        if (turn !== this.domainSupplementTurn) return;
+        const receipt = this.domainSupplementReceipt(startedAt, rssBefore, recalled, {
+          kind: 'fallback', reason: 'exception', result: null,
+        });
+        this.longTerm?.recordDomainSupplement(receipt);
+        this.domainSupplementReceiptTurn = turn;
+        this.domainSupplementReceiptAt = receipt.at;
+        if (baselineWithheldNotice) this.injectMemoryContext(baselineWithheldNotice);
+        else this.injectBaselineMemory(recalled, baselineText, baselineEvidence);
+        this.core?.log.warn('[memory] opt-in domain supplement failed', {
+          fallbackContext: baselineWithheldNotice ? 'source_evidence_incomplete_notice' : 'ordinary_recall_baseline',
+          message: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        clearTimeout(timer);
+        if (this.domainSupplementAbort === controller) this.domainSupplementAbort = null;
+      }
+    }
+
+    private domainSupplementEligibility(
+      recalled: TurnRecall,
+      baselineEvidence: readonly EvidenceAttachment[],
+      bankId: string,
+      endpoint: string,
+    ): { ok: true } | { ok: false; reason: string } {
+      // The ordinary `complete` flag also counts the non-source formatted header, so a
+      // non-empty baseline can legitimately carry the incomplete notice. Eligibility for
+      // appending checks every traced source segment and its minted attachment instead;
+      // the default-off notice behavior itself is unchanged.
+      const trace = recalled.trace;
+      if (!recalled.text) {
+        const ids = [
+          ...(trace?.format.sourceSegments.map((segment) => segment.documentId) ?? []),
+          ...(trace?.format.includedSourceDocumentIds ?? []),
+        ];
+        if (recalled.status !== 'absent' || ids.length > 0) {
+          return {
+            ok: false,
+            reason: recalled.status === 'fenced' ? 'baseline_fenced'
+              : recalled.status === 'unavailable' ? 'baseline_unavailable'
+                : recalled.status === 'incomplete' ? 'baseline_incomplete'
+                  : 'baseline_identity_unavailable',
+          };
+        }
+        return { ok: true };
+      }
+      if (recalled.status !== 'found') return { ok: false, reason: `baseline_${recalled.status}` };
+      const segments = trace?.format.sourceSegments ?? [];
+      if (!trace || segments.length === 0) return { ok: false, reason: 'baseline_identity_unavailable' };
+      if (baselineEvidence.length !== segments.length) return { ok: false, reason: 'baseline_evidence_incomplete' };
+      for (let index = 0; index < segments.length; index += 1) {
+        const segment = segments[index]!;
+        const attachment = baselineEvidence[index]!;
+        if (attachment.bankId !== bankId || attachment.endpoint !== endpoint
+          || attachment.documentId !== segment.documentId
+          || attachment.segment.start !== segment.start || attachment.segment.end !== segment.end
+          || attachment.validationStatus !== 'validated' || attachment.revisionState !== 'current'
+          || !attachment.contentDigest || !attachment.validationReceipt
+          || createHash('sha256').update(recalled.text.slice(segment.start, segment.end), 'utf8').digest('hex') !== attachment.segment.digest) {
+          return { ok: false, reason: 'baseline_evidence_incomplete' };
+        }
+      }
+      return { ok: true };
+    }
+
+    /**
+     * Captures the S2 result instead of injecting it. Only exactly new segments are
+     * finalized through the existing `HindsightMemory.evidenceForSegments()`; the raw S2
+     * attachments never reach Core and are only cross-checked against the appended text.
+     */
+    private async consumeDomainSupplement(
+      query: string,
+      recalled: TurnRecall,
+      baselineText: string,
+      baselineEvidence: EvidenceAttachment[],
+      options: DomainSupplementOptions,
+      signal: AbortSignal,
+    ): Promise<DomainSupplementOutcome> {
+      const memory = this.longTerm;
+      if (!memory) return { kind: 'fallback', reason: 'memory_unavailable', result: null };
+      const bankId = memory.bankId();
+      const endpoint = memory.endpoint();
+      const store = memory.domainStore();
+      const provider = memory.domainReadbackProvider();
+      const expectedEpoch = memory.evidenceEpoch();
+      if (!bankId || !endpoint || !store || !provider || !expectedEpoch) {
+        return { kind: 'fallback', reason: 'accessors_unavailable', result: null };
+      }
+      const eligibility = this.domainSupplementEligibility(recalled, baselineEvidence, bankId, endpoint);
+      if (!eligibility.ok) return { kind: 'fallback', reason: eligibility.reason, result: null };
+      if (signal.aborted) return { kind: 'fallback', reason: 'cancelled', result: null };
+
+      const deliveries: CoreMemoryConsumption[] = [];
+      let result: DomainRelevantConsumeResult;
+      try {
+        result = await consumeDomainRelevantMemory({
+          enabled: true,
+          query,
+          bankId,
+          endpoint,
+          store,
+          baseline: {
+            text: baselineText,
+            status: recalled.status,
+            ...(recalled.trace ? { trace: recalled.trace } : {}),
+            evidence: baselineEvidence,
+          },
+          search: (text, searchOptions) => memory.searchResultsDetailed(text, {
+            ...searchOptions,
+            types: [...memory.domainSupplementTypes()],
+          }),
+          readbackProvider: provider,
+          finalReadbackProvider: provider,
+          getEvidenceEpoch: () => memory.evidenceEpoch(),
+          limits: options.limits,
+          signal,
+          deliver: (block) => { deliveries.push(block); },
+        });
+      } catch {
+        return {
+          kind: 'fallback',
+          reason: 'consume_exception',
+          result: null,
+        };
+      }
+      if (signal.aborted) return { kind: 'fallback', reason: 'cancelled', result };
+      const expectedDeliveryCount = result.text ? 1 : 0;
+      if (deliveries.length !== expectedDeliveryCount || result.deliveries !== expectedDeliveryCount) {
+        return { kind: 'fallback', reason: 'delivery_count', result };
+      }
+      if (result.status !== 'supplemented' && result.status !== 'supplemented_partial') {
+        return { kind: 'fallback', reason: result.stopReason ?? result.status, result };
+      }
+      // Only the exact source-excerpt block may reach the Provider. The labelled display text is
+      // for receipts; it carries no source proof and would leave the request unmappable.
+      const block = deliveries[0]!;
+      const core = {
+        text: block.coreText ?? '', evidence: block.coreEvidence ?? [], sourceSegments: block.coreSegments ?? [],
+      };
+      if (!core.text || core.sourceSegments.length !== core.evidence.length) {
+        return { kind: 'fallback', reason: 'delivery_mismatch', result };
+      }
+      if (block.text !== result.text || block.sourceSegments.length !== result.sourceSegments.length) {
+        return { kind: 'fallback', reason: 'delivery_mismatch', result };
+      }
+      if (!baselineSourceExcerpts({
+        text: baselineText,
+        status: recalled.status,
+        ...(recalled.trace ? { trace: recalled.trace } : {}),
+      }).every((excerpt) => core.text.includes(excerpt))) {
+        return { kind: 'fallback', reason: 'baseline_not_preserved', result };
+      }
+      if (result.supplement.budget.supplementChars <= 0
+        || result.supplement.budget.supplementChars > options.limits.maxSupplementChars) {
+        return { kind: 'fallback', reason: 'supplement_budget', result };
+      }
+      if (result.consumedSources.length === 0 || result.supplement.consumedCount !== result.consumedSources.length) {
+        return { kind: 'fallback', reason: 'consumed_source_mismatch', result };
+      }
+
+      const tupleKey = (documentId: string) => JSON.stringify([bankId, endpoint, documentId]);
+      const baselineTuples = new Set<string>([
+        ...(recalled.trace?.format.sourceSegments.map((segment) => tupleKey(segment.documentId)) ?? []),
+        ...(recalled.trace?.format.includedSourceDocumentIds.map(tupleKey) ?? []),
+      ]);
+      const newSegments = core.sourceSegments.filter((segment) => !baselineTuples.has(tupleKey(segment.documentId)));
+      if (newSegments.length === 0) return { kind: 'fallback', reason: 'no_new_segments', result };
+
+      const consumedSpans = new Map<string, { contentDigest: string; digest: string; text: string }>();
+      for (const source of result.consumedSources) {
+        if (source.identity.bankId !== bankId || source.identity.endpoint !== endpoint) {
+          return { kind: 'fallback', reason: 'source_namespace_mismatch', result };
+        }
+        for (const span of source.spans) {
+          if (!Number.isInteger(span.start) || !Number.isInteger(span.end)
+            || span.start < 0 || span.end <= span.start || span.end > core.text.length
+            || core.text.slice(span.start, span.end) !== span.text
+            || createHash('sha256').update(span.text, 'utf8').digest('hex') !== span.digest) {
+            return { kind: 'fallback', reason: 'supplement_span_mismatch', result };
+          }
+          const key = `${tupleKey(source.identity.documentId)}\u0000${span.start}\u0000${span.end}`;
+          if (consumedSpans.has(key)) return { kind: 'fallback', reason: 'duplicate_supplement_span', result };
+          consumedSpans.set(key, { contentDigest: source.contentDigest, digest: span.digest, text: span.text });
+        }
+      }
+      if (consumedSpans.size !== newSegments.length) return { kind: 'fallback', reason: 'segment_count_mismatch', result };
+
+      for (const segment of newSegments) {
+        if (!segment.documentId || !Number.isInteger(segment.start) || !Number.isInteger(segment.end)
+          || segment.start < 0 || segment.end <= segment.start || segment.end > core.text.length) {
+          return { kind: 'fallback', reason: 'supplement_segment_invalid', result };
+        }
+        const key = `${tupleKey(segment.documentId)}\u0000${segment.start}\u0000${segment.end}`;
+        const span = consumedSpans.get(key);
+        const text = core.text.slice(segment.start, segment.end);
+        if (!span || span.text !== text
+          || createHash('sha256').update(text, 'utf8').digest('hex') !== span.digest) {
+          return { kind: 'fallback', reason: 'segment_span_mismatch', result };
+        }
+        const raw = core.evidence.find((attachment) => attachment.bankId === bankId
+          && attachment.endpoint === endpoint
+          && attachment.documentId === segment.documentId
+          && attachment.segment.start === segment.start
+          && attachment.segment.end === segment.end);
+        if (!raw || raw.validationStatus !== 'validated' || raw.revisionState !== 'current'
+          || raw.validatedEpoch !== expectedEpoch || !raw.validationReceipt
+          || raw.contentDigest !== span.contentDigest || raw.segment.digest !== span.digest) {
+          return { kind: 'fallback', reason: 'raw_attachment_mismatch', result };
+        }
+      }
+
+      const finalized: EvidenceAttachment[] | null = await this.awaitDomainSupplementReadback(
+        memory.evidenceForSegments(core.text, newSegments),
+        signal,
+      );
+      if (!finalized) return { kind: 'fallback', reason: 'cancelled', result };
+      if (finalized.length !== newSegments.length) return { kind: 'fallback', reason: 'finalize_incomplete', result };
+      for (let index = 0; index < newSegments.length; index += 1) {
+        const segment = newSegments[index]!;
+        const attachment = finalized[index]!;
+        const proof = attachment.segment.sourceProof;
+        const segmentDigest = createHash('sha256').update(core.text.slice(segment.start, segment.end), 'utf8').digest('hex');
+        if (attachment.bankId !== bankId || attachment.endpoint !== endpoint
+          || attachment.documentId !== segment.documentId
+          || attachment.segment.start !== segment.start || attachment.segment.end !== segment.end
+          || attachment.segment.digest !== segmentDigest
+          || attachment.validatedEpoch !== expectedEpoch
+          || attachment.validationStatus !== 'validated' || attachment.revisionState !== 'current'
+          || !/^[a-f0-9]{64}$/.test(attachment.contentDigest) || !attachment.validationReceipt
+          || !proof || typeof proof.token !== 'string' || proof.token.length === 0
+          || proof.startUtf16 !== 0 || proof.endUtf16 !== segment.end - segment.start) {
+          return { kind: 'fallback', reason: 'finalize_invalid', result };
+        }
+      }
+      if (signal.aborted) return { kind: 'fallback', reason: 'cancelled', result };
+      if (memory.evidenceEpoch() !== expectedEpoch) return { kind: 'fallback', reason: 'epoch_changed', result };
+      return {
+        kind: 'finalized',
+        text: core.text,
+        evidence: [...finalized],
+        segments: newSegments,
+        result,
+      };
+    }
+
+    /**
+     * Stops waiting for a readback when the turn is cancelled. The in-flight read may still
+     * settle, but its result is discarded and cannot be injected into a newer turn.
+     */
+    private awaitDomainSupplementReadback<T>(work: Promise<T>, signal: AbortSignal): Promise<T | null> {
+      if (signal.aborted) return Promise.resolve(null);
+      return new Promise<T | null>((resolvePromise) => {
+        let settled = false;
+        const finish = (value: T | null) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener('abort', onAbort);
+          resolvePromise(value);
+        };
+        const onAbort = () => finish(null);
+        signal.addEventListener('abort', onAbort, { once: true });
+        work.then((value) => finish(value), () => finish(null));
+      });
+    }
+
+    private domainSupplementReceipt(
+      startedAt: number,
+      rssBefore: number,
+      recalled: TurnRecall,
+      outcome: DomainSupplementOutcome,
+    ): DomainSupplementReceipt {
+      const result = outcome.result;
+      const supplement = result?.supplement;
+      return {
+        at: new Date().toISOString(),
+        enabled: true,
+        status: outcome.kind === 'finalized' ? 'finalized'
+          : supplement?.queried ? 'fallback' : 'skipped',
+        fallbackReason: outcome.kind === 'finalized' ? null : outcome.reason,
+        baselineStatus: recalled.status,
+        queryHash: supplement?.queryHash ?? null,
+        candidateCount: supplement?.candidateCount ?? 0,
+        verifiedCount: supplement?.verifiedCount ?? 0,
+        consumedCount: supplement?.consumedCount ?? 0,
+        addedSourceCount: result?.addedSourceTuples.length ?? 0,
+        withheldCount: supplement?.withheldCount ?? 0,
+        fallbackCount: supplement?.fallbackCount ?? 0,
+        finalizedSegmentCount: outcome.kind === 'finalized' ? outcome.segments.length : 0,
+        queryCalls: supplement?.budget.queryCalls ?? 0,
+        readbackCalls: supplement?.budget.readbackCalls ?? 0,
+        finalReadbackCalls: supplement?.budget.finalReadbackCalls ?? 0,
+        supplementalChars: supplement?.budget.supplementChars ?? 0,
+        elapsedMs: Math.max(0, Date.now() - startedAt),
+        rssDeltaBytes: Math.max(0, process.memoryUsage().rss - rssBefore),
+      };
     }
 
     private handoffIsProtected(snapshot: readonly ContextRecord[]): boolean {
@@ -2343,7 +3862,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             && memory.sourceCurrentForContext(source.documentId)));
         const sourceMaps = (record.context.sourceMapSpans ?? []).filter((span) => validSpan(text, span)
           && span.origin !== 'unknown-derived'
-          && (span.origin === 'core-generated' || span.origin === 'user-input'
+          && (span.origin === 'core-generated' || span.origin === 'user-input' || span.origin === 'user-config'
             ? !span.exposedSources?.length
             : (span.exposedSources?.length ?? 0) > 0
               && span.exposedSources!.every((source) => memory?.sourceVisible(source.documentId)
@@ -2483,7 +4002,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
      * drops an orphaned output, and reusing both records leaves the original cursor and
      * user-input span intact without replaying the event.
      */
-    protected override handoffTail(snapshot: ContextRecord[]): ContextRecord[] {
+    protected override handoffTail(snapshot: ContextRecord[], afterCursor?: number): ContextRecord[] {
       let latest: { call: ContextRecord; output: ContextRecord } | null = null;
       for (let index = 0; index < snapshot.length; index++) {
         const output = snapshot[index];
@@ -2496,6 +4015,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         const event = events[0];
         if (event.type !== 'desktop-pet.message' || event.source !== 'desktop-pet') continue;
         if (!Number.isInteger(event.cursor) || event.cursor < 0
+          || (afterCursor !== undefined && event.cursor <= afterCursor)
           || !Number.isInteger(event.start) || event.start < 0
           || !Number.isInteger(event.chars) || event.chars <= 0) continue;
         const text = textOf(output);
@@ -2610,11 +4130,30 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
     }
 
     async prepareHandoff(snapshot: ContextRecord[], ctx: ContextHandoffPrepareContext): Promise<PreparedContextHandoff> {
+      const reset = this.pendingForgottenHandoffReset;
+      if (reset?.phase === 'reset-ready') {
+        if (reset.expectedGeneration === ctx.expectedGeneration) {
+          reset.resetCandidateSnapshotId = ctx.candidateSnapshotId;
+          return this.prepareForgottenContextReset(snapshot, ctx, reset);
+        }
+        this.pendingForgottenHandoffReset = null;
+      }
       await this.recoverHandoffFiles();
       const memory = this.longTerm;
+      const rebuild = this.pendingCleanHandoffRebuild;
       const protectedSnapshot = this.handoffIsProtected(snapshot);
-      const expectedMemoryEpoch = memory?.evidenceEpoch() ?? null;
-      const filtered = this.handoffSnapshot(snapshot, ctx.sourceEvidence);
+      const expectedMemoryEpoch = rebuild?.expectedEpoch ?? memory?.evidenceEpoch() ?? null;
+      const cleanExcerpts = rebuild ? this.cleanHandoffSourceExcerpts(snapshot, rebuild) : null;
+      if (rebuild && (!memory || memory.evidenceEpoch() !== rebuild.expectedEpoch || !cleanExcerpts)) {
+        return {
+          result: { tail: [] },
+          protected: true,
+          discard: () => { if (this.pendingCleanHandoffRebuild === rebuild) this.pendingCleanHandoffRebuild = null; },
+        };
+      }
+      const filtered: { records: ContextRecord[]; sourceExcerpts: ContextHandoffSourceExcerpt[] } = rebuild
+        ? { records: [], sourceExcerpts: cleanExcerpts! }
+        : this.handoffSnapshot(snapshot, ctx.sourceEvidence);
       const candidateEvidence = ctx.inspectCandidate(filtered.records, filtered.sourceExcerpts);
       const memorySourcesVerified = !!memory && !!expectedMemoryEpoch && candidateEvidence.mappingState === 'complete'
         && candidateEvidence.exposedSources.length > 0
@@ -2639,9 +4178,18 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         })];
       });
       const noteSnapshot = [...filtered.records, ...excerptRecords];
+      // Workspace reads are task material, not history. Their bodies can be large and are
+      // often folded; keeping them in a handoff note leaves truncated text that cannot be
+      // source-mapped, which would close the next Provider request. The files stay on disk and
+      // can be read again; the note keeps the event and the call, not the file body.
+      const handoffFlowTools = new Set<string>([
+        ...(this.core?.toolsTagged('flow') ?? new Set<string>()),
+        'read_file', 'list_files', 'glob_files', 'grep_files',
+        'memory_search', 'memory_remember', 'memory_correct', 'memory_forget', 'memory_reflect',
+      ]);
       const note = renderHandoffNote(noteSnapshot, {
         speechTools: this.core?.toolsTagged('speak') ?? new Set<string>(),
-        flowTools: this.core?.toolsTagged('flow') ?? new Set<string>(),
+        flowTools: handoffFlowTools,
         snapshotTools: this.core?.toolsTagged('snapshot') ?? new Set<string>(),
         now,
         budgetTokens: Math.floor(maxTokens * keepRatio),
@@ -2765,10 +4313,32 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         throw error;
       }
 
+      if (rebuild && (!memory || !expectedMemoryEpoch
+        || !await memory.verifyExposureSources(candidateEvidence.exposedSources, expectedMemoryEpoch)
+        || memory.evidenceEpoch() !== expectedMemoryEpoch)) {
+        cleanupStage();
+        cleanupOwnedDirs();
+        return {
+          result: { tail: [] },
+          protected: true,
+          discard: () => { if (this.pendingCleanHandoffRebuild === rebuild) this.pendingCleanHandoffRebuild = null; },
+        };
+      }
+
       const commitGuard = (): HandoffCommitCheck => {
         const generation = this.core?.sessionInfo(ctx.sessionId).generation;
         if (!generation || generation.status !== 'current' || generation.token !== ctx.expectedGeneration) {
           return { status: 'stale', reason: 'generation-changed' };
+        }
+        if (rebuild) {
+          const expectedSources = rebuild.sourceRefs.map(handoffSourceProofIdentity).sort().join('\n');
+          const candidateSources = candidateEvidence.exposedSources.map(handoffSourceProofIdentity).sort().join('\n');
+          if (this.pendingCleanHandoffRebuild !== rebuild || !memory
+            || memory.evidenceEpoch() !== rebuild.expectedEpoch || expectedMemoryEpoch !== rebuild.expectedEpoch
+            || expectedSources !== candidateSources || !memory.sourceExposureCurrent(candidateEvidence.exposedSources)
+            || !this.cleanHandoffSourceExcerpts(snapshot, rebuild)) {
+            return { status: 'blocked', reason: 'clean-handoff-source-proof-changed' };
+          }
         }
         if (!stageIdentity || !fileOwner || !handoffFileMatches(stagePath, fileOwner, noteDigest)) {
           return { status: 'blocked', reason: 'staged-candidate-changed' };
@@ -2776,6 +4346,14 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         if (existsSync(join(handoffPath, plannedFilename!))) return { status: 'blocked', reason: 'handoff-target-owned-elsewhere' };
         if (candidateEvidence.mappingState !== 'complete') {
           return { status: 'blocked', reason: 'candidate-source-mapping-incomplete' };
+        }
+        if (ctx.sourceEvidence.exposedSources.length > 0
+          && (!memory || !expectedMemoryEpoch || !memory.enabled() || !memory.settled()
+            || memory.evidenceEpoch() !== expectedMemoryEpoch
+            || ctx.sourceEvidence.exposedSources.some((source) => !memory.sourceVisible(source.documentId)
+              || !memory.sourceCurrentForContext(source.documentId)))) {
+          this.signalForgottenHandoffBlocked(ctx);
+          return { status: 'blocked', reason: 'original-memory-source-dependency-unverified' };
         }
         if (candidateEvidence.exposedSources.length > 0) {
           if (!memory || !expectedMemoryEpoch || !memorySourcesVerified || !memory.enabled() || !memory.settled()
@@ -2834,8 +4412,10 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           throw new Error('Handoff file changed before provenance activation completed.');
         }
         cleanupStage();
+        if (rebuild && persona.pendingCleanHandoffRebuild === rebuild) persona.pendingCleanHandoffRebuild = null;
       };
       const discard = (): void => {
+        if (rebuild && persona.pendingCleanHandoffRebuild === rebuild) persona.pendingCleanHandoffRebuild = null;
         removeOwnedFile(finalPath, finalIdentity);
         memory?.withdrawDerivedArtifact(handoffArtifactId, 'handoff-candidate-discarded');
         finalPath = null;
@@ -2851,7 +4431,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       };
 
       return {
-        result: { tail: this.handoffTail(filtered.records) },
+        result: { tail: rebuild ? this.handoffTail(snapshot) : this.handoffTail(filtered.records) },
         candidate: {
           snapshotId: ctx.candidateSnapshotId,
           records: filtered.records,
@@ -2886,10 +4466,11 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         + 'Whatever from long before you are still following or still mean to do, write it into a file now; soon the context will be gone.';
     }
 
-    override onStallsRecovered({ count, quietMs }: { count: number; quietMs: number }): string | null {
+    override onStallsRecovered({ count, quietMs }: { count: number; quietMs: number }): string | { text: string; sourceMapSpans: SourceMapSpan[] } | null {
       if (count < 2) return null;
       const span = quietMs >= 60_000 ? `about ${Math.round(quietMs / 60_000)} min` : `about ${Math.round(quietMs / 1000)} s`;
-      return `[system] You got stuck ${count} times and could not speak for ${span}; it was not your choice. You can speak again now.`;
+      const text = `[system] You got stuck ${count} times and could not speak for ${span}; it was not your choice. You can speak again now.`;
+      return { text, sourceMapSpans: [{ start: 0, end: text.length, digest: sha256(text), origin: 'core-generated' }] };
     }
 
     private handoffNoteAt(file: string): string {
@@ -2917,20 +4498,13 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       return '[system] You have taken many steps in a row this turn. Finish what is in hand, then call end_turn.';
     }
 
-    protected override prefixWorkspaceFiles(): string[] {
-      const files: string[] = [];
-      for (const name of readdirSync(this.memoryDir).sort()) {
-        if (name.startsWith('.') || name === HANDOFF_DIR.slice(0, -1)) continue;
-        if (statSync(join(this.memoryDir, name)).isDirectory()) files.push(...this.memory.walkFiles(name));
-        else files.push(name);
-      }
-      return files;
-    }
-
+    /**
+     * The prefix names no workspace file. W4 removed the old note index/injection: a filename
+     * listing is not history, and listing every journal or note made the workspace look like a
+     * second memory. File access stays on demand through the workspace tools.
+     */
     protected override prefixWorkspaceListing(): string {
-      const listing = super.prefixWorkspaceListing();
-      const heading = listing === 'Your workspace is empty.' ? 'Files in your workspace:' : listing;
-      return `${heading}\n- ${HANDOFF_DISCOVERY}`;
+      return 'Workspace files are task material, not long-term memory. Use list_files, glob_files or grep_files when the current task needs a file; read_file shows it on demand. For a past event, preference or decision, call memory_search. Use list_files with dir handoffs to find handoff notes; verify a note and its current sources before using it.';
     }
 
     protected override prefixFolds(): Array<{ prefix: string; line: (n: number) => string }> {

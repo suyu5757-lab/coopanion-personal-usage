@@ -4,6 +4,7 @@
  * streaming, with the key in `x-goog-api-key`. Images are limited to the newest delivered batch
  * (`sinceLastDelivery`).
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Logger } from 'cortico/core/types.ts';
 import { nullLogger } from 'cortico/core/util.ts';
 import type { GenerateOptions, Generation } from 'cortico/core/generation.ts';
@@ -13,6 +14,7 @@ import { LLMError } from 'cortico/providers/transport/errors.ts';
 import type { CompatMediaOptions } from 'cortico/providers/transport/history.ts';
 import type { ResponseAssembly } from 'cortico/providers/transport/response-assembly.ts';
 import { sinceLastDelivery } from '../context.ts';
+import type { EffortMap } from '../vendors.ts';
 import { GeminiResponseAssembly, geminiRequest, parseGeminiResponse } from './wire.ts';
 
 export interface GeminiProviderOptions {
@@ -21,10 +23,21 @@ export interface GeminiProviderOptions {
   media?: CompatMediaOptions;
   keepThinking?: () => boolean;
   log?: Logger;
+  /** `bearer` sends `Authorization` instead of Gemini's own `x-goog-api-key`. */
+  auth?: 'api-key' | 'bearer';
+  /** Headers every request carries. */
+  extraHeaders?: Record<string, string>;
+  /** Headers that depend on the request, such as a conversation's session id. */
+  requestHeaders?: (options: GenerateOptions) => Record<string, string> | undefined;
+  /** Validates the URL assembled for this request before the transport runs. */
+  requestUrlGuard?: (url: string, request: Request, options: GenerateOptions) => void;
+  /** The effort values the service takes for a model, where they differ from the levels. */
+  effort?: (model: string) => EffortMap | undefined;
 }
 
 export class GeminiProvider extends OpenAIHttpClient {
   private readonly opts: GeminiProviderOptions;
+  private readonly requestHeaders = new AsyncLocalStorage<Record<string, string>>();
 
   constructor(opts: GeminiProviderOptions) {
     super(opts.baseUrl, opts.log ?? nullLogger());
@@ -39,12 +52,14 @@ export class GeminiProvider extends OpenAIHttpClient {
   override respond(request: Request, options: GenerateOptions = {}): Promise<Generation> {
     const method = options.onEvent ? 'streamGenerateContent?alt=sse' : 'generateContent';
     this.chatPath = `/models/${encodeURIComponent(request.model ?? '')}:${method}`;
-    return super.respond(request, options);
+    this.opts.requestUrlGuard?.(this.baseUrl + this.chatPath, request, options);
+    const headers = this.opts.requestHeaders?.(options);
+    return headers ? this.requestHeaders.run(headers, () => super.respond(request, options)) : super.respond(request, options);
   }
 
   protected override buildResponseBody(request: Request, options: GenerateOptions): Record<string, unknown> {
     const limited = options.context ? { ...options, context: sinceLastDelivery(options.context) } : options;
-    return geminiRequest(request, limited, { media: this.opts.media, keepThinking: this.opts.keepThinking });
+    return geminiRequest(request, limited, { media: this.opts.media, keepThinking: this.opts.keepThinking, effort: this.opts.effort?.(request.model ?? '') });
   }
 
   /** The body is built whole in `buildResponseBody`. */
@@ -60,7 +75,14 @@ export class GeminiProvider extends OpenAIHttpClient {
 
   protected headers(): Record<string, string> {
     if (!this.opts.apiKey) throw new LLMError('Gemini API 缺密钥(端点的密钥变量未设置)', 401, '');
-    return { 'Content-Type': 'application/json', 'x-goog-api-key': this.opts.apiKey };
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...this.opts.extraHeaders,
+      ...this.requestHeaders.getStore(),
+    };
+    if (this.opts.auth === 'bearer') headers.Authorization = `Bearer ${this.opts.apiKey}`;
+    else headers['x-goog-api-key'] = this.opts.apiKey;
+    return headers;
   }
 }
 

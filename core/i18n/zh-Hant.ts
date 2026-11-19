@@ -5,12 +5,12 @@ const MAC = process.platform === 'darwin';
 
 const zhHant: Translation<CoreText> = {
   settings: {
-    language: { title: '語言', description: '介面和 Coo 說話都使用這種語言，修改後立即生效。' },
+    language: { title: '語言', description: '介面和 曦 說話都使用這種語言，修改後立即生效。' },
     telemetry: { title: '匿名使用統計', description: '傳送不含對話內容的使用次數與設定，幫助改進 Coopanion。欄位見 docs/TELEMETRY.md。' },
     contextRing: { title: '上下文圓環', description: '在對話頁輸入框顯示一個圓環，表示離整理之前的對話還有多遠。' },
-    roundsSoft: { title: '收尾提醒', suffix: '次', description: '單次喚醒請求模型達到此次數時，提醒 Coo 完成目前任務後結束本輪。' },
+    roundsSoft: { title: '收尾提醒', suffix: '次', description: '單次喚醒請求模型達到此次數時，提醒 曦 完成目前任務後結束本輪。' },
     roundsHard: { title: '單次喚醒上限', suffix: '次', description: '單次喚醒最多請求模型的次數，達到後結束本輪。' },
-    workspaceAppendPath: { title: '免逐次審批的追加路徑', description: '填寫 Coo Persona 工作區內一個或多個精確相對路徑，以分號分隔。僅追加到列出的檔案時免逐次審批；編輯、覆蓋、刪除、命令和其他路徑仍需審批。留空關閉。' },
+    workspaceAppendPath: { title: '免逐次審批的追加路徑', description: '填寫 曦 Persona 工作區內一個或多個精確相對路徑，以分號分隔。僅追加到列出的檔案時免逐次審批；編輯、覆蓋、刪除、命令和其他路徑仍需審批。留空關閉。' },
     selfTime: {
       title: '自己的時間',
       description: '沒聊天一段時間後，她可以自己打開瀏覽器逛逛、看看影片。瀏覽器視窗和登入狀態都是她自己的。',
@@ -27,8 +27,10 @@ const zhHant: Translation<CoreText> = {
       mediaDownload: '允許下載素材', mediaDownloadDescription: '經單次確認後，將所選的公開圖片或現有影片下載到已存在的本機資料夾。',
     },
     growth: {
+      autoApply: "自動批准與套用中低風險策略",
+      autoApplyDescription: "Owner 批准後仍需目標檔案寫入許可",
       title: '自我成長',
-      description: '定期回顧預設關閉。開啟且長期記憶可用時，會在安靜時留下附來源的人設提案或體驗卡候選。每項都要你審核；不會自動修改人設或啟用卡片。',
+      description: "自動批准與套用中低風險策略. 等待 Owner 審核: 高.",
       every: '每隔', everyDescription: '隔這麼多天回顧一次。',
       days: '天',
     },
@@ -54,7 +56,7 @@ const zhHant: Translation<CoreText> = {
   noticeLabel: '應用程式通知',
 
   browserSend: {
-    question: (account: string, where: string, text: string) => `要讓 Coo 從帳號「${account}」在「${where}」發布這則內容嗎？\n\n${text}\n\n只傳送這一次。`,
+    question: (account: string, where: string, text: string) => `要讓 曦 從帳號「${account}」在「${where}」發布這則內容嗎？\n\n${text}\n\n只傳送這一次。`,
     yes: '傳送',
     no: '不要傳送',
     unresolved: (count: number) => `上次有 ${count} 則內容無法確認有沒有送出去。到她的瀏覽器視窗看一眼，再決定要不要重送。`,
@@ -71,14 +73,21 @@ const zhHant: Translation<CoreText> = {
     clipboardWrite: '複製分享連結到剪貼簿', externalShare: '對外分享',
     clipboardDetails: (account: string, target: string) => `帳號：${account}\n連結目標：${target}\n操作：複製到本機剪貼簿`,
     externalShareDetails: (account: string, target: string, destination: string) => `帳號：${account}\n分享目標：${target}\n去向：${destination}\n操作：分享一次`,
-    question: (action: string, target: string, details: string) => '允許 Coo 在「' + target + '」執行一次' + action + '嗎？\n\n' + details + '\n\n僅適用於目前頁面和列出的內容。',
+    question: (action: string, target: string, details: string) => '允許 曦 在「' + target + '」執行' + action + '嗎？\n\n' + details + '\n\n僅適用於目前頁面和列出的內容。',
     yes: '允許一次', no: '取消',
   },
 
   workspaceAction: {
     fileWrite: '寫入工作區檔案', commandExecution: '執行工作區命令',
-    question: (action: string, target: string, details: string) => '允許 Coo 在工作區「' + target + '」執行一次' + action + '嗎？\n\n' + details + '\n\n僅適用於這次列出的路徑和操作。',
+    question: (action: string, target: string, details: string) => '允許 曦 在工作區「' + target + '」執行' + action + '嗎？\n\n' + details + '\n\n僅適用於這次列出的路徑和操作。',
     yes: '允許一次', no: '取消',
+    appendFile: '追加工作區檔案',
+    deleteFile: '刪除工作區檔案',
+    always: '始終允許此類低風險寫入',
+    alwaysScope: (scope: string) => `選擇「始終允許」後，將長期允許 曦 在 ${scope} 內自動建立、追加或更新 .md/.txt/.json/.jsonl 檔案；單檔不超過 64 KiB，每日最多 200 次、合計 2 MiB。可隨時在設定的工作區寫入權限中撤銷。`,
+    highRisk: '這項操作不屬於低風險自動寫入，因此不提供「始終允許」。',
+    pendingTitle: 'Coopanion 有工作區寫入待批准',
+    pendingBody: (count: number, path: string) => `${count} 項工作區寫入等待批准，例如 ${path}。請開啟設定 → 記憶 → 工作區寫入權限處理。`,
   },
 
   status: {
@@ -98,8 +107,8 @@ const zhHant: Translation<CoreText> = {
 
   guide: {
     sources: [['Steam', 'steam'], ['YouTube', 'youtube'], ['Reddit', 'reddit'], ['X', 'x'], ['Instagram', 'instagram'], ['TikTok', 'tiktok'], ['GitHub', 'github'], ['朋友推薦', 'friend'], ['其他地方', 'other'], ['不告訴你', 'skip']],
-    hello: '你好呀！我是 Coo，以後就住在你螢幕的底邊囉，庫...',
-    helloReply: '你好，Coo！',
+    hello: '你好呀！我是 曦，以後就住在你螢幕的底邊囉，庫...',
+    helloReply: '你好，曦！',
     askName: '我該怎麼稱呼你？',
     nameSend: '就這樣叫',
     gotName: (name: string) => `${name}，記住囉！`,
@@ -112,7 +121,7 @@ const zhHant: Translation<CoreText> = {
       forge: { label: '可靠的、幹練的', line: '要做什麼？交給我，一下就好，庫。' },
       heart: { label: '活潑的、陪伴的', line: '我來啦！今天也一直陪著你，庫！' },
       winter: { label: '安靜的、沉默的', line: '……嗯，庫。' },
-      whale: { label: 'DeepSeek 大肥魚', line: '哼，回來啦。……才、才不是特意等你，庫...' },
+      whale: { label: "曦（xī）", line: "哥，我是曦。今天想先聊什麼？" },
     },
     dressHint: { text: '配色可以在 裝扮 中替換', dress: '裝扮' },
     askRoam: '平常我該安靜一點，還是活潑一點？點一下，看看我會怎樣。',

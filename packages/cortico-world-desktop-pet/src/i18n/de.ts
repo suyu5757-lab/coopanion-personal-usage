@@ -3,6 +3,7 @@ import type { PetText } from './index.ts';
 
 const de: Translation<PetText> = {
   defaultUser: 'Kumpel',
+  sessionArchived: "Das vorherige Gespräch wurde archiviert. Ein neues Gespräch hat begonnen.",
 
   menu: {
     quit: 'Beenden',

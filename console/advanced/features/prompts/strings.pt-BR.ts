@@ -36,6 +36,12 @@ export const S: Partial<typeof en> = {
   undoAll: "Reverter todas as alterações",
   undoAllHint: "Restaura o último conteúdo salvo. Desfazer permite recuperar as alterações.",
   saveToFile: "Salvar",
+  attestLocal: "Confirmar configuração local",
+  attestTitle: "Confirmar a configuração local atual",
+  attestBody: "Registra o resumo e a hora dos arquivos de personalidade locais atuais como uma confirmação feita nos Ajustes. Isso não vira algo que você disse na conversa nem é gravado na memória de longo prazo. Editar um arquivo depois exige confirmar de novo.",
+  attestDone: (n: number) => `${n} arquivo(s) de configuração local confirmado(s).`,
+  attestNone: "Não há configuração local para confirmar; estas são as versões integradas.",
+  attestFailed: (msg: string) => `Falha ao confirmar: ${msg}`,
   // index.ts
   title: 'Prompt de sistema',
   introDesc: "Ctrl+S salva os modelos; “Aplicar agora” atualiza o prompt da conversa atual. Seções geradas são somente leitura.",

@@ -32,6 +32,7 @@ export interface GrowthScheduleDeps {
   config: () => GrowthConfig;
   timers: TimersApi;
   run: () => Promise<void | GrowthRunResult>;
+  cancel?: () => void;
   now?: () => Date;
   log?: GrowthLog;
   /** True while the app is paused: no background review starts. */
@@ -127,6 +128,7 @@ export class GrowthSchedule {
       this.start();
       return;
     }
+    if (!this.d.config().enabled || this.d.paused?.()) this.d.cancel?.();
     try {
       this.reload(true);
     } catch (err) {
@@ -142,21 +144,25 @@ export class GrowthSchedule {
   /** Runs one review when it is due and quiet. Returns whether a review ran. */
   async check(): Promise<boolean> {
     const config = this.d.config();
-    if (!config.enabled || !(this.d.allowed?.() ?? true) || this.running || !this.state || this.d.paused?.()) return false;
+    if (!config.enabled || !(this.d.allowed?.() ?? true) || this.d.paused?.()) {
+      if (this.running) this.d.cancel?.();
+      return false;
+    }
+    if (this.running || !this.state) return false;
     if (this.d.forkRunning?.()) return false;
     const now = this.now();
     if (Date.parse(this.state.nextReviewAt) > now.getTime()) return false;
     if (now.getTime() - this.lastActivityAt < QUIET_MS) return false;
-    this.running = true;
     const runId = randomUUID();
     this.save({ ...this.state, activeRunId: runId, activeStartedAt: now.toISOString() });
+    this.running = true;
     this.log?.info('[growth] self-review started', { dueAt: this.state.nextReviewAt, runId });
     try {
       const result = await this.d.run();
       const finishedAt = this.now();
       this.save({
-        lastReviewAt: finishedAt.toISOString(),
-        nextReviewAt: addDays(finishedAt, config.everyDays),
+        lastReviewAt: result?.cancelled ? this.state.lastReviewAt : finishedAt.toISOString(),
+        nextReviewAt: result?.cancelled ? new Date(finishedAt.getTime() + RETRY_MS).toISOString() : addDays(finishedAt, config.everyDays),
         lastStatus: result?.cancelled ? 'failed' : 'ok',
         ...(result?.cancelled ? { lastError: result.cancellationStatus === 'unknown'
           ? 'Core cancellation timed out; tracked fork work remains unresolved'
@@ -245,11 +251,12 @@ export class GrowthSchedule {
   }
 
   private save(state: GrowthState): void {
-    this.state = state;
     try {
       writeState(this.d.stateFile, `${JSON.stringify(state, null, 2)}\n`);
+      this.state = state;
     } catch (err) {
       this.log?.warn('[growth] could not save the review schedule', { err: err instanceof Error ? err.message : String(err) });
+      throw err;
     }
   }
 

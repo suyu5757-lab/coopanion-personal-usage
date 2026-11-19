@@ -15,6 +15,9 @@ import { partnerProvenancePath, partnerSegmentDigest, partnerWorkspaceDigest, wr
 const CoopanionPersona = coopanionPersona(Cormini);
 const ctx = { role: 'main', log: { emit: () => {}, warn: () => {}, error: () => {}, info: () => {}, debug: () => {} } } as never;
 const git = (dir: string, ...args: string[]) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8' }).trim();
+const toolText = (value: unknown): string => typeof value === 'string'
+  ? value
+  : String((value as { text?: unknown } | null)?.text ?? '');
 
 function persona(growthStateFile?: string) {
   const dir = mkdtempSync(join(tmpdir(), 'coo-persona-'));
@@ -31,14 +34,14 @@ describe.skipIf(!gitInstalled())('Coo’s workspace history', () => {
       p.snapshot('1.0.0');
       symlinkSync('.git', join(dir, 'git-history'));
 
-      expect(String(await run('read_file', { path: '.git/HEAD' }))).toContain('Git metadata is not available through workspace tools');
-      expect(String(await run('read_file', { path: 'notes/../.git/HEAD' }))).toContain('Git metadata is not available through workspace tools');
-      expect(String(await run('read_file', { path: 'git-history/HEAD' }))).toContain('Git metadata is not available through workspace tools');
-      expect(String(await run('grep_files', { pattern: 'checkpoint0', path: '.git' }))).toContain('Git metadata is not available through workspace tools');
-      expect(String(await run('glob_files', { glob_pattern: '*', target_directory: '.git' }))).toContain('Git metadata is not available through workspace tools');
-      expect(String(await run('list_files', { dir: '.git' }))).toContain('Git metadata is not available through workspace tools');
-      expect(String(await run('write_file', { path: '.git/HEAD', content: 'damaged' }))).toContain('Git metadata is not available through workspace tools');
-      expect(String(await run('delete_file', { path: '.git/HEAD' }))).toContain('Git metadata is not available through workspace tools');
+      expect(toolText(await run('read_file', { path: '.git/HEAD' }))).toContain('Git metadata is not available through workspace tools');
+      expect(toolText(await run('read_file', { path: 'notes/../.git/HEAD' }))).toContain('Git metadata is not available through workspace tools');
+      expect(toolText(await run('read_file', { path: 'git-history/HEAD' }))).toContain('Git metadata is not available through workspace tools');
+      expect(toolText(await run('grep_files', { pattern: 'checkpoint0', path: '.git' }))).toContain('Git metadata is not available through workspace tools');
+      expect(toolText(await run('glob_files', { glob_pattern: '*', target_directory: '.git' }))).toContain('Git metadata is not available through workspace tools');
+      expect(toolText(await run('list_files', { dir: '.git' }))).toContain('Git metadata is not available through workspace tools');
+      expect(toolText(await run('write_file', { path: '.git/HEAD', content: 'damaged' }))).toContain('Git metadata is not available through workspace tools');
+      expect(toolText(await run('delete_file', { path: '.git/HEAD' }))).toContain('Git metadata is not available through workspace tools');
       rmSync(join(dir, 'git-history'));
       expect(git(dir, 'status', '--porcelain')).toBe('');
     } finally {
@@ -108,10 +111,10 @@ describe('PARTNER.md', () => {
       const readText = typeof read === 'string' ? read : (read as { text?: string }).text ?? '';
       expect(readText).toContain('[read failed] PARTNER.md paragraphs are withheld');
       expect(readText).not.toContain('Likes cats. Works late.');
-      const grep = String(await run('grep_files', { pattern: 'cats', path: '.' }));
+      const grep = toolText(await run('grep_files', { pattern: 'cats', path: '.' }));
       expect(grep).toContain('[search failed]');
       expect(grep).not.toContain('Likes cats.');
-      expect(String(await run('delete_file', { path: PARTNER_FILE }))).toContain('[delete failed]');
+      expect(toolText(await run('delete_file', { path: PARTNER_FILE }))).toContain('[delete failed]');
     } finally {
       rmSync(workspace, { recursive: true, force: true });
       rmSync(stateDir, { recursive: true, force: true });
@@ -124,12 +127,12 @@ describe('PARTNER.md', () => {
       mkdirSync(join(dir, 'agenda'));
       writeFileSync(join(dir, 'agenda', 'now.md'), 'Synthetic task note: prepare the project outline.');
 
-      const read = String(await run('read_file', { path: 'agenda/now.md' }));
-      const search = String(await run('grep_files', { pattern: 'project outline', path: 'agenda' }));
+      const read = toolText(await run('read_file', { path: 'agenda/now.md' }));
+      const search = toolText(await run('grep_files', { pattern: 'project outline', path: 'agenda' }));
 
-      expect(read).toContain('[workspace artifact; path="agenda/now.md"; historicalEvidence=unverified]');
+      expect(read).toContain('[workspace artifact; path="agenda/now.md"; historicalEvidence=unverified; workspaceMaterial=1]');
       expect(read).toContain('Synthetic task note: prepare the project outline.');
-      expect(search).toContain('[workspace artifact; path="agenda"; historicalEvidence=unverified]');
+      expect(search).toContain('[workspace artifact; path="agenda"; historicalEvidence=unverified; workspaceMaterial=1]');
       expect(search).toContain('Synthetic task note: prepare the project outline.');
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -145,7 +148,7 @@ describe('PARTNER.md', () => {
       expect(prefix).not.toContain('Legacy private note.');
       expect(prefix).toContain('provenance sidecar is missing');
       expect(prefix).toContain('unknown, not false');
-      expect(String(await run('read_file', { path: PARTNER_FILE }))).not.toContain('Legacy private note.');
+      expect(toolText(await run('read_file', { path: PARTNER_FILE }))).not.toContain('Legacy private note.');
     } finally {
       rmSync(dir, { recursive: true, force: true });
       rmSync(stateDir, { recursive: true, force: true });
@@ -304,7 +307,7 @@ describe('Core-gated Persona workspace writes', () => {
 
       writeFileSync(join(workspace, 'note.md'), 'approved content');
       alterBeforeApproval = true;
-      expect(String(await run('write_file', { path: 'note.md', content: 'new content' }))).toContain('changed before dispatch');
+      expect(toolText(await run('write_file', { path: 'note.md', content: 'new content' }))).toContain('changed before dispatch');
       expect(readFileSync(join(workspace, 'note.md'), 'utf8')).toBe('changed elsewhere');
       expect(receipts().at(-1)).toMatchObject({ phase: 'cancelled', outcome: 'cancelled' });
     } finally {
