@@ -543,6 +543,108 @@ function startItem(it) {
   }
 }
 
+/* ---------- E12 voice clock: the bubble types with the audible voice ---------- */
+const e12Clock = { at: 0, busy: false, data: null, gotAt: 0 };
+function pollE12Clock() {
+  const now = performance.now();
+  if (e12Clock.busy || now - e12Clock.at < 200) return;
+  e12Clock.busy = true; e12Clock.at = now;
+  fetch('/api/clock', { cache: 'no-store' })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((d) => { e12Clock.data = d; e12Clock.gotAt = performance.now(); })
+    .catch(() => { e12Clock.data = null; })
+    .finally(() => { e12Clock.busy = false; });
+}
+/** One beat's voice-follow state: matched worker jobs and the text they cover. */
+function makeE12Sync(text, now) {
+  return { text, jobs: new Map(), jobEnd: 0, matched: false, active: false, lastProgressAt: now, lastShown: 0,
+    epoch: e12Clock.data?.epoch ?? null, startedAt: now, off: false };
+}
+function paintBubble(it, text) {
+  const p = bubble.querySelector('.b-text');
+  if (!p) return;
+  if (it.marks?.length) p.innerHTML = marked(text, it.shown, it.marks);
+  else p.replaceChildren(linked(text, it.shown));
+}
+function fireBeatAnchors(it, b) {
+  while (it.fired < (b.anchors?.length || 0) && b.anchors[it.fired].at <= it.shown) acts.push(...b.anchors[it.fired++].actions);
+}
+/**
+ * Follow the worker's playback clock. Returns true while the voice drives the text;
+ * false only when no matching job appeared in time, so the caller can use the old 20 chars/s.
+ */
+function stepSayWithVoice(it, b, dt) {
+  const s = it.sync;
+  if (!s || s.off) return false;
+  pollE12Clock();
+  const fresh = e12Clock.data && performance.now() - e12Clock.gotAt < 1500 ? e12Clock.data : null;
+  if (fresh && fresh.epoch !== undefined) {
+    if (s.epoch === null) s.epoch = fresh.epoch;
+    else if (fresh.epoch !== s.epoch) {
+      // hush increments the worker epoch. Before this bubble has a job, a new turn's hush just
+      // changes the epoch to adopt; once its job is playing, an epoch change means it was cut.
+      if (s.active) { it.beatDone = true; it.holdUntil = T; return true; }
+      s.epoch = fresh.epoch;
+    }
+  }
+  let reveal = -1;
+  if (fresh && fresh.ok !== false) {
+    const jobs = [];
+    if (fresh.current) jobs.push(fresh.current);
+    for (const q of fresh.queue || []) jobs.push(q);
+    const seen = new Set();
+    for (const job of jobs) {
+      if (!job || typeof job.text !== 'string' || !job.text) continue;
+      seen.add(job.id);
+      let rec = s.jobs.get(job.id);
+      if (!rec) {
+        const idx = s.text.indexOf(job.text, s.jobEnd);
+        if (idx < 0) continue;
+        rec = { idx, len: job.text.length };
+        s.jobs.set(job.id, rec);
+        if (fresh.current && fresh.current.id === job.id) { s.matched = true; s.active = true; }
+        s.jobEnd = Math.max(s.jobEnd, idx + rec.len);
+      }
+      const current = !!fresh.current && fresh.current.id === job.id;
+      if (current) { s.active = true; s.lastProgressAt = T; }
+      if (current && !job.done) {
+        const cps = Number(fresh.cps) || 4.8;
+        // Owner 2026-11-19: a touch ahead of the voice (6% + 1 char); the last char still waits for done
+        const shown = Math.floor((Number(job.elapsed) || 0) * cps * 1.06) + 1;
+        reveal = Math.max(reveal, rec.idx + Math.min(rec.len - 1, shown));
+        break;
+      }
+      if (job.done) { reveal = Math.max(reveal, rec.idx + rec.len); continue; }
+      break;
+    }
+    // a matched job that left the clock has ended (or was cancelled): show its text and move on
+    for (const [id, rec] of s.jobs) if (!seen.has(id)) reveal = Math.max(reveal, rec.idx + rec.len);
+  }
+  if (reveal > it.shown) {
+    it.shown = Math.min(b.text.length, reveal);
+    s.lastShown = it.shown;
+    s.lastProgressAt = T;
+    paintBubble(it, b.text);
+    fireBeatAnchors(it, b);
+  }
+  if (it.shown >= b.text.length) {
+    it.beatDone = true;
+    it.holdUntil = T + .45;
+    return true;
+  }
+  if (s.active && T - s.lastProgressAt > 2.5) { it.beatDone = true; it.holdUntil = T + .2; return true; }
+  if (s.matched) return true;
+  // the worker has not reached this bubble yet: start at the voice's pace, then fall back if it never comes
+  if (T - s.startedAt < 1.6) {
+    it.acc += dt * 4.8;
+    while (it.acc >= 1 && it.shown < b.text.length) { it.shown++; it.acc -= 1; }
+    if (it.shown > 0) { paintBubble(it, b.text); fireBeatAnchors(it, b); }
+    return true;
+  }
+  s.off = true;
+  return false;
+}
+
 function stepDialog(dt) {
   if (!item && queue.length && at() && !at().busy) startItem(queue.shift());
   const it = item;
@@ -557,14 +659,17 @@ function stepDialog(dt) {
       const b = it.beats[it.i];
       let lead = 0;
       for (const a of b.actions || []) { acts.push(a); lead = .45; }
-      it.shown = 0; it.acc = 0; it.fired = 0; it.startAt = T + lead;
+      it.shown = 0; it.acc = 0; it.fired = 0; it.startAt = T + lead; it.sync = null; it.syncBeat = -1;
       if (b.text) { openBubble('say', '<p class="b-text"></p>'); sfx.pop(); } else { bubble.hidden = true; }
       return;
     }
     const b = it.beats[it.i];
     if (T < it.startAt) return;
     if (!b.text) { it.beatDone = true; it.holdUntil = T + .8 / prefs.bubbleSpeed; return; }
-    typeText(it, b.text, dt, b.anchors || []);
+    if (it.syncBeat !== it.i) { it.syncBeat = it.i; it.sync = makeE12Sync(b.text, T); }
+    const voiced = stepSayWithVoice(it, b, dt);
+    if (it.beatDone) return;
+    if (!voiced) typeText(it, b.text, dt, b.anchors || []);
     if (it.shown >= b.text.length && !it.beatDone) {
       it.beatDone = true;
       const last = it.i === it.beats.length - 1;

@@ -849,14 +849,33 @@ export class DesktopPetWorld implements World {
       this.spokenThisTurn.clear();
       void this.closeActivity();
       const visible = replies.filter((reply) => !spoken.has(reply.text.trim()));
-      for (const reply of visible) {
-        this.server.sendPet({ t: 'say', beats: [{ text: reply.text, actions: [], anchors: [] }] });
-      }
+      for (const reply of visible) void this.sendAssistantBubble(reply.text);
       if (visible.length > 0) this.assistantFlush = this.assistantFlush.then(async () => {
         for (const reply of visible) await this.record({ kind: 'assistant', responseId: reply.responseId }, reply.text);
       }).catch((err: unknown) => this.log?.warn(`回复没能保存:${(err as Error).message}`));
     }
     this.chat.broadcast({ t: 'phase', phase });
+  }
+
+  /**
+   * The assistant's plain reply is a bubble too. Wait until its own E12 audio starts before showing it,
+   * so a long pet_say bubble is not replaced while its voice is still speaking. With no voice worker
+   * (or another TTS) the clock answers nothing and the bubble shows at once.
+   */
+  private async sendAssistantBubble(text: string): Promise<void> {
+    const started = Date.now();
+    while (Date.now() - started < 60_000) {
+      try {
+        const res = await fetch('http://127.0.0.1:9882/clock', { signal: AbortSignal.timeout(600) });
+        if (!res.ok) break;
+        const clock = await res.json() as { playing?: boolean; current?: { text?: string } | null };
+        const current = clock.current?.text ?? '';
+        if (!clock.playing || !current) break;
+        if (current.includes(text) || text.includes(current)) break;
+      } catch { break; }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    this.server.sendPet({ t: 'say', beats: [{ text, actions: [], anchors: [] }] });
   }
 
   /**

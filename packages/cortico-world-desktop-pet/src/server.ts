@@ -342,6 +342,17 @@ export class PetServer {
       return this.sendFile(res, full, PACK_CSP, req.headers.origin === 'null');
     }
     if (req.method === 'GET' && path === '/api/state') return json(res, 200, this.opts.snapshot());
+    // The E12 voice worker's playback clock, proxied so the pet page can type with the audible voice.
+    // It is read-only, loopback-only, and answers {"playing":false} while the voice is off.
+    if (req.method === 'GET' && path === '/api/clock') {
+      const target = process.env.COOPANION_MLX_URL || 'http://127.0.0.1:9882';
+      try {
+        const r = await fetch(`${target}/clock`, { signal: AbortSignal.timeout(500) });
+        return json(res, 200, r.ok ? await r.json() : { playing: false, current: null, queue: [] });
+      } catch {
+        return json(res, 200, { playing: false, current: null, queue: [] });
+      }
+    }
     if (req.method === 'GET' && path === '/api/avatar') {
       const bytes = this.opts.avatarFile ? await readFile(this.opts.avatarFile).catch(() => null) : null;
       if (!bytes) { res.writeHead(404).end(); return; }
