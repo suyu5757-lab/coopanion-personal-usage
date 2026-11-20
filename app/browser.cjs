@@ -17,7 +17,7 @@
  * and non-proxied WebRTC UDP are blocked.
  */
 const { app, BrowserWindow, screen, session } = require('electron');
-const { createHmac, randomBytes, randomUUID } = require('node:crypto');
+const { createHash, createHmac, randomBytes, randomUUID } = require('node:crypto');
 const { closeSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync } = require('node:fs');
 const { dirname, join } = require('node:path');
 const { MAX_IMAGE_BYTES, generatedImagePath, isChatGPTImageDownloadUrl, isChatGPTPageUrl, verifyGeneratedImage } = require('./browser-image-download.cjs');
@@ -119,6 +119,7 @@ function sameMediaRequestUrl(left, right) {
 function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () => null, partition = PARTITION, resolveHostForUrl }) {
   /** @type {import('electron').BrowserWindow | null} */
   let win = null;
+  let lastReadWasCdp = false;
   /** Whether the page script is present in the current document. */
   let injected = false;
   /** Whether the person's setting wants the tab silent. */
@@ -610,20 +611,107 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
 
   const waitForLoad = async (start, settleMs = SETTLE_MS) => {
     if (!win || win.isDestroyed()) throw new Error('browser window is closed');
+    const wc = win.webContents;
     let timer;
-    await Promise.race([
-      start.then(() => true),
+    let onDomReady;
+    const domReady = new Promise((resolve) => {
+      onDomReady = () => resolve('dom-ready');
+      wc.once('dom-ready', onDomReady);
+    });
+    const safeStart = start.then(() => 'load').catch((err) => {
+      if (err && typeof err.code === 'string' && err.code === 'ERR_ABORTED') return 'aborted-redirect';
+      if (err && err.errno === -3) return 'aborted-redirect';
+      throw err;
+    });
+    const winner = await Promise.race([
+      safeStart,
+      domReady,
       new Promise((_, fail) => { timer = setTimeout(() => fail(new Error('page load timed out')), LOAD_TIMEOUT_MS); }),
-    ]).finally(() => clearTimeout(timer));
-    await sleep(settleMs);
+    ]).finally(() => {
+      clearTimeout(timer);
+      if (onDomReady && !wc.isDestroyed()) wc.removeListener('dom-ready', onDomReady);
+    });
+    // Prevent late unhandled rejection if dom-ready won before a redirect aborted loadURL.
+    start.catch(() => undefined);
+    await sleep(winner === 'dom-ready' ? Math.max(settleMs, 1400) : settleMs);
+  };
+
+  /** Native Electron CDP Accessibility.getFullAXTree read-only fallback when heavy SPA JS blocks executeJavaScript. */
+  const cdpReadState = async () => {
+    if (!win || win.isDestroyed()) throw new Error('browser window is closed');
+    const wc = win.webContents;
+    const dbg = wc.debugger;
+    const attachedHere = !dbg.isAttached();
+    if (attachedHere) dbg.attach('1.3');
+    try {
+      const res = await within(() => dbg.sendCommand('Accessibility.getFullAXTree', { depth: 8 }), 6000, 'cdp axtree');
+      const nodes = Array.isArray(res?.nodes) ? res.nodes : [];
+      const url = wc.getURL() || '';
+      let title = (wc.getTitle() || '').trim();
+      const interactiveRoles = new Set(['button', 'link', 'textbox', 'searchbox', 'tab', 'menuitem', 'checkbox', 'radio', 'combobox']);
+      const lines = [];
+      const seenLines = new Set();
+      const controls = [];
+      for (const node of nodes) {
+        if (!node || node.ignored) continue;
+        const role = String(node.role?.value || '').toLowerCase();
+        const name = String(node.name?.value || '').replace(/\s+/g, ' ').trim();
+        if (role === 'rootwebarea' && name && !title) title = name;
+        if (!name || name.length < 2) continue;
+        if (interactiveRoles.has(role) && controls.length < 60) {
+          controls.push({ role, accessibleName: name.slice(0, 120), backendDOMNodeId: node.backendDOMNodeId, frameId: node.frameId });
+        }
+        const textLine = interactiveRoles.has(role) ? `[${role}] ${name}` : name;
+        if (!seenLines.has(textLine) && lines.length < 120) {
+          seenLines.add(textLine);
+          lines.push(textLine.slice(0, 200));
+        }
+      }
+      const [vw, vh] = win.getContentSize();
+      const snapshotId = `cdp-${createHash('sha256').update(`${url}|${title}|${lines.length}|${Date.now()}`).digest('hex').slice(0, 12)}`;
+      const header = `[CDP AXTree 只读模式: 页面主线程繁忙，已通过 Chromium 原生无障碍树读取，共提取 ${lines.length} 条文本 / ${controls.length} 个 AX 控件（只读）]`;
+      const content = `${header}\n${lines.join('\n')}`.slice(0, 6000);
+      return {
+        url,
+        title: title || url,
+        viewport: { width: vw || 1100, height: vh || 700 },
+        page: { width: vw || 1100, height: vh || 700, pagesAbove: 0, pagesBelow: 0, totalPages: 1, percent: 0 },
+        content,
+        elements: [],
+        controls,
+        snapshotId,
+        mediaTargets: [],
+        cdpFallback: true,
+      };
+    } finally {
+      if (attachedHere && dbg.isAttached()) {
+        try { dbg.detach(); } catch { /* ignore */ }
+      }
+    }
+  };
+
+  const readStateWithCdpFallback = async () => {
+    try {
+      await ensureAgent();
+      const result = await state();
+      lastReadWasCdp = false;
+      return result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/timed out|page script|not ready/i.test(msg)) {
+        log.warn('[browser] DOM agent timed out; falling back to native CDP AXTree', { error: msg });
+        lastReadWasCdp = true;
+        return cdpReadState();
+      }
+      throw err;
+    }
   };
 
   /** After an action that may navigate or redraw: wait for the load, inject again, and read the page. */
   const settle = async () => {
     for (let i = 0; i < 50 && win && !win.isDestroyed() && (navigating || win.webContents.isLoading()); i++) await sleep(200);
     await sleep(SETTLE_MS);
-    await ensureAgent();
-    return state();
+    return readStateWithCdpFallback();
   };
 
   const collectState = async () => {
@@ -902,8 +990,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       .then(() => { navigating = false; })
       .catch((error) => { navigating = false; throw error; });
     await waitForLoad(loaded, settleMs);
-    await ensureAgent();
-    return state();
+    return readStateWithCdpFallback();
   };
 
   const capture = async () => {
@@ -1555,7 +1642,13 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
         restoreMute();
       }
     }
-    if (op === 'read') { await ensureAgent(); return state(); }
+    if (op === 'read') { return readStateWithCdpFallback(); }
+    const targetsControl = op === 'element' || op === 'resolveLocator' || op === 'input' || op === 'hover'
+      || ((op === 'click' || op === 'scroll' || op === 'press') && message.index != null);
+    const requestedSnapshotId = message.snapshotId ?? message.expectedSnapshotId;
+    if (requestedSnapshotId?.startsWith?.('cdp-') || (lastReadWasCdp && targetsControl)) {
+      throw new Error('read_only_unactionable: read the current DOM before using a control target');
+    }
     if (op === 'text') { await ensureAgent(); return agentCall('text'); }
     if (op === 'element') { await ensureAgent(); return agentCall('element', [message.index]); }
     if (op === 'resolveLocator') { await ensureAgent(); return agentCall('resolveLocator', [message.locator, message.expectedSnapshotId]); }
