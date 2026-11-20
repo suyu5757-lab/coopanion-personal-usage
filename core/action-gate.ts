@@ -51,6 +51,34 @@ export interface DesktopStepGrantRequest {
   policyRuleId?: string;
 }
 
+export interface DesktopTaskGrantRequest {
+  taskId: string;
+  taskText: string;
+  risk: Exclude<ActionRisk, 'IRREVERSIBLE_OR_PUBLIC'>;
+  target: DesktopTargetEvidence;
+  expiresInMs: number;
+  maxSteps: number;
+  unbounded?: boolean;
+  policyRuleId?: string;
+}
+
+export interface DesktopTaskGrantHandle {
+  grantId: string;
+  taskId: string;
+  grantDigest: string;
+  approvedAt: number;
+  expiresAt: number;
+  maxSteps: number;
+  approvalChannel: ApprovalChannel;
+  revoke(): void;
+}
+
+export interface DesktopTaskStepRequest {
+  target: DesktopTargetEvidence;
+  expectedChange: string;
+  risk: Exclude<ActionRisk, 'IRREVERSIBLE_OR_PUBLIC'>;
+}
+
 export interface FileSystemStepGrantRequest {
   taskId: string;
   taskText: string;
@@ -113,6 +141,14 @@ export interface GatePolicy {
 }
 
 const describeTarget = (request: ActionRequest): string => request.target ? `「${request.target}」` : '';
+const HIGH_RISK_ORDINARY_BUNDLES = new Set([
+  'com.apple.mail', 'com.apple.MobileSMS', 'com.apple.Terminal', 'com.googlecode.iterm2',
+  'com.apple.AppStore', 'com.apple.Passbook', 'com.apple.Wallet',
+  'com.tencent.xinWeChat', 'com.tencent.qq', 'com.tinyspeck.slackmacgap', 'com.hnc.Discord', 'ru.keepcoder.Telegram',
+]);
+const SENSITIVE_ORDINARY_KEY_RE = /(?:^|,)(?:(?:cmd|command|meta|super)\+(?:q|w|delete|backspace|return|enter|shift\+delete|shift\+q|option\+esc|alt\+esc)|ctrl\+alt\+delete|alt\+f4)(?:$|,)/i;
+const SAFE_ORDINARY_KEY_TOKENS_RE = /^(?:(?:(?:cmd|command)\+(?:s|a|c|v|z|shift\+z|f|i|1|2|3|4)|return|enter|tab|escape|esc|space|up|down|left|right|pageup|pagedown|home|end|backspace)(?:\s+|$))+$/i;
+const HIGH_RISK_CLICK_LABEL_RE = /(?:\b(?:send|publish|post|pay|purchase|buy|checkout|delete|erase|remove|transfer|submit\s+order|confirm\s+payment)\b|发送|发布|支付|付款|购买|下单|转账|永久删除)/iu;
 
 export class ActionGate {
   private readonly grants: TaskGrantRegistry;
@@ -176,6 +212,35 @@ export class ActionGate {
     });
   }
 
+  allowsOrdinaryDesktopStep(tool: string, request: DesktopTaskStepRequest): boolean {
+    const { target, expectedChange } = request;
+    if ((request.risk as ActionRisk) === 'IRREVERSIBLE_OR_PUBLIC') return false;
+    if ((target.route !== 'background-window-pixel' && target.route !== 'background-ax')
+      || !this.capabilityAllows('desktop', 'computer-input', target)) return false;
+    if (HIGH_RISK_ORDINARY_BUNDLES.has(target.bundleId)) return false;
+    if (tool === 'pet_cua_move' || tool === 'pet_cua_scroll') return true;
+    if (tool === 'pet_cua_type') {
+      if (!expectedChange.startsWith('type ')) return false;
+      try {
+        const parsed = JSON.parse(expectedChange.slice(5));
+        return typeof parsed === 'string' && parsed.length > 0 && !/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/u.test(parsed);
+      } catch {
+        return false;
+      }
+    }
+    if (tool === 'pet_cua_key') {
+      const match = /^press\s+(.+)$/i.exec(expectedChange.trim());
+      if (!match) return false;
+      const spec = match[1]!.toLowerCase().replace(/\s+/g, ' ').trim();
+      if (SENSITIVE_ORDINARY_KEY_RE.test(spec.replace(/\s+/g, ''))) return false;
+      return SAFE_ORDINARY_KEY_TOKENS_RE.test(spec);
+    }
+    if (tool === 'pet_cua_click') {
+      return !HIGH_RISK_CLICK_LABEL_RE.test(expectedChange);
+    }
+    return false;
+  }
+
   /** Creates a one-step desktop grant and delays ticket consumption until the dispatch boundary. */
   async requestDesktopStep(
     request: DesktopStepGrantRequest,
@@ -219,6 +284,76 @@ export class ActionGate {
         return consumed;
       },
       revoke,
+    };
+  }
+
+  /**
+   * Issues a multi-step task-level desktop grant after ONE Core UI confirmation.
+   * Public/irreversible risks are never bundled into a multi-step desktop grant.
+   */
+  async requestDesktopTaskGrant(
+    request: DesktopTaskGrantRequest,
+    confirmInCoreUi: CoreUiConfirmation,
+  ): Promise<DesktopTaskGrantHandle | null> {
+    if ((request.risk as ActionRisk) === 'IRREVERSIBLE_OR_PUBLIC') return null;
+    const grant = await this.requestTaskGrant({
+      taskId: request.taskId,
+      taskText: request.taskText,
+      risk: request.risk,
+      target: request.target,
+      actions: ['computer-input'],
+      expiresInMs: request.expiresInMs,
+      maxSteps: request.maxSteps,
+      ...(request.unbounded ? { unbounded: true } : {}),
+      ...(request.policyRuleId ? { policyRuleId: request.policyRuleId } : {}),
+    }, confirmInCoreUi);
+    if (!grant) return null;
+    return {
+      grantId: grant.id,
+      taskId: grant.taskId,
+      grantDigest: grant.digest,
+      approvedAt: grant.approvedAt,
+      expiresAt: grant.expiresAt,
+      maxSteps: grant.maxSteps,
+      approvalChannel: grant.approvalChannel,
+      revoke: () => this.revokeTask(grant.taskId),
+    };
+  }
+
+  /**
+   * Authorizes one step under an active desktop task grant WITHOUT re-prompting the user.
+   * Each step still binds to its exact fresh window snapshot and consumes a one-use StepTicket.
+   */
+  authorizeDesktopTaskStep(
+    grantId: string,
+    request: DesktopTaskStepRequest,
+  ): DesktopStepAuthorization | null {
+    this.synchronizeGeneration();
+    if ((request.risk as ActionRisk) === 'IRREVERSIBLE_OR_PUBLIC') return null;
+    const grant = this.grants.getGrant(grantId);
+    if (!grant || grant.surface !== 'desktop') return null;
+    if (grant.risk === 'REVERSIBLE_LOCAL' && request.risk === 'EXTERNAL_MUTATION') return null;
+    if (!this.capabilityAllows('desktop', 'computer-input', request.target)) return null;
+    const approvedEvidence = desktopEvidenceKey(request.target);
+    let finished = false;
+    return {
+      grantDigest: grant.digest,
+      approvedAt: grant.approvedAt,
+      expiresAt: grant.expiresAt,
+      approvalChannel: grant.approvalChannel,
+      consume: (target, expectedChange) => {
+        if (finished) return false;
+        finished = true;
+        if (!target || expectedChange !== request.expectedChange || desktopEvidenceKey(target) !== approvedEvidence) {
+          return false;
+        }
+        const step: StepRequest = { action: 'computer-input', target, expectedChange };
+        const ticket = this.issueStepTicket(grant.id, step);
+        return !!ticket && this.consumeStepTicket(ticket.id, step);
+      },
+      revoke: () => {
+        finished = true;
+      },
     };
   }
 

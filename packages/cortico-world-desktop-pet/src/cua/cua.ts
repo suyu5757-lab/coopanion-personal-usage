@@ -78,7 +78,14 @@ export interface CuaOptions {
   /** Core's fail-closed check for every input tool while no task-grant bridge is configured. */
   allowInput?: (tool: string) => boolean;
   /** Core verifies the native target, obtains approval and consumes a one-use step ticket. */
+  allowsOrdinaryInput?: (request: Pick<CuaInputGrantRequest, 'tool' | 'target' | 'expectedChange'>) => boolean;
   authorizeInput?: (request: CuaInputGrantRequest) => Promise<CuaInputAuthorization | null>;
+  /** Explicitly cancels an active desktop task grant and its persisted continuation state. */
+  revokeInputTask?: (taskId: string) => void;
+  /** Suspends ephemeral in-memory grants on shutdown or window switch without cancelling persisted task state. */
+  suspendInputTask?: (taskId: string) => void;
+  /** Restores an interrupted resumable logical task ID from Core's persistent task journal on startup. */
+  initialTaskId?: () => string | null;
 }
 
 export interface CuaDesktopTargetEvidence {
@@ -109,7 +116,9 @@ export interface CuaInputGrantRequest {
   risk?: 'REVERSIBLE_LOCAL' | 'EXTERNAL_MUTATION';
   target: CuaDesktopTargetEvidence;
   expiresInMs: number;
-  maxSteps: 1;
+  maxSteps: number;
+  unbounded?: boolean;
+  reuseTaskGrant?: boolean;
   confirmInCoreUi: () => Promise<boolean>;
 }
 
@@ -172,6 +181,20 @@ const windowGone = (err: unknown) => err instanceof DriverFailure && /window_id_
 const captureStale = (err: unknown) => err instanceof DriverFailure && /capture_not_found|capture_expired|stale.*capture|capture.*stale/i.test(`${err.code} ${err.message}`);
 const backgroundUnavailable = (err: unknown) => err instanceof DriverFailure && err.code === 'background_unavailable';
 
+/** Short single-action ticket lifetime; never used to terminate a goal-scoped task. */
+const SINGLE_STEP_TICKET_MS = 30_000;
+
+/** Shortcuts that close/quit/delete/submit or escalate privilege always require fresh single-step approval. */
+function isSensitiveKeySpec(spec: string): boolean {
+  const normalized = spec.toLowerCase().replace(/\s+/g, '');
+  return /(?:^|,)(?:(?:cmd|command|meta|super)\+(?:q|w|delete|backspace|return|enter|shift\+delete|shift\+q|option\+esc|alt\+esc)|ctrl\+alt\+delete|alt\+f4)(?:$|,)/.test(normalized);
+}
+
+interface ActiveTaskGrant {
+  taskId: string;
+  scopeKey: string;
+}
+
 interface ApprovedInput {
   digest: string;
   frame: string;
@@ -219,6 +242,10 @@ export class Cua {
   private driverClient: CuaDriverLike | null = null;
   /** The window background actions act on; null means the whole screen. */
   private target: WindowTarget | null = null;
+  /** Active task-level authorization for low-risk background steps on the bound window. */
+  private activeTask: ActiveTaskGrant | null = null;
+  /** Persistent logical task ID across ordinary multi-step and cross-app work until cancelled/stopped. */
+  private logicalTaskId: string | null = null;
 
   constructor(private readonly opts: CuaOptions) {}
 
@@ -279,7 +306,56 @@ export class Cua {
     return this.screenAsked;
   }
 
+  /** Returns the current logical task ID, restoring any resumable task from Core before creating a new one. */
+  currentTaskId(): string {
+    if (!this.logicalTaskId) {
+      const resumed = this.opts.initialTaskId?.() ?? null;
+      this.logicalTaskId = resumed || randomUUID();
+    }
+    return this.logicalTaskId;
+  }
+
+  /** Suspends ephemeral in-memory grants on process shutdown/restart WITHOUT cancelling persisted task state. */
+  suspendForShutdown(): void {
+    const ids = new Set<string>();
+    if (this.activeTask) {
+      ids.add(this.activeTask.taskId);
+      this.activeTask = null;
+    }
+    if (this.logicalTaskId) {
+      ids.add(this.logicalTaskId);
+      this.logicalTaskId = null;
+    }
+    for (const taskId of ids) this.opts.suspendInputTask?.(taskId);
+  }
+
+  /** Explicitly cancels and revokes any active task-level desktop authorization and rotates the logical task ID. */
+  cancelActiveTask(): void {
+    const ids = new Set<string>();
+    if (this.activeTask) {
+      ids.add(this.activeTask.taskId);
+      this.activeTask = null;
+    }
+    if (this.logicalTaskId) {
+      ids.add(this.logicalTaskId);
+      this.logicalTaskId = null;
+    }
+    for (const taskId of ids) this.opts.revokeInputTask?.(taskId);
+  }
+
+  private taskScopeKey(evidence: CuaDesktopTargetEvidence): string {
+    return JSON.stringify([
+      evidence.instanceId,
+      evidence.bundleId,
+      evidence.executablePath,
+      evidence.ownerPid,
+      evidence.processStart,
+      evidence.windowId,
+    ]);
+  }
+
   async stop(): Promise<void> {
+    this.suspendForShutdown();
     this.target = null;
     await this.endEngine(this.t.worldStopped);
     this.host = null;
@@ -287,6 +363,7 @@ export class Cua {
 
   /** Computer use was switched off: the engine process ends, and the next call starts another. */
   switchedOff(): Promise<void> {
+    this.cancelActiveTask();
     this.target = null;
     return this.endEngine(this.t.switchedOff);
   }
@@ -440,10 +517,22 @@ export class Cua {
     return evidence.instanceId && isSupportedCuaTarget(evidence) ? evidence : null;
   }
 
-  private async approveInput(tool: string, operation: keyof CuaText['ask']['actions'], detail: string, signal?: AbortSignal, targetOverride?: string, element?: DriverElement): Promise<ApprovedInput | null> {
+  private async approveInput(
+    tool: string,
+    operation: keyof CuaText['ask']['actions'],
+    detail: string,
+    signal?: AbortSignal,
+    targetOverride?: string,
+    element?: DriverElement,
+    opts?: { forceSingleStep?: boolean },
+  ): Promise<ApprovedInput | null> {
     if (!this.opts.askPermission && !this.opts.authorizeInput) return null;
     if (this.opts.authorizeInput && (operation === 'focus' || operation === 'foreground')) return null;
-    await this.permit('act', signal);
+    const evidence = this.desktopTargetEvidence(element);
+    const ordinary = !!(this.opts.authorizeInput && evidence
+      && this.opts.allowsOrdinaryInput?.({ tool, target: evidence, expectedChange: detail }));
+    if (!ordinary) await this.permit('act', signal);
+    if (signal?.aborted) return null;
     const frame = this.inputFrame();
     const target = targetOverride ?? this.inputTarget();
     const digest = createHash('sha256').update(JSON.stringify([tool, operation, target, detail, frame])).digest('hex');
@@ -451,23 +540,73 @@ export class Cua {
     const question = this.ui.ask.action(who, this.ui.ask.actions[operation], target, `${detail} (${digest.slice(0, 12)})`);
     let authorization: CuaInputAuthorization | null = null;
     if (this.opts.authorizeInput) {
-      const evidence = this.desktopTargetEvidence(element);
-      if (!evidence) return null;
-      authorization = await this.opts.authorizeInput({
-        tool,
-        taskId: randomUUID(),
-        taskText: `${tool}: ${detail}`,
-        expectedChange: detail,
-        risk: operation === 'move' || operation === 'scroll' ? 'REVERSIBLE_LOCAL' : 'EXTERNAL_MUTATION',
-        target: evidence,
-        expiresInMs: 30_000,
-        maxSteps: 1,
-        confirmInCoreUi: async () => {
-          if (!this.opts.askPermission) return false;
-          const answer = await untilAborted(this.opts.askPermission(question, [this.ui.ask.yes, this.ui.ask.no]), signal);
-          return answer === 'yes' && frame === this.inputFrame();
-        },
-      });
+      const currentEvidence = this.desktopTargetEvidence(element);
+      if (!currentEvidence) return null;
+      const risk = operation === 'move' || operation === 'scroll' ? 'REVERSIBLE_LOCAL' as const : 'EXTERNAL_MUTATION' as const;
+      const confirmInCoreUi = async () => {
+        if (!this.opts.askPermission) return false;
+        const answer = await untilAborted(this.opts.askPermission(question, [this.ui.ask.yes, this.ui.ask.no]), signal);
+        return answer === 'yes' && frame === this.inputFrame();
+      };
+      const taskId = this.currentTaskId();
+      const useTaskGrant = !ordinary && !opts?.forceSingleStep;
+      if (useTaskGrant) {
+        const scopeKey = this.taskScopeKey(currentEvidence);
+        if (this.activeTask && this.activeTask.scopeKey !== scopeKey) {
+          const previousTaskId = this.activeTask.taskId;
+          this.activeTask = null;
+          (this.opts.suspendInputTask ?? this.opts.revokeInputTask)?.(previousTaskId);
+        }
+        if (this.activeTask) {
+          authorization = await this.opts.authorizeInput({
+            tool,
+            taskId: this.activeTask.taskId,
+            taskText: `${tool}: ${detail}`,
+            expectedChange: detail,
+            risk,
+            target: currentEvidence,
+            expiresInMs: SINGLE_STEP_TICKET_MS,
+            maxSteps: 200,
+            unbounded: true,
+            reuseTaskGrant: true,
+            confirmInCoreUi: async () => false,
+          });
+          if (!authorization) {
+            const previousTaskId = this.activeTask.taskId;
+            this.activeTask = null;
+            (this.opts.suspendInputTask ?? this.opts.revokeInputTask)?.(previousTaskId);
+          }
+        }
+        if (!authorization) {
+          authorization = await this.opts.authorizeInput({
+            tool,
+            taskId,
+            taskText: `${tool}: ${detail}`,
+            expectedChange: detail,
+            risk,
+            target: currentEvidence,
+            expiresInMs: SINGLE_STEP_TICKET_MS,
+            maxSteps: 200,
+            unbounded: true,
+            confirmInCoreUi,
+          });
+          if (authorization) {
+            this.activeTask = { taskId, scopeKey };
+          }
+        }
+      } else {
+        authorization = await this.opts.authorizeInput({
+          tool,
+          taskId,
+          taskText: `${tool}: ${detail}`,
+          expectedChange: detail,
+          risk,
+          target: currentEvidence,
+          expiresInMs: SINGLE_STEP_TICKET_MS,
+          maxSteps: 1,
+          confirmInCoreUi: ordinary ? async () => false : confirmInCoreUi,
+        });
+      }
       if (!authorization) return null;
     } else {
       const answer = await untilAborted(this.askQuestion(question, signal), signal);
@@ -618,13 +757,22 @@ export class Cua {
     await this.permit('see', signal);
     try {
       const cap = await this.driver.capture(pid, windowId, this.captureOptions(true, signal));
+      if (this.target && this.target.handle !== handle && this.activeTask) {
+        const previousTaskId = this.activeTask.taskId;
+        this.activeTask = null;
+        (this.opts.suspendInputTask ?? this.opts.revokeInputTask)?.(previousTaskId);
+      }
+      const hitBounds = hit.rect && [hit.rect.x, hit.rect.y, hit.rect.width, hit.rect.height].every((n) => typeof n === 'number' && Number.isFinite(n))
+        ? { x: hit.rect.x, y: hit.rect.y, width: hit.rect.width, height: hit.rect.height }
+        : null;
       this.target = {
         handle, pid, ownerPid: cap.ownerPid, windowId, title: title || cap.title || handle,
-        captureId: cap.captureId, snapshotId: cap.snapshotId, elements: cap.elements,
-        bounds: cap.bounds, processIdentity: cap.processIdentity,
+        captureId: cap.captureId, snapshotId: cap.snapshotId || cap.captureId, elements: cap.elements,
+        bounds: cap.bounds ?? hitBounds, processIdentity: cap.processIdentity,
         truncated: cap.truncated, truncationReason: cap.truncationReason, elementsComplete: cap.elementsComplete,
         width: cap.width, height: cap.height,
       };
+      this.currentTaskId();
       return this.windowOutcome('', cap);
     } catch (err) {
       return this.driverOutcome('pet_cua_window', err);
@@ -640,21 +788,30 @@ export class Cua {
       const maxElements = typeof args.maxElements === 'number' && Number.isFinite(args.maxElements) ? args.maxElements : 250;
       await this.refreshWindow(false, signal, query || undefined, maxElements);
       const current = this.target!;
-      const elements = current.elements.filter((element) => current.snapshotId
-        && element.token.startsWith(`${current.snapshotId}:`)
-        && element.actions.some((action) => action.toLowerCase() === 'press'));
       if (!current.snapshotId) return { text: this.t.notRun('pet_cua_accessibility', this.t.accessibilityEmpty), failed: true };
-      if (!elements.length) {
-        const reason = current.truncated ? this.t.accessibilityTruncated(current.truncationReason) : this.t.accessibilityEmpty;
-        return { text: this.t.notRun('pet_cua_accessibility', reason), failed: true };
-      }
+      const validElements = current.elements.filter((element) => element.token.startsWith(`${current.snapshotId}:`));
+      const pressable = validElements.filter((element) => element.actions.some((action) => action.toLowerCase() === 'press'));
+      const editableOrReadable = validElements.filter((element) => !pressable.includes(element));
       const limit = 120;
-      const lines = elements.slice(0, limit).map((element) => {
+      const lines: string[] = [];
+      for (const element of pressable.slice(0, limit)) {
         const label = element.label ? ` "${element.label.slice(0, 160)}"` : '';
-        return `- ${element.token} ${element.role || 'element'}${label}`;
-      });
-      if (elements.length > limit) lines.push(`… ${elements.length - limit} more`);
-      return { text: `${this.t.windowCurrent(current.title, current.handle)}\n${this.t.accessibilityList(current.snapshotId, elements.length, lines, current.truncated, current.truncationReason)}` };
+        lines.push(`- [press] ${element.token} ${element.role || 'element'}${label}`);
+      }
+      const remaining = Math.max(0, limit - lines.length);
+      for (const element of editableOrReadable.slice(0, remaining)) {
+        const label = element.label ? ` "${element.label.slice(0, 120)}"` : '';
+        const frame = element.frame ? ` @(${Math.round(element.frame.x)},${Math.round(element.frame.y)},${Math.round(element.frame.width)}x${Math.round(element.frame.height)})` : '';
+        const actions = element.actions.length ? ` actions=[${element.actions.join(',')}]` : '';
+        lines.push(`- [observe] ${element.token} ${element.role || 'element'}${label}${frame}${actions}`);
+      }
+      if (validElements.length > limit) lines.push(`… ${validElements.length - limit} more`);
+      if (!lines.length) {
+        lines.push('(no AX press elements listed; window-level background input via pet_cua_type, pet_cua_key, pet_cua_scroll, or pet_cua_click(x,y) remains available on this bound window)');
+      } else if (!pressable.length) {
+        lines.push('(no pressable buttons; for editable text areas in this bound window, use pet_cua_type and pet_cua_key directly)');
+      }
+      return { text: `${this.t.windowCurrent(current.title, current.handle)}\n${this.t.accessibilityList(current.snapshotId, pressable.length, lines, current.truncated, current.truncationReason)}` };
     } catch (err) {
       return this.driverOutcome('pet_cua_accessibility', err);
     }
@@ -666,12 +823,12 @@ export class Cua {
     const cap = await this.driver.capture(target.pid, target.windowId, this.captureOptions(screenshot, signal, query, maxElements));
     this.target = {
       ...target,
-      ownerPid: cap.ownerPid,
+      ownerPid: cap.ownerPid ?? target.ownerPid,
       title: target.title || cap.title,
-      bounds: cap.bounds,
-      processIdentity: cap.processIdentity,
-      captureId: screenshot ? cap.captureId : target.captureId,
-      snapshotId: cap.snapshotId,
+      bounds: cap.bounds ?? target.bounds,
+      processIdentity: cap.processIdentity ?? target.processIdentity,
+      captureId: screenshot ? (cap.captureId || target.captureId) : target.captureId,
+      snapshotId: cap.snapshotId || target.snapshotId,
       elements: cap.elements,
       truncated: cap.truncated,
       truncationReason: cap.truncationReason,
@@ -995,7 +1152,7 @@ export class Cua {
       return { text: this.t.notRun('pet_cua_key', this.t.keyBad(why)), failed: true };
     }
     const detail = `press ${spec.trim()}`;
-    const approval = await this.approveInput('pet_cua_key', 'key', detail, signal);
+    const approval = await this.approveInput('pet_cua_key', 'key', detail, signal, undefined, undefined, { forceSingleStep: isSensitiveKeySpec(spec) });
     if (!this.consumeApproval(approval, 'pet_cua_key', 'key', detail)) return { text: this.t.notRun('pet_cua_key', this.inputApprovalRefusal()), failed: true };
     try {
       let action: DriverAction;

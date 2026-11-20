@@ -69,6 +69,8 @@ export interface TaskGrantRequest {
   files?: Array<{ path: string; digest: string; bytes: number; mime: string }>;
   expiresInMs: number;
   maxSteps: number;
+  /** When true, the task grant is goal-scoped without fixed wall-clock or step-count truncation. */
+  unbounded?: boolean;
   /** The durable rule that made this grant automatic, when one did. */
   policyRuleId?: string;
 }
@@ -86,6 +88,7 @@ export interface TaskGrant {
   approvedAt: number;
   expiresAt: number;
   maxSteps: number;
+  unbounded?: boolean;
   stepsUsed: number;
   digest: string;
   revoked: boolean;
@@ -182,11 +185,12 @@ export class TaskGrantRegistry {
   ): Promise<TaskGrant | null> {
     const actions = sorted(request.actions);
     const files = normalizeFiles(request.files);
+    const unbounded = request.unbounded === true && request.risk !== 'IRREVERSIBLE_OR_PUBLIC';
     if (!request.taskId || !request.taskText.trim() || request.taskText.length > 4000 || !ACTION_RISKS.has(request.risk) || !validTarget(request.target)
       || actions.length === 0 || actions.length > 16 || files.some((file) => !safeRelativePath(file.path)
       || !/^[a-f0-9]{64}$/.test(file.digest) || !Number.isSafeInteger(file.bytes) || file.bytes < 0 || !file.mime.trim())
-      || !Number.isSafeInteger(request.expiresInMs) || request.expiresInMs < 1_000 || request.expiresInMs > 60 * 60_000
-      || !Number.isSafeInteger(request.maxSteps) || request.maxSteps < 1 || request.maxSteps > 200) {
+      || (!unbounded && (!Number.isSafeInteger(request.expiresInMs) || request.expiresInMs < 1_000 || request.expiresInMs > 60 * 60_000
+        || !Number.isSafeInteger(request.maxSteps) || request.maxSteps < 1 || request.maxSteps > 200))) {
       throw new Error('task grant request is incomplete or outside its limits');
     }
     const confirmation = await confirmInCoreUi();
@@ -194,6 +198,8 @@ export class TaskGrantRegistry {
     if (!approval.approved) return null;
     if (!stillAllowed()) return null;
     const targetDigest = hash(targetIdentity(request.target));
+    const expiresAt = unbounded ? Number.MAX_SAFE_INTEGER : now + request.expiresInMs;
+    const maxSteps = unbounded ? Number.MAX_SAFE_INTEGER : request.maxSteps;
     const grant: TaskGrant = {
       id: randomUUID(),
       taskId: request.taskId,
@@ -205,10 +211,11 @@ export class TaskGrantRegistry {
       files,
       permissionGeneration: this.generation,
       approvedAt: now,
-      expiresAt: now + request.expiresInMs,
-      maxSteps: request.maxSteps,
+      expiresAt,
+      maxSteps,
+      ...(unbounded ? { unbounded: true } : {}),
       stepsUsed: 0,
-      digest: hash([request.taskId, request.taskText, request.risk, targetDigest, actions, files, this.generation, now, request.expiresInMs, request.maxSteps,
+      digest: hash([request.taskId, request.taskText, request.risk, targetDigest, actions, files, this.generation, now, unbounded ? 'unbounded' : request.expiresInMs, unbounded ? 'unbounded' : request.maxSteps,
         approval.channel ?? 'core-pet-bubble', request.policyRuleId ?? approval.ruleId ?? '']),
       revoked: false,
       approvalChannel: approval.channel ?? 'core-pet-bubble',
@@ -250,8 +257,15 @@ export class TaskGrantRegistry {
       || record.ticket.expectedChangeDigest !== hash(current.expectedChange)
       || hash(normalizeFiles(record.request.files)) !== hash(normalizeFiles(current.files))) return false;
     grant.stepsUsed++;
-    if (grant.stepsUsed >= grant.maxSteps) this.grants.delete(grant.id);
+    if (!grant.unbounded && grant.stepsUsed >= grant.maxSteps) this.grants.delete(grant.id);
     return true;
+  }
+
+  getGrant(grantId: string, now = Date.now()): TaskGrant | null {
+    const grant = this.grants.get(grantId);
+    if (!grant || grant.revoked || grant.permissionGeneration !== this.generation
+      || (!grant.unbounded && (now > grant.expiresAt || grant.stepsUsed >= grant.maxSteps))) return null;
+    return structuredClone(grant);
   }
 
   revokeTask(taskId: string): void {
@@ -266,8 +280,9 @@ export class TaskGrantRegistry {
 
   private usable(grant: TaskGrant, request: StepRequest, now: number): boolean {
     const files = normalizeFiles(request.files);
-    return !grant.revoked && grant.permissionGeneration === this.generation && now <= grant.expiresAt
-      && grant.stepsUsed < grant.maxSteps && grant.surface === request.target.surface
+    return !grant.revoked && grant.permissionGeneration === this.generation
+      && (grant.unbounded === true || (now <= grant.expiresAt && grant.stepsUsed < grant.maxSteps))
+      && grant.surface === request.target.surface
       && grant.actions.includes(request.action) && validTarget(request.target)
       && grant.targetDigest === hash(targetIdentity(request.target))
       && hash(files) === hash(grant.files);

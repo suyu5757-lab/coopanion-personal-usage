@@ -279,9 +279,19 @@ export class CuaDriver implements CuaDriverLike {
           height = img.height;
         }
       }
-      const bounds = raw.window_bounds && typeof raw.window_bounds === 'object' ? raw.window_bounds as DriverCapture['bounds'] : null;
-      const ownerPid = Number.isInteger(raw.owner_pid) ? Number(raw.owner_pid) : null;
+      const rawBounds = [raw.window_bounds, raw.bounds, raw.window_frame, raw.frame].find((v) => v && typeof v === 'object') as Record<string, unknown> | undefined;
+      const bounds = rawBounds
+        && [rawBounds.x, rawBounds.y, rawBounds.width, rawBounds.height].every((n) => typeof n === 'number' && Number.isFinite(n))
+        ? { x: Number(rawBounds.x), y: Number(rawBounds.y), width: Number(rawBounds.width), height: Number(rawBounds.height) }
+        : null;
+      const ownerPid = Number.isInteger(raw.owner_pid)
+        ? Number(raw.owner_pid)
+        : Number.isInteger(raw.pid)
+          ? Number(raw.pid)
+          : (raw.owner_pid === undefined && raw.pid === undefined ? pid : null);
       const processIdentity = ownerPid === pid ? await this.identifyProcess(pid, opts.signal) : null;
+      const captureId = String(raw.capture_id ?? '');
+      const snapshotId = String(raw.snapshot_id || captureId || '');
       return {
         pid,
         ownerPid,
@@ -290,8 +300,8 @@ export class CuaDriver implements CuaDriverLike {
         width,
         height,
         scale: Number(raw.screenshot_scale ?? 1),
-        captureId: String(raw.capture_id ?? ''),
-        snapshotId: String(raw.snapshot_id ?? ''),
+        captureId,
+        snapshotId,
         truncated: raw.truncated === true,
         truncationReason: typeof raw.truncation_reason === 'string' ? raw.truncation_reason : null,
         elementsComplete: typeof raw.elements_complete === 'boolean' ? raw.elements_complete : null,
@@ -404,14 +414,26 @@ export class CuaDriver implements CuaDriverLike {
   }
 
   private async call<T>(tool: string, args: Record<string, unknown>, opts: { signal?: AbortSignal; screenshotFile?: string } = {}): Promise<T> {
-    try {
-      const bin = await this.ensure(opts.signal);
+    const execOnce = async (bin: string): Promise<T> => {
       await this.startSession(bin, opts.signal);
       const options = this.options!;
       const argv = ['call', tool, JSON.stringify({ session: options.session, ...args }), '--socket', options.socketPath];
       if (opts.screenshotFile) argv.push('--screenshot-out-file', opts.screenshotFile);
       const { stdout } = await runFile(bin, argv, { timeout: DRIVER_TIMEOUT_MS, signal: opts.signal });
       return parseJson<T>(stdout);
+    };
+    try {
+      const bin = await this.ensure(opts.signal);
+      try {
+        return await execOnce(bin);
+      } catch (firstErr) {
+        const firstFailure = failureFrom(firstErr);
+        if (/session has ended|start_session/i.test(firstFailure.message)) {
+          this.sessionStarted = false;
+          return await execOnce(bin);
+        }
+        throw firstFailure;
+      }
     } catch (err) {
       throw failureFrom(err);
     }

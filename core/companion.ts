@@ -65,6 +65,7 @@ import { withWorlds, type WorldDefinition, type WorldSection } from 'cortico/wor
 import { ActionGate } from './action-gate.ts';
 import { authorizeFileSystemAction, authorizeFileSystemActionEx, type FileSystemActionAuthorizationRequest, type WorkspaceAuthorization } from './action-authorization.ts';
 import { actionReceiptDuplicateKey } from './action-receipts.ts';
+import { TaskContinuationJournal } from './task-continuation.ts';
 import { isWorkspaceAppendPreapproved, parseWorkspaceAppendPaths } from './workspace-append-approval.ts';
 import { WorkspacePermissionStore, type WorkspacePrompt, type WorkspacePromptAnswer } from './workspace-permissions.ts';
 import { InstanceLockedError } from 'cortico/core/instance-lock.ts';
@@ -79,6 +80,8 @@ import { coopanionWorldPromptTrust, withTrustedConsoleVariables, withTrustedWorl
 import { askForKey, guideDone, markDone, runGuide, type GuideDeps } from './guide.ts';
 import { NOTICE_ID, noticeDefinition, type NoticeWorld } from './notice.ts';
 import { browserDefinition, BROWSER_ID } from './browser/definition.ts';
+import { BROWSER_TOOL_DECLS } from './browser/tools.ts';
+const BROWSER_TOOL_NAMES = new Set(BROWSER_TOOL_DECLS.map((decl) => decl.name));
 import { BrowserBridge } from './browser/bridge.ts';
 import { BrowserTaskActionJournal } from './browser/task-actions.ts';
 import { hashContent } from './browser/actions.ts';
@@ -520,12 +523,21 @@ export async function main(): Promise<void> {
   });
   workspacePolicyGeneration = () => workspacePermissions.generation();
   const actionReceiptFile = join(deployDir, 'browser', 'task-actions.json');
+  const taskJournalFile = join(deployDir, 'browser', 'task-journal.json');
   let actionReceipts: BrowserTaskActionJournal | null = null;
+  let taskJournal: TaskContinuationJournal | null = null;
+  let activeResumeTaskId: string | null = null;
   try {
     actionReceipts = new BrowserTaskActionJournal(actionReceiptFile);
     actionReceipts.recoverInterrupted();
   } catch { actionReceipts = null; /* Browser and CUA writes fail closed if the ledger is unreadable */ }
+  try {
+    taskJournal = new TaskContinuationJournal(taskJournalFile);
+    taskJournal.recoverAfterRestart();
+    activeResumeTaskId = taskJournal.findResumableTask()?.taskId ?? null;
+  } catch { taskJournal = null; }
   const desktopInputInstanceId = randomUUID();
+  const cuaTaskGrants = new Map<string, string>();
   const browserBridge = new BrowserBridge();
   /** The introduction is running: the settings it makes are not told as changes. */
   let guiding = false;
@@ -552,7 +564,13 @@ export async function main(): Promise<void> {
     // the menu's header lends pause/resume, settings and quit; its dress tile opens the settings window's dress page, the typing bubble's expand button its chat page
     controls: {
       isPaused: () => bus?.isPaused() ?? false,
-      setPaused: (paused) => bus?.setPaused(paused),
+      setPaused: (paused) => {
+        if (paused) {
+          for (const taskId of cuaTaskGrants.keys()) gate.revokeTask(taskId);
+          cuaTaskGrants.clear();
+        }
+        bus?.setPaused(paused);
+      },
       openSettings: () => process.send?.({ type: 'companion:open', path: '' }),
       openChat: () => process.send?.({ type: 'companion:open', path: '#/chat' }),
       openDress: () => process.send?.({ type: 'companion:open', path: '#/dress' }),
@@ -574,12 +592,37 @@ export async function main(): Promise<void> {
       if (answer === 'yes') telemetry?.count('cuaGranted');
     },
     cuaInstanceId: desktopInputInstanceId,
+    revokeCuaTask: (taskId) => {
+      cuaTaskGrants.delete(taskId);
+      gate.revokeTask(taskId);
+      if (activeResumeTaskId === taskId) activeResumeTaskId = null;
+      taskJournal?.cancelTask(taskId, 'revoked by CUA or user');
+    },
+    suspendCuaTask: (taskId) => {
+      cuaTaskGrants.delete(taskId);
+      gate.revokeTask(taskId);
+    },
+    resumeCuaTaskId: () => activeResumeTaskId,
+    allowsOrdinaryCuaInput: ({ tool, target, expectedChange }) =>
+      !bus?.isPaused() && gate.allowsOrdinaryDesktopStep(tool, { target, expectedChange, risk: 'REVERSIBLE_LOCAL' }),
     authorizeCuaInput: async (request) => {
       const receipts = actionReceipts;
-      if (!receipts) return null;
-      const risk = request.risk ?? 'EXTERNAL_MUTATION';
+      if (!receipts || bus?.isPaused()) return null;
+      const ordinary = gate.allowsOrdinaryDesktopStep(request.tool, {
+        target: request.target,
+        expectedChange: request.expectedChange,
+        risk: request.risk ?? 'EXTERNAL_MUTATION',
+      });
+      const risk = ordinary ? 'REVERSIBLE_LOCAL' : request.risk ?? 'EXTERNAL_MUTATION';
       const payloadDigest = hashContent(request.taskText);
       const duplicateKey = actionReceiptDuplicateKey('computer-input', request.target, payloadDigest, request.expectedChange);
+      const journalTask = taskJournal?.ensureTask({
+        taskId: request.taskId,
+        objective: `${request.target.bundleId}:${request.tool}`,
+        scope: 'desktop-ordinary-cua',
+        allowedImpact: ['computer-input'],
+      });
+      const taskEpoch = journalTask?.generation ?? 1;
       let receipt;
       try {
         receipt = receipts.begin({
@@ -596,41 +639,116 @@ export async function main(): Promise<void> {
       } catch {
         return null;
       }
+      const matchedPlanned = taskJournal?.findPlannedStep(request.taskId, request.tool, request.target.bundleId) ?? null;
+      const journalStepId = matchedPlanned?.stepId ?? receipt.id;
+      if (!matchedPlanned) {
+        taskJournal?.planStep(request.taskId, {
+          stepId: journalStepId,
+          intent: 'computer-input',
+          tool: request.tool,
+          target: { surface: 'desktop', bundleId: request.target.bundleId, snapshotRef: request.target.snapshotId },
+          payloadDigest,
+        });
+      }
       let authorization;
       try {
-        authorization = await gate.requestDesktopStep({
-          taskId: request.taskId,
-          taskText: request.taskText,
-          expectedChange: request.expectedChange,
-          risk,
-          target: request.target,
-          expiresInMs: request.expiresInMs,
-          maxSteps: request.maxSteps,
-        }, request.confirmInCoreUi);
+        if (ordinary) {
+          const ruleId = 'desktop-ordinary-background';
+          authorization = await gate.requestDesktopStep({
+            taskId: receipt.id,
+            taskText: request.tool,
+            expectedChange: request.expectedChange,
+            risk,
+            target: request.target,
+            expiresInMs: 30_000,
+            maxSteps: 1,
+            policyRuleId: ruleId,
+          }, async () => ({ approved: !bus?.isPaused(), channel: 'durable-rule', ruleId }));
+        } else if (request.reuseTaskGrant) {
+          const grantId = cuaTaskGrants.get(request.taskId);
+          authorization = grantId ? gate.authorizeDesktopTaskStep(grantId, {
+            target: request.target,
+            expectedChange: request.expectedChange,
+            risk,
+          }) : null;
+          if (!authorization) cuaTaskGrants.delete(request.taskId);
+        } else if (request.maxSteps > 1 || request.unbounded) {
+          const handle = await gate.requestDesktopTaskGrant({
+            taskId: request.taskId,
+            taskText: request.taskText,
+            risk,
+            target: request.target,
+            expiresInMs: request.expiresInMs,
+            maxSteps: request.maxSteps,
+            unbounded: request.unbounded,
+          }, request.confirmInCoreUi);
+          if (handle) {
+            cuaTaskGrants.set(request.taskId, handle.grantId);
+            authorization = gate.authorizeDesktopTaskStep(handle.grantId, {
+              target: request.target,
+              expectedChange: request.expectedChange,
+              risk,
+            });
+            if (!authorization) {
+              cuaTaskGrants.delete(request.taskId);
+              handle.revoke();
+            }
+          } else {
+            authorization = null;
+          }
+        } else {
+          authorization = await gate.requestDesktopStep({
+            taskId: request.taskId,
+            taskText: request.taskText,
+            expectedChange: request.expectedChange,
+            risk,
+            target: request.target,
+            expiresInMs: request.expiresInMs,
+            maxSteps: 1,
+          }, request.confirmInCoreUi);
+        }
       } catch {
         receipts.finish(receipt.id, 'cancelled', 'the Core task grant could not be created');
+        taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'cancelled', note: 'grant creation failed' });
         return null;
       }
       if (!authorization) {
         receipts.finish(receipt.id, 'cancelled', 'the Core task grant was not approved');
+        taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'cancelled', note: 'grant not approved' });
         return null;
       }
       try {
-        receipts.acting(receipt.id, authorization.grantDigest, authorization.approvedAt, authorization.expiresAt);
+        receipts.acting(receipt.id, authorization.grantDigest, authorization.approvedAt, authorization.expiresAt, Date.now(), {
+          channel: authorization.approvalChannel,
+          ...(ordinary ? { ruleId: 'desktop-ordinary-background' } : {}),
+        });
       } catch {
         authorization.revoke();
         receipts.finish(receipt.id, 'cancelled', 'the approved grant could not be recorded');
+        taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'cancelled', note: 'acting record failed' });
         return null;
       }
       return {
         consume: (target, expectedChange) => {
+          if (bus?.isPaused()) {
+            authorization.revoke();
+            receipts.finish(receipt.id, 'cancelled', 'the desktop task is paused');
+            taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'cancelled', note: 'paused' });
+            return false;
+          }
           const consumed = authorization.consume(target, expectedChange);
-          if (!consumed) receipts.finish(receipt.id, 'cancelled', 'the target evidence changed before dispatch');
+          if (!consumed) {
+            receipts.finish(receipt.id, 'cancelled', 'the target evidence changed before dispatch');
+            taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'cancelled', note: 'target changed' });
+          } else {
+            taskJournal?.markDispatched(request.taskId, journalStepId, receipt.id, taskEpoch);
+          }
           return consumed;
         },
         revoke: () => {
           authorization.revoke();
           receipts.finish(receipt.id, 'cancelled', 'the CUA step was revoked before dispatch');
+          taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'cancelled', note: 'revoked' });
         },
         complete: (result) => {
           const now = Date.now();
@@ -645,10 +763,14 @@ export async function main(): Promise<void> {
             const note = `CUA driver effect: ${result.effect}`;
             if (result.outcome === 'ui-observed') {
               receipts.complete(receipt.id, { phase: 'verified', dispatchState: 'delivered', outcome: 'ui-observed', note, evidence }, now);
+              taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'verified', externalCheckDigest: evidence.digest, note }, now);
+              if (activeResumeTaskId === request.taskId && taskJournal?.getTask(request.taskId)?.status === 'completed') activeResumeTaskId = null;
             } else if (result.outcome === 'cancelled') {
               receipts.complete(receipt.id, { phase: 'cancelled', dispatchState: 'not-dispatched', outcome: 'cancelled', note, evidence }, now);
+              taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'cancelled', note }, now);
             } else {
               receipts.complete(receipt.id, { phase: 'unknown', dispatchState: result.dispatchState, outcome: 'unknown', note, evidence }, now);
+              taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'unknown', note }, now);
             }
           } catch { /* an acting receipt remains unresolved and recovers as unknown */ }
         },
@@ -853,9 +975,10 @@ export async function main(): Promise<void> {
             deploymentOverride: (path: string, digest: string) => promptProvenance.verifyWorldTemplate(world.id, path, digest),
           } : undefined;
         },
-        worldEventTrust: (world, event) => world === pet
-          && (['desktop-pet.message', 'desktop-pet.speech', 'desktop-pet.touch', 'desktop-pet.self'].includes(event.type)
-            || (['desktop-pet.answer', 'desktop-pet.guide-answer'].includes(event.type) && pet.admitUserAnswer(event))),
+        worldEventTrust: (world, event) => (world === pet
+          && (['desktop-pet.message', 'desktop-pet.speech', 'desktop-pet.touch', 'desktop-pet.self', 'desktop-pet.figure'].includes(event.type)
+            || (['desktop-pet.answer', 'desktop-pet.guide-answer'].includes(event.type) && pet.admitUserAnswer(event))))
+          || (world.id === BROWSER_ID && ['browser.closed', 'browser.unresolved'].includes(event.type)),
         worldToolOutcomeTrust: (world, tool, outcome) => (world === pet && (
           (tool === 'pet_say' && pet.admitSayReceipt(outcome))
           || (tool === 'pet_ask' && pet.admitAskReceipt(outcome))
@@ -864,7 +987,12 @@ export async function main(): Promise<void> {
           // template about the pet's own screen or settings; without admission the next request
           // would be blocked for a line the Host itself wrote.
           || !['pet_say', 'pet_ask', 'pet_act'].includes(tool)
-        )) || ((world.id === 'tts' || world.id === 'audio-play') && isVoiceToolReceipt(tool, outcome)),
+        )) || (
+          // Browser World outcomes are Host-formatted readouts/receipts for Cortico's evidence gate
+          // only; third-party page content never enters user-input spans and never authorizes writes
+          // (all external writes remain gated by ActionGate + Core UI confirmation).
+          world.id === BROWSER_ID && BROWSER_TOOL_NAMES.has(tool) && typeof outcome.text === 'string'
+        ) || ((world.id === 'tts' || world.id === 'audio-play') && isVoiceToolReceipt(tool, outcome)),
         worldDeferredTrust: (world, type, rendered) => notice !== null && world === notice
           && ((type === 'coopanion.updated' && notice.admitUpdate(rendered))
             || (type === 'coopanion.guide' && notice.admitGuideSummary(rendered))
@@ -1088,6 +1216,33 @@ export async function main(): Promise<void> {
   journal.start();
   affinitySync.start();
   process.send?.({ type: 'companion:ready', port, dataDir: loaded.dataDir, keyMissing, language: language() });
+  if (taskJournal && activeResumeTaskId && !bus?.isPaused()) {
+    const resumeTaskId = activeResumeTaskId;
+    void (async () => {
+      const decision = await taskJournal.planResume(resumeTaskId, async (step) => {
+        if (step.target.path && existsSync(step.target.path) && step.externalCheckDigest) {
+          const digest = hashContent(readFileSync(step.target.path, 'utf8'));
+          if (digest === step.externalCheckDigest) return { state: 'verified', digest, note: 'read-only disk SHA matched on restart' };
+        }
+        return { state: 'unknown', note: 'unverified step requires explicit read-only check before retry' };
+      });
+      console.info('[cua-resume] planResume', decision);
+      if (!decision || !decision.nextStep || decision.status === 'cancelled' || decision.status === 'completed') {
+        if (activeResumeTaskId === resumeTaskId) activeResumeTaskId = null;
+        return;
+      }
+      await sleep(1500);
+      const livePet = pet as DesktopPetWorld | null;
+      if (!livePet || bus?.isPaused()) return;
+      const next = decision.nextStep;
+      const targetHint = next.target.bundleId ? `${next.target.bundleId}${next.target.windowTitle ? ` (${next.target.windowTitle})` : ''}` : '目标普通窗口';
+      const resumePrompt = [
+        `[系统自动续作 taskId=${decision.taskId} generation=${decision.generation}] Core 重启恢复：已验证跳过步骤 [${decision.skippedStepIds.join(', ')}]（严禁重复执行）。`,
+        `请只使用 pet_cua_* 工具重新发现当前窗口（不要复用重启前旧 windowId），选中 ${targetHint}，执行待完成步骤 ${next.stepId}（工具=${next.tool}，意图=${next.intent}），并在动作前后各调用一次 pet_cua_accessibility 回读状态变化，最后简短汇报结果。`,
+      ].join('\n');
+      await livePet.pushContinuationResume(resumePrompt, { taskId: decision.taskId, stepId: next.stepId, generation: decision.generation });
+    })().catch((err) => console.warn('[cua-resume] 续作编排失败', String(err)));
+  }
   const guideDeps: GuideDeps = {
     pet: () => pet,
     console: `http://127.0.0.1:${port}`,

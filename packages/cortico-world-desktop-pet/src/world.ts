@@ -333,8 +333,15 @@ export interface DesktopPetWorldOptions {
   allowCuaInput?: (tool: string) => boolean;
   /** Identifies this Core run in native-window evidence. */
   cuaInstanceId?: string;
-  /** Core confirms and issues a one-step grant for a supported native target. */
+  /** Core confirms and issues a task-level or single-step grant for a supported native target. */
+  allowsOrdinaryCuaInput?: (request: Pick<CuaInputGrantRequest, 'tool' | 'target' | 'expectedChange'>) => boolean;
   authorizeCuaInput?: (request: CuaInputGrantRequest) => Promise<CuaInputAuthorization | null>;
+  /** Explicitly cancels an active desktop CUA task grant and its continuation state. */
+  revokeCuaTask?: (taskId: string) => void;
+  /** Suspends ephemeral in-memory CUA grants on shutdown/window switch without cancelling persisted tasks. */
+  suspendCuaTask?: (taskId: string) => void;
+  /** Returns the persisted resumable CUA task ID on startup, if any. */
+  resumeCuaTaskId?: () => string | null;
   /** Exact app-managed Cua Driver endpoint and session. */
   cuaDriver?: CuaDriverOptions;
 }
@@ -493,6 +500,8 @@ export class DesktopPetWorld implements World {
   private readonly pendingAssistantResponses: Array<{ responseId: string; text: string }> = [];
   private readonly spokenThisTurn = new Set<string>();
   private assistantFlush: Promise<void> = Promise.resolve();
+  /** Bumped whenever a new user turn starts or a round is preempted, cancelling stale say bubbles. */
+  private sayEpoch = 0;
   /** The first cursor of this run: Core queues this World's undelivered events from before it again at start. */
   private startCursor = 0;
   /** Text the bubble's expand button carried, until a chat page takes it. */
@@ -513,7 +522,11 @@ export class DesktopPetWorld implements World {
       language: () => this.appLanguage,
       allowInput: opts.allowCuaInput,
       instanceId: opts.cuaInstanceId,
+      allowsOrdinaryInput: opts.allowsOrdinaryCuaInput,
       authorizeInput: opts.authorizeCuaInput,
+      revokeInputTask: opts.revokeCuaTask,
+      suspendInputTask: opts.suspendCuaTask,
+      initialTaskId: opts.resumeCuaTaskId,
       askPermission: async (question, choices) => {
         const answer = await this.confirm(question, choices);
         if (answer === 'unavailable') return null;
@@ -829,8 +842,15 @@ export class DesktopPetWorld implements World {
       onAbort: () => {
         for (const reply of this.pendingAssistantResponses) this.assistantResponseIds.delete(reply.responseId);
         this.pendingAssistantResponses.length = 0;
+        this.clearQueuedSayBubbles();
       },
     };
+  }
+
+  private clearQueuedSayBubbles(): void {
+    this.sayEpoch++;
+    this.busyUntil = 0;
+    this.server.sendPet({ t: 'say-clear' });
   }
 
   onSessionArchived(): void {
@@ -842,6 +862,9 @@ export class DesktopPetWorld implements World {
   onRunPhase(phase: RunPhase): void {
     this.phase = phase;
     this.status.onPhase(phase);
+    if (phase.state === 'delivering' && phase.round === undefined) {
+      this.clearQueuedSayBubbles();
+    }
     if (this.activity.observe(phase, Date.now())) this.chat.broadcast({ t: 'activity', steps: this.activity.steps, startedAt: this.activity.startedAt });
     if (phase.state === 'idle') {
       const replies = this.pendingAssistantResponses.splice(0);
@@ -853,7 +876,8 @@ export class DesktopPetWorld implements World {
         // A reply that only repeats what a pet_say bubble already said (markers ignored) is not a second bubble.
         return beats.length > 0 && !beats.every((text) => spoken.has(text));
       });
-      for (const reply of visible) void this.sendAssistantBubble(reply.text);
+      const epoch = this.sayEpoch;
+      for (const reply of visible) void this.sendAssistantBubble(reply.text, epoch);
       if (visible.length > 0) this.assistantFlush = this.assistantFlush.then(async () => {
         for (const reply of visible) await this.record({ kind: 'assistant', responseId: reply.responseId }, reply.text);
       }).catch((err: unknown) => this.log?.warn(`回复没能保存:${(err as Error).message}`));
@@ -866,9 +890,10 @@ export class DesktopPetWorld implements World {
    * so a long pet_say bubble is not replaced while its voice is still speaking. With no voice worker
    * (or another TTS) the clock answers nothing and the bubble shows at once.
    */
-  private async sendAssistantBubble(text: string): Promise<void> {
+  private async sendAssistantBubble(text: string, epoch = this.sayEpoch): Promise<void> {
     const started = Date.now();
     while (Date.now() - started < 60_000) {
+      if (epoch !== this.sayEpoch) return;
       try {
         const res = await fetch('http://127.0.0.1:9882/clock', { signal: AbortSignal.timeout(600) });
         if (!res.ok) break;
@@ -892,6 +917,7 @@ export class DesktopPetWorld implements World {
       } catch { break; }
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
+    if (epoch !== this.sayEpoch) return;
     const { beats } = parseScript(text, this.vocab());
     if (beats.length) this.server.sendPet({ t: 'say', beats });
   }
@@ -1472,6 +1498,12 @@ export class DesktopPetWorld implements World {
    * Delivers an event to the bot. `meta` carries what the chat page shows of it; the person's
    * messages stay pending on the page until Core reports them delivered.
    */
+  /** Pushes a Core-originated continuation wake after restart for a verified resumable CUA task. */
+  async pushContinuationResume(text: string, meta: Record<string, unknown>): Promise<boolean> {
+    const e = await this.push('desktop-pet.message', 'desktop-pet.resume', text, 'flush', { meta: { via: 'resume', ...meta } });
+    return e !== null;
+  }
+
   /** Publishes only a validated, non-secret answer received from the dialog page. */
   publishDialogAnswer(answer: PetDialogAnswer, step = ''): boolean {
     const admitted = this.admittedDialogAnswers.get(answer);
@@ -1495,12 +1527,12 @@ export class DesktopPetWorld implements World {
     return true;
   }
 
-  /** Admits only the one-time receipt from a spoken message the connected pet page accepted. */
+  /** Admits one-time speech receipts produced by this World. */
   admitSayReceipt(outcome: ToolOutcome): boolean {
     const expected = this.admittedSayReceipts.get(outcome);
     if (expected === undefined) return false;
     this.admittedSayReceipts.delete(outcome);
-    return outcome.failed !== true && outcome.text === expected;
+    return outcome.text === expected;
   }
 
   /** Admits the fixed receipt produced after the pet accepted a question. */
@@ -1983,7 +2015,11 @@ export class DesktopPetWorld implements World {
     const { beats, dropped } = parseScript(script, this.vocab());
     const spoken = beats.some((b) => b.text || b.actions.length || b.anchors.length);
     if (!spoken && shown.blobs.length === 0) return { text: this.t.sayEmpty, failed: true };
-    if (spoken && !this.server.sendPet({ t: 'say', id: nextId('s'), beats })) return this.notConnected('pet_say');
+    if (spoken && !this.server.sendPet({ t: 'say', id: nextId('s'), beats })) {
+      const receipt: ToolOutcome = { text: this.t.notConnected('pet_say', null, this.userName), failed: true };
+      this.admittedSayReceipts.set(receipt, receipt.text);
+      return receipt;
+    }
     if (spoken) for (const beat of beats) if (beat.text.trim()) this.spokenThisTurn.add(beat.text.trim());
     void this.closeActivity();
     void this.record({ kind: 'say', beats: beats.map((b) => ({ text: b.text, ...moodOf(b.actions, this.vocab()) })) }, beats.map((b) => b.text).join(''), shown.blobs);

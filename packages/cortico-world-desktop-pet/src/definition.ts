@@ -101,8 +101,15 @@ export interface DesktopPetAssembly {
   authorizeInput?(tool: string): boolean;
   /** Identifies this Core run in native-window evidence. */
   cuaInstanceId?: string;
-  /** Core confirms and issues a one-step grant for a supported native target. */
+  /** Core confirms and issues a task-level or single-step grant for a supported native target. */
+  allowsOrdinaryCuaInput?: (request: Pick<CuaInputGrantRequest, 'tool' | 'target' | 'expectedChange'>) => boolean;
   authorizeCuaInput?(request: CuaInputGrantRequest): Promise<CuaInputAuthorization | null>;
+  /** Explicitly cancels an active desktop CUA task grant and its continuation state. */
+  revokeCuaTask?(taskId: string): void;
+  /** Suspends ephemeral in-memory CUA grants on shutdown/window switch without cancelling persisted tasks. */
+  suspendCuaTask?(taskId: string): void;
+  /** Returns the persisted resumable CUA task ID on startup, if any. */
+  resumeCuaTaskId?(): string | null;
   /** Exact app-managed Cua Driver endpoint and session. */
   cuaDriver?: CuaDriverOptions;
 }
@@ -140,7 +147,11 @@ export function desktopPetDefinition(assembly: DesktopPetAssembly = {}): WorldDe
         cuaDriver: assembly.cuaDriver,
         allowCuaInput: assembly.authorizeInput,
         cuaInstanceId: assembly.cuaInstanceId,
+        allowsOrdinaryCuaInput: assembly.allowsOrdinaryCuaInput,
         authorizeCuaInput: assembly.authorizeCuaInput,
+        revokeCuaTask: assembly.revokeCuaTask,
+        suspendCuaTask: assembly.suspendCuaTask,
+        resumeCuaTaskId: assembly.resumeCuaTaskId,
       });
       assembly.onCreate?.(world);
       return world;
