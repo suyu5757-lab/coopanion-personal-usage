@@ -63,9 +63,21 @@ export interface ResumeDecision {
 const MAX_RECENT_TASKS = 200;
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
 
+function lastVerifiedIndex(steps: readonly ContinuationStep[]): number {
+  for (let i = steps.length - 1; i >= 0; i--) {
+    if (steps[i]!.status === 'verified') return i;
+  }
+  return -1;
+}
+
 function computeResumeCursor(steps: readonly ContinuationStep[]): number {
-  const index = steps.findIndex((step) => step.status !== 'verified' && step.status !== 'skipped');
-  return index < 0 ? steps.length : index;
+  const afterVerified = lastVerifiedIndex(steps);
+  const start = afterVerified >= 0 ? afterVerified + 1 : 0;
+  for (let i = start; i < steps.length; i++) {
+    const status = steps[i]!.status;
+    if (status !== 'verified' && status !== 'skipped') return i;
+  }
+  return steps.length;
 }
 
 export class TaskContinuationJournal {
@@ -286,9 +298,19 @@ export class TaskContinuationJournal {
     let blockedStepId: string | null = null;
     let changed = false;
 
-    for (const step of task.steps) {
+    const lastVerified = lastVerifiedIndex(task.steps);
+    for (let i = 0; i < task.steps.length; i++) {
+      const step = task.steps[i]!;
       if (step.status === 'verified' || step.status === 'skipped') {
         skippedStepIds.push(step.stepId);
+        continue;
+      }
+      if (i < lastVerified && step.status === 'unknown') {
+        step.status = 'skipped';
+        step.note = 'superseded by later verified step in same task';
+        step.updatedAt = now;
+        skippedStepIds.push(step.stepId);
+        changed = true;
         continue;
       }
       if (step.status === 'unknown' || step.status === 'dispatched') {
