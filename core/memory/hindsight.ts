@@ -14,7 +14,7 @@ import { formatPortrait, formatRecall, formatRecallDetailed, type RecallFormatTr
 import { captureRetrievalScores, type RetrievalScoreEvidence } from './retrieval-scores.ts';
 import { sanitizeForMemory } from './policy.ts';
 import { loadHindsightConfig, type HindsightConfig, type HindsightFileConfig } from './config.ts';
-import { evidenceCoversText } from './source-evidence.ts';
+import { evidenceCoversSegments, evidenceCoversText } from './source-evidence.ts';
 import { DeliveryError, OutboxDelivery, type DeliveryOps, type OperationState } from './delivery.ts';
 import { MemoryOutbox, readLegacyOutbox, requestHashFor, type OutboxItem, type RetainItem } from './outbox.ts';
 import { ForgetLedger, readLegacyForget, type DeletionInput, type ForgetIntentAcceptance } from './forget-ledger.ts';
