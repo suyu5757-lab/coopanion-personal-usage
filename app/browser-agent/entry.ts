@@ -396,16 +396,38 @@ if (!host[KEY]) {
     const overlaps = (a: { left: number; top: number; right: number; bottom: number }, b: { left: number; top: number; right: number; bottom: number }) =>
       a.left < b.right + 2 && a.right + 2 > b.left && a.top < b.bottom + 2 && a.bottom + 2 > b.top;
 
+    const indexedEls = new Set<HTMLElement>();
+    for (const node of map.values()) { if (node?.ref?.isConnected) indexedEls.add(node.ref); }
+
     for (const [index, node] of map.entries()) {
       const el = node?.ref;
       if (!el || !el.isConnected || !isVisible(el)) continue;
       const rect = visibleClippedRect(el);
       if (!rect) continue;
+      // Skip giant full-viewport scroll/page wrappers that should never carry corner badges.
+      if (rect.width > vw * 0.85 && rect.height > vh * 0.75) continue;
+      // Skip redundant nested non-semantic children inside an already-indexed semantic control (e.g. icon/label divs inside <a>/<button>).
+      const tag = el.tagName.toLowerCase();
+      const isOwnSemantic = el.matches('a[href], button, input, textarea, select, [role="button"], [role="link"], [role="tab"]');
+      if (!isOwnSemantic) {
+        let coveredByIndexedParent = false;
+        for (let p = composedParentElement(el); p && p !== document.body; p = composedParentElement(p)) {
+          if (indexedEls.has(p) && p.matches('a[href], button, [role="button"], [role="link"], [role="tab"]')) {
+            coveredByIndexedParent = true;
+            break;
+          }
+        }
+        if (coveredByIndexedParent) continue;
+      }
+      // Skip ghost elements covered by a foreground modal/header.
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const hit = document.elementFromPoint(cx, cy);
+      if (hit && hit !== el && !el.contains(hit) && !hit.contains(el)) continue;
 
       const labelText = String(index);
       const badgeW = Math.max(16, labelText.length * 6 + 9);
       const badgeH = 15;
-      const tag = el.tagName.toLowerCase();
       const isInputLike = tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
       const isCard = rect.width >= 140 && rect.height >= 90;
       const isCompact = rect.height <= 44 && rect.width <= 110;
@@ -574,6 +596,11 @@ if (!host[KEY]) {
       return augmented as typeof raw;
     }
     finally { restore(); }
+  };
+
+  /** Ensures selectorMap is populated without renumbering an existing map before an indexed lookup/action. */
+  const ensureSelectorMap = async () => {
+    if (!internals.selectorMap?.size) await readPage();
   };
 
   const describe = (index: number): AgentElement | null => {
@@ -970,7 +997,7 @@ if (!host[KEY]) {
     text: async (): Promise<{ url: string; title: string; text: string; video: VideoState | null }> =>
       ({ url: location.href, title: document.title, text: pageText(), video: video() }),
     click: async (index: number, expectedSnapshotId?: string): Promise<ActionResult> => {
-      await readPage();
+      await ensureSelectorMap();
       const expected = expectedSnapshotId ?? snapshotId();
       if (snapshotId() !== expected) return { success: false, message: 'stale snapshot' };
       const element = elementAt(index);
@@ -985,7 +1012,7 @@ if (!host[KEY]) {
       | { ok: true; x: number; y: number; snapshotId: string }
       | { ok: false; reason: ActionabilityFailure | 'stale-snapshot' | 'none' | 'unstable' }
     > => {
-      await readPage();
+      await ensureSelectorMap();
       if (!expectedSnapshotId || snapshotId() !== expectedSnapshotId) return { ok: false, reason: 'stale-snapshot' };
       const element = elementAt(index);
       if (!element) return { ok: false, reason: 'none' };
@@ -997,7 +1024,7 @@ if (!host[KEY]) {
     setAgentAction: (active: boolean): void => { fileChooserGuard.setAgentAction(active); },
     /** Focus a text box and select its contents so the host's real text insertion replaces them. */
     prepareInput: async (index: number, expectedSnapshotId?: string): Promise<boolean> => {
-      await readPage();
+      await ensureSelectorMap();
       if (expectedSnapshotId && snapshotId() !== expectedSnapshotId) return false;
       const element = elementAt(index);
       if (!element) return false;
@@ -1015,19 +1042,19 @@ if (!host[KEY]) {
       return true;
     },
     scroll: async (options: { down: boolean; numPages: number; index?: number }, expectedSnapshotId?: string): Promise<ActionResult> => {
-      await readPage();
+      await ensureSelectorMap();
       if (expectedSnapshotId && snapshotId() !== expectedSnapshotId) return { success: false, message: 'stale snapshot' };
       return controller.scroll(options);
     },
     select: (index: number, text: string): Promise<ActionResult> => controller.selectOption(index, text),
     focus: async (index: number, expectedSnapshotId?: string): Promise<boolean> => {
-      await readPage();
+      await ensureSelectorMap();
       if (expectedSnapshotId && snapshotId() !== expectedSnapshotId) return false;
       const element = elementAt(index); element?.focus(); return !!element;
     },
     /** The element's viewport center, after bringing it into view, for the host's real pointer move. */
     center: async (index: number, expectedSnapshotId?: string): Promise<{ x: number; y: number } | null> => {
-      await readPage();
+      await ensureSelectorMap();
       if (expectedSnapshotId && snapshotId() !== expectedSnapshotId) return null;
       const element = elementAt(index);
       if (!element) return null;
@@ -1126,7 +1153,7 @@ if (!host[KEY]) {
       if (!expectedSnapshotId || snapshotId() !== expectedSnapshotId) return null;
       return mediaTargets().find((target) => target.id === id) ?? null;
     },
-    element: async (index: number): Promise<AgentElement | null> => { await readPage(); return describe(index); },
+    element: async (index: number): Promise<AgentElement | null> => { await ensureSelectorMap(); return describe(index); },
     resolveLocator: async (locator: TargetLocator, expectedSnapshotId?: string): Promise<
       | { ok: true; id: number; snapshotId: string }
       | { ok: false; reason: 'invalid' | 'none' | 'ambiguous' | 'stale-snapshot' }
@@ -1158,7 +1185,7 @@ if (!host[KEY]) {
     },
     /** The live text of one box, for the confirmation the host shows before a public write. */
     draft: async (index: number, expectedSnapshotId?: string): Promise<string | null> => {
-      await readPage();
+      await ensureSelectorMap();
       if (expectedSnapshotId && snapshotId() !== expectedSnapshotId) return null;
       const element = elementAt(index);
       if (!element) return null;
