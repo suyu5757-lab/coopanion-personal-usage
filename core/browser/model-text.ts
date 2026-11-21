@@ -105,6 +105,7 @@ export interface BrowserText {
   scrolled(down: boolean, pages: number): string;
   played(paused: boolean): string;
   screenshot: string;
+  screenshotReadOnly(width: number, height: number): string;
   screenshotCapture(captureId: string, width: number, height: number): string;
   visualClickUnknown(description: string): string;
   watched(seconds: number, frames: number, times: number[]): string;
@@ -190,6 +191,7 @@ const zh: BrowserText = {
   scrolled: (down, pages) => `[浏览器] ${down ? '向下' : '向上'}翻了 ${pages} 屏`,
   played: (paused) => `[浏览器] ${paused ? '暂停' : '播放'}了视频`,
   screenshot: '[浏览器] 当前页面截图',
+  screenshotReadOnly: (width, height) => `[浏览器] 当前页面只读截图（${width}×${height}，不可用于坐标点击；仅作为当前同源页面的画面观察证据）`,
   screenshotCapture: (captureId, width, height) => `[浏览器] 截图 captureId=${captureId}，图片尺寸 ${width}×${height}。坐标只能取自这张图，点击一次后该 captureId 失效。`,
   visualClickUnknown: (description) => `[浏览器] 已对截图目标「${description}」发送一次点击，但没有独立确认业务结果；结果未知。先检查页面或未决回执，不要重试。`,
   watched: (seconds, frames, times) => `[浏览器] 看了 ${seconds} 秒,截了 ${frames} 帧(第 ${times.join('、')} 秒)`,
@@ -286,6 +288,7 @@ const en: BrowserText = {
   scrolled: (down, pages) => `[browser] Scrolled ${down ? 'down' : 'up'} ${pages} screen${pages === 1 ? '' : 's'}`,
   played: (paused) => `[browser] ${paused ? 'Paused' : 'Played'} the video`,
   screenshot: '[browser] Screenshot of the page',
+  screenshotReadOnly: (width, height) => `[browser] Read-only screenshot of the current page (${width}×${height}; not bound for visual clicking; same-origin visual observation only)`,
   screenshotCapture: (captureId, width, height) => `[browser] Screenshot captureId=${captureId}, image size ${width}×${height}. Coordinates must come from this image; this captureId expires after one click attempt.`,
   visualClickUnknown: (description) => `[browser] Sent one click to the screenshot target "${description}", but did not independently verify the business result; outcome is unknown. Check the page or unresolved receipt before any retry.`,
   watched: (seconds, frames, times) => `[browser] Watched ${seconds} seconds; ${frames} frames at ${times.join(', ')}s`,

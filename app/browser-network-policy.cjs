@@ -163,4 +163,20 @@ function mappedIpv4(value) {
   return Number(value & 0xffffffffn);
 }
 
-module.exports = { checkPublicDestination, httpUrl, isPublicHttp, isPublicResolvedHost, isWebSocketRequest, sameAddress };
+const FAKE_IP_BASE = 0xc6120000;
+const FAKE_IP_MASK = (0xffffffff << (32 - 15)) >>> 0;
+
+/**
+ * True only when every resolved endpoint is an IPv4 address inside RFC 2544 (198.18.0.0/15),
+ * which local TUN proxies use for Fake-IP DNS interception. Never true for loopback/private ranges.
+ */
+function isFakeIpOnlyResult(result) {
+  const endpoints = Array.isArray(result?.endpoints) ? result.endpoints : [];
+  return endpoints.length > 0 && endpoints.every((endpoint) => {
+    if (!endpoint || typeof endpoint.address !== 'string') return false;
+    const value = ipv4Number(endpoint.address);
+    return value !== null && ((value & FAKE_IP_MASK) >>> 0) === FAKE_IP_BASE;
+  });
+}
+
+module.exports = { checkPublicDestination, httpUrl, isFakeIpOnlyResult, isPublicHttp, isPublicResolvedHost, isWebSocketRequest, sameAddress };

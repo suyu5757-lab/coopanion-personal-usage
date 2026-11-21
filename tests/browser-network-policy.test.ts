@@ -106,4 +106,16 @@ describe('Browser public destination preflight', () => {
     expect(timeout).toEqual({ allowed: false, reason: 'resolution-timeout' });
     expect(failure).toEqual({ allowed: false, reason: 'resolution-failed' });
   });
+
+  it('detects RFC 2544 Fake-IP-only DNS results without ever permitting 198.18.0.0/15 as a public address', () => {
+    const { isFakeIpOnlyResult } = require('../app/browser-network-policy.cjs') as {
+      isFakeIpOnlyResult(result: ResolvedHost): boolean;
+    };
+    expect(isFakeIpOnlyResult({ endpoints: [{ address: '198.18.0.133' }] })).toBe(true);
+    expect(isFakeIpOnlyResult({ endpoints: [{ address: '198.19.255.1' }] })).toBe(true);
+    expect(isFakeIpOnlyResult({ endpoints: [{ address: '127.0.0.1' }] })).toBe(false);
+    expect(isFakeIpOnlyResult({ endpoints: [{ address: '198.18.0.133' }, { address: '127.0.0.1' }] })).toBe(false);
+    expect(isFakeIpOnlyResult({ endpoints: [{ address: '93.184.216.34' }] })).toBe(false);
+    expect(isPublicResolvedHost({ endpoints: [{ address: '198.18.0.133' }] })).toBe(false);
+  });
 });

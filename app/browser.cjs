@@ -28,6 +28,7 @@ const { createBrowserEgressProxy } = require('./browser-egress-proxy.cjs');
 const {
   checkPublicDestination: evaluatePublicDestination,
   httpUrl,
+  isFakeIpOnlyResult,
   isPublicHttp,
   isWebSocketRequest,
 } = require('./browser-network-policy.cjs');
@@ -114,6 +115,28 @@ function normalizedMediaRequestUrl(value) {
 
 function sameMediaRequestUrl(left, right) {
   return !!normalizedMediaRequestUrl(left) && normalizedMediaRequestUrl(left) === normalizedMediaRequestUrl(right);
+}
+
+/** Classifies a CDP read-only page state without claiming content when gated or empty. */
+function classifyCdpPageState({ url = '', title = '', lines = [], controlsCount = 0, loadTimedOut = false } = {}) {
+  const normalizedUrl = String(url || '').trim();
+  const normalizedTitle = String(title || '').trim();
+  const sample = Array.isArray(lines) ? lines.slice(0, 40) : [];
+  const haystack = [normalizedUrl, normalizedTitle, ...sample].join('\n');
+  if (!normalizedUrl || normalizedUrl === 'about:blank') return 'blank-or-error';
+  if (/(?:安全验证|人机验证|滑动验证|拖动滑块|拼图验证|请完成下列验证|verifycenter|captcha|baxia|waf)/i.test(haystack)) {
+    return 'challenge-visible';
+  }
+  if (sample.length === 0 && Number(controlsCount || 0) === 0) {
+    return loadTimedOut ? 'navigation-timeout' : 'blank-or-error';
+  }
+  const hasFeedSignals = /(?:精选|推荐|关注|粉丝|作品|评论|搜索|直播|商城|点赞|收藏)/.test(haystack);
+  const isLoginUrl = /(?:\/login|passport|signin|oauth|auth)/i.test(normalizedUrl);
+  const hasLoginGate = /(?:扫码登录|手机号登录|密码登录|验证码登录|登录后即可|立即登录|请先登录)/.test(haystack);
+  if (isLoginUrl || (hasLoginGate && sample.length < 18 && !hasFeedSignals)) {
+    return 'login-required';
+  }
+  return 'content-ready';
 }
 
 function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () => null, partition = PARTITION, resolveHostForUrl }) {
@@ -481,12 +504,56 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     return agent;
   };
 
+  const CN_DOH_HOST_RE = /(?:^|\.)(?:cn|douyin\.com|douyinvod\.com|douyinpic\.com|douyincdn\.com|douyinliving\.com|bytedance\.com|byteimg\.com|bytescm\.com|bytegoofy\.com|bytednsdoc\.com|ibytedtos\.com|zijieapi\.com|pstatp\.com|amemv\.com|snssdk\.com|ixigua\.com|toutiao\.com|bilibili\.com|bilivideo\.com|hdslb\.com|xiaohongshu\.com|xhscdn\.com|weibo\.com|zhihu\.com|taobao\.com|tmall\.com|alicdn\.com|qq\.com|baidu\.com|bdstatic\.com|jd\.com|163\.com)$/i;
+  const CN_DOH_ENDPOINTS = ['https://dns.alidns.com/resolve', 'https://doh.pub/resolve'];
+  const GLOBAL_DOH_ENDPOINTS = ['https://1.1.1.1/dns-query', 'https://dns.google/resolve'];
+  const dohCache = new Map();
+  const queryDohEndpoint = async (endpoint, key) => {
+    const res = await fetch(`${endpoint}?name=${encodeURIComponent(key)}&type=A`, {
+      headers: { accept: 'application/dns-json' },
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!res.ok) throw new Error(`DoH HTTP ${res.status}`);
+    const data = await res.json();
+    const addresses = Array.isArray(data?.Answer)
+      ? data.Answer.filter((a) => a && a.type === 1 && typeof a.data === 'string').map((a) => ({ address: a.data }))
+      : [];
+    if (!addresses.length) throw new Error('DoH empty');
+    return { endpoints: addresses };
+  };
+  const resolvePublicViaDoh = async (hostname) => {
+    const key = String(hostname ?? '').toLowerCase();
+    const cached = dohCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.result;
+    const tiers = CN_DOH_HOST_RE.test(key)
+      ? [CN_DOH_ENDPOINTS, GLOBAL_DOH_ENDPOINTS]
+      : [[...GLOBAL_DOH_ENDPOINTS, ...CN_DOH_ENDPOINTS]];
+    for (const tier of tiers) {
+      try {
+        const result = await Promise.any(tier.map((endpoint) => queryDohEndpoint(endpoint, key)));
+        dohCache.set(key, { result, expiresAt: Date.now() + 60_000 });
+        return result;
+      } catch { /* try next DoH tier */ }
+    }
+    return { endpoints: [] };
+  };
+
+  const resolveHostSafely = async (hostname) => {
+    if (resolveHostForUrl) return resolveHostForUrl(hostname);
+    const local = await session.fromPartition(partition).resolveHost(hostname, { cacheUsage: 'allowed' });
+    // When a local TUN proxy intercepts DNS with RFC 2544 Fake-IPs (198.18.0.0/15), resolve the
+    // real authoritative IPv4 endpoints via DoH so the unmodified SSRF policy still validates real IPs.
+    if (isFakeIpOnlyResult(local)) {
+      const real = await resolvePublicViaDoh(hostname);
+      if (real.endpoints.length) return real;
+    }
+    return local;
+  };
+
   const publicDestinationCheck = (value) => evaluatePublicDestination(
     value,
-    (hostname) => resolveHostForUrl
-      ? resolveHostForUrl(hostname)
-      : session.fromPartition(partition).resolveHost(hostname, { cacheUsage: 'allowed' }),
-    (work) => within(work, 2500, 'public destination check'),
+    resolveHostSafely,
+    (work) => within(work, 5000, 'public destination check'),
   );
 
   const isPublicDestination = async (value) => (await publicDestinationCheck(value)).allowed;
@@ -633,18 +700,55 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     });
     // Prevent late unhandled rejection if dom-ready won before a redirect aborted loadURL.
     start.catch(() => undefined);
+    if (winner === 'aborted-redirect') {
+      if (wc.isLoading()) {
+        let redirectTimer;
+        let onRedirectReady;
+        await Promise.race([
+          new Promise((resolve) => {
+            onRedirectReady = () => resolve('dom-ready');
+            wc.once('dom-ready', onRedirectReady);
+          }),
+          new Promise((resolve) => { redirectTimer = setTimeout(() => resolve('redirect-wait-done'), 6000); }),
+        ]).finally(() => {
+          clearTimeout(redirectTimer);
+          if (onRedirectReady && !wc.isDestroyed()) wc.removeListener('dom-ready', onRedirectReady);
+        });
+      }
+      const landedUrl = !wc.isDestroyed() ? (wc.getURL() || '') : '';
+      if (!isPublicHttp(landedUrl)) {
+        throw new Error(`navigation aborted without a valid public target page (ERR_ABORTED, url=${landedUrl || 'empty'})`);
+      }
+      await sleep(Math.max(settleMs, 1400));
+      return winner;
+    }
     await sleep(winner === 'dom-ready' ? Math.max(settleMs, 1400) : settleMs);
+    return winner;
   };
 
   /** Native Electron CDP Accessibility.getFullAXTree read-only fallback when heavy SPA JS blocks executeJavaScript. */
-  const cdpReadState = async () => {
+  const cdpReadState = async ({ loadTimedOut = false, domError = '' } = {}) => {
     if (!win || win.isDestroyed()) throw new Error('browser window is closed');
     const wc = win.webContents;
     const dbg = wc.debugger;
     const attachedHere = !dbg.isAttached();
-    if (attachedHere) dbg.attach('1.3');
+    if (attachedHere) {
+      try {
+        dbg.attach('1.3');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(`cdp_attach_error: ${msg}`);
+      }
+    }
     try {
-      const res = await within(() => dbg.sendCommand('Accessibility.getFullAXTree', { depth: 8 }), 6000, 'cdp axtree');
+      let res;
+      try {
+        res = await within(() => dbg.sendCommand('Accessibility.getFullAXTree', { depth: 8 }), 6000, 'cdp axtree');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/timed out/i.test(msg)) throw new Error(`cdp_timeout: ${msg}`);
+        throw new Error(`cdp_protocol_error: ${msg}`);
+      }
       const nodes = Array.isArray(res?.nodes) ? res.nodes : [];
       const url = wc.getURL() || '';
       let title = (wc.getTitle() || '').trim();
@@ -668,12 +772,23 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
         }
       }
       const [vw, vh] = win.getContentSize();
+      const pageStatus = classifyCdpPageState({ url, title, lines, controlsCount: controls.length, loadTimedOut });
+      const noNodes = lines.length === 0 && controls.length === 0;
       const snapshotId = `cdp-${createHash('sha256').update(`${url}|${title}|${lines.length}|${Date.now()}`).digest('hex').slice(0, 12)}`;
-      const header = `[CDP AXTree 只读模式: 页面主线程繁忙，已通过 Chromium 原生无障碍树读取，共提取 ${lines.length} 条文本 / ${controls.length} 个 AX 控件（只读）]`;
-      const content = `${header}\n${lines.join('\n')}`.slice(0, 6000);
+      const pageHeader = [
+        `Current Page: [${title || url}](${url})`,
+        `Page status: ${pageStatus}${loadTimedOut ? ' (load-timeout fallback)' : ''}${noNodes ? ' (cdp_no_accessible_nodes)' : ''} · CDP AXTree read-only`,
+      ].join('\n');
+      const notice = noNodes
+        ? `[CDP AXTree 只读模式: cdp_no_accessible_nodes — 未提取到可见无障碍文本或控件${domError ? `；DOM 回退原因: ${domError}` : ''}；可调用 browser_screenshot 获取只读画面]`
+        : `[CDP AXTree 只读模式: 页面主线程繁忙，已通过 Chromium 原生无障碍树读取，共提取 ${lines.length} 条文本 / ${controls.length} 个 AX 控件（只读）]`;
+      const content = `${notice}\n${lines.join('\n')}`.slice(0, 6000);
       return {
         url,
         title: title || url,
+        header: pageHeader,
+        footer: '',
+        video: null,
         viewport: { width: vw || 1100, height: vh || 700 },
         page: { width: vw || 1100, height: vh || 700, pagesAbove: 0, pagesBelow: 0, totalPages: 1, percent: 0 },
         content,
@@ -682,6 +797,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
         snapshotId,
         mediaTargets: [],
         cdpFallback: true,
+        pageStatus,
+        ...(noNodes ? { cdpError: 'cdp_no_accessible_nodes' } : {}),
       };
     } finally {
       if (attachedHere && dbg.isAttached()) {
@@ -690,7 +807,12 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     }
   };
 
-  const readStateWithCdpFallback = async () => {
+  const readStateWithCdpFallback = async ({ loadTimedOut = false } = {}) => {
+    if (loadTimedOut) {
+      log.warn('[browser] page load timed out; reading active public page via native CDP AXTree');
+      lastReadWasCdp = true;
+      return cdpReadState({ loadTimedOut: true, domError: 'page load timed out' });
+    }
     try {
       await ensureAgent();
       const result = await state();
@@ -701,7 +823,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       if (/timed out|page script|not ready/i.test(msg)) {
         log.warn('[browser] DOM agent timed out; falling back to native CDP AXTree', { error: msg });
         lastReadWasCdp = true;
-        return cdpReadState();
+        return cdpReadState({ loadTimedOut: false, domError: msg });
       }
       throw err;
     }
@@ -989,8 +1111,20 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     const loaded = win.webContents.loadURL(target.href)
       .then(() => { navigating = false; })
       .catch((error) => { navigating = false; throw error; });
-    await waitForLoad(loaded, settleMs);
-    return readStateWithCdpFallback();
+    let loadTimedOut = false;
+    try {
+      await waitForLoad(loaded, settleMs);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const currentUrl = win && !win.isDestroyed() ? (win.webContents.getURL() || '') : '';
+      if (/page load timed out/i.test(msg) && isPublicHttp(currentUrl)) {
+        log.warn('[browser] page load timed out on active public URL; falling back to read-only CDP state', { url: currentUrl });
+        loadTimedOut = true;
+      } else {
+        throw err;
+      }
+    }
+    return readStateWithCdpFallback({ loadTimedOut });
   };
 
   const capture = async () => {
@@ -1032,6 +1166,45 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       used: false,
     };
     return { ...image, state: after, captureId, viewportWidth: viewport.width, viewportHeight: viewport.height };
+  };
+
+  const captureReadOnlyFallback = async (domError = '') => {
+    activeVisualCapture = null;
+    const image = await capture();
+    let pageState;
+    try {
+      pageState = await cdpReadState({ domError });
+    } catch (cdpErr) {
+      const url = win && !win.isDestroyed() ? (win.webContents.getURL() || '') : '';
+      const title = win && !win.isDestroyed() ? (win.webContents.getTitle() || '').trim() : '';
+      const [vw, vh] = win && !win.isDestroyed() ? win.getContentSize() : [image.width, image.height];
+      const cdpMsg = cdpErr instanceof Error ? cdpErr.message : String(cdpErr);
+      pageState = {
+        url,
+        title: title || url,
+        header: `Current Page: [${title || url}](${url})\nPage status: blank-or-error · read-only screenshot fallback (${cdpMsg})`,
+        content: `[只读截图模式: DOM 与 CDP 均不可用 (${cdpMsg})，仅提供当前同源页面画面作为只读证据]`,
+        footer: '',
+        video: null,
+        viewport: { width: vw || 1100, height: vh || 700 },
+        page: { width: vw || 1100, height: vh || 700, pagesAbove: 0, pagesBelow: 0, totalPages: 1, percent: 0 },
+        elements: [],
+        controls: [],
+        snapshotId: `cdp-shot-${createHash('sha256').update(`${url}|${title}|${Date.now()}`).digest('hex').slice(0, 12)}`,
+        mediaTargets: [],
+        cdpFallback: true,
+        cdpError: cdpMsg,
+      };
+    }
+    lastReadWasCdp = true;
+    const [vw, vh] = win && !win.isDestroyed() ? win.getContentSize() : [image.width, image.height];
+    return {
+      ...image,
+      state: pageState,
+      readOnly: true,
+      viewportWidth: vw || image.width,
+      viewportHeight: vh || image.height,
+    };
   };
 
   const inspectVisualPoint = async (message, allowUsed = false) => {
@@ -1089,7 +1262,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     const username = 'coopanion-browser';
     const password = randomUUID();
     const proxy = createBrowserEgressProxy({
-      resolveHost: (hostname) => ses.resolveHost(hostname, { cacheUsage: 'allowed' }),
+      resolveHost: resolveHostSafely,
       username,
       password,
     });
@@ -1809,7 +1982,16 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       return { answer: safeAnswer, state: await state() };
     }
     if (op === 'screenshot') {
-      return captureForVisualClick();
+      try {
+        return await captureForVisualClick();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/timed out|page script|not ready|no stable screenshot viewport/i.test(msg)) {
+          log.warn('[browser] visual-click screenshot unavailable; falling back to read-only screenshot', { error: msg });
+          return captureReadOnlyFallback(msg);
+        }
+        throw err;
+      }
     }
     if (op === 'back') {
       if (!win.webContents.navigationHistory.canGoBack()) return { back: false, state: await state() };
@@ -1848,4 +2030,4 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
   };
 }
 
-module.exports = { createBrowserHost };
+module.exports = { createBrowserHost, classifyCdpPageState };

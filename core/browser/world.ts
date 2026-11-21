@@ -1620,6 +1620,10 @@ export class BrowserWorld implements World {
       const captureId = typeof shot.captureId === 'string' ? shot.captureId : '';
       const viewportWidth = Number(shot.viewportWidth) || 0;
       const viewportHeight = Number(shot.viewportHeight) || 0;
+      if (shot.readOnly === true || state.snapshotId?.startsWith('cdp-')) {
+        this.lastVisualCapture = null;
+        return this.image({ base64: shot.base64, width, height, state }, this.t.screenshotReadOnly(width, height));
+      }
       if (!(this.host?.modelFacts.accepts('image/jpeg') ?? true)) {
         this.lastVisualCapture = null;
         return this.image({ base64: shot.base64, width, height, state }, this.t.screenshot);
