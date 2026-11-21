@@ -328,7 +328,40 @@ if (!host[KEY]) {
   let overlayScrollBound = false;
   let overlayRaf = 0;
 
-  /** Removes redundant/misaligned default badges and renders high-contrast, non-overlapping badges locked to each element's real viewport rect. */
+  /** Computes the element's visible rect clipped by both the viewport and any overflow-clipping ancestors. */
+  const visibleClippedRect = (el: HTMLElement): { left: number; top: number; right: number; bottom: number; width: number; height: number } | null => {
+    const vw = window.innerWidth || document.documentElement.clientWidth;
+    const vh = window.innerHeight || document.documentElement.clientHeight;
+    const rect = el.getBoundingClientRect();
+    let left = Math.max(0, rect.left);
+    let top = Math.max(0, rect.top);
+    let right = Math.min(vw, rect.right);
+    let bottom = Math.min(vh, rect.bottom);
+    if (right <= left || bottom <= top) return null;
+    for (let parent = composedParentElement(el); parent && parent !== document.documentElement; parent = composedParentElement(parent)) {
+      const style = parent.ownerDocument.defaultView?.getComputedStyle(parent);
+      if (!style) continue;
+      if (style.position === 'fixed') break;
+      const ox = style.overflowX;
+      const oy = style.overflowY;
+      if (ox === 'hidden' || ox === 'clip' || ox === 'scroll' || ox === 'auto'
+        || oy === 'hidden' || oy === 'clip' || oy === 'scroll' || oy === 'auto') {
+        const pr = parent.getBoundingClientRect();
+        if (pr.width > 0 && pr.height > 0) {
+          left = Math.max(left, pr.left);
+          top = Math.max(top, pr.top);
+          right = Math.min(right, pr.right);
+          bottom = Math.min(bottom, pr.bottom);
+          if (right <= left || bottom <= top) return null;
+        }
+      }
+    }
+    const width = right - left;
+    const height = bottom - top;
+    return width >= 4 && height >= 4 ? { left, top, right, bottom, width, height } : null;
+  };
+
+  /** Removes misaligned default badges and renders layout-adaptive, clip-aware, non-overlapping badges aligned to each element's real visible box. */
   const alignHighlightOverlay = (): void => {
     const map = internals.selectorMap;
     if (!map || !document.body) return;
@@ -336,7 +369,10 @@ if (!host[KEY]) {
     if (!styleEl) {
       styleEl = document.createElement('style');
       styleEl.id = OVERLAY_STYLE_ID;
-      styleEl.textContent = `#${HIGHLIGHTS} .coo-badge{position:fixed;z-index:2147483647;pointer-events:none;background:rgba(15,23,42,0.88);color:#fff;border:1px solid rgba(255,255,255,0.72);border-radius:4px;padding:1px 4px;font:600 11px/1.15 -apple-system,BlinkMacSystemFont,sans-serif;box-shadow:0 1px 3px rgba(0,0,0,0.45);white-space:nowrap;}`;
+      styleEl.textContent = [
+        `#${HIGHLIGHTS} .coo-badge{position:fixed;z-index:2147483647;pointer-events:none;background:rgba(15,23,42,0.88);color:#fff;border:1px solid rgba(255,255,255,0.75);border-radius:4px;padding:1px 4px;font:600 10px/1.15 -apple-system,BlinkMacSystemFont,sans-serif;box-shadow:0 1px 3px rgba(0,0,0,0.45);white-space:nowrap;}`,
+        `#${HIGHLIGHTS} .coo-box{position:fixed;z-index:2147483646;pointer-events:none;border:1px solid rgba(56,189,248,0.45);border-radius:4px;box-sizing:border-box;}`,
+      ].join('');
       (document.head || document.documentElement).appendChild(styleEl);
     }
     let container = document.getElementById(HIGHLIGHTS);
@@ -358,23 +394,44 @@ if (!host[KEY]) {
     for (const [index, node] of map.entries()) {
       const el = node?.ref;
       if (!el || !el.isConnected || !isVisible(el)) continue;
-      const rect = el.getBoundingClientRect();
-      if (rect.width < 4 || rect.height < 4) continue;
-      if (rect.bottom <= 0 || rect.top >= vh || rect.right <= 0 || rect.left >= vw) continue;
+      const rect = visibleClippedRect(el);
+      if (!rect) continue;
 
       const labelText = String(index);
-      const badgeW = Math.max(18, labelText.length * 7 + 10);
-      const badgeH = 16;
-      const baseLeft = Math.max(2, Math.min(rect.left + 2, vw - badgeW - 2));
-      const baseTop = Math.max(2, Math.min(rect.top + 2, vh - badgeH - 2));
+      const badgeW = Math.max(16, labelText.length * 6 + 9);
+      const badgeH = 15;
+      const tag = el.tagName.toLowerCase();
+      const isInputLike = tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
+      const isCard = rect.width >= 140 && rect.height >= 90;
+      const isCompact = rect.height <= 44 && rect.width <= 110;
 
-      const candidates = [
-        { left: baseLeft, top: baseTop },
-        { left: Math.max(2, Math.min(rect.right - badgeW - 2, vw - badgeW - 2)), top: baseTop },
-        { left: baseLeft, top: Math.max(2, Math.min(rect.bottom - badgeH - 2, vh - badgeH - 2)) },
-        { left: Math.max(2, Math.min(baseLeft + badgeW + 3, vw - badgeW - 2)), top: baseTop },
-        { left: baseLeft, top: Math.max(2, Math.min(baseTop + badgeH + 3, vh - badgeH - 2)) },
-      ];
+      const clampL = (v: number) => Math.max(2, Math.min(v, vw - badgeW - 2));
+      const clampT = (v: number) => Math.max(2, Math.min(v, vh - badgeH - 2));
+
+      const candidates = isInputLike
+        ? [
+          { left: clampL(rect.right - badgeW - 3), top: clampT(rect.top + Math.max(2, (rect.height - badgeH) / 2)) },
+          { left: clampL(rect.left + 2), top: clampT(rect.top - badgeH - 2) },
+        ]
+        : isCard
+          ? [
+            { left: clampL(rect.left + 4), top: clampT(rect.top + 4) },
+            { left: clampL(rect.right - badgeW - 4), top: clampT(rect.top + 4) },
+            { left: clampL(rect.left + 4), top: clampT(rect.bottom - badgeH - 4) },
+          ]
+          : isCompact
+            ? [
+              { left: clampL(rect.left), top: clampT(rect.top - badgeH + 3) },
+              { left: clampL(rect.left), top: clampT(rect.top + 1) },
+              { left: clampL(rect.right - badgeW), top: clampT(rect.top - badgeH + 3) },
+              { left: clampL(rect.left), top: clampT(rect.bottom - 2) },
+            ]
+            : [
+              { left: clampL(rect.left + 2), top: clampT(rect.top + 2) },
+              { left: clampL(rect.right - badgeW - 2), top: clampT(rect.top + 2) },
+              { left: clampL(rect.left + 2), top: clampT(rect.bottom - badgeH - 2) },
+            ];
+
       let chosen = candidates[0]!;
       for (const cand of candidates) {
         const box = { left: cand.left, top: cand.top, right: cand.left + badgeW, bottom: cand.top + badgeH };
@@ -384,6 +441,16 @@ if (!host[KEY]) {
         }
       }
       placed.push({ left: chosen.left, top: chosen.top, right: chosen.left + badgeW, bottom: chosen.top + badgeH });
+
+      if (isCard) {
+        const outline = document.createElement('div');
+        outline.className = 'coo-box';
+        outline.style.left = `${Math.round(rect.left)}px`;
+        outline.style.top = `${Math.round(rect.top)}px`;
+        outline.style.width = `${Math.round(rect.width)}px`;
+        outline.style.height = `${Math.round(rect.height)}px`;
+        frag.appendChild(outline);
+      }
 
       const badge = document.createElement('div');
       badge.className = 'coo-badge';
