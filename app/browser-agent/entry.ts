@@ -324,10 +324,180 @@ if (!host[KEY]) {
     return () => { for (const restore of restores.reverse()) restore(); };
   };
 
+  const OVERLAY_STYLE_ID = 'coo-browser-badge-style';
+  let overlayScrollBound = false;
+  let overlayRaf = 0;
+
+  /** Removes redundant/misaligned default badges and renders high-contrast, non-overlapping badges locked to each element's real viewport rect. */
+  const alignHighlightOverlay = (): void => {
+    const map = internals.selectorMap;
+    if (!map || !document.body) return;
+    let styleEl = document.getElementById(OVERLAY_STYLE_ID) as HTMLStyleElement | null;
+    if (!styleEl) {
+      styleEl = document.createElement('style');
+      styleEl.id = OVERLAY_STYLE_ID;
+      styleEl.textContent = `#${HIGHLIGHTS} .coo-badge{position:fixed;z-index:2147483647;pointer-events:none;background:rgba(15,23,42,0.88);color:#fff;border:1px solid rgba(255,255,255,0.72);border-radius:4px;padding:1px 4px;font:600 11px/1.15 -apple-system,BlinkMacSystemFont,sans-serif;box-shadow:0 1px 3px rgba(0,0,0,0.45);white-space:nowrap;}`;
+      (document.head || document.documentElement).appendChild(styleEl);
+    }
+    let container = document.getElementById(HIGHLIGHTS);
+    if (!container) {
+      container = document.createElement('div');
+      container.id = HIGHLIGHTS;
+      container.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647;';
+      document.documentElement.appendChild(container);
+    }
+    container.innerHTML = '';
+
+    const vw = window.innerWidth || document.documentElement.clientWidth;
+    const vh = window.innerHeight || document.documentElement.clientHeight;
+    const placed: Array<{ left: number; top: number; right: number; bottom: number }> = [];
+    const frag = document.createDocumentFragment();
+    const overlaps = (a: { left: number; top: number; right: number; bottom: number }, b: { left: number; top: number; right: number; bottom: number }) =>
+      a.left < b.right + 2 && a.right + 2 > b.left && a.top < b.bottom + 2 && a.bottom + 2 > b.top;
+
+    for (const [index, node] of map.entries()) {
+      const el = node?.ref;
+      if (!el || !el.isConnected || !isVisible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 4 || rect.height < 4) continue;
+      if (rect.bottom <= 0 || rect.top >= vh || rect.right <= 0 || rect.left >= vw) continue;
+
+      const labelText = String(index);
+      const badgeW = Math.max(18, labelText.length * 7 + 10);
+      const badgeH = 16;
+      const baseLeft = Math.max(2, Math.min(rect.left + 2, vw - badgeW - 2));
+      const baseTop = Math.max(2, Math.min(rect.top + 2, vh - badgeH - 2));
+
+      const candidates = [
+        { left: baseLeft, top: baseTop },
+        { left: Math.max(2, Math.min(rect.right - badgeW - 2, vw - badgeW - 2)), top: baseTop },
+        { left: baseLeft, top: Math.max(2, Math.min(rect.bottom - badgeH - 2, vh - badgeH - 2)) },
+        { left: Math.max(2, Math.min(baseLeft + badgeW + 3, vw - badgeW - 2)), top: baseTop },
+        { left: baseLeft, top: Math.max(2, Math.min(baseTop + badgeH + 3, vh - badgeH - 2)) },
+      ];
+      let chosen = candidates[0]!;
+      for (const cand of candidates) {
+        const box = { left: cand.left, top: cand.top, right: cand.left + badgeW, bottom: cand.top + badgeH };
+        if (!placed.some((p) => overlaps(p, box))) {
+          chosen = cand;
+          break;
+        }
+      }
+      placed.push({ left: chosen.left, top: chosen.top, right: chosen.left + badgeW, bottom: chosen.top + badgeH });
+
+      const badge = document.createElement('div');
+      badge.className = 'coo-badge';
+      badge.textContent = labelText;
+      badge.style.left = `${Math.round(chosen.left)}px`;
+      badge.style.top = `${Math.round(chosen.top)}px`;
+      frag.appendChild(badge);
+    }
+    container.appendChild(frag);
+
+    if (!overlayScrollBound) {
+      overlayScrollBound = true;
+      const schedule = () => {
+        if (overlayRaf) return;
+        overlayRaf = window.requestAnimationFrame(() => {
+          overlayRaf = 0;
+          alignHighlightOverlay();
+        });
+      };
+      window.addEventListener('scroll', schedule, { passive: true, capture: true });
+      window.addEventListener('resize', schedule, { passive: true });
+    }
+  };
+
+  /**
+   * Whole-page augmentation: PageController skips interactive descendants inside highlighted scroll containers
+   * (such as feed cards, links, and buttons inside <main> or overflow-scroll lists). Discover visible,
+   * unobscured interactive targets across the entire viewport and add them to selectorMap & page content.
+   */
+  const augmentViewportTargets = (page: { content?: string; [k: string]: unknown }) => {
+    const map = internals.selectorMap;
+    if (!map) return page;
+    const existingRefs = new Set<HTMLElement>();
+    let maxIndex = -1;
+    for (const [idx, node] of map.entries()) {
+      if (idx > maxIndex) maxIndex = idx;
+      if (node?.ref) existingRefs.add(node.ref);
+    }
+    const vw = window.innerWidth || document.documentElement.clientWidth;
+    const vh = window.innerHeight || document.documentElement.clientHeight;
+    const extraLines: string[] = [];
+    const addedRects: Array<{ left: number; top: number; width: number; height: number; el: HTMLElement }> = [];
+
+    const isSameBox = (r1: DOMRect, r2: { left: number; top: number; width: number; height: number }) =>
+      Math.abs(r1.left - r2.left) < 8 && Math.abs(r1.top - r2.top) < 8
+      && Math.abs(r1.width - r2.width) < 12 && Math.abs(r1.height - r2.height) < 12;
+
+    for (const el of composedElements(document)) {
+      if (map.size >= ELEMENT_LIST_MAX) break;
+      if (existingRefs.has(el)) continue;
+      if (el.id === HIGHLIGHTS || el.closest?.(`#${HIGHLIGHTS}`)) continue;
+      if (!isVisible(el)) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 12 || rect.height < 12) continue;
+      if (rect.bottom <= 0 || rect.top >= vh || rect.right <= 0 || rect.left >= vw) continue;
+      if (rect.width > vw * 0.92 && rect.height > vh * 0.85) continue;
+
+      const tag = el.tagName.toLowerCase();
+      const semantic = el.matches('a[href], button, summary, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"]');
+      let isInteractiveCard = false;
+      if (!semantic) {
+        const style = el.ownerDocument.defaultView?.getComputedStyle(el);
+        if (style?.cursor === 'pointer' && rect.width >= 48 && rect.height >= 40) {
+          // Prefer leaf-ish clickable cards/controls rather than huge page wrappers.
+          const hasSemanticChildSameBox = !!el.querySelector('a[href], button') && rect.width * rect.height > vw * vh * 0.35;
+          if (!hasSemanticChildSameBox) isInteractiveCard = true;
+        }
+      }
+      if (!semantic && !isInteractiveCard) continue;
+
+      const label = currentElementLabel(el);
+      if (!label) continue;
+
+      // Skip if an existing indexed element or previously added element covers the exact same box.
+      let dup = false;
+      for (const prev of addedRects) {
+        if (isSameBox(rect, prev) || (prev.el.contains(el) && isSameBox(rect, prev))) { dup = true; break; }
+      }
+      if (dup) continue;
+      for (const ref of existingRefs) {
+        if (!ref.isConnected) continue;
+        const r = ref.getBoundingClientRect();
+        if (isSameBox(rect, r)) { dup = true; break; }
+      }
+      if (dup) continue;
+
+      const point = actionabilityPoint(document, el);
+      if (!point.ok) continue;
+
+      const nextIndex = ++maxIndex;
+      map.set(nextIndex, { ref: el });
+      internals.elementTextMap?.set(nextIndex, label);
+      existingRefs.add(el);
+      addedRects.push({ left: rect.left, top: rect.top, width: rect.width, height: rect.height, el });
+      const href = el instanceof HTMLAnchorElement && el.href ? ` href="${el.href.slice(0, 200)}"` : '';
+      extraLines.push(`[${nextIndex}]<${tag}${href}>${label.slice(0, 140)}</${tag}>`);
+      if (extraLines.length >= 60) break;
+    }
+
+    if (extraLines.length && typeof page.content === 'string') {
+      return { ...page, content: `${page.content}\n\n[Viewport interactive targets]\n${extraLines.join('\n')}` };
+    }
+    return page;
+  };
+
   /** Refreshes PageController's numbered-element map before returning or using an index. */
   const readPage = async () => {
     const restore = markShareControl();
-    try { return await controller.getBrowserState(); }
+    try {
+      const raw = await controller.getBrowserState();
+      const augmented = augmentViewportTargets(raw as unknown as { content?: string; [k: string]: unknown });
+      alignHighlightOverlay();
+      return augmented as typeof raw;
+    }
     finally { restore(); }
   };
 
