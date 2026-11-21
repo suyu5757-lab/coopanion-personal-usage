@@ -176,6 +176,8 @@ if (!host[KEY]) {
   const snapshotId = (): string => {
     const current = videoEvidence(document);
     const account = accountEvidence(document)?.ref ?? '';
+    const stableText = (value: string, maxLen: number): string =>
+      value.replace(/\s+/g, ' ').trim().replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, '<time>').slice(0, maxLen);
     const scopeCache = new WeakMap<HTMLElement, unknown[]>();
     const scopeEvidenceFor = (element: HTMLElement): unknown[] => {
       const isScope = (candidate: HTMLElement): boolean => candidate.matches('article, [role], li, [data-e2e]');
@@ -194,9 +196,9 @@ if (!host[KEY]) {
       while (scope && evidence.length < 3) {
         evidence.push([
           elementId(scope), scope.tagName.toLowerCase(),
-          currentElementLabel(scope).replace(/\s+/g, ' ').trim().toLowerCase(),
+          stableText(currentElementLabel(scope), 200).toLowerCase(),
           scope.getAttribute('role') ?? '', scope.getAttribute('data-e2e') ?? '',
-          (scope.innerText || scope.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 240),
+          stableText(scope.innerText || scope.textContent || '', 240),
         ]);
         scope = semanticParent(scope);
       }
@@ -209,8 +211,8 @@ if (!host[KEY]) {
         if (!element) return [index, ''];
         const label = currentElementLabel(element) || (shareMarked.has(element) ? '分享' : '');
         return [index, elementId(element), framePath(element), element.isConnected, element.tagName.toLowerCase(),
-          label.replace(/\s+/g, ' ').trim().toLowerCase(),
-          (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200),
+          stableText(label, 200).toLowerCase(),
+          stableText(element.innerText || element.textContent || '', 200),
           element instanceof HTMLAnchorElement ? element.href : '',
           element.getAttribute('aria-label') ?? '', element.getAttribute('title') ?? '',
           element.getAttribute('aria-pressed') ?? '', element.getAttribute('aria-selected') ?? '',
@@ -399,6 +401,11 @@ if (!host[KEY]) {
     const indexedEls = new Set<HTMLElement>();
     for (const node of map.values()) { if (node?.ref?.isConnected) indexedEls.add(node.ref); }
 
+    const isSemanticControl = (candidate: HTMLElement): boolean =>
+      candidate.matches('a[href], button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="menuitem"]');
+
+    const renderedNonSemanticCards: HTMLElement[] = [];
+
     for (const [index, node] of map.entries()) {
       const el = node?.ref;
       if (!el || !el.isConnected || !isVisible(el)) continue;
@@ -406,18 +413,22 @@ if (!host[KEY]) {
       if (!rect) continue;
       // Skip giant full-viewport scroll/page wrappers that should never carry corner badges.
       if (rect.width > vw * 0.85 && rect.height > vh * 0.75) continue;
-      // Skip redundant nested non-semantic children inside an already-indexed semantic control (e.g. icon/label divs inside <a>/<button>).
       const tag = el.tagName.toLowerCase();
-      const isOwnSemantic = el.matches('a[href], button, input, textarea, select, [role="button"], [role="link"], [role="tab"]');
+      const isOwnSemantic = isSemanticControl(el);
       if (!isOwnSemantic) {
-        let coveredByIndexedParent = false;
-        for (let p = composedParentElement(el); p && p !== document.body; p = composedParentElement(p)) {
-          if (indexedEls.has(p) && p.matches('a[href], button, [role="button"], [role="link"], [role="tab"]')) {
-            coveredByIndexedParent = true;
-            break;
-          }
+        // Skip layout/scroll container wrappers (e.g. header, tablist, menu containers, flex/scroll wrappers) that wrap other indexed controls.
+        let wrapsIndexedChild = false;
+        for (const other of indexedEls) {
+          if (other !== el && el.contains(other)) { wrapsIndexedChild = true; break; }
         }
-        if (coveredByIndexedParent) continue;
+        if (wrapsIndexedChild) continue;
+        // Skip redundant nested non-semantic children inside an already-indexed semantic control or already-rendered card.
+        let coveredByParent = false;
+        for (let p = composedParentElement(el); p && p !== document.body; p = composedParentElement(p)) {
+          if (indexedEls.has(p) && isSemanticControl(p)) { coveredByParent = true; break; }
+        }
+        if (!coveredByParent && renderedNonSemanticCards.some((card) => card.contains(el))) coveredByParent = true;
+        if (coveredByParent) continue;
       }
       // Skip ghost elements covered by a foreground modal/header.
       const cx = rect.left + rect.width / 2;
@@ -430,7 +441,8 @@ if (!host[KEY]) {
       const badgeH = 15;
       const isInputLike = tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
       const isCard = rect.width >= 140 && rect.height >= 90;
-      const isCompact = rect.height <= 44 && rect.width <= 110;
+      const isCompact = rect.height <= 56 && rect.width <= 110;
+      if (!isOwnSemantic && isCard) renderedNonSemanticCards.push(el);
 
       const clampL = (v: number) => Math.max(2, Math.min(v, vw - badgeW - 2));
       const clampT = (v: number) => Math.max(2, Math.min(v, vh - badgeH - 2));
@@ -448,9 +460,9 @@ if (!host[KEY]) {
           ]
           : isCompact
             ? [
-              { left: clampL(rect.left), top: clampT(rect.top - badgeH + 3) },
+              { left: clampL(rect.left), top: clampT(rect.top - badgeH + 4) },
               { left: clampL(rect.left), top: clampT(rect.top + 1) },
-              { left: clampL(rect.right - badgeW), top: clampT(rect.top - badgeH + 3) },
+              { left: clampL(rect.right - badgeW), top: clampT(rect.top - badgeH + 4) },
               { left: clampL(rect.left), top: clampT(rect.bottom - 2) },
             ]
             : [
@@ -519,14 +531,14 @@ if (!host[KEY]) {
     const vw = window.innerWidth || document.documentElement.clientWidth;
     const vh = window.innerHeight || document.documentElement.clientHeight;
     const extraLines: string[] = [];
-    const addedRects: Array<{ left: number; top: number; width: number; height: number; el: HTMLElement }> = [];
+    const addedRects: Array<{ left: number; top: number; width: number; height: number; el: HTMLElement; semantic: boolean }> = [];
 
     const isSameBox = (r1: DOMRect, r2: { left: number; top: number; width: number; height: number }) =>
       Math.abs(r1.left - r2.left) < 8 && Math.abs(r1.top - r2.top) < 8
       && Math.abs(r1.width - r2.width) < 12 && Math.abs(r1.height - r2.height) < 12;
 
     const candidateNodes = document.getElementsByTagName('*').length > 4000
-      ? Array.from(document.querySelectorAll<HTMLElement>('a[href], button, summary, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [data-e2e], article, li'))
+      ? Array.from(document.querySelectorAll<HTMLElement>('a[href], button, summary, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [data-e2e], article, li, header div, header span, nav div, [role="tablist"] ~ div, [role="tablist"] ~ span'))
       : composedElements(document);
     for (const el of candidateNodes) {
       if (map.size >= ELEMENT_LIST_MAX) break;
@@ -534,36 +546,42 @@ if (!host[KEY]) {
       if (el.id === HIGHLIGHTS || el.closest?.(`#${HIGHLIGHTS}`)) continue;
       if (!isVisible(el)) continue;
       const rect = el.getBoundingClientRect();
-      if (rect.width < 12 || rect.height < 12) continue;
+      if (rect.width < 14 || rect.height < 14) continue;
       if (rect.bottom <= 0 || rect.top >= vh || rect.right <= 0 || rect.left >= vw) continue;
       if (rect.width > vw * 0.92 && rect.height > vh * 0.85) continue;
 
       const tag = el.tagName.toLowerCase();
       const semantic = el.matches('a[href], button, summary, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"]');
-      let isInteractiveCard = false;
+      let isInteractiveTarget = false;
       if (!semantic) {
         const style = el.ownerDocument.defaultView?.getComputedStyle(el);
-        if (style?.cursor === 'pointer' && rect.width >= 48 && rect.height >= 40) {
-          // Prefer leaf-ish clickable cards/controls rather than huge page wrappers.
-          const hasSemanticChildSameBox = !!el.querySelector('a[href], button') && rect.width * rect.height > vw * vh * 0.35;
-          if (!hasSemanticChildSameBox) isInteractiveCard = true;
+        if (style?.cursor === 'pointer' && rect.width >= 18 && rect.height >= 18) {
+          // Skip container divs that wrap multiple semantic controls or a full section.
+          const semanticChildren = el.querySelectorAll('a[href], button, [role="button"], [role="tab"]');
+          const isContainerWrapper = semanticChildren.length > 1 || (semanticChildren.length === 1 && rect.width * rect.height > vw * vh * 0.25);
+          if (!isContainerWrapper) isInteractiveTarget = true;
         }
       }
-      if (!semantic && !isInteractiveCard) continue;
+      if (!semantic && !isInteractiveTarget) continue;
 
-      const label = currentElementLabel(el);
+      let label = currentElementLabel(el);
+      if (!label && rect.width <= 84 && rect.height <= 84 && el.querySelector('svg, img')) {
+        label = (el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('data-e2e') || '').trim() || 'icon-button';
+      }
       if (!label) continue;
 
-      // Skip if an existing indexed element or previously added element covers the exact same box.
+      // Skip if an existing indexed element or previously added element covers the exact same box,
+      // or if a non-semantic target is nested inside an already-added non-semantic card/control.
       let dup = false;
       for (const prev of addedRects) {
-        if (isSameBox(rect, prev) || (prev.el.contains(el) && isSameBox(rect, prev))) { dup = true; break; }
+        if (isSameBox(rect, prev) || (!semantic && prev.el.contains(el))) { dup = true; break; }
       }
       if (dup) continue;
       for (const ref of existingRefs) {
         if (!ref.isConnected) continue;
         const r = ref.getBoundingClientRect();
         if (isSameBox(rect, r)) { dup = true; break; }
+        if (!semantic && ref.contains(el) && ref.matches('a[href], button, [role="button"], [role="link"], [role="tab"]')) { dup = true; break; }
       }
       if (dup) continue;
 
@@ -574,10 +592,10 @@ if (!host[KEY]) {
       map.set(nextIndex, { ref: el });
       internals.elementTextMap?.set(nextIndex, label);
       existingRefs.add(el);
-      addedRects.push({ left: rect.left, top: rect.top, width: rect.width, height: rect.height, el });
+      addedRects.push({ left: rect.left, top: rect.top, width: rect.width, height: rect.height, el, semantic });
       const href = el instanceof HTMLAnchorElement && el.href ? ` href="${el.href.slice(0, 200)}"` : '';
       extraLines.push(`[${nextIndex}]<${tag}${href}>${label.slice(0, 140)}</${tag}>`);
-      if (extraLines.length >= 60) break;
+      if (extraLines.length >= 80) break;
     }
 
     if (extraLines.length && typeof page.content === 'string') {

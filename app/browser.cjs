@@ -1027,13 +1027,18 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
   const frameElement = async (id) => {
     const prior = compositeStateCache;
     if (!prior) return null;
+    const frameTarget = frameTargets.get(id);
+    if (!frameTarget) {
+      try {
+        const value = await rootAgentCall('element', [id]);
+        if (!value || value.snapshotId !== prior.root.snapshotId) return null;
+        return { ...value, id, snapshotId: prior.snapshotId };
+      } catch { return null; }
+    }
     const current = await state();
     if (!prior || current?.snapshotId !== prior.snapshotId) return null;
-    const frameTarget = frameTargets.get(id);
     try {
-      const value = frameTarget
-        ? await frameAgentCall(frameTarget.frame, 'element', [frameTarget.localId])
-        : await rootAgentCall('element', [id]);
+      const value = await frameAgentCall(frameTarget.frame, 'element', [frameTarget.localId]);
       if (!value) return null;
       return { ...value, id, snapshotId: current.snapshotId };
     } catch { return null; }
@@ -1041,13 +1046,15 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
 
   const frameMethod = async (method, id, expectedSnapshotId) => {
     const prior = compositeStateCache;
-    if (!prior) return method === 'center' ? null : false;
-    const current = await state();
-    if (current?.snapshotId !== prior.snapshotId || (expectedSnapshotId && expectedSnapshotId !== prior.snapshotId)) {
+    if (!prior || (expectedSnapshotId && expectedSnapshotId !== prior.snapshotId)) {
       return method === 'center' ? null : false;
     }
     const target = frameTargets.get(id);
-    if (!target) return rootAgentCall(method, [id, compositeStateCache.root.snapshotId]);
+    if (!target) return rootAgentCall(method, [id, prior.root.snapshotId]);
+    const current = await state();
+    if (current?.snapshotId !== prior.snapshotId) {
+      return method === 'center' ? null : false;
+    }
     let result;
     try { result = await frameAgentCall(target.frame, method, [target.localId, target.frameSnapshotId]); }
     catch { return method === 'center' ? null : false; }
@@ -1060,14 +1067,16 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
 
   const frameScroll = async (options, expectedSnapshotId) => {
     const prior = compositeStateCache;
-    if (!prior) return { success: false, message: 'stale snapshot' };
-    const current = await state();
-    if (current?.snapshotId !== prior.snapshotId || (expectedSnapshotId && expectedSnapshotId !== prior.snapshotId)) {
+    if (!prior || (expectedSnapshotId && expectedSnapshotId !== prior.snapshotId)) {
       return { success: false, message: 'stale snapshot' };
     }
     const index = Number.isInteger(options?.index) ? options.index : null;
     const target = index === null ? null : frameTargets.get(index);
-    if (!target) return rootAgentCall('scroll', [options, compositeStateCache.root.snapshotId]);
+    if (!target) return rootAgentCall('scroll', [options, prior.root.snapshotId]);
+    const current = await state();
+    if (current?.snapshotId !== prior.snapshotId) {
+      return { success: false, message: 'stale snapshot' };
+    }
     return frameAgentCall(target.frame, 'scroll', [{ ...options, index: target.localId }, target.frameSnapshotId]);
   };
 
@@ -1106,12 +1115,16 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
   };
 
   const frameClick = async (id, expectedSnapshotId) => {
-    const before = await state();
-    if (!before?.snapshotId || before.snapshotId !== expectedSnapshotId || !compositeStateCache) {
+    const prior = compositeStateCache;
+    if (!prior || !expectedSnapshotId || prior.snapshotId !== expectedSnapshotId) {
       return { success: false, message: 'stale snapshot' };
     }
     const target = frameTargets.get(id);
-    if (!target) return rootAgentCall('click', [id, compositeStateCache.root.snapshotId]);
+    if (!target) return rootAgentCall('click', [id, prior.root.snapshotId]);
+    const before = await state();
+    if (!before?.snapshotId || before.snapshotId !== expectedSnapshotId) {
+      return { success: false, message: 'stale snapshot' };
+    }
     if (target.compositeSnapshotId !== before.snapshotId || target.frame.isDestroyed() || target.frame.detached
       || target.frame.frameToken !== target.frameToken) return { success: false, message: 'stale snapshot' };
     const point = await frameAgentCall(target.frame, 'actionPoint', [target.localId, target.frameSnapshotId]);
