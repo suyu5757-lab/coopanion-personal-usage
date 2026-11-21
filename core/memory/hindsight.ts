@@ -20,6 +20,7 @@ import { MemoryOutbox, readLegacyOutbox, requestHashFor, type OutboxItem, type R
 import { ForgetLedger, readLegacyForget, type DeletionInput, type ForgetIntentAcceptance } from './forget-ledger.ts';
 import {
   memoryArtifactScope,
+  MemoryStateStore,
   openMemoryStateStore,
   type DerivedArtifact,
   type DerivedArtifactInput,
@@ -32,7 +33,6 @@ import {
   type MemorySourceDependency,
   type MemorySourceMappingState,
   type MemorySourceValidationState,
-  type MemoryStateStore,
 } from './state-store.ts';
 import { planRecall, type RecallRoute } from './router.ts';
 import { partnerSourceScopeDigest, partnerUserNoteDocumentId } from './partner-provenance.ts';
@@ -54,9 +54,23 @@ import {
   type PersistCooGrowthCandidateSourceInput,
 } from './coo-growth-source.ts';
 import { verifyCooSelfGrowthCandidate } from './coo-self-growth-trust.ts';
-import type { CooGrowthCandidateSourceEvidence, SourceDomainClassificationInput } from './source-domains.ts';
+import type {
+  CooGrowthCandidateSourceEvidence,
+  SourceDomainClassificationInput,
+  SourceDomainEvidence,
+  SourceDomainEvidenceProvider,
+} from './source-domains.ts';
 import { createSourceDomainReadbackAdapter } from './source-domain-readback-adapter.ts';
-import type { TrustedSourceReadbackProvider } from './source-domain-consumer.ts';
+import type {
+  AutoDomainClassificationRequest,
+  AutoDomainSafetyContext,
+  SourceDomainSuggestionProvider,
+} from './source-domain-auto-classifier.ts';
+import {
+  persistVerifiedUserSourceDomain,
+  type PersistenceBridgeResult,
+} from './source-domain-persistence-bridge.ts';
+import type { SourceDomainIdentity, TrustedSourceReadbackProvider } from './source-domain-consumer.ts';
 import { createSourceDomainReadStore, type SourceDomainReadStore } from './source-domain-read-store.ts';
 import { DOMAIN_SUPPLEMENT_SOURCE_FACTS_TOKEN_BUDGET } from './recall-limits.ts';
 
@@ -785,10 +799,10 @@ const MODEL_IDS = [...BRIEFING_MODEL_IDS, SELF_PORTRAIT_MODEL] as const;
 type ModelId = typeof MODEL_IDS[number];
 
 const MODEL_QUERIES: Record<ModelId, string> = {
-  'partner-portrait': 'Write a compact portrait of the person Coo lives with: their name or how they want to be addressed, stable preferences, routines, boundaries, important people, current projects, and what they expect from Coo. Prefer durable facts; ignore one-off chatter.',
-  'relationship': 'Describe the relationship between Coo and the person: shared rituals, affectionate moments, conflicts and repairs, what makes the person feel cared for, and what they dislike. Be concrete and kind; no diagnosis.',
-  'open-loops': 'List open loops: promises Coo made, things the person asked Coo to remember or follow up on, and unresolved topics. Include dates when known.',
-  [SELF_PORTRAIT_MODEL]: 'Describe how Coo has been showing up lately, using her own words and the relationship diary: her tone, recurring phrases, what she does when praised, worried, contradicted, bored or needed; what she keeps doing or avoiding; what seems to be changing in her. Focus on Coo, not on the person. Prefer durable patterns over one-off moods. Be concrete and quote a short phrase when it shows the pattern.',
+  'partner-portrait': 'Write a compact portrait of Xi (曦)\'s older brother (哥哥): his preferred address, stable preferences, routines, boundaries, important people, current projects, and what he expects from Xi. Prefer durable facts; ignore one-off chatter.',
+  'relationship': 'Describe the relationship between Xi (曦) and her older brother (哥哥): shared rituals, affectionate moments, conflicts and repairs, what makes him feel cared for, and what he dislikes. Be concrete and kind; no diagnosis.',
+  'open-loops': 'List open loops: promises Xi (曦) made, things her older brother (哥哥) asked Xi to remember or follow up on, and unresolved topics. Include dates when known.',
+  [SELF_PORTRAIT_MODEL]: 'Describe how Xi (曦) has been showing up lately, using her own words and the relationship diary: her tone, recurring phrases, what she does when praised, worried, contradicted, bored or needed; what she keeps doing or avoiding; what seems to be changing in her. Focus on Xi, not on her brother. Prefer durable patterns over one-off moods. Be concrete and quote a short phrase when it shows the pattern.',
 };
 
 const MODEL_TITLES: Record<ModelId, string> = {
@@ -874,6 +888,7 @@ export class HindsightMemory {
   private draining = false;
   private drainTimer: ReturnType<typeof setInterval> | null = null;
   private readonly readBackProofs = new Map<string, string>();
+  private sourceDomainWriteController: AbortController | null = null;
   private readonly segmentProofs = new Map<string, { sourceTuple: string; sourceProof: string; sourceDigest: string;
     startUtf16: number; endUtf16: number; text: string }>();
   /**
@@ -1473,7 +1488,7 @@ export class HindsightMemory {
           endpoint: config.apiUrl,
           documentId: bundle.documentId,
           content: bundle.content,
-          context: 'Coo-authored Growth candidate source. Candidate state only; no verified fact, execution, or tool permission.',
+          context: 'Xi-authored Growth candidate source. Candidate state only; no verified fact, execution, or tool permission.',
           tags: ['scope:life', 'source:coo-growth', 'candidate:self-growth'],
           metadata: bundle.metadata,
           timestamp: bundle.candidateCreatedAt,
@@ -1557,6 +1572,8 @@ export class HindsightMemory {
   }
 
   configure(rootDir: string, log: MemoryLog, overrides?: HindsightFileConfig): void {
+    this.sourceDomainWriteController?.abort();
+    this.sourceDomainWriteController = null;
     this.config = loadHindsightConfig(rootDir, overrides);
     this.rootDir = rootDir;
     this.log = log;
@@ -1698,6 +1715,90 @@ export class HindsightMemory {
         try { return ledger.epoch(bankId, endpoint); } catch { return -1; }
       },
     });
+  }
+
+  /** Persist a current user event through exact Hindsight readback and the D3-S1 consumer. */
+  async classifyAndPersistUserSourceDomain(
+    request: AutoDomainClassificationRequest,
+    suggester: SourceDomainSuggestionProvider | null | undefined,
+    options: { providerTimeoutMs?: number; timeBudgetMs?: number; signal?: AbortSignal } = {},
+  ): Promise<PersistenceBridgeResult | null> {
+    const config = this.config;
+    const reader = this.stateStore;
+    const ledger = this.ledger;
+    if (!config || config.readOnly || !reader || !ledger || !this.enabled()
+      || request.bankId !== config.bankId || request.endpoint !== config.apiUrl
+      || this.sourceDomainWriteController) return null;
+
+    const readback = this.domainReadbackProvider();
+    if (!readback) return null;
+
+    const controller = new AbortController();
+    const relayAbort = () => controller.abort();
+    if (options.signal?.aborted) controller.abort();
+    else options.signal?.addEventListener('abort', relayAbort, { once: true });
+    this.sourceDomainWriteController = controller;
+
+    const evidence = new Map<string, SourceDomainEvidence>();
+    const evidenceKey = (source: SourceDomainIdentity) =>
+      JSON.stringify([source.bankId, source.endpoint, source.documentId]);
+    const isCurrent = () => this.sourceDomainWriteController === controller
+      && this.config === config && this.stateStore === reader && this.ledger === ledger
+      && !controller.signal.aborted;
+    const sourceDomainEvidence: SourceDomainEvidenceProvider = (bankId, endpoint, documentId) =>
+      isCurrent() ? evidence.get(evidenceKey({ bankId, endpoint, documentId })) ?? null : null;
+
+    let writer: MemoryStateStore | null = null;
+    try {
+      writer = new MemoryStateStore(reader.path, { sourceDomainEvidence });
+      const verifiedReadback: TrustedSourceReadbackProvider = async (source, context) => {
+        if (!isCurrent()) return null;
+        const verified = await readback(source, context);
+        if (verified && isCurrent()) {
+          evidence.set(evidenceKey(source), {
+            bankId: verified.bankId,
+            endpoint: verified.endpoint,
+            documentId: verified.documentId,
+            content: verified.content,
+            sourceEpoch: verified.sourceEpoch,
+            sourceActor: verified.sourceActor,
+            sourceKind: verified.sourceKind,
+            sourceStatus: verified.sourceStatus,
+          });
+        }
+        return verified;
+      };
+      const safety: AutoDomainSafetyContext = {
+        epoch: (bankId, endpoint) => {
+          try { return ledger.epoch(bankId, endpoint); } catch { return -1; }
+        },
+        isFenced: (source) => ledger.damaged() || ledger.bankClearPending(source.bankId, source.endpoint)
+          || ledger.forgotten(source.bankId, source.endpoint, source.documentId),
+        isSuperseded: (source) => reader.supersededSources(source.bankId, source.endpoint).has(source.documentId),
+      };
+      return await persistVerifiedUserSourceDomain(request, {
+        writer,
+        reader,
+        readback: verifiedReadback,
+        suggester,
+        safety,
+        commitEvidence: (bankId, endpoint, documentId) =>
+          sourceDomainEvidence(bankId, endpoint, documentId),
+        providerTimeoutMs: options.providerTimeoutMs,
+        timeBudgetMs: options.timeBudgetMs,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      this.log?.warn('[memory] source-domain classification failed closed', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    } finally {
+      evidence.clear();
+      writer?.close();
+      if (this.sourceDomainWriteController === controller) this.sourceDomainWriteController = null;
+      options.signal?.removeEventListener('abort', relayAbort);
+    }
   }
 
   /**
@@ -1999,9 +2100,9 @@ export class HindsightMemory {
     const config = this.config!;
     await this.client!.createBank(config.bankId, {
       name: 'Coopanion',
-      reflectMission: 'You are Coo, a small desktop companion who lives on the person\'s screen. Reason from the person\'s stable preferences, routines, boundaries and shared history. Be concrete, warm and brief.',
-      retainMission: 'Extract durable facts about the person, Coo, and their shared daily life: names, preferences, routines, boundaries, important people, ongoing projects, promises and relationship patterns. Ignore greetings, filler and one-off small talk. Use the context to decide whether a first-person sentence belongs to the person or to Coo.',
-      observationsMission: 'Consolidate durable preferences, habits, boundaries, important people, ongoing projects, promises, Coo\'s recurring ways of speaking and acting, and recurring relationship patterns. Drop ephemeral states such as mood-of-the-minute or what was eaten for lunch unless the person made it meaningful.',
+      reflectMission: 'You are Xi (曦), the person\'s younger sister. The person is your older brother (哥哥), and you are a desktop companion living on their screen. Reason from the person\'s stable preferences, routines, boundaries and shared history. Be concrete, warm and brief.',
+      retainMission: 'Extract durable facts about the person, Xi (曦), and their shared daily life: names, preferences, routines, boundaries, important people, ongoing projects, promises and relationship patterns. Ignore greetings, filler and one-off small talk. Use the context to decide whether a first-person sentence belongs to the person or to Xi.',
+      observationsMission: 'Consolidate durable preferences, habits, boundaries, important people, ongoing projects, promises, Xi\'s recurring ways of speaking and acting, and recurring relationship patterns. Drop ephemeral states such as mood-of-the-minute or what was eaten for lunch unless the person made it meaningful.',
       retainExtractionMode: 'concise',
       enableObservations: true,
       dispositionEmpathy: 4,
@@ -2058,7 +2159,7 @@ export class HindsightMemory {
         operationId: 'hindsight-session-briefing',
         reason: 'Hindsight mental models do not expose a source dependency envelope',
       });
-      const fallback = await this.recallBlockDetailed('Who is the person Coo lives with, and what matters to them?', {
+      const fallback = await this.recallBlockDetailed('Who is 哥哥, and what matters to him?', {
         timeoutMs: Math.min(1500, config.recall.timeoutMs),
         maxTokens: 500,
         types: ['observation', 'world'],
@@ -2935,7 +3036,7 @@ export class HindsightMemory {
     const cached = !context.captureTrace && plan.route === 'standard' ? this.recallCache.get(key) : undefined;
     if (cached && Date.now() - cached.at < 5 * 60_000) return finish(cached.value, 'found', cached.trace, true);
     if (plan.route === 'standard') {
-      const read = await this.recallBlockDetailed(query, {
+      let read = await this.recallBlockDetailed(query, {
         budget: plan.budget,
         maxTokens: plan.maxTokens,
         maxSourceFactsTokens: plan.maxSourceFactsTokens,
@@ -2947,6 +3048,25 @@ export class HindsightMemory {
         ...(context.userEventDocumentId ? { userEventDocumentId: context.userEventDocumentId } : {}),
       });
       if (epoch !== this.cacheEpoch) return finish('', 'fenced');
+      // When natural phrasing misses on the first standard pass, try one bounded topic-phrase
+      // fallback without activation bias so decayed low-activation memories can still surface.
+      if (read.status === 'absent' && !read.text && queryPlan.supplementalQueries.length > 0) {
+        const remainingMs = Math.max(0, plan.timeoutMs - (Date.now() - started));
+        if (remainingMs >= 300) {
+          const fallback = await this.recallBlockDetailed(queryPlan.supplementalQueries[0]!, {
+            budget: plan.budget,
+            maxTokens: Math.min(SUPPLEMENTAL_RECALL_MAX_TOKENS, plan.maxTokens),
+            maxSourceFactsTokens: Math.min(SUPPLEMENTAL_SOURCE_FACTS_MAX_TOKENS, plan.maxSourceFactsTokens),
+            timeoutMs: Math.min(remainingMs, 3000),
+            maxChars: plan.maxChars,
+            activationEnabled: false,
+            captureTrace: true,
+            ...(context.userEventDocumentId ? { userEventDocumentId: context.userEventDocumentId } : {}),
+          });
+          if (epoch !== this.cacheEpoch) return finish('', 'fenced');
+          if (fallback.status === 'found' && fallback.text) read = fallback;
+        }
+      }
       if (read.text) {
         this.recallCache.set(key, { at: Date.now(), value: read.text, trace: read.trace });
         if (this.recallCache.size > 64) {
@@ -3352,9 +3472,9 @@ export class HindsightMemory {
     const saidAt = meta.timestamp ?? new Date().toISOString();
     const documentId = `user:${session}:${id}`;
     const queued = this.enqueue({
-      content: `The person said to Coo: ${body.slice(0, 4000)}`,
+      content: `The person said to Xi (曦): ${body.slice(0, 4000)}`,
       documentId,
-      context: 'The person is speaking to Coo, a desktop pet. First-person "I" refers to the person.',
+      context: 'The person is speaking to Xi (曦). First-person "I" refers to the person.',
       tags: ['scope:life', 'source:chat', `session:${session}`],
       timestamp: meta.timestamp,
       priority: 'normal',
@@ -3503,9 +3623,9 @@ export class HindsightMemory {
       sources: evidenceSources,
     };
     const item: RetainItem = {
-      content: `Coo said to the person: ${body.slice(0, 4000)}`,
+      content: `Xi said to the person: ${body.slice(0, 4000)}`,
       documentId,
-      context: 'Coo is speaking to the person. First-person "I" refers to Coo.',
+      context: 'Xi is speaking to the person. First-person "I" refers to Xi.',
       tags: ['scope:life', 'source:chat', `session:${session}`],
       timestamp: at,
       priority: 'low',
@@ -3564,11 +3684,11 @@ export class HindsightMemory {
     }
     const at = new Date().toISOString();
     const queued = this.enqueue({
-      content: `The person asked Coo to remember: ${body.slice(0, 4000)}`,
+      content: `The person asked Xi (曦) to remember: ${body.slice(0, 4000)}`,
       // The timestamp makes a later, deliberate re-telling a new source instead of a replay of a
       // fenced one.
       documentId: `explicit:${session}:${hash(body)}:${hash(at)}`,
-      context: 'The person asked Coo to remember this. It is a fact about the person or their shared life.',
+      context: 'The person asked Xi to remember this. It is a fact about the person or their shared life.',
       tags: ['scope:life', 'source:explicit', `session:${session}`],
       priority: 'critical',
       metadata: sourceMetadata({ actor: 'inference', kind: 'fact', status: 'current', saidAt: at }),
@@ -3636,13 +3756,13 @@ export class HindsightMemory {
     const kind = String(touch.kind ?? 'touch');
     const count = typeof touch.count === 'number' && touch.count > 1 ? ` ×${Math.trunc(touch.count)}` : '';
     const at = meta.at ?? new Date().toISOString();
-    const body = `On ${at.slice(0, 10)} the person touched Coo: ${kind}${count}${touch.crashed === true ? ' (crashed)' : ''}.`;
+    const body = `On ${at.slice(0, 10)} the person touched Xi (曦): ${kind}${count}${touch.crashed === true ? ' (crashed)' : ''}.`;
     const safe = sanitizeForMemory(body);
     if (!safe.text || safe.skip) return;
     this.enqueue({
       content: safe.text,
       documentId: `touch:${meta.session ?? 'main'}:${meta.cursor ?? hash(body)}`,
-      context: "This is a touch event recorded by the desktop pet app. It is a fact about the person's interaction with Coo.",
+      context: "This is a touch event recorded by the desktop pet app. It is a fact about the person's interaction with Xi (曦).",
       tags: ['scope:affection', 'source:touch', `session:${meta.session ?? 'main'}`],
       timestamp: at,
       priority: 'low',
@@ -3671,7 +3791,7 @@ export class HindsightMemory {
     this.enqueue({
       content: safe.text,
       documentId,
-      context: 'This is an affinity change recorded by the Coopanion affinity extension. It is a fact about the relationship between the person and Coo.',
+      context: 'This is an affinity change recorded by the Coopanion affinity extension. It is a fact about the relationship between the person and Xi (曦).',
       tags: ['scope:affection', 'source:affinity', 'session:main'],
       timestamp: at,
       priority: 'normal',
@@ -3734,7 +3854,7 @@ export class HindsightMemory {
     const retainItem: RetainItem = {
       content: safe.text,
       documentId,
-      context: 'Coo generated this unverified reflection from the linked sources. Claims of actions or outcomes in it require independent execution receipts.',
+      context: 'Xi generated this unverified reflection from the linked sources. Claims of actions or outcomes in it require independent execution receipts.',
       tags: ['scope:affection', 'source:journal', 'journal:generated'],
       timestamp: saidAt,
       priority: 'normal',
@@ -3769,7 +3889,7 @@ export class HindsightMemory {
             lineageState: 'complete',
             lineageReceiptDigest: sha256(JSON.stringify([config.bankId, config.apiUrl, documentId, bodyDigest, operationId])),
             lineageValidatedAt: at,
-            statusReason: 'Unverified Coo reflection with current source dependencies',
+            statusReason: 'Unverified Xi reflection with current source dependencies',
             createdAt: at,
             updatedAt: at,
             sources: dependencies,

@@ -86,6 +86,10 @@ export interface RecallLimits {
 
 const BUDGET_ORDER = { low: 0, mid: 1, high: 2 } as const;
 
+/** Natural declarative cues that imply personal preference, habit, continuation or recommendation. */
+const NATURAL_MEMORY_CUE_ZH = /(?:继续|接着|照旧|按老样子|老规矩|像平时|按我习惯|平时|习惯|偏好|讨厌|过敏|不吃|最爱|帮我挑|帮我选|帮我推荐|推荐一下|按之前|再做|换个)/u;
+const NATURAL_MEMORY_CUE_EN = /\b(?:as usual|continue|pick up|recommend|my preference|i prefer|i hate|allergic|usual)\b/i;
+
 export function planRecall(text: string, limits: RecallLimits = {}): RecallPlan {
   const query = text.trim();
   const currentPlan = currentPlanningQuestion(query);
@@ -100,6 +104,7 @@ export function planRecall(text: string, limits: RecallLimits = {}): RecallPlan 
         || (PAST_TIME_EN.test(query) && PAST_QUESTION_EN.test(query)))
         ? 'deep'
         : NEW_STATEMENT.test(query) && !SELF_QUESTION.test(query) && !QUESTION_WORD_ZH.test(query)
+          && !NATURAL_MEMORY_CUE_ZH.test(query) && !NATURAL_MEMORY_CUE_EN.test(query)
           ? 'fast'
           : 'standard';
   const plan = { route, ...PLANS[route] };

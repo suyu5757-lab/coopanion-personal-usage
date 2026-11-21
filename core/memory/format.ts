@@ -4,7 +4,7 @@ import { MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, SOURCE_LOOKUP_CANDIDATE_HEADE
 import type { SourceMatchType } from './recall-query.ts';
 
 const MARKER = /【[^】]*】|<[^<>]*>/g;
-export const DEFAULT_ACTIVATION_RANK_INFLUENCE = 0.25;
+export const DEFAULT_ACTIVATION_RANK_INFLUENCE = 0.18;
 
 export function cleanSpeech(text: string): string {
   return text.replace(MARKER, ' ').replace(/\s+/g, ' ').trim();

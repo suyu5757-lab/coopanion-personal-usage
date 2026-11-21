@@ -37,6 +37,17 @@ describe('parseScript', () => {
   it('allows a beat with actions only', () => {
     expect(parseScript('【sleep】').beats).toEqual([{ actions: ['sleep'], text: '', anchors: [] }]);
   });
+
+  it('strips U+FFFD replacement characters and lone surrogates while keeping valid emoji and inline anchors intact', () => {
+    const { beats } = parseScript('【开心】嗯，那我就在这儿歇着。<眨眼>\uFFFD\uFFFD\uFFFD不是想赖着不动，是你说停的。🐾\uD800');
+    expect(beats).toEqual([
+      {
+        actions: ['happy'],
+        text: '嗯，那我就在这儿歇着。不是想赖着不动，是你说停的。🐾',
+        anchors: [{ at: 11, actions: ['wink'] }],
+      },
+    ]);
+  });
 });
 
 describe('vocabulary', () => {
