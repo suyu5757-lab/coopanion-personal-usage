@@ -743,7 +743,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     try {
       let res;
       try {
-        res = await within(() => dbg.sendCommand('Accessibility.getFullAXTree', { depth: 8 }), 6000, 'cdp axtree');
+        res = await within(() => dbg.sendCommand('Accessibility.getFullAXTree', {}), 8000, 'cdp axtree');
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (/timed out/i.test(msg)) throw new Error(`cdp_timeout: ${msg}`);
@@ -754,7 +754,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       let title = (wc.getTitle() || '').trim();
       const interactiveRoles = new Set(['button', 'link', 'textbox', 'searchbox', 'tab', 'menuitem', 'checkbox', 'radio', 'combobox']);
       const lines = [];
-      const seenLines = new Set();
+      const seenNames = new Set();
       const controls = [];
       for (const node of nodes) {
         if (!node || node.ignored) continue;
@@ -762,13 +762,27 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
         const name = String(node.name?.value || '').replace(/\s+/g, ' ').trim();
         if (role === 'rootwebarea' && name && !title) title = name;
         if (!name || name.length < 2) continue;
-        if (interactiveRoles.has(role) && controls.length < 60) {
-          controls.push({ role, accessibleName: name.slice(0, 120), backendDOMNodeId: node.backendDOMNodeId, frameId: node.frameId });
+        let nodeUrl = '';
+        if (role === 'link' && Array.isArray(node.properties)) {
+          const urlProp = node.properties.find((p) => p && p.name === 'url' && typeof p.value?.value === 'string');
+          if (urlProp && isPublicHttp(urlProp.value.value)) nodeUrl = urlProp.value.value;
         }
-        const textLine = interactiveRoles.has(role) ? `[${role}] ${name}` : name;
-        if (!seenLines.has(textLine) && lines.length < 120) {
-          seenLines.add(textLine);
-          lines.push(textLine.slice(0, 200));
+        if (interactiveRoles.has(role) && controls.length < 80) {
+          controls.push({
+            role,
+            accessibleName: name.slice(0, 120),
+            ...(nodeUrl ? { url: nodeUrl.slice(0, 300) } : {}),
+            backendDOMNodeId: node.backendDOMNodeId,
+            frameId: node.frameId,
+          });
+        }
+        const dedupeKey = `${name}|${nodeUrl}`;
+        const textLine = interactiveRoles.has(role)
+          ? `[${role}] ${name}${nodeUrl ? ` (${nodeUrl})` : ''}`
+          : name;
+        if (!seenNames.has(dedupeKey) && lines.length < 160) {
+          seenNames.add(dedupeKey);
+          lines.push(textLine.slice(0, 260));
         }
       }
       const [vw, vh] = win.getContentSize();
@@ -782,7 +796,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       const notice = noNodes
         ? `[CDP AXTree 只读模式: cdp_no_accessible_nodes — 未提取到可见无障碍文本或控件${domError ? `；DOM 回退原因: ${domError}` : ''}；可调用 browser_screenshot 获取只读画面]`
         : `[CDP AXTree 只读模式: 页面主线程繁忙，已通过 Chromium 原生无障碍树读取，共提取 ${lines.length} 条文本 / ${controls.length} 个 AX 控件（只读）]`;
-      const content = `${notice}\n${lines.join('\n')}`.slice(0, 6000);
+      const content = `${notice}\n${lines.join('\n')}`.slice(0, 7200);
       return {
         url,
         title: title || url,
