@@ -88,17 +88,18 @@ function viewMaps(view: ToolOutcome): boolean {
   return inspectRequestEvidence(request, [record], request as never).mappingState === 'complete';
 }
 
-function safeSearchResult(read: MemoryTextRead, output: string, evidence: ToolOutcome['evidence']): ToolOutcome {
+function safeSearchResult(read: MemoryTextRead, output: string, evidence: ToolOutcome['evidence'], extraOmitted = false): ToolOutcome {
   const format = read.trace?.format;
   if (read.status !== 'found' || read.sourceFactsTruncated || read.rejectedSourceDocumentIds?.length
     || format?.sourceFactsTruncated
-    || format?.incompleteResultIds.length || format?.omittedSourceDocumentIds.length || format?.clippedResultIds.length
+    || format?.incompleteResultIds.length || format?.clippedResultIds.length
     || format?.clippedContextResultIds.length || format?.clippedSourceFactIds.length) {
     return fixedOutcome(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE, true);
   }
+  const omittedByFormat = extraOmitted || (format?.omittedSourceDocumentIds.length ?? 0) > 0;
   const total = evidence?.length ?? 0;
   const withOmitted = (view: ToolOutcome): ToolOutcome => {
-    if (view.evidence?.length === total) return view;
+    if (!omittedByFormat && view.evidence?.length === total) return view;
     const line = MEMORY_SOURCE_OMITTED_NOTICE;
     const start = view.text.length + 1;
     return {
@@ -228,7 +229,27 @@ export function memoryTools(deps: MemoryToolDeps): ToolDef[] {
         }
         const evidence = await memory.evidenceForRead(read);
         if (!evidenceComplete(read, evidence, true)) output = withIncompleteEvidence(output);
-        if (deps.sourceSafeToolResults) return safeSearchResult(read, output, evidence);
+        if (deps.sourceSafeToolResults) {
+          const direct = safeSearchResult(read, output, evidence);
+          if (!direct.failed) return direct;
+          // When semantic recall returns paraphrased facts (or hits pagination) while the underlying
+          // retained documents are valid and unfenced, rebuild a verbatim verified source view.
+          if (read.status === 'found' && !read.sourceFactsTruncated && !read.rejectedSourceDocumentIds?.length
+            && typeof memory.verifiedSourceExcerptsForDocuments === 'function') {
+            const excludeDocumentId = deps.currentReadSource?.(ctx.role) ?? deps.currentUserSource?.(ctx.role) ?? undefined;
+            const candidateIds = [
+              ...(read.trace?.format.includedSourceDocumentIds ?? []),
+              ...(read.trace?.format.sourceSegments.map((segment) => segment.documentId) ?? []),
+            ];
+            const rebuilt = await memory.verifiedSourceExcerptsForDocuments(candidateIds, { excludeDocumentId, maxSources: 6 });
+            if (rebuilt) {
+              const omitted = (read.trace?.format.omittedSourceDocumentIds.length ?? 0) > 0
+                || new Set(candidateIds.filter((id) => id !== excludeDocumentId)).size > rebuilt.evidence.length;
+              return safeSearchResult({ ...read, text: rebuilt.text, trace: undefined }, rebuilt.text, rebuilt.evidence, omitted);
+            }
+          }
+          return direct;
+        }
         return evidence.length ? { text: output, evidence } satisfies ToolOutcome : output;
       },
     },

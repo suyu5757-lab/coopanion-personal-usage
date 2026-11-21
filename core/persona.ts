@@ -3402,15 +3402,49 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           captureTrace: true,
         });
         const sourceSegments = recalled.trace?.format.sourceSegments ?? [];
-        const baselineEvidence = recalled.text
-          ? await this.longTerm.evidenceForSegments(recalled.text, sourceSegments)
+        let effectiveRecalled = recalled;
+        let baselineText = recalled.text;
+        let baselineEvidence = baselineText
+          ? await this.longTerm.evidenceForSegments(baselineText, sourceSegments)
           : [];
         // Every traced source body must be present, current, validated and digest-matched.
         // The fixed `[memory]` header, result labels and the incomplete-facts notice are Core
         // formatting, not historical content, so they are not required to carry a source span.
-        const complete = sourceSegments.length > 0
-          && evidenceCoversSegments(recalled.text, sourceSegments, baselineEvidence);
-        if (recalled.text && !complete) {
+        let complete = sourceSegments.length > 0
+          && evidenceCoversSegments(baselineText, sourceSegments, baselineEvidence);
+        if (baselineText && !complete && typeof this.longTerm.verifiedSourceExcerptsForDocuments === 'function') {
+          // Semantic recall often returns paraphrased facts that do not match the original text
+          // verbatim. Rebuild the baseline from verified original source excerpts so SourceProof
+          // stays strict without discarding valid semantic hits.
+          const candidateDocIds = [
+            ...(recalled.trace?.format.includedSourceDocumentIds ?? []),
+            ...sourceSegments.map((segment) => segment.documentId),
+          ];
+          const rebuilt = await this.longTerm.verifiedSourceExcerptsForDocuments(candidateDocIds, {
+            ...(latestUserDocumentId ? { excludeDocumentId: latestUserDocumentId } : {}),
+            maxSources: 6,
+          });
+          if (rebuilt) {
+            baselineText = rebuilt.text;
+            baselineEvidence = rebuilt.evidence;
+            effectiveRecalled = recalled.trace
+              ? {
+                ...recalled,
+                text: rebuilt.text,
+                trace: {
+                  ...recalled.trace,
+                  format: {
+                    ...recalled.trace.format,
+                    sourceSegments: rebuilt.sourceSegments,
+                    includedSourceDocumentIds: [...new Set(rebuilt.sourceSegments.map((segment) => segment.documentId))],
+                  },
+                },
+              }
+              : { ...recalled, text: rebuilt.text };
+            complete = true;
+          }
+        }
+        if (baselineText && !complete) {
           // A summary without full evidence cannot enter the request; the opt-in consumer can still try exact indexed sources.
           if (!supplementOptions?.enabled) {
             this.injectMemoryContext(MEMORY_SOURCE_EVIDENCE_INCOMPLETE_NOTICE);
@@ -3424,16 +3458,15 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           );
           return;
         }
-        const baselineText = recalled.text;
         if (!supplementOptions?.enabled) {
-          if (recalled.text) this.injectMemoryContext(baselineText, baselineEvidence);
+          if (baselineText) this.injectMemoryContext(baselineText, baselineEvidence);
           else if (recalled.route === 'deep' && recalled.status !== 'skipped') {
             this.injectMemoryContext(`${memoryReadNotice(recalled.status)} If you are not sure, say so; do not invent dates, names or past events.`);
           }
           return;
         }
         if (!supplementTurn || supplementTurn.turn !== this.domainSupplementTurn) return;
-        await this.deliverWithDomainSupplement(latest, recalled, baselineText, baselineEvidence, supplementOptions, supplementTurn);
+        await this.deliverWithDomainSupplement(latest, effectiveRecalled, baselineText, baselineEvidence, supplementOptions, supplementTurn);
       } finally {
         // A failure before delivery must not leave the diagnostic surface stuck "in progress".
         if (supplementTurn && this.domainSupplementAbort === supplementTurn.controller) {
