@@ -48,7 +48,7 @@ import { Packer, Segmenter, rmsDb, type SegmentConfig, type SegmentSink, type Ut
 import { comboLabel, hotkeyBadge, hotkeyLabel, parseHotkey, splitTaps, watchHotkey, type KeyWatcher } from './asr/hotkey.ts';
 import { joinSpeech, looksHallucinated, type TranscribeResult } from './asr/result.ts';
 import { toSimplified } from './asr/simplify.ts';
-import { estimateSeconds, parseActions, parseScript, vocabChange, vocabTable, type VocabWord } from './script.ts';
+import { estimateSeconds, parseActions, parseScript, parseScriptWithSpans, vocabChange, vocabTable, type BeatSpan, type VocabWord } from './script.ts';
 import { ActivityGroup, ChatSockets, SELF_TYPE, assistantReplyFromEvent, chatHistory, chatItem, chatRefs, type ChatFigure } from './chat.ts';
 import { ASK_OPTION_MAX, petToolDecls } from './tools.ts';
 import { COO, figurePacks, lookOf, modelName, nameIn, packFor, type FigurePack, type MoveTarget, type PackScan } from './packs.ts';
@@ -500,8 +500,18 @@ export class DesktopPetWorld implements World {
   private readonly pendingAssistantResponses: Array<{ responseId: string; text: string }> = [];
   private readonly spokenThisTurn = new Set<string>();
   private assistantFlush: Promise<void> = Promise.resolve();
+  /** Serializes assistant bubble sends so multiple replies in one turn never overtake each other. */
+  private assistantBubbleChain: Promise<void> = Promise.resolve();
   /** Bumped whenever a new user turn starts or a round is preempted, cancelling stale say bubbles. */
   private sayEpoch = 0;
+  /** Tracks whether we are already inside a `delivering` (round=undefined) notification to avoid duplicate clears. */
+  private inDeliveringBatch = false;
+  /** Current OpenResponses generation id observed on the trusted outputTap stream. */
+  private activeResponseId: string | null = null;
+  /** Trusted FIFO queue of pet_say calls observed on outputTap in this response. */
+  private readonly pendingSayCalls: Array<{ generationId: string | null; outputIndex: number; callId?: string }> = [];
+  /** Bounded desensitized voice-bubble sync trace reported by the pet page (no raw text). */
+  private readonly syncTrace: Array<Record<string, unknown>> = [];
   /** The first cursor of this run: Core queues this World's undelivered events from before it again at start. */
   private startCursor = 0;
   /** Text the bubble's expand button carried, until a chat page takes it. */
@@ -827,12 +837,57 @@ export class DesktopPetWorld implements World {
     return { text: this.t.cuaSettingsOpened(this.userName) };
   }
 
+  private voiceSyncBridge(): { activeGenerationId?: string | null; recentJobs?: Array<Record<string, unknown>> } | null {
+    const bridge = (globalThis as Record<symbol, unknown>)[Symbol.for('coopanion.voiceSync.v1')];
+    return bridge && typeof bridge === 'object' ? (bridge as { activeGenerationId?: string | null; recentJobs?: Array<Record<string, unknown>> }) : null;
+  }
+
+  private buildBindings(
+    utteranceId: string,
+    spans: readonly BeatSpan[],
+    generationId: string | null,
+    outputIndex: number | null,
+    sayEpoch: number,
+  ): Array<Record<string, unknown>> {
+    const segmentPrefix = generationId && outputIndex !== null ? `${generationId}#${outputIndex}:` : undefined;
+    return spans.map((span, i) => ({
+      bubbleId: `${utteranceId}:b${i}`,
+      sayEpoch,
+      scriptStart: span.scriptStart,
+      scriptEnd: span.scriptEnd,
+      ...(generationId ? { generationId } : {}),
+      ...(outputIndex !== null ? { outputIndex, contentOrdinal: outputIndex } : {}),
+      ...(segmentPrefix ? { segmentPrefix } : {}),
+    }));
+  }
+
   outputTap(): OutputTap | undefined {
     if (!this.server.petConnected && this.chat.size === 0) return undefined;
     return {
       externalizes: () => false,
       onEvent: (event) => {
         this.status.onEvent(event);
+        const ev = event as unknown as {
+          type?: string;
+          output_index?: number;
+          response?: { id?: string };
+          item?: { type?: string; name?: string; call_id?: string };
+        };
+        if (ev.type === 'response.created') {
+          this.activeResponseId = ev.response?.id || this.voiceSyncBridge()?.activeGenerationId || null;
+          this.pendingSayCalls.length = 0;
+        } else if (ev.type === 'response.output_item.added' && ev.item?.type === 'function_call' && ev.item.name === 'pet_say') {
+          const genId = this.activeResponseId || this.voiceSyncBridge()?.activeGenerationId || null;
+          this.pendingSayCalls.push({
+            generationId: genId,
+            outputIndex: typeof ev.output_index === 'number' ? ev.output_index : 0,
+            ...(ev.item.call_id ? { callId: ev.item.call_id } : {}),
+          });
+          this.pendingSayCalls.sort((a, b) => a.outputIndex - b.outputIndex);
+        } else if (ev.type === 'response.failed' || ev.type === 'error') {
+          this.activeResponseId = null;
+          this.pendingSayCalls.length = 0;
+        }
         const reply = assistantReplyFromEvent(event);
         if (!reply || this.assistantResponseIds.has(reply.responseId)) return;
         this.assistantResponseIds.add(reply.responseId);
@@ -842,6 +897,9 @@ export class DesktopPetWorld implements World {
       onAbort: () => {
         for (const reply of this.pendingAssistantResponses) this.assistantResponseIds.delete(reply.responseId);
         this.pendingAssistantResponses.length = 0;
+        this.pendingSayCalls.length = 0;
+        this.activeResponseId = null;
+        this.inDeliveringBatch = false;
         this.clearQueuedSayBubbles();
       },
     };
@@ -850,12 +908,19 @@ export class DesktopPetWorld implements World {
   private clearQueuedSayBubbles(): void {
     this.sayEpoch++;
     this.busyUntil = 0;
-    this.server.sendPet({ t: 'say-clear' });
+    this.server.sendPet({ t: 'say-clear', epoch: this.sayEpoch });
   }
 
   onSessionArchived(): void {
     const text = this.ui.sessionArchived;
-    this.server.sendPet({ t: 'say', beats: [{ text, actions: [], anchors: [] }] });
+    const id = nextId('s');
+    this.server.sendPet({
+      t: 'say',
+      id,
+      epoch: this.sayEpoch,
+      beats: [{ text, actions: [], anchors: [] }],
+      bindings: this.buildBindings(id, [{ scriptStart: 0, scriptEnd: text.length }], null, null, this.sayEpoch),
+    });
     void this.record({ kind: 'say', beats: [{ text }] }, text);
   }
 
@@ -863,7 +928,13 @@ export class DesktopPetWorld implements World {
     this.phase = phase;
     this.status.onPhase(phase);
     if (phase.state === 'delivering' && phase.round === undefined) {
-      this.clearQueuedSayBubbles();
+      // Duplicate delivering notifications for the same batch must not wipe out active bubbles.
+      if (!this.inDeliveringBatch) {
+        this.inDeliveringBatch = true;
+        this.clearQueuedSayBubbles();
+      }
+    } else if (phase.state !== 'delivering') {
+      this.inDeliveringBatch = false;
     }
     if (this.activity.observe(phase, Date.now())) this.chat.broadcast({ t: 'activity', steps: this.activity.steps, startedAt: this.activity.startedAt });
     if (phase.state === 'idle') {
@@ -877,7 +948,11 @@ export class DesktopPetWorld implements World {
         return beats.length > 0 && !beats.every((text) => spoken.has(text));
       });
       const epoch = this.sayEpoch;
-      for (const reply of visible) void this.sendAssistantBubble(reply.text, epoch);
+      for (const reply of visible) {
+        this.assistantBubbleChain = this.assistantBubbleChain
+          .then(() => this.sendAssistantBubble(reply.text, epoch, reply.responseId))
+          .catch((err: unknown) => this.log?.warn(`气泡发送失败:${(err as Error).message}`));
+      }
       if (visible.length > 0) this.assistantFlush = this.assistantFlush.then(async () => {
         for (const reply of visible) await this.record({ kind: 'assistant', responseId: reply.responseId }, reply.text);
       }).catch((err: unknown) => this.log?.warn(`回复没能保存:${(err as Error).message}`));
@@ -886,40 +961,62 @@ export class DesktopPetWorld implements World {
   }
 
   /**
-   * The assistant's plain reply is a bubble too. Wait until its own E12 audio starts before showing it,
-   * so a long pet_say bubble is not replaced while its voice is still speaking. With no voice worker
-   * (or another TTS) the clock answers nothing and the bubble shows at once.
+   * The assistant's plain reply is a bubble too. Wait until its own E12 audio starts (preferring
+   * trusted `generationId` match) before showing it, so a long pet_say bubble is not replaced while
+   * its voice is still speaking. Transient clock errors do not fake idle.
    */
-  private async sendAssistantBubble(text: string, epoch = this.sayEpoch): Promise<void> {
+  private async sendAssistantBubble(text: string, epoch = this.sayEpoch, responseId: string | null = null): Promise<void> {
+    const target = process.env.COOPANION_MLX_URL || 'http://127.0.0.1:9882';
     const started = Date.now();
+    let consecutiveErrors = 0;
     while (Date.now() - started < 60_000) {
       if (epoch !== this.sayEpoch) return;
       try {
-        const res = await fetch('http://127.0.0.1:9882/clock', { signal: AbortSignal.timeout(600) });
-        if (!res.ok) break;
-        const clock = await res.json() as { playing?: boolean; current?: { text?: string } | null };
-        const current = clock.current?.text ?? '';
+        const res = await fetch(`${target}/clock`, { signal: AbortSignal.timeout(600) });
+        if (!res.ok) {
+          if (++consecutiveErrors >= 3) break;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          continue;
+        }
+        consecutiveErrors = 0;
+        const clock = await res.json() as { playing?: boolean; current?: { text?: string; generationId?: string } | null; queue?: Array<{ generationId?: string }> };
+        const current = clock.current;
         if (!clock.playing || !current) break;
-        const clean = (value: string): string => value
-          .replace(/【[^】]*】/g, ' ')
-          .replace(/<[^<>\n]{1,32}>/g, ' ')
-          .replace(/https?:\/\/\S+/g, ' ')
-          .replace(/[\p{Extended_Pictographic}\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/gu, ' ')
-          .replace(/[*_`~#>|]+/g, ' ')
-          .replace(/\s+/g, '');
-        const want = clean(text), got = clean(current);
-        // Require a substantial boundary match. A short reply like 「。」 must not match the period
-        // at the end of an unrelated job, and a shared two-character greeting is not enough either.
-        const enough = want.length >= 8;
-        if (enough && got && (got === want
-          || (want.startsWith(got) && got.length >= 12)
-          || (got.startsWith(want) && want.length >= 12))) break;
-      } catch { break; }
+        if (responseId && current.generationId) {
+          if (current.generationId === responseId) break;
+        } else {
+          const currentText = current.text ?? '';
+          const clean = (value: string): string => value
+            .replace(/【[^】]*】/g, ' ')
+            .replace(/<[^<>\n]{1,32}>/g, ' ')
+            .replace(/https?:\/\/\S+/g, ' ')
+            .replace(/[\p{Extended_Pictographic}\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/gu, ' ')
+            .replace(/[*_`~#>|]+/g, ' ')
+            .replace(/\s+/g, '');
+          const want = clean(text), got = clean(currentText);
+          const enough = want.length >= 8;
+          if (enough && got && (got === want
+            || (want.startsWith(got) && got.length >= 12)
+            || (got.startsWith(want) && want.length >= 12))) break;
+        }
+      } catch {
+        if (++consecutiveErrors >= 3) break;
+      }
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
     if (epoch !== this.sayEpoch) return;
-    const { beats } = parseScript(text, this.vocab());
-    if (beats.length) this.server.sendPet({ t: 'say', beats });
+    const { beats, spans } = parseScriptWithSpans(text, this.vocab());
+    if (!beats.length) return;
+    const id = nextId('s');
+    const genId = responseId || this.voiceSyncBridge()?.activeGenerationId || null;
+    this.server.sendPet({
+      t: 'say',
+      id,
+      epoch,
+      ...(genId ? { generationId: genId, outputIndex: -1 } : {}),
+      beats,
+      bindings: this.buildBindings(id, spans, genId, genId ? -1 : null, epoch),
+    });
   }
 
   /**
@@ -1320,6 +1417,13 @@ export class DesktopPetWorld implements World {
       }
       case 'commit': return this.commitSpeech();
       case 'cancel': return this.cancelSpeech();
+      case 'sync-trace': {
+        if (msg.entry && typeof msg.entry === 'object') {
+          this.syncTrace.push(msg.entry as Record<string, unknown>);
+          if (this.syncTrace.length > 128) this.syncTrace.shift();
+        }
+        return;
+      }
     }
   }
 
@@ -2012,10 +2116,23 @@ export class DesktopPetWorld implements World {
     const script = typeof args.script === 'string' ? args.script : '';
     const shown = this.shownImages(args.images);
     if (!shown.ok) return { text: shown.reason, failed: true };
-    const { beats, dropped } = parseScript(script, this.vocab());
+    const { beats, spans, dropped } = parseScriptWithSpans(script, this.vocab());
     const spoken = beats.some((b) => b.text || b.actions.length || b.anchors.length);
     if (!spoken && shown.blobs.length === 0) return { text: this.t.sayEmpty, failed: true };
-    if (spoken && !this.server.sendPet({ t: 'say', id: nextId('s'), beats })) {
+    const callMeta = this.pendingSayCalls.shift();
+    const generationId = callMeta?.generationId || this.activeResponseId || this.voiceSyncBridge()?.activeGenerationId || null;
+    const outputIndex = callMeta ? callMeta.outputIndex : (generationId ? 0 : null);
+    const utteranceId = nextId('s');
+    const bindings = this.buildBindings(utteranceId, spans, generationId, outputIndex, this.sayEpoch);
+    if (spoken && !this.server.sendPet({
+      t: 'say',
+      id: utteranceId,
+      epoch: this.sayEpoch,
+      ...(generationId ? { generationId } : {}),
+      ...(outputIndex !== null ? { outputIndex } : {}),
+      beats,
+      bindings,
+    })) {
       const receipt: ToolOutcome = { text: this.t.notConnected('pet_say', null, this.userName), failed: true };
       this.admittedSayReceipts.set(receipt, receipt.text);
       return receipt;
@@ -2372,6 +2489,7 @@ export class DesktopPetWorld implements World {
       selfAdjust: { mode: selfAdjustMode(this.cfg.selfAdjust), custom: this.selfCustom() },
       /** The Habits page's typing key: the setting, the keys named in the app language, and why it cannot be read. */
       typeKey: { ...this.cfg.typeKey, keyLabel: comboLabel(this.cfg.typeKey.hotkey, process.platform, this.ui), problem: this.typeKeyProblem },
+      syncTrace: this.syncTrace.slice(-32),
     };
   }
 

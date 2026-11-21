@@ -58,9 +58,20 @@ export interface Beat {
   anchors: Anchor[];
 }
 
+export interface BeatSpan {
+  /** UTF-16 start offset in the marker-stripped script (same coordinate space as StreamVoice chunker). */
+  scriptStart: number;
+  /** UTF-16 end offset in the marker-stripped script (exclusive). */
+  scriptEnd: number;
+}
+
 export interface ParsedScript {
   beats: Beat[];
   dropped: string[];
+}
+
+export interface ParsedScriptWithSpans extends ParsedScript {
+  spans: BeatSpan[];
 }
 
 export const INLINE_TAG_MAX = 32;
@@ -76,19 +87,27 @@ function words(inner: string, dropped: string[], vocab: readonly VocabWord[]): s
   return out;
 }
 
-export function parseScript(script: string, vocab: readonly VocabWord[]): ParsedScript {
+export function parseScriptWithSpans(script: string, vocab: readonly VocabWord[]): ParsedScriptWithSpans {
   const dropped: string[] = [];
-  const beats: Beat[] = [];
+  const entries: Array<{ beat: Beat; rawStart: number }> = [];
   let cur: Beat = { actions: [], text: '', anchors: [] };
+  let curRawStart = 0;
+  let strippedOffset = 0;
   let i = 0;
   while (i < script.length) {
     const ch = script[i];
     if (ch === '【') {
       const end = script.indexOf('】', i + 1);
-      if (end < 0) { cur.text += script.slice(i); break; }
+      if (end < 0) {
+        const tail = script.slice(i);
+        cur.text += tail;
+        strippedOffset += tail.length;
+        break;
+      }
       const acts = words(script.slice(i + 1, end), dropped, vocab);
-      if (cur.text.trim() || cur.actions.length || cur.anchors.length) beats.push(cur);
+      if (cur.text.trim() || cur.actions.length || cur.anchors.length) entries.push({ beat: cur, rawStart: curRawStart });
       cur = { actions: acts, text: '', anchors: [] };
+      curRawStart = strippedOffset;
       i = end + 1;
       continue;
     }
@@ -96,34 +115,52 @@ export function parseScript(script: string, vocab: readonly VocabWord[]): Parsed
       const close = ch === '<' ? '>' : '＞';
       const end = script.indexOf(close, i + 1);
       const inner = end < 0 ? '' : script.slice(i + 1, end);
-      if (end < 0 || inner.length > INLINE_TAG_MAX || /\n/.test(inner)) { cur.text += ch; i++; continue; }
+      if (end < 0 || inner.length > INLINE_TAG_MAX || /\n/.test(inner)) { cur.text += ch; strippedOffset++; i++; continue; }
       const acts = words(inner, dropped, vocab);
       if (acts.length) cur.anchors.push({ at: cur.text.length, actions: acts });
       i = end + 1;
       continue;
     }
     cur.text += ch;
+    strippedOffset++;
     i++;
   }
-  if (cur.text.trim() || cur.actions.length || cur.anchors.length) beats.push(cur);
-  for (const b of beats) {
+  if (cur.text.trim() || cur.actions.length || cur.anchors.length) entries.push({ beat: cur, rawStart: curRawStart });
+  const spans: BeatSpan[] = [];
+  for (const entry of entries) {
+    const b = entry.beat;
     const lead = b.text.length - b.text.trimStart().length;
     b.text = b.text.trim();
+    const scriptStart = entry.rawStart + lead;
+    spans.push({ scriptStart, scriptEnd: scriptStart + b.text.length });
     for (const a of b.anchors) a.at = Math.max(0, Math.min(b.text.length, a.at - lead));
   }
   // A marker like 【look】 before the sentence's own 。 creates a second beat whose text is only
   // punctuation. Merge that punctuation into the previous balloon instead of showing a lone 。 bubble.
   const punctuationOnly = (text: string): boolean => !/[^\s，。！？；：、…—·,.!?;:]/u.test(text);
-  const merged: Beat[] = [];
-  for (const b of beats) {
+  const mergedBeats: Beat[] = [];
+  const mergedSpans: BeatSpan[] = [];
+  for (let idx = 0; idx < entries.length; idx++) {
+    const b = entries[idx]!.beat;
+    const sp = spans[idx]!;
     if (b.text && punctuationOnly(b.text)) {
-      const prev = merged[merged.length - 1];
-      if (prev) prev.text += b.text;
+      const prev = mergedBeats[mergedBeats.length - 1];
+      const prevSpan = mergedSpans[mergedSpans.length - 1];
+      if (prev && prevSpan) {
+        prev.text += b.text;
+        prevSpan.scriptEnd = Math.max(prevSpan.scriptEnd, sp.scriptEnd);
+      }
       continue;
     }
-    merged.push(b);
+    mergedBeats.push(b);
+    mergedSpans.push(sp);
   }
-  return { beats: merged, dropped };
+  return { beats: mergedBeats, spans: mergedSpans, dropped };
+}
+
+export function parseScript(script: string, vocab: readonly VocabWord[]): ParsedScript {
+  const { beats, dropped } = parseScriptWithSpans(script, vocab);
+  return { beats, dropped };
 }
 
 /**
