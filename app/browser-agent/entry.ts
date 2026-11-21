@@ -128,7 +128,12 @@ if (!host[KEY]) {
     if (id === undefined) { id = nextDocumentId++; documentIds.set(owner, id); }
     return id;
   };
-  const mediaTargets = (): AgentMediaTarget[] => discoverMediaTargets(document, 40, [...composedElements(document)]);
+  const mediaTargets = (): AgentMediaTarget[] => {
+    const fastNodes = document.getElementsByTagName('*').length > 4000
+      ? Array.from(document.querySelectorAll<HTMLElement>('img, video, picture, source'))
+      : [...composedElements(document)];
+    return discoverMediaTargets(document, 40, fastNodes);
+  };
   const elementAt = (index: number): HTMLElement | null => {
     const element = internals.selectorMap?.get(index)?.ref;
     return element?.isConnected ? element : null;
@@ -498,7 +503,10 @@ if (!host[KEY]) {
       Math.abs(r1.left - r2.left) < 8 && Math.abs(r1.top - r2.top) < 8
       && Math.abs(r1.width - r2.width) < 12 && Math.abs(r1.height - r2.height) < 12;
 
-    for (const el of composedElements(document)) {
+    const candidateNodes = document.getElementsByTagName('*').length > 4000
+      ? Array.from(document.querySelectorAll<HTMLElement>('a[href], button, summary, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [data-e2e], article, li'))
+      : composedElements(document);
+    for (const el of candidateNodes) {
       if (map.size >= ELEMENT_LIST_MAX) break;
       if (existingRefs.has(el)) continue;
       if (el.id === HIGHLIGHTS || el.closest?.(`#${HIGHLIGHTS}`)) continue;

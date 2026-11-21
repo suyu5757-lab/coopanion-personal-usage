@@ -47,7 +47,7 @@ const { setFileInputFiles } = require('./browser-cdp-upload.cjs');
 const PARTITION = 'persist:coo-browser';
 const AGENT_FILE = ['build', 'browser-agent.js'];
 const LOAD_TIMEOUT_MS = 25_000;
-const SCRIPT_TIMEOUT_MS = 12_000;
+const SCRIPT_TIMEOUT_MS = 18_000;
 const SETTLE_MS = 500;
 const MEDIA_TARGET_TOKEN_TTL_MS = 5 * 60_000;
 const WINDOW_WIDTH = 1100;
@@ -759,6 +759,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       for (const node of nodes) {
         if (!node || node.ignored) continue;
         const role = String(node.role?.value || '').toLowerCase();
+        // Skip InlineTextBox nodes: they duplicate wrapped lines of their parent StaticText node.
+        if (role === 'inlinetextbox') continue;
         const name = String(node.name?.value || '').replace(/\s+/g, ' ').trim();
         if (role === 'rootwebarea' && name && !title) title = name;
         if (!name || name.length < 2) continue;
@@ -785,6 +787,37 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
           lines.push(textLine.slice(0, 260));
         }
       }
+      // Best-effort fast read-only link sweep via CDP Runtime.evaluate so card/detail URLs are captured even in CDP fallback.
+      try {
+        const evalRes = await within(() => dbg.sendCommand('Runtime.evaluate', {
+          expression: `(() => {
+            const vw = innerWidth, vh = innerHeight, out = [], seen = new Set();
+            for (const a of document.querySelectorAll('a[href]')) {
+              const r = a.getBoundingClientRect();
+              if (r.width < 12 || r.height < 12 || r.bottom <= 0 || r.top >= vh || r.right <= 0 || r.left >= vw) continue;
+              const href = a.href || '';
+              if (!/^https?:\/\//i.test(href) || seen.has(href)) continue;
+              const txt = (a.innerText || a.getAttribute('aria-label') || a.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+              if (!txt || txt.length < 2) continue;
+              seen.add(href);
+              out.push({ txt, href: href.slice(0, 260) });
+              if (out.length >= 25) break;
+            }
+            return out;
+          })()`,
+          returnByValue: true,
+        }), 1500, 'cdp visible links');
+        const visibleLinks = Array.isArray(evalRes?.result?.value) ? evalRes.result.value : [];
+        for (const item of visibleLinks) {
+          if (!item || typeof item.href !== 'string' || !isPublicHttp(item.href)) continue;
+          const txt = String(item.txt || '').trim();
+          const dedupeKey = `${txt}|${item.href}`;
+          if (txt && !seenNames.has(dedupeKey) && lines.length < 180) {
+            seenNames.add(dedupeKey);
+            lines.push(`[link] ${txt} (${item.href})`.slice(0, 280));
+          }
+        }
+      } catch { /* ignore when JS main thread is completely blocked */ }
       const [vw, vh] = win.getContentSize();
       const pageStatus = classifyCdpPageState({ url, title, lines, controlsCount: controls.length, loadTimedOut });
       const noNodes = lines.length === 0 && controls.length === 0;
