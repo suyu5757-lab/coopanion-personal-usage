@@ -36,6 +36,12 @@ export const S: Partial<typeof en> = {
   undoAll: "Ripristina il contenuto salvato",
   undoAllHint: "Ripristina l’ultimo contenuto salvato. Annulla permette di recuperare le modifiche.",
   saveToFile: "Salva",
+  attestLocal: "Conferma configurazione locale",
+  attestTitle: "Conferma la configurazione locale attuale",
+  attestBody: "Registra l’impronta e l’ora dei file di personalità locali attuali come conferma fatta nelle Impostazioni. Non diventa qualcosa che hai detto in conversazione e non viene scritto nella memoria a lungo termine. Modificare un file in seguito richiede una nuova conferma.",
+  attestDone: (n: number) => `${n} file di configurazione locale confermato/i.`,
+  attestNone: "Nessuna configurazione locale da confermare; queste sono le versioni integrate.",
+  attestFailed: (msg: string) => `Conferma non riuscita: ${msg}`,
   // index.ts
   title: 'Prompt di sistema',
   introDesc: "Ctrl+S salva i template; «Applica ora» aggiorna il prompt della conversazione attuale. Le sezioni generate sono in sola lettura.",

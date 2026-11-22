@@ -1,11 +1,9 @@
-import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
-
-/** `cortico/*` resolves to the vendored Cortico sources, as tsconfig.json says. */
-const CORTICO_SRC = fileURLToPath(new URL('./vendor/cortico/src/', import.meta.url));
+import { CORTICO_ALIAS, decodeFileUrlIds } from './vitest.shared.ts';
 
 export default defineConfig({
-  resolve: { alias: [{ find: /^cortico\//, replacement: CORTICO_SRC }] },
+  plugins: [decodeFileUrlIds],
+  resolve: { alias: CORTICO_ALIAS },
   // what scripts/stage.ts defines when it builds the settings window (console/app-version.ts)
   define: { COOPANION_VERSION: JSON.stringify('0.0.0'), COOPANION_CHANNEL: JSON.stringify('github') },
   test: {

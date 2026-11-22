@@ -36,6 +36,12 @@ export const S: Partial<typeof en> = {
   undoAll: "復原全部修改",
   undoAllHint: "恢復到上次儲存的內容；可用復原取回這些修改。",
   saveToFile: "儲存",
+  attestLocal: "確認本機設定",
+  attestTitle: "確認目前的本機設定",
+  attestBody: "把目前本機人格設定檔的內容摘要和時間記為設定介面的確認。它不會變成你說過的話，也不會寫入長期記憶；之後修改檔案需要重新確認。",
+  attestDone: (n: number) => `已確認 ${n} 份本機設定。`,
+  attestNone: "沒有需要確認的本機設定；目前是內建版本。",
+  attestFailed: (msg: string) => `確認失敗：${msg}`,
   // index.ts
   title: '系統提示詞',
   introDesc: "Ctrl+S 儲存範本，「立即套用」後目前對話改用新的提示詞。自動生成的段落唯讀。",

@@ -4,7 +4,7 @@ export const S: Partial<typeof en> = {
   title: "Contrôle de l'ordinateur",
   enabled: 'Laisser Coo utiliser cet ordinateur',
   control: 'Autoriser la souris et le clavier',
-  controlHint: "Désactivé, Coo peut seulement regarder l'écran.",
+  controlHint: "Cette version candidate permet de consulter les écrans et fenêtres. La souris et le clavier sont temporairement indisponibles.",
   permission: 'Quand vous demander',
   levels: { 'ask-each-turn': 'À chaque tour', 'ask-before-acting': "Avant d'agir", 'ask-once': 'Une fois', 'never-ask': 'Jamais' },
   levelHints: {

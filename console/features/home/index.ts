@@ -24,15 +24,30 @@ import { intro } from '../intro.ts';
 import { revealWhenPainted } from '../frame-reveal.ts';
 import { schemesCard } from '../schemes/index.ts';
 import { CHATGPT_TEXT, openInBrowser } from '../chatgpt/index.ts';
-import { signInReason } from 'cortico-provider-coo/src/strings.ts';
+import { cooText, signInReason } from 'cortico-provider-coo/src/strings.ts';
 import { readMode, requestMode } from '../mode.ts';
 import {
-  connectChatGPT, connectionVendor, connectVendor, consoleCall, defaultRegion, localized, readStatus, regionsOf, siteOf, testEndpoint, VENDOR_ICONS, vendorName, vendorsFor,
-  type ConnectResult, type Region, type Status, type Vendor,
+  connectChatGPT, connectionVendor, connectVendor, consoleCall, defaultRegion, localized, readStatus, regionsOf, siteOf, testEndpoint, vendorEntry, VENDOR_ICONS, vendorName, vendorsFor,
+  type ConnectResult, type Protocol, type Region, type Status, type Vendor,
 } from './model.ts';
 import { S } from './strings.ts';
 
 const PET_PAGE = 'world:desktop-pet';
+const GO_VENDOR = 'opencode-go';
+type GoTier = 'off' | 'low' | 'high' | 'max';
+const GO_ORDER: readonly GoTier[] = ['off', 'low', 'high', 'max'];
+
+/** A row of OpenCode Go's catalogue as the endpoint's model route returns it. */
+interface GoModelRow {
+  id: string;
+  displayName?: string;
+  contextWindow?: number;
+  inputImages?: boolean;
+  protocol: Protocol | null;
+  tiers: Record<GoTier, boolean>;
+  effort: Partial<Record<GoTier, string | null>>;
+  defaultEffort?: string;
+}
 
 interface PetState { connected: boolean; onDesktop?: boolean; url: string | null }
 
@@ -69,6 +84,10 @@ async function mount(ctx: PageContext): Promise<void> {
   let vendor: Vendor = shown[0]!;
   /** Which of the service's platforms, for a service with one per region. */
   let region: Region = defaultRegion(LANGUAGE);
+  /** OpenCode Go's catalogue, the chosen row's protocol, and the thinking level chosen for it. */
+  let goModels: GoModelRow[] = [];
+  let goProtocol: Protocol | undefined;
+  let goTier: GoTier = 'high';
   const vendorButton = (mark: string, name: string) => {
     const b = ui.h('button', 'home-vendor');
     b.type = 'button';
@@ -114,6 +133,20 @@ async function mount(ctx: PageContext): Promise<void> {
   const modelField = ui.field(S.modelLabel, modelInput);
   modelField.classList.add('home-modelfield');
   keyRow.append(modelField, keyField, modelList, save);
+  // OpenCode Go reads its models at run time, so its model and thinking level are picked from that list
+  const goRow = ui.rowbar();
+  goRow.classList.add('home-keyrow', 'home-gorow');
+  const goModel = ui.select({ onChange: (value) => selectGoModel(value) });
+  goModel.setAttribute('aria-label', S.modelPick);
+  const goReasoning = ui.select({ onChange: (value) => { goTier = value as GoTier; } });
+  goReasoning.setAttribute('aria-label', S.reasoningLabel);
+  goReasoning.disabled = true;
+  const refreshGo = ui.button(S.refreshModels, { size: 'sm' });
+  const goMsg = ui.msgline('');
+  const goModelField = ui.field(S.modelPick, goModel);
+  const goReasoningField = ui.field(S.reasoningLabel, goReasoning);
+  goRow.append(goModelField, goReasoningField, refreshGo, goMsg);
+  goRow.hidden = true;
   /** The active endpoint's service, platform and model, once the status is read. */
   let active: { vendor: Vendor | null; region: Region | null; model: string } = { vendor: null, region: null, model: '' };
   /** The active endpoint when it is none of the listed services (set up by hand on the Model page). */
@@ -150,6 +183,90 @@ async function mount(ctx: PageContext): Promise<void> {
     const rest = listed.filter((v) => v !== current && (unfolded || !more.includes(v) || v === vendor));
     otherBox.replaceChildren(...rest.map((v) => vendorButtons[listed.indexOf(v)]!), ...(unfolded ? [] : [moreButton]));
   };
+  /** The tier a catalogue effort value belongs to, where the catalogue names one. */
+  const tierOfEffort = (effort: string | undefined): GoTier | undefined => {
+    if (!effort) return undefined;
+    if (effort === 'none') return 'off';
+    if (effort === 'low' || effort === 'minimal') return 'low';
+    if (effort === 'high' || effort === 'medium') return 'high';
+    if (effort === 'max' || effort === 'xhigh') return 'max';
+    return undefined;
+  };
+  /** Fills the model picker from the catalogue; a model whose API family is unknown stays visible but disabled. */
+  const paintGoModels = () => {
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = goModels.length ? S.modelPick : S.modelPickFirst;
+    const rows = goModels.map((model) => {
+      const option = document.createElement('option');
+      option.value = model.id;
+      option.textContent = model.displayName && model.displayName !== model.id ? `${model.displayName} · ${model.id}` : model.id;
+      option.disabled = !model.protocol;
+      return option;
+    });
+    goModel.replaceChildren(placeholder, ...rows);
+    const usable = goModels.filter((model) => model.protocol);
+    goModel.disabled = !usable.length;
+    if (!usable.length) {
+      goReasoning.replaceChildren();
+      goReasoning.disabled = true;
+      goProtocol = undefined;
+      return;
+    }
+    const wanted = (inUse() && active.model) || modelInput.value;
+    const chosen = usable.find((model) => model.id === wanted) ?? usable[0]!;
+    goModel.value = chosen.id;
+    selectGoModel(chosen.id);
+  };
+  /** Shows the chosen model's supported thinking levels; an unsupported level is disabled. */
+  const selectGoModel = (id: string) => {
+    const model = goModels.find((row) => row.id === id);
+    if (!model || !model.protocol) return;
+    goProtocol = model.protocol;
+    modelInput.value = model.id;
+    const labels = cooText(LANGUAGE).tiers;
+    const options = GO_ORDER.map((tier) => {
+      const option = document.createElement('option');
+      option.value = tier;
+      option.textContent = labels[tier];
+      option.disabled = model.tiers?.[tier] === false;
+      return option;
+    });
+    goReasoning.replaceChildren(...options);
+    goReasoning.disabled = false;
+    const preferred = [tierOfEffort(model.defaultEffort), 'high', 'max', 'low', 'off'].filter((tier): tier is GoTier => !!tier);
+    goTier = preferred.find((tier) => model.tiers?.[tier] !== false) ?? 'off';
+    goReasoning.value = goTier;
+  };
+  /** Reads the Go catalogue with the typed key, or the saved endpoint's key when the box is empty. */
+  const refreshGoModels = async () => {
+    if (vendor.id !== GO_VENDOR) return;
+    const key = keyInput.value.trim();
+    if (!key && !inUse()) {
+      goMsg.textContent = S.modelsNeedKey;
+      goMsg.classList.remove('bad');
+      return;
+    }
+    refreshGo.disabled = true;
+    goMsg.textContent = S.modelsFetching;
+    goMsg.classList.remove('bad');
+    try {
+      let entry: Record<string, unknown>;
+      try { entry = (await call<{ entry: Record<string, unknown> }>(`/api/providers/${GO_VENDOR}`)).entry; }
+      catch { entry = vendorEntry(vendor, modelInput.value || vendor.model, region) as unknown as Record<string, unknown>; }
+      const result = await call<{ models: GoModelRow[] }>(`/api/providers/${GO_VENDOR}/models`, { entry, ...(key ? { secretValue: key } : {}) });
+      goModels = Array.isArray(result.models) ? result.models.filter((model) => model && typeof model.id === 'string') : [];
+      goMsg.textContent = goModels.length ? S.modelsFetched(goModels.length) : S.modelsEmpty;
+      goMsg.classList.toggle('bad', !goModels.length);
+      paintGoModels();
+    } catch (err) {
+      goMsg.textContent = S.testFail(errText(err));
+      goMsg.classList.add('bad');
+    } finally {
+      refreshGo.disabled = false;
+    }
+  };
+  refreshGo.addEventListener('click', () => void refreshGoModels(), opts);
   /** The service in use starts on its own platform, another one on the platform for the language. */
   const pickVendor = (v: Vendor, r?: Region) => {
     vendor = v;
@@ -164,10 +281,27 @@ async function mount(ctx: PageContext): Promise<void> {
     getKey.href = siteOf(v, region).keyUrl;
     regionLink.hidden = !regionsOf(v).length;
     regionLink.textContent = region === 'cn' ? S.toIntl : S.toCn;
-    // ChatGPT takes no key and picks its model from the plan's list once signed in
-    keyField.hidden = modelField.hidden = getKey.hidden = !!v.signIn;
+    // ChatGPT takes no key and picks its model from the plan's list once signed in; Go picks from its catalogue
+    const go = v.id === GO_VENDOR;
+    keyField.hidden = getKey.hidden = !!v.signIn;
+    modelField.hidden = !!v.signIn || go;
+    goRow.hidden = !go;
     quota.hidden = !v.signIn;
     save.textContent = v.signIn ? CHATGPT_TEXT.go : S.saveStart;
+    if (!go) return;
+    if (goModels.length) paintGoModels();
+    else {
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = S.modelPickFirst;
+      goModel.replaceChildren(placeholder);
+      goModel.disabled = true;
+      goReasoning.replaceChildren();
+      goReasoning.disabled = true;
+      goMsg.textContent = inUse() || keyInput.value.trim() ? '' : S.modelsNeedKey;
+      goMsg.classList.remove('bad');
+      if (inUse() || keyInput.value.trim()) void refreshGoModels();
+    }
   };
   pickVendor(vendor);
   const need = ui.h('p', 'home-note', S.modelNeed(vendorName(shown[0]!, LANGUAGE)));
@@ -184,7 +318,7 @@ async function mount(ctx: PageContext): Promise<void> {
   const links = ui.rowbar();
   links.classList.add('home-links');
   links.append(getKey, regionLink, ui.h('span', 'grow'), otherLink);
-  model.body.append(need, picker, keyRow, quota, links, modelMsg);
+  model.body.append(need, picker, keyRow, goRow, quota, links, modelMsg);
   root.append(model.el);
 
   /* ---------- pet ---------- */
@@ -273,10 +407,23 @@ async function mount(ctx: PageContext): Promise<void> {
     const key = keyInput.value.trim();
     // only the endpoint in use has a key saved to keep
     if (!key && !inUse()) { keyInput.focus(); return; }
+    const goSelected = vendor.id === GO_VENDOR ? goModels.find((model) => model.id === goModel.value) : undefined;
+    if (vendor.id === GO_VENDOR && (!goSelected || !goSelected.protocol || !goProtocol)) {
+      goMsg.textContent = S.modelPickFirst;
+      goMsg.classList.add('bad');
+      return;
+    }
+    const settings = goSelected ? {
+      protocol: goSelected.protocol!,
+      thinking: goTier !== 'off',
+      multimodal: goSelected.inputImages === true,
+      ...(goTier !== 'off' && goSelected.effort[goTier] ? { reasoningEffort: goSelected.effort[goTier]! } : {}),
+      ...(goSelected.contextWindow ? { contextWindow: goSelected.contextWindow } : {}),
+    } : {};
     save.disabled = true;
     try {
       testing();
-      const r = await connectVendor(call, vendor, key, modelInput.value, region);
+      const r = await connectVendor(call, vendor, key, modelInput.value, region, settings);
       keyInput.value = '';
       showTest(r);
       if (r.ok) modelMsg.textContent = S.started;

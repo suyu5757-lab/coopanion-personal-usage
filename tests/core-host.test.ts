@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -67,6 +68,26 @@ async function exercise(mode: 'clean' | 'hung') {
 }
 
 describe('Core shutdown', () => {
+  it('keeps Core alive through its graceful shutdown deadline', async () => {
+    const { CoreHost } = require(join(repo, 'app/core-host.cjs'));
+    const host = new CoreHost({ appRoot: repo, logDir: 'logs', env: process.env, resolveProxy: async () => 'DIRECT' });
+    const child = new EventEmitter() as EventEmitter & { send: () => void; kill: () => void };
+    let killed = false;
+    child.send = () => {};
+    child.kill = () => { killed = true; child.emit('exit', null, 'SIGKILL'); };
+    host.child = child;
+    vi.useFakeTimers();
+    const stopping = host.stop();
+    try {
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(killed).toBe(false);
+    } finally {
+      child.emit('exit', 0, null);
+      await stopping;
+      vi.useRealTimers();
+    }
+  });
+
   it('exits promptly after a cooperative shutdown without keeping the grace timer alive', async () => {
     const result = await exercise('clean');
     expect(result).toMatchObject({ code: 0, child: null, port: null, state: 'stopped', crashes: [] });

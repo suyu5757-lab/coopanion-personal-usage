@@ -21,13 +21,20 @@ describe('first-run seed', () => {
       const home = mkdtempSync(join(tmpdir(), 'cc-seed-'));
       const vendor = firstVendor(language), endpoint = endpointName(vendor, defaultRegion(language));
       seed(home, language);
+      const orientation = readFileSync(join(home, DEPLOYMENT, 'prompts', 'ORIENTATION.md'), 'utf8');
+      expect(orientation).toContain(language === 'zh' ? '## 社交情境与安全' : '## Social situations and safety');
       expect(read(join(home, DEPLOYMENT, 'deployment.json'))).toEqual({ bot: 'cormini' });
-      expect(read(join(home, DEPLOYMENT, 'config.json'))).toMatchObject({ activeProvider: endpoint, language });
+      expect(read(join(home, DEPLOYMENT, 'config.json'))).toMatchObject({
+        activeProvider: endpoint,
+        language,
+        worlds: { 'desktop-pet': { cua: { control: false } } },
+        companion: { selfTime: { actions: false, imageGeneration: false, imageSaving: false, mediaUpload: false, mediaDownload: false } },
+      });
       // the next start, in another system language, leaves a new install's language and computer-use asking as seeded
       seed(home, language === 'zh' ? 'en' : 'zh');
       expect(read(join(home, DEPLOYMENT, 'config.json'))).toMatchObject({ language, worlds: { 'desktop-pet': { cua: { permission: 'ask-once' } } } });
       expect(read(join(home, 'providers', endpoint, 'config.json'))).toMatchObject({ kind: 'coo', secret: vendor.secret, spec: { model: vendor.model } });
-      expect(readFileSync(join(home, DEPLOYMENT, 'workspace', 'CONSTITUTION.md'), 'utf8')).toBe(readFileSync(personaFile('coo', language), 'utf8'));
+      expect(readFileSync(join(home, DEPLOYMENT, 'workspace', 'CONSTITUTION.md'), 'utf8')).toBe(readFileSync(personaFile('whale', language), 'utf8'));
       expect(readFileSync(join(home, DEPLOYMENT, 'avatar.png')).subarray(1, 4).toString()).toBe('PNG');
     }
   });
@@ -103,6 +110,65 @@ describe('first-run seed', () => {
     expect((read(cfg).hindsight as Record<string, unknown>).enabled).toBe(false);
   });
 
+  it('keeps legacy social actions and closes new browser permissions in an idempotent migration', () => {
+    const home = mkdtempSync(join(tmpdir(), 'cc-seed-'));
+    mkdirSync(join(home, DEPLOYMENT), { recursive: true });
+    const cfg = join(home, DEPLOYMENT, 'config.json');
+    const original = {
+      displayName: 'mine',
+      worlds: { 'desktop-pet': { cua: { permission: 'ask-once' } } },
+      companion: { selfTime: { enabled: true, actions: true } },
+    };
+    writeFileSync(cfg, JSON.stringify(original));
+
+    seed(home, 'zh');
+    expect(read(cfg).companion).toEqual({ selfTime: { enabled: true, actions: true, imageGeneration: false, imageSaving: false, mediaUpload: false, mediaDownload: false } });
+    expect(read(`${cfg}.pre-action-permissions-v1`)).toEqual(original);
+    expect(read(join(home, DEPLOYMENT, 'action-permissions-v1.json'))).toEqual({ v: 1, applied: true });
+    expect(read(cfg).worlds).toMatchObject({ 'desktop-pet': { cua: { control: false } } });
+
+    const migrated = read(cfg);
+    migrated.companion = { selfTime: { enabled: true, actions: true, imageGeneration: true, imageSaving: false, mediaUpload: false } };
+    writeFileSync(cfg, JSON.stringify(migrated));
+    seed(home, 'zh');
+    expect((read(cfg).companion as Record<string, unknown>).selfTime).toEqual({ enabled: true, actions: true, imageGeneration: true, imageSaving: false, mediaUpload: false, mediaDownload: false });
+  });
+
+  it('normalizes missing or invalid permission values to false and preserves explicit booleans', () => {
+    for (const selfTime of [
+      { actions: false },
+      { actions: 'true', imageGeneration: 'yes', imageSaving: 1, mediaUpload: null },
+      { actions: true, imageGeneration: true, imageSaving: false, mediaUpload: true, mediaDownload: true },
+    ]) {
+      const home = mkdtempSync(join(tmpdir(), 'cc-seed-'));
+      mkdirSync(join(home, DEPLOYMENT), { recursive: true });
+      const cfg = join(home, DEPLOYMENT, 'config.json');
+      writeFileSync(cfg, JSON.stringify({ companion: { selfTime } }));
+      seed(home, 'zh');
+      const migrated = (read(cfg).companion as Record<string, unknown>).selfTime as Record<string, unknown>;
+      expect(migrated.actions).toBe(typeof selfTime.actions === 'boolean' ? selfTime.actions : false);
+      expect(migrated.imageGeneration).toBe(typeof selfTime.imageGeneration === 'boolean' ? selfTime.imageGeneration : false);
+      expect(migrated.imageSaving).toBe(typeof selfTime.imageSaving === 'boolean' ? selfTime.imageSaving : false);
+      expect(migrated.mediaUpload).toBe(typeof selfTime.mediaUpload === 'boolean' ? selfTime.mediaUpload : false);
+      expect(migrated.mediaDownload).toBe(typeof selfTime.mediaDownload === 'boolean' ? selfTime.mediaDownload : false);
+    }
+  });
+
+  it('keeps an explicit CUA preference and defaults missing or invalid desktop input off', () => {
+    for (const control of [undefined, true, false, 'true']) {
+      const home = mkdtempSync(join(tmpdir(), 'cc-seed-'));
+      mkdirSync(join(home, DEPLOYMENT), { recursive: true });
+      const cfg = join(home, DEPLOYMENT, 'config.json');
+      const cua = control === undefined ? {} : { control };
+      writeFileSync(cfg, JSON.stringify({ worlds: { 'desktop-pet': { cua } }, companion: { selfTime: { actions: true } } }));
+      seed(home, 'zh');
+      const migrated = read(cfg).worlds as Record<string, unknown>;
+      expect(((migrated['desktop-pet'] as Record<string, unknown>).cua as Record<string, unknown>).control)
+        .toBe(typeof control === 'boolean' ? control : false);
+      expect((((read(cfg).companion as Record<string, unknown>).selfTime as Record<string, unknown>).actions)).toBe(true);
+    }
+  });
+
   it('ships every persona in every app language, each told apart from the others', () => {
     const workspace = mkdtempSync(join(tmpdir(), 'cc-persona-'));
     for (const id of PERSONAS) for (const language of LANGUAGES) {
@@ -116,10 +182,10 @@ describe('first-run seed', () => {
     mkdirSync(join(home, DEPLOYMENT));
     const cfg = join(home, DEPLOYMENT, 'config.json');
     const constitution = join(home, DEPLOYMENT, 'workspace', 'CONSTITUTION.md');
-    const shipped = (id: 'coo' | 'winter', language: 'zh' | 'ja' | 'zh-Hant') => readFileSync(personaFile(id, language), 'utf8');
+    const shipped = (id: 'coo' | 'winter' | 'whale', language: 'zh' | 'ja' | 'zh-Hant') => readFileSync(personaFile(id, language), 'utf8');
     writeFileSync(cfg, JSON.stringify({ language: 'ja' }));
     seed(home, 'zh');
-    expect(readFileSync(constitution, 'utf8')).toBe(shipped('coo', 'ja'));
+    expect(readFileSync(constitution, 'utf8')).toBe(shipped('whale', 'ja'));
     applyPersona(join(home, DEPLOYMENT, 'workspace'), 'winter', 'ja');
     writeFileSync(cfg, JSON.stringify({ language: 'zh-Hant' }));
     seed(home, 'zh');
@@ -156,7 +222,7 @@ describe('first-run seed', () => {
     writeFileSync(constitution, '# 我自己写的');
     seed(home, 'zh');
     // a config from before new installs got a computer-use `permission` keeps the default it had
-    expect(read(cfg)).toEqual({ displayName: 'mine', worlds: { 'desktop-pet': { cua: { permission: 'ask-each-turn' } } } });
+    expect(read(cfg)).toMatchObject({ displayName: 'mine', worlds: { 'desktop-pet': { cua: { permission: 'ask-each-turn' } } } });
     expect(readFileSync(constitution, 'utf8')).toBe('# 我自己写的');
   });
 
@@ -167,11 +233,11 @@ describe('first-run seed', () => {
     const cua = { enabled: true, permission: 'never-ask', grantMinutes: 90, screenshot: { quality: 60 } };
     writeFileSync(cfg, JSON.stringify({ displayName: 'mine', worlds: { cua, 'desktop-pet': { roam: 'off' } } }));
     seed(home, 'zh');
-    expect(read(cfg)).toEqual({ displayName: 'mine', worlds: { 'desktop-pet': { roam: 'off', cua } } });
+    expect(read(cfg)).toMatchObject({ displayName: 'mine', worlds: { 'desktop-pet': { roam: 'off', cua } } });
     // an old config without its asking level keeps the default it had then
     writeFileSync(cfg, JSON.stringify({ worlds: { cua: { enabled: true } } }));
     seed(home, 'zh');
-    expect(read(cfg)).toEqual({ worlds: { 'desktop-pet': { cua: { enabled: true, permission: 'ask-each-turn' } } } });
+    expect(read(cfg)).toMatchObject({ worlds: { 'desktop-pet': { cua: { enabled: true, permission: 'ask-each-turn' } } } });
   });
 
   it('moves the terminal World, its prompt override and the console log level to the names Cortico 0.2.0 gave them', () => {
@@ -184,11 +250,11 @@ describe('first-run seed', () => {
     mkdirSync(join(deploy, 'worlds', 'terminal'), { recursive: true });
     writeFileSync(join(deploy, 'worlds', 'terminal', 'ENV_PROMPT.md'), 'mine');
     seed(home, 'zh');
-    expect(read(cfg)).toEqual({ worlds: { 'desktop-pet': pet, [CONSOLE.id]: { enabled: true, pin: '123456' } }, logging: { file: 'debug', stdout: 'warn' } });
+    expect(read(cfg)).toMatchObject({ worlds: { 'desktop-pet': pet, [CONSOLE.id]: { enabled: true, pin: '123456' } }, logging: { file: 'debug', stdout: 'warn' } });
     expect(readFileSync(join(deploy, 'worlds', CONSOLE.id, 'ENV_PROMPT.md'), 'utf8')).toBe('mine');
     // a key already under the new name wins over the old one
     writeFileSync(cfg, JSON.stringify({ worlds: { terminal: { enabled: true, pin: '' }, [CONSOLE.id]: { pin: '654321' }, 'desktop-pet': pet }, logging: { console: 'warn', stdout: 'error' } }));
     seed(home, 'zh');
-    expect(read(cfg)).toEqual({ worlds: { [CONSOLE.id]: { enabled: true, pin: '654321' }, 'desktop-pet': pet }, logging: { stdout: 'error' } });
+    expect(read(cfg)).toMatchObject({ worlds: { [CONSOLE.id]: { enabled: true, pin: '654321' }, 'desktop-pet': pet }, logging: { stdout: 'error' } });
   });
 });

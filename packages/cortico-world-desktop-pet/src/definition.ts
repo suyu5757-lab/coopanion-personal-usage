@@ -7,6 +7,8 @@ import { DesktopPetWorld, modelsDirFor, type PetBotControls } from './world.ts';
 import type { DescribeTool } from './status.ts';
 import type { ModelLanguage } from './model-text.ts';
 import type { Answer } from './cua/engine-ipc.ts';
+import type { CuaDriverOptions } from './cua/driver.ts';
+import type { CuaInputAuthorization, CuaInputGrantRequest } from './cua/cua.ts';
 import { CUA_OFF_TOOL_DECLS, CUA_TOOL_DECLS } from './cua/tools.ts';
 import { petToolDecls } from './tools.ts';
 import { SELF_TYPE } from './chat.ts';
@@ -47,6 +49,11 @@ const DESCRIBE: WorldDescribe = {
       type: 'desktop-pet.speech',
       description: { zh: '使用者按住说话键说的话,识别成的文字。', en: 'What the person said while holding the talk key, as recognized text.' },
       trigger: 'flush',
+    },
+    {
+      type: 'desktop-pet.guide-answer',
+      description: { zh: '使用者在使用向导中提交的回答。', en: 'An answer submitted in the introduction.' },
+      trigger: 'debounce',
     },
     {
       type: 'desktop-pet.answer',
@@ -90,6 +97,21 @@ export interface DesktopPetAssembly {
   language?(): Language;
   /** Called with each answer to computer use's question in the pet's bubble. */
   onCuaAnswer?(answer: Answer): void;
+  /** Core's fail-closed policy check for each computer input tool. */
+  authorizeInput?(tool: string): boolean;
+  /** Identifies this Core run in native-window evidence. */
+  cuaInstanceId?: string;
+  /** Core confirms and issues a task-level or single-step grant for a supported native target. */
+  allowsOrdinaryCuaInput?: (request: Pick<CuaInputGrantRequest, 'tool' | 'target' | 'expectedChange'>) => boolean;
+  authorizeCuaInput?(request: CuaInputGrantRequest): Promise<CuaInputAuthorization | null>;
+  /** Explicitly cancels an active desktop CUA task grant and its continuation state. */
+  revokeCuaTask?(taskId: string): void;
+  /** Suspends ephemeral in-memory CUA grants on shutdown/window switch without cancelling persisted tasks. */
+  suspendCuaTask?(taskId: string): void;
+  /** Returns the persisted resumable CUA task ID on startup, if any. */
+  resumeCuaTaskId?(): string | null;
+  /** Exact app-managed Cua Driver endpoint and session. */
+  cuaDriver?: CuaDriverOptions;
 }
 
 /** The definition, with what an embedding app lends the World. */
@@ -122,6 +144,14 @@ export function desktopPetDefinition(assembly: DesktopPetAssembly = {}): WorldDe
         replyLanguage: () => assembly.replyLanguage?.() ?? null,
         language: () => assembly.language?.() ?? 'zh',
         onCuaAnswer: (answer) => assembly.onCuaAnswer?.(answer),
+        cuaDriver: assembly.cuaDriver,
+        allowCuaInput: assembly.authorizeInput,
+        cuaInstanceId: assembly.cuaInstanceId,
+        allowsOrdinaryCuaInput: assembly.allowsOrdinaryCuaInput,
+        authorizeCuaInput: assembly.authorizeCuaInput,
+        revokeCuaTask: assembly.revokeCuaTask,
+        suspendCuaTask: assembly.suspendCuaTask,
+        resumeCuaTaskId: assembly.resumeCuaTaskId,
       });
       assembly.onCreate?.(world);
       return world;

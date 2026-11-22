@@ -49,18 +49,24 @@ export class BrowserBridge implements BrowserTransport {
     const send = (message: object) => process.send!(message);
     if (signal?.aborted) return Promise.reject(new Error('interrupted'));
     const id = ++this.seq;
+    const timeoutMs = op === 'download-media' ? 130_000 : CALL_TIMEOUT_MS;
+    const cancelRequest = () => {
+      try { send({ type: 'companion:browser-cancel', id }); } catch { /* the app may already be closing */ }
+    };
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         const pending = this.pending.get(id);
         if (!pending) return;
         this.settle(id, pending);
+        cancelRequest();
         reject(new Error(`${op} timed out`));
-      }, CALL_TIMEOUT_MS);
+      }, timeoutMs);
       timer.unref?.();
       const abort = () => {
         const pending = this.pending.get(id);
         if (!pending) return;
         this.settle(id, pending);
+        cancelRequest();
         reject(new Error('interrupted'));
       };
       signal?.addEventListener('abort', abort, { once: true });
@@ -89,6 +95,7 @@ export class BrowserBridge implements BrowserTransport {
   close(): void {
     process.off('message', this.onMessage);
     for (const [id, pending] of this.pending) {
+      try { process.send?.({ type: 'companion:browser-cancel', id }); } catch { /* the app may already be closing */ }
       this.settle(id, pending);
       pending.reject(new Error('browser bridge closed'));
     }

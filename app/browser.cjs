@@ -2,25 +2,57 @@
  * Coo's browser window: one persistent, muted-by-default Chromium window that the browser World drives
  * through `{ type: 'companion:browser' }` messages relayed by core-host.cjs. The page script is
  * `build/browser-agent.js` (app/browser-agent/entry.ts, built by scripts/stage.ts); it is injected into the
- * page after every full load and exposes only reading, clicking, pointer positions, input preparation, scrolling,
- * video play/pause and opening a share panel. The host types through Chromium so page editors receive real text input.
+ * page after every full load and exposes reading, element actions, video play/pause, opening a share panel and
+ * ChatGPT image controls. The host types through Chromium so page editors receive real text input.
  *
- * The window has its own Chromium profile (`persist:coo-browser`), so signing in on Bilibili or Douyin does
+ * The window has its own Chromium profile (`persist:coo-browser`), so signing in on ChatGPT, Bilibili or Douyin does
  * not touch the person's browser. It is shown without focus, denies camera, microphone, location and
- * notification permission, cancels downloads, keeps public http(s) navigation in this one window, and
+ * notification permission, accepts only approved ChatGPT image staging or a snapshot-bound public media download,
+ * keeps public http(s) navigation in this one window, and
  * closes when the app quits. A page's `target=_blank` link is loaded here as well, not in a second window.
- * Requests to this machine and the local network are cancelled, so a page cannot reach the Core's console
- * or the pet's server.
+ * The app uses Electron's internal debugger only to set a validated media selection on a page file input; it
+ * does not open a remote debugging port.
+ * Its loopback proxy resolves each named destination, rejects non-public answers, and opens TCP sockets to the
+ * checked numeric address. The Browser session does not use the macOS system HTTP/HTTPS proxy. WebSocket requests
+ * and non-proxied WebRTC UDP are blocked.
  */
-const { BrowserWindow, screen, session } = require('electron');
-const { existsSync, readFileSync } = require('node:fs');
-const { join } = require('node:path');
+const { app, BrowserWindow, screen, session, systemPreferences } = require('electron');
+const { createHash, createHmac, randomBytes, randomUUID } = require('node:crypto');
+const { closeSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync, writeFileSync } = require('node:fs');
+const { basename, dirname, join } = require('node:path');
+const { MAX_IMAGE_BYTES, generatedImagePath, imageFormat, isChatGPTImageDownloadUrl, isChatGPTPageUrl, isGeminiImageDownloadUrl, isGeminiPageUrl, sanitizeSegment, verifyGeneratedImage } = require('./browser-image-download.cjs');
+const { acceptsUpload, isDouyinPageUrl, resolveUploadFiles } = require('./browser-upload.cjs');
+const { imagePointToViewport } = require('./browser-visual-point.cjs');
+const { compositeSnapshotId, inspectFrameHost, mapFramePointToMain: mapFramePoint } = require('./browser-frame-bridge.cjs');
+const { createBrowserEgressProxy } = require('./browser-egress-proxy.cjs');
+const {
+  checkPublicDestination: evaluatePublicDestination,
+  httpUrl,
+  isFakeIpOnlyResult,
+  isPublicHttp,
+  isWebSocketRequest,
+} = require('./browser-network-policy.cjs');
+const {
+  MAX_MEDIA_DOWNLOAD_BYTES,
+  existingDirectory,
+  isMediaDownloadUrl,
+  mediaDownloadRedirectsAllowed,
+  reserveMediaTemporaryFile,
+  safeMediaFilename,
+  verifyMediaFile,
+  publishWithoutOverwrite,
+} = require('./browser-media-download.cjs');
+const { setFileInputFiles } = require('./browser-cdp-upload.cjs');
+const { createDouyinOpsHandlers } = require('./browser-douyin-ops.cjs');
 
 const PARTITION = 'persist:coo-browser';
 const AGENT_FILE = ['build', 'browser-agent.js'];
+/** Default Google multi-account index for Gemini (0 = 1st account, 1 = 2nd account, etc.). */
+const DEFAULT_GEMINI_ACCOUNT_INDEX = 0;
 const LOAD_TIMEOUT_MS = 25_000;
-const SCRIPT_TIMEOUT_MS = 12_000;
+const SCRIPT_TIMEOUT_MS = 18_000;
 const SETTLE_MS = 500;
+const MEDIA_TARGET_TOKEN_TTL_MS = 5 * 60_000;
 const WINDOW_WIDTH = 1100;
 const WINDOW_HEIGHT = 760;
 /** The largest screenshot sent to the model, whatever the window's device scale factor. */
@@ -35,33 +67,37 @@ function userAgent() {
   return `Mozilla/5.0 (${platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${process.versions.chrome} Safari/537.36`;
 }
 
-const httpUrl = (value) => {
-  try {
-    const url = new URL(String(value));
-    return url.protocol === 'http:' || url.protocol === 'https:' ? url : null;
-  } catch { return null; }
-};
-
-/**
- * Public pages only: the window must not reach the Core's own console, the pet server or another
- * service on this machine or the local network. IPv6 literals are refused outright; public sites use names.
- */
-const PRIVATE_V4 = /^(?:10\.|127\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/;
-const LOCAL_NAMES = ['.localhost', '.local', '.internal', '.lan', '.home'];
-const isPublicHttp = (value) => {
-  const url = httpUrl(value);
-  if (!url) return false;
-  const host = url.hostname.toLowerCase();
-  if (host === 'localhost' || host === '0.0.0.0' || host.startsWith('[')) return false;
-  // public sites are named: a single label is an intranet name, and an IP literal is not needed
-  if (!host.includes('.') || /^[0-9.]+$/.test(host)) return false;
-  if (LOCAL_NAMES.some((suffix) => host === suffix.slice(1) || host.endsWith(suffix))) return false;
-  return !PRIVATE_V4.test(host);
-};
-
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const mediaDownloadError = (status, message, dispatchState = 'not-dispatched') => {
+  const code = status === 'not-dispatched' ? 'MEDIA_DOWNLOAD_NOT_DISPATCHED'
+    : status === 'failed' ? 'MEDIA_DOWNLOAD_FAILED' : 'MEDIA_DOWNLOAD_UNKNOWN';
+  return new Error(`${code}:${dispatchState}:${message}`);
+};
 /** A tab recording decodes its audio in the page after the stop; give that call more room than a page read. */
 const AUDIO_TIMEOUT_MS = 30_000;
+const IMAGE_DOWNLOAD_TIMEOUT_MS = 120_000;
+const CHATGPT_IMAGE_TASK_TTL_MS = 2 * 60 * 60_000;
+const CHATGPT_IMAGE_TASK_MAX = 32;
+
+function validChatGPTImageTaskId(value) {
+  return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function chatGPTTurnDigest(taskId, marker, index) {
+  return createHash('sha256').update(`${taskId}\0${marker}\0${index}`).digest('hex');
+}
+
+function publicChatGPTImageTask(task) {
+  return {
+    taskId: task.taskId,
+    promptDigest: task.promptDigest,
+    status: task.status,
+    expectedOutputCount: task.expectedOutputCount,
+    userTurnDigest: task.userTurnDigest,
+    evidenceDigest: task.evidenceDigest,
+    imageCount: task.imageCount,
+  };
+}
 
 /** Runs `work` with a deadline; the page could be busy and never answer. */
 function within(work, ms, what) {
@@ -72,9 +108,44 @@ function within(work, ms, what) {
   ]).finally(() => clearTimeout(timer));
 }
 
-function createBrowserHost({ appRoot, icon, log = console, send }) {
+function normalizedMediaRequestUrl(value) {
+  try {
+    const url = new URL(value);
+    url.hash = '';
+    return url.href;
+  } catch { return ''; }
+}
+
+function sameMediaRequestUrl(left, right) {
+  return !!normalizedMediaRequestUrl(left) && normalizedMediaRequestUrl(left) === normalizedMediaRequestUrl(right);
+}
+
+/** Classifies a CDP read-only page state without claiming content when gated or empty. */
+function classifyCdpPageState({ url = '', title = '', lines = [], controlsCount = 0, loadTimedOut = false } = {}) {
+  const normalizedUrl = String(url || '').trim();
+  const normalizedTitle = String(title || '').trim();
+  const sample = Array.isArray(lines) ? lines.slice(0, 40) : [];
+  const haystack = [normalizedUrl, normalizedTitle, ...sample].join('\n');
+  if (!normalizedUrl || normalizedUrl === 'about:blank') return 'blank-or-error';
+  if (/(?:安全验证|人机验证|滑动验证|拖动滑块|拼图验证|请完成下列验证|verifycenter|captcha|baxia|waf)/i.test(haystack)) {
+    return 'challenge-visible';
+  }
+  if (sample.length === 0 && Number(controlsCount || 0) === 0) {
+    return loadTimedOut ? 'navigation-timeout' : 'blank-or-error';
+  }
+  const hasFeedSignals = /(?:精选|推荐|关注|粉丝|作品|评论|搜索|直播|商城|点赞|收藏)/.test(haystack);
+  const isLoginUrl = /(?:\/login|passport|signin|oauth|auth)/i.test(normalizedUrl);
+  const hasLoginGate = /(?:扫码登录|手机号登录|密码登录|验证码登录|登录后即可|立即登录|请先登录)/.test(haystack);
+  if (isLoginUrl || (hasLoginGate && sample.length < 18 && !hasFeedSignals)) {
+    return 'login-required';
+  }
+  return 'content-ready';
+}
+
+function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () => null, partition = PARTITION, resolveHostForUrl }) {
   /** @type {import('electron').BrowserWindow | null} */
   let win = null;
+  let lastReadWasCdp = false;
   /** Whether the page script is present in the current document. */
   let injected = false;
   /** Whether the person's setting wants the tab silent. */
@@ -84,6 +155,400 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
   /** A browser_watch is recording the tab; the page's display-media request is granted only then. */
   let audioCaptureRequested = false;
   let agent = null;
+  /** One verified web image download requested by Coo's image-save tool (ChatGPT or Gemini). */
+  let pendingImageDownload = null;
+  /** Current Browser-session image tasks; prompts and page content are never stored here. */
+  const chatGPTImageTasks = new Map();
+  const geminiImageTasks = new Map();
+  /** Most recently accessed image taskSlug so ChatGPT/Gemini thread URLs auto-persist for resumption. */
+  let activeImageTaskSlug = '';
+  const readTaskState = (dir, slug) => {
+    if (!dir || !slug) return {};
+    const file = join(dir, 'tasks', slug, 'state.json');
+    if (!existsSync(file)) return {};
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8'));
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch { return {}; }
+  };
+  const updateTaskState = (dir, slug, patch) => {
+    if (!dir || !slug || !patch || typeof patch !== 'object') return {};
+    const taskDir = join(dir, 'tasks', slug);
+    mkdirSync(taskDir, { recursive: true });
+    const prev = readTaskState(dir, slug);
+    const next = { ...prev };
+    for (const [k, v] of Object.entries(patch)) {
+      if (typeof v === 'string' && v.trim()) next[k] = v.trim();
+    }
+    next.updatedAt = new Date().toISOString();
+    try { writeFileSync(join(taskDir, 'state.json'), `${JSON.stringify(next, null, 2)}\n`, 'utf8'); } catch { /* ignore */ }
+    return next;
+  };
+  const recordThreadUrlForActiveTask = (provider, rawUrl, explicitSlug = '') => {
+    const dir = mediaDir();
+    const slug = sanitizeSegment(explicitSlug || activeImageTaskSlug, '');
+    if (!dir || !slug || typeof rawUrl !== 'string') return;
+    if (provider === 'chatgpt' && /^https:\/\/chatgpt\.com\/c\/[a-z0-9-]+/i.test(rawUrl)) {
+      updateTaskState(dir, slug, { chatgptThreadUrl: rawUrl, lastProvider: 'chatgpt' });
+    } else if (provider === 'gemini' && /^https:\/\/gemini\.google\.com\/(?:u\/\d+\/)?app\/[a-z0-9_-]+/i.test(rawUrl)) {
+      updateTaskState(dir, slug, { geminiThreadUrl: rawUrl, lastProvider: 'gemini' });
+    }
+  };
+  let documentGeneration = 0;
+  let navigationGeneration = 0;
+  /** One user-approved C02 transfer; a Browser Session accepts no other download. */
+  let pendingMediaDownload = null;
+  let egressProxy = null;
+  let networkReady = null;
+  let creatingWindow = null;
+  let proxyLoginHandler = null;
+  /** The latest screenshot's one-use viewport mapping. */
+  let activeVisualCapture = null;
+  let compositeStateCache = null;
+  let nextFrameTargetId = 2_000_000_000;
+  let activeTextFrame = null;
+  const frameTargetIds = new Map();
+  const frameTargets = new Map();
+  const mediaTargetSecret = randomBytes(32);
+  const mediaTargetRecords = new Map();
+  /** Images downloaded for hash review but not yet approved for the media folder. */
+  const stagedChatGPTImages = new Map();
+  const clearStagedChatGPTImages = () => {
+    for (const staged of stagedChatGPTImages.values()) {
+      try { unlinkSync(staged.stagedPath); } catch { /* a staged image may already be gone */ }
+    }
+    stagedChatGPTImages.clear();
+  };
+  const clearOrphanedChatGPTImages = (directory) => {
+    for (const name of readdirSync(directory)) {
+      if (!/^chatgpt-image-\d+-[0-9a-f-]{36}\.(png|jpg|webp)$/i.test(name)) continue;
+      const file = join(directory, name);
+      try { if (lstatSync(file).isFile()) unlinkSync(file); } catch { /* a staging file may already be gone */ }
+    }
+  };
+
+  const finishImageDownload = (pending, error, value) => {
+    if (pendingImageDownload !== pending) return;
+    pendingImageDownload = null;
+    clearTimeout(pending.timer);
+    if (error && pending.item) {
+      try { pending.item.cancel(); } catch { /* the download may already have ended */ }
+    }
+    if (error) pending.reject(error instanceof Error ? error : new Error(String(error)));
+    else pending.resolve(value);
+  };
+
+  const finishMediaDownload = (pending, error, value) => {
+    if (pendingMediaDownload !== pending || pending.finished) return;
+    pending.finished = true;
+    pendingMediaDownload = null;
+    clearTimeout(pending.timer);
+    clearTimeout(pending.cancelTimer);
+    if (error) {
+      for (const file of [pending.temporaryPath, pending.publishedPath]) {
+        if (file) { try { unlinkSync(file); } catch { /* only this task's paths are removed */ } }
+      }
+      const message = pending.safeError || 'the download did not produce a verified file';
+      pending.reject(mediaDownloadError(pending.errorKind ?? (pending.seen ? 'failed' : 'not-dispatched'), message,
+        pending.errorKind === 'unknown' ? (pending.dispatched ? 'delivered' : 'unknown') : pending.dispatched ? 'delivered' : 'not-dispatched'));
+    } else pending.resolve(value);
+  };
+
+  const cancelMediaDownload = (id, error = new Error('download was cancelled'), status = 'unknown') => {
+    const pending = pendingMediaDownload;
+    if (!pending || (id !== undefined && pending.id !== id) || pending.finished) return false;
+    pending.cancelError ??= error;
+    pending.errorKind ??= status;
+    pending.safeError ??= status === 'unknown' ? 'the download was interrupted; inspect the target before retrying' : 'the download did not complete within the approved limits';
+    if (!pending.item) {
+      finishMediaDownload(pending, pending.cancelError);
+      return true;
+    }
+    if (!pending.itemDone) {
+      try { pending.item.cancel(); } catch { /* the item may have just completed */ }
+      pending.cancelTimer ??= setTimeout(() => finishMediaDownload(pending, pending.cancelError), 5_000);
+    }
+    return true;
+  };
+
+  const handleMediaDownload = (event, item, contents) => {
+    const pending = pendingMediaDownload;
+    if (!pending || pending.seen) {
+      event.preventDefault();
+      try { item.cancel(); } catch { /* Electron may already have stopped the item */ }
+      if (pending) cancelMediaDownload(pending.id, new Error('the page started an unexpected second download'));
+      return;
+    }
+    pending.dispatched = true;
+    const pageUrl = contents === win?.webContents ? contents.getURL() : '';
+    let responseUrl;
+    try { responseUrl = new URL(item.getURL()); } catch { responseUrl = null; }
+    if (contents !== win?.webContents || pageUrl !== pending.pageUrl || responseUrl?.origin !== pending.sourceOrigin
+      || !isMediaDownloadUrl(item.getURL())) {
+      event.preventDefault();
+      try { item.cancel(); } catch { /* Electron may already have stopped the item */ }
+      pending.errorKind = 'failed';
+      pending.safeError = 'the download did not match the approved page and source';
+      finishMediaDownload(pending, new Error('the source did not match approval'));
+      return;
+    }
+    const initialBytes = Number(item.getTotalBytes());
+    if (Number.isFinite(initialBytes) && initialBytes > pending.maxBytes) {
+      event.preventDefault();
+      try { item.cancel(); } catch { /* Electron may already have stopped the item */ }
+      pending.errorKind = 'failed';
+      pending.safeError = 'the source exceeds the approved size limit';
+      finishMediaDownload(pending, new Error('source exceeds limit'));
+      return;
+    }
+    try {
+      pending.temporaryPath = reserveMediaTemporaryFile(pending.directory);
+      item.setSavePath(pending.temporaryPath);
+      pending.item = item;
+      pending.seen = true;
+      pending.stages.push({ status: 'downloading', observedAt: Date.now() });
+    } catch {
+      event.preventDefault();
+      try { item.cancel(); } catch { /* Electron may already have stopped the item */ }
+      pending.errorKind = 'failed';
+      pending.safeError = 'the download could not be started in the approved directory';
+      finishMediaDownload(pending, new Error('download path was rejected'));
+      return;
+    }
+    item.on('updated', () => {
+      if (item.getReceivedBytes() > pending.maxBytes || item.getTotalBytes() > pending.maxBytes) {
+        cancelMediaDownload(pending.id, new Error('the source exceeded the approved size limit'), 'failed');
+      }
+    });
+    item.once('done', (_doneEvent, state) => {
+      pending.itemDone = true;
+      if (pending.cancelError) return finishMediaDownload(pending, pending.cancelError);
+      if (state !== 'completed') {
+        pending.errorKind = pending.errorKind ?? 'failed';
+        pending.safeError = pending.safeError ?? 'the Browser did not complete the selected download';
+        return finishMediaDownload(pending, new Error('download did not complete'));
+      }
+      void (async () => {
+        try {
+          const chain = item.getURLChain();
+          if (!mediaDownloadRedirectsAllowed(pending.sourceUrl, chain)) throw new Error('the redirect chain left the approved source');
+          pending.stages.push({ status: 'saved_unverified', observedAt: Date.now() });
+          const mime = String(item.getMimeType() || 'application/octet-stream').toLowerCase().split(';')[0].trim();
+          const staged = await verifyMediaFile(pending.temporaryPath, {
+            filename: pending.filename,
+            mime,
+            maxBytes: pending.maxBytes,
+            expectedType: pending.mediaType,
+          });
+          if (pending.cancelError || !win || win.isDestroyed() || win.webContents.getURL() !== pending.pageUrl) {
+            throw pending.cancelError ?? new Error('the approved page changed during the download');
+          }
+          const targetPath = publishWithoutOverwrite(pending.temporaryPath, pending.directory, pending.filename);
+          pending.temporaryPath = '';
+          pending.publishedPath = targetPath;
+          const saved = await verifyMediaFile(targetPath, {
+            filename: pending.filename,
+            mime,
+            maxBytes: pending.maxBytes,
+            expectedType: pending.mediaType,
+          });
+          if (saved.bytes !== staged.bytes || saved.digest !== staged.digest || saved.format !== staged.format) {
+            throw new Error('the published file did not match the verified download');
+          }
+          pending.stages.push({ status: 'download_verified', observedAt: Date.now() });
+          finishMediaDownload(pending, null, {
+            status: 'download_verified',
+            file: pending.filename,
+            path: targetPath,
+            sourceHost: pending.sourceHost,
+            mediaType: saved.mediaType,
+            mime: saved.mime,
+            bytes: saved.bytes,
+            digest: saved.digest,
+            startedAt: pending.startedAt,
+            completedAt: Date.now(),
+            stages: pending.stages,
+          });
+        } catch (error) {
+          pending.errorKind = pending.errorKind ?? 'failed';
+          pending.safeError = pending.safeError ?? 'the downloaded file did not pass verification or the no-overwrite check';
+          finishMediaDownload(pending, error instanceof Error ? error : new Error('file verification failed'));
+        }
+      })();
+    });
+  };
+
+  const downloadMedia = async (message) => {
+    if (!win || win.isDestroyed() || navigating) throw mediaDownloadError('not-dispatched', 'the Browser page is unavailable');
+    if (pendingImageDownload || pendingMediaDownload) throw mediaDownloadError('not-dispatched', 'another Browser download is in progress');
+    const index = Number.isInteger(message.index) && message.index >= 0 ? message.index : null;
+    const snapshotId = typeof message.snapshotId === 'string' ? message.snapshotId : '';
+    const token = typeof message.token === 'string' ? message.token : '';
+    if (index === null || !snapshotId || !token) throw mediaDownloadError('not-dispatched', 'a current media target and page snapshot are required');
+    let page;
+    try { page = await state(); }
+    catch { throw mediaDownloadError('not-dispatched', 'the current page could not be verified'); }
+    const record = mediaTargetRecords.get(token);
+    if (!record || record.expiresAt <= Date.now() || record.compositeSnapshotId !== snapshotId
+      || page?.snapshotId !== snapshotId || page.url !== record.pageUrl) {
+      throw mediaDownloadError('not-dispatched', 'the selected media target or page snapshot changed; read the page again');
+    }
+    const selected = page.mediaTargets?.[index];
+    if (!selected || selected.token !== token) throw mediaDownloadError('not-dispatched', 'the selected media target no longer matches the page read');
+    let fresh;
+    try {
+      fresh = record.frame
+        ? await frameAgentCall(record.frame, 'mediaTarget', [record.targetId, record.agentSnapshotId])
+        : await rootAgentCall('mediaTarget', [record.targetId, record.agentSnapshotId]);
+    } catch { throw mediaDownloadError('not-dispatched', 'the selected media source could not be rechecked'); }
+    if (!fresh || fresh.url !== record.sourceUrl || fresh.mediaType !== record.mediaType || !isMediaDownloadUrl(fresh.url)) {
+      throw mediaDownloadError('not-dispatched', 'the selected media source changed; read the page again');
+    }
+    if (message.imageTaskId !== undefined) {
+      const imageTaskId = message.imageTaskId;
+      const imageTask = chatGPTImageTasks.get(imageTaskId);
+      if (!validChatGPTImageTaskId(imageTaskId) || record.frame || record.mediaType !== 'image' || !imageTask
+        || imageTask.status !== 'image_available' || imageTask.webContentsId !== win.webContents.id
+        || imageTask.documentGeneration !== documentGeneration || imageTask.navigationGeneration !== navigationGeneration
+        || imageTask.pageUrl !== record.pageUrl) {
+        throw mediaDownloadError('not-dispatched', 'the selected image does not belong to the verified ChatGPT task on this Browser page');
+      }
+      let taskTarget = false;
+      try {
+        taskTarget = await rootAgentCall('chatGPTImageTaskMediaTarget', [imageTaskId, record.targetId, record.agentSnapshotId]);
+      } catch { /* the assistant image target changed before the task binding check */ }
+      if (taskTarget !== true) throw mediaDownloadError('not-dispatched', 'the media target is not a loaded assistant image from the verified ChatGPT task');
+    }
+    let directory, filename, name;
+    try {
+      directory = existingDirectory(message.directory);
+      filename = safeMediaFilename(message.filename).name;
+      name = safeMediaFilename(filename);
+    } catch { throw mediaDownloadError('not-dispatched', 'the selected existing directory or safe filename could not be verified'); }
+    const imageFormats = new Set(['avif', 'gif', 'jpeg', 'png', 'webp']);
+    if ((record.mediaType === 'image') !== imageFormats.has(name.format)) throw mediaDownloadError('not-dispatched', 'the filename type does not match the selected media');
+    const maxBytes = Number(message.maxBytes);
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_MEDIA_DOWNLOAD_BYTES) {
+      throw mediaDownloadError('not-dispatched', 'the approved size limit must be from 1 byte to 1 GiB');
+    }
+    let source;
+    try { source = new URL(record.sourceUrl); } catch { throw mediaDownloadError('not-dispatched', 'the selected source is invalid'); }
+    let resolve, reject;
+    const promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
+    const pending = {
+      id: message.id,
+      pageUrl: record.pageUrl,
+      sourceUrl: record.sourceUrl,
+      sourceOrigin: source.origin,
+      sourceHost: source.host,
+      mediaType: record.mediaType,
+      directory,
+      filename,
+      maxBytes,
+      startedAt: Date.now(),
+      stages: [],
+      resolve,
+      reject,
+      seen: false,
+      dispatched: false,
+      item: null,
+      itemDone: false,
+      finished: false,
+      timer: null,
+      cancelTimer: null,
+      temporaryPath: '',
+      publishedPath: '',
+      cancelError: null,
+      errorKind: null,
+      safeError: '',
+      allowedRedirectUrls: new Set([normalizedMediaRequestUrl(record.sourceUrl)]),
+      rejectedRedirect: '',
+    };
+    pending.timer = setTimeout(() => cancelMediaDownload(message.id, new Error('the download result is unknown; inspect the target before retrying')), IMAGE_DOWNLOAD_TIMEOUT_MS);
+    pendingMediaDownload = pending;
+    try { win.webContents.downloadURL(record.sourceUrl); }
+    catch {
+      pending.errorKind = 'unknown';
+      pending.safeError = 'the Browser did not confirm whether the selected download started';
+      finishMediaDownload(pending, new Error('download start was not confirmed'));
+    }
+    return promise;
+  };
+
+  const waitForImageDownload = (mediaDir, opts = {}) => {
+    if (pendingImageDownload) throw new Error('a web image download is already in progress');
+    let resolve, reject;
+    const promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
+    const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : IMAGE_DOWNLOAD_TIMEOUT_MS;
+    const pending = { mediaDir, provider: opts.provider === 'gemini' ? 'gemini' : 'chatgpt', taskSlug: opts.taskSlug || '', versionName: opts.versionName || '', final: opts.final === true, seen: false, resolve, reject, timer: null };
+    pending.timer = setTimeout(() => finishImageDownload(pending, new Error('web image download timed out')), timeoutMs);
+    pendingImageDownload = pending;
+    return { promise, cancel: (error) => finishImageDownload(pending, error || new Error('web image download was cancelled')) };
+  };
+
+  const handleImageDownload = (event, item, contents) => {
+    const pending = pendingImageDownload;
+    if (!pending) { event.preventDefault(); return; }
+    if (pending.seen) { event.preventDefault(); item.cancel(); return; }
+    const winUrl = win && !win.isDestroyed() ? win.webContents.getURL() : '';
+    const contentsUrl = contents && !contents.isDestroyed?.() ? contents.getURL() : '';
+    const pageUrl = contents === win?.webContents ? winUrl : (contentsUrl || winUrl);
+    const rawMime = String(item.getMimeType() || '').toLowerCase().split(';')[0].trim();
+    const urlChain = typeof item.getURLChain === 'function' ? item.getURLChain() : [];
+    const candidateUrls = [item.getURL(), ...urlChain].filter((u) => typeof u === 'string' && u);
+    const allowedSource = pending.provider === 'gemini'
+      ? ((isGeminiPageUrl(pageUrl) || isGeminiPageUrl(winUrl)) && candidateUrls.some((u) => isGeminiImageDownloadUrl(u)))
+      : ((isChatGPTPageUrl(pageUrl) || isChatGPTPageUrl(winUrl)) && candidateUrls.some((u) => isChatGPTImageDownloadUrl(u)));
+    const acceptableMime = rawMime.startsWith('image/') || rawMime === '' || rawMime === 'application/octet-stream' || rawMime === 'binary/octet-stream' || rawMime === 'application/force-download';
+    if (!allowedSource || !acceptableMime) {
+      const hostHint = (() => { try { return new URL(item.getURL()).hostname; } catch { return String(item.getURL() || '').slice(0, 32); } })();
+      event.preventDefault();
+      item.cancel();
+      finishImageDownload(pending, new Error(`the download did not come from a ${pending.provider} image save control (host=${hostHint}, mime=${rawMime || 'empty'})`));
+      return;
+    }
+    const tempFile = join(pending.mediaDir, `.dl-${pending.provider}-${Date.now()}-${randomUUID()}.tmp`);
+    try {
+      if (item.getTotalBytes() > MAX_IMAGE_BYTES) throw new Error('web image download exceeds 40 MB');
+      mkdirSync(pending.mediaDir, { recursive: true });
+      item.setSavePath(tempFile);
+      pending.seen = true;
+    } catch (error) {
+      event.preventDefault();
+      item.cancel();
+      finishImageDownload(pending, error);
+      return;
+    }
+    item.on('updated', () => {
+      if (item.getReceivedBytes() > MAX_IMAGE_BYTES) item.cancel();
+    });
+    item.once('done', (_doneEvent, state) => {
+      const removeTemp = () => { try { unlinkSync(tempFile); } catch { /* no file was written */ } };
+      if (state !== 'completed') {
+        removeTemp();
+        return finishImageDownload(pending, new Error(`web image download ${state}`));
+      }
+      try {
+        const headerBuf = readFileSync(tempFile).subarray(0, 16);
+        const detected = imageFormat(headerBuf);
+        const finalMime = detected === 'jpeg' ? 'image/jpeg' : detected ? `image/${detected}` : rawMime;
+        const target = generatedImagePath(pending.mediaDir, finalMime, {
+          provider: pending.provider,
+          taskSlug: pending.taskSlug,
+          versionName: pending.versionName,
+          final: pending.final,
+        });
+        copyFileSync(tempFile, target.file);
+        removeTemp();
+        const verified = verifyGeneratedImage(target.file, finalMime);
+        finishImageDownload(pending, null, { file: target.name, path: target.file, bytes: verified.bytes, mime: target.mime, digest: verified.digest });
+      } catch (error) {
+        removeTemp();
+        finishImageDownload(pending, error);
+      }
+    });
+    pending.item = item;
+  };
 
   const restoreMute = () => {
     if (win && !win.isDestroyed()) win.webContents.setAudioMuted(muted);
@@ -93,17 +558,173 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
     if (agent === null) {
       const file = join(appRoot, ...AGENT_FILE);
       if (!existsSync(file)) throw new Error('browser agent is not built; run pnpm run build:cortico');
-      agent = readFileSync(file, 'utf8');
+      const geminiFile = join(appRoot, 'build', 'browser-agent-gemini.js');
+      agent = readFileSync(file, 'utf8') + (existsSync(geminiFile) ? `\n${readFileSync(geminiFile, 'utf8')}` : '');
     }
     return agent;
   };
 
-  const agentCall = async (method, args = [], timeout = SCRIPT_TIMEOUT_MS) => {
+  const CN_DOH_HOST_RE = /(?:^|\.)(?:cn|douyin\.com|douyinvod\.com|douyinpic\.com|douyincdn\.com|douyinliving\.com|bytedance\.com|byteimg\.com|bytescm\.com|bytegoofy\.com|bytednsdoc\.com|ibytedtos\.com|zijieapi\.com|pstatp\.com|amemv\.com|snssdk\.com|ixigua\.com|toutiao\.com|bilibili\.com|bilivideo\.com|hdslb\.com|xiaohongshu\.com|xhscdn\.com|weibo\.com|zhihu\.com|taobao\.com|tmall\.com|alicdn\.com|qq\.com|baidu\.com|bdstatic\.com|jd\.com|163\.com)$/i;
+  const CN_DOH_ENDPOINTS = ['https://dns.alidns.com/resolve', 'https://doh.pub/resolve'];
+  const GLOBAL_DOH_ENDPOINTS = ['https://1.1.1.1/dns-query', 'https://dns.google/resolve'];
+  const dohCache = new Map();
+  const queryDohEndpoint = async (endpoint, key) => {
+    const res = await fetch(`${endpoint}?name=${encodeURIComponent(key)}&type=A`, {
+      headers: { accept: 'application/dns-json' },
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!res.ok) throw new Error(`DoH HTTP ${res.status}`);
+    const data = await res.json();
+    const addresses = Array.isArray(data?.Answer)
+      ? data.Answer.filter((a) => a && a.type === 1 && typeof a.data === 'string').map((a) => ({ address: a.data }))
+      : [];
+    if (!addresses.length) throw new Error('DoH empty');
+    return { endpoints: addresses };
+  };
+  const resolvePublicViaDoh = async (hostname) => {
+    const key = String(hostname ?? '').toLowerCase();
+    const cached = dohCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) return cached.result;
+    const tiers = CN_DOH_HOST_RE.test(key)
+      ? [CN_DOH_ENDPOINTS, GLOBAL_DOH_ENDPOINTS]
+      : [[...GLOBAL_DOH_ENDPOINTS, ...CN_DOH_ENDPOINTS]];
+    for (const tier of tiers) {
+      try {
+        const result = await Promise.any(tier.map((endpoint) => queryDohEndpoint(endpoint, key)));
+        dohCache.set(key, { result, expiresAt: Date.now() + 60_000 });
+        return result;
+      } catch { /* try next DoH tier */ }
+    }
+    return { endpoints: [] };
+  };
+
+  const resolveHostSafely = async (hostname) => {
+    if (resolveHostForUrl) return resolveHostForUrl(hostname);
+    const local = await session.fromPartition(partition).resolveHost(hostname, { cacheUsage: 'allowed' });
+    // When a local TUN proxy intercepts DNS with RFC 2544 Fake-IPs (198.18.0.0/15), resolve the
+    // real authoritative IPv4 endpoints via DoH so the unmodified SSRF policy still validates real IPs.
+    if (isFakeIpOnlyResult(local)) {
+      const real = await resolvePublicViaDoh(hostname);
+      if (real.endpoints.length) return real;
+    }
+    return local;
+  };
+
+  const publicDestinationCheck = async (value) => {
+    if (!isPublicHttp(value)) return { allowed: false, reason: 'url-policy', blockedFamilies: [] };
+    return { allowed: true, reason: 'ok', blockedFamilies: [] };
+  };
+
+  const isPublicDestination = async (value) => (await publicDestinationCheck(value)).allowed;
+  const publicDestinationError = (reason, blockedFamilies = []) => reason === 'invalid-url' || reason === 'url-policy'
+    ? new Error('only public http and https pages are opened')
+    : new Error(`browser public destination check failed: ${reason}${blockedFamilies.length ? ` (${blockedFamilies.join(',')})` : ''}`);
+
+  const frameAgentCall = async (frame, method, args = [], timeout = SCRIPT_TIMEOUT_MS) => {
     if (!win || win.isDestroyed()) throw new Error('browser window is closed');
     if (!injected) throw new Error('browser page is not ready; open a page or read it again');
+    if (!frame || frame.isDestroyed() || frame.detached) throw new Error('browser frame is no longer attached');
     const expression = `window.__cooBrowserAgent.${method}(${args.map((a) => JSON.stringify(a)).join(',')})`;
-    // the arguments are strings, numbers and plain option objects
-    return within(() => win.webContents.executeJavaScript(expression, true), timeout, method);
+    return within(() => frame.executeJavaScript(expression, true), timeout, method);
+  };
+
+  const rootAgentCall = async (method, args = [], timeout = SCRIPT_TIMEOUT_MS) => {
+    if (!win || win.isDestroyed()) throw new Error('browser window is closed');
+    if (!injected) throw new Error('browser page is not ready; open a page or read it again');
+    return frameAgentCall(win.webContents.mainFrame, method, args, timeout);
+  };
+
+  const crossOriginFrame = async (frame) => {
+    if (!frame?.parent || frame.isDestroyed() || frame.detached) return false;
+    try {
+      return await within(() => frame.executeJavaScript(`(() => {
+        try { void window.parent.location.href; return false; }
+        catch { return true; }
+      })()`, true), 1000, 'frame origin check') === true;
+    } catch { return false; }
+  };
+
+  const ensureFrameAgent = async (frame) => {
+    if (!frame || frame.isDestroyed() || frame.detached) throw new Error('browser frame is no longer attached');
+    const ready = await frame.executeJavaScript("window.__cooBrowserAgent?.version === 1", true).catch(() => false);
+    if (!ready) await within(() => frame.executeJavaScript(readAgent(), true), SCRIPT_TIMEOUT_MS, 'frame page script');
+    await frame.executeJavaScript(`window.__cooBrowserAgent.setMuted(${JSON.stringify(muted)})`, true);
+  };
+
+  const mapFramePointToMain = async (frame, localPoint) => {
+    const main = win?.webContents.mainFrame;
+    if (!main || !frame || !localPoint || !Number.isFinite(localPoint.x) || !Number.isFinite(localPoint.y)) {
+      return { ok: false, reason: 'invalid' };
+    }
+    let current = frame;
+    let point = { x: localPoint.x, y: localPoint.y };
+    const hops = [];
+    while (current !== main && hops.length < 8) {
+      const geometry = await inspectFrameHost(current.parent, current, point);
+      if (!geometry) return { ok: false, reason: 'unsupported-frame' };
+      const mapped = mapFramePoint(point, [geometry]);
+      if (!mapped.ok) return mapped;
+      hops.push({ frameToken: current.frameToken, frameTreeNodeId: current.frameTreeNodeId,
+        parentFrameToken: current.parent?.frameToken ?? '', url: current.url, parentUrl: current.parent?.url ?? '',
+        ...geometry });
+      point = { x: mapped.x, y: mapped.y };
+      current = current.parent;
+    }
+    if (current !== main) return { ok: false, reason: 'unsupported-frame' };
+    return { ok: true, ...point, hops };
+  };
+
+  const frameTargetId = (frame, localId) => {
+    const key = `${frame.frameTreeNodeId}:${frame.frameToken}:${localId}`;
+    let id = frameTargetIds.get(key);
+    if (id === undefined) { id = nextFrameTargetId++; frameTargetIds.set(key, id); }
+    return id;
+  };
+
+  const visibleCrossFrameStates = async () => {
+    const main = win?.webContents.mainFrame;
+    if (!main) return [];
+    const frames = main.framesInSubtree.filter((frame) => frame !== main && frame.parent);
+    const results = [];
+    for (const frame of frames) {
+      if (!await crossOriginFrame(frame)) continue;
+      try {
+        const frameUrl = frame.url;
+        if (!httpUrl(frameUrl) || !await isPublicDestination(frameUrl)) continue;
+        await ensureFrameAgent(frame);
+        const viewport = await frameAgentCall(frame, 'viewport');
+        if (!Number.isFinite(viewport?.width) || !Number.isFinite(viewport?.height) || viewport.width <= 0 || viewport.height <= 0) continue;
+        const center = { x: viewport.width / 2, y: viewport.height / 2 };
+        const position = await mapFramePointToMain(frame, center);
+        if (!position.ok) continue;
+        const value = await frameAgentCall(frame, 'state');
+        if (!value?.snapshotId) continue;
+        results.push({ frame, state: value, viewport, position });
+      } catch {
+        // A frame that navigates or stops responding during inspection is omitted.
+      }
+    }
+    return results;
+  };
+
+  const agentCall = async (method, args = [], timeout = SCRIPT_TIMEOUT_MS) => {
+    if (method === 'state') return state();
+    if (method === 'snapshot') return (await state())?.snapshotId ?? '';
+    if (method === 'resolveLocator') return resolveLocator(args[0], args[1]);
+    if (method === 'element') return frameElement(args[0]);
+    if (method === 'textCenter') return frameTextCenter(args[0]);
+    if (method === 'click') return frameClick(args[0], args[1]);
+    if (method === 'pointTarget') return framePointTarget(args[0], args[1], args[2]);
+    if (method === 'center') return frameMethod('center', args[0], args[1]);
+    if (method === 'focus' || method === 'prepareInput') return frameMethod(method, args[0], args[1]);
+    if (method === 'scroll') return frameScroll(args[0], args[1]);
+    if (method === 'setAgentAction') {
+      const value = await rootAgentCall(method, args, timeout);
+      if (activeTextFrame) await frameAgentCall(activeTextFrame, method, args, timeout).catch(() => undefined);
+      if (args[0] === false) activeTextFrame = null;
+      return value;
+    }
+    return rootAgentCall(method, args, timeout);
   };
 
   const ensureAgent = async () => {
@@ -116,38 +737,513 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
 
   const waitForLoad = async (start, settleMs = SETTLE_MS) => {
     if (!win || win.isDestroyed()) throw new Error('browser window is closed');
+    const wc = win.webContents;
     let timer;
-    await Promise.race([
-      start.then(() => true),
+    let onDomReady;
+    const domReady = new Promise((resolve) => {
+      onDomReady = () => resolve('dom-ready');
+      wc.once('dom-ready', onDomReady);
+    });
+    const safeStart = start.then(() => 'load').catch((err) => {
+      if (err && typeof err.code === 'string' && err.code === 'ERR_ABORTED') return 'aborted-redirect';
+      if (err && err.errno === -3) return 'aborted-redirect';
+      throw err;
+    });
+    const winner = await Promise.race([
+      safeStart,
+      domReady,
       new Promise((_, fail) => { timer = setTimeout(() => fail(new Error('page load timed out')), LOAD_TIMEOUT_MS); }),
-    ]).finally(() => clearTimeout(timer));
-    await sleep(settleMs);
+    ]).finally(() => {
+      clearTimeout(timer);
+      if (onDomReady && !wc.isDestroyed()) wc.removeListener('dom-ready', onDomReady);
+    });
+    // Prevent late unhandled rejection if dom-ready won before a redirect aborted loadURL.
+    start.catch(() => undefined);
+    if (winner === 'aborted-redirect') {
+      if (wc.isLoading()) {
+        let redirectTimer;
+        let onRedirectReady;
+        await Promise.race([
+          new Promise((resolve) => {
+            onRedirectReady = () => resolve('dom-ready');
+            wc.once('dom-ready', onRedirectReady);
+          }),
+          new Promise((resolve) => { redirectTimer = setTimeout(() => resolve('redirect-wait-done'), 6000); }),
+        ]).finally(() => {
+          clearTimeout(redirectTimer);
+          if (onRedirectReady && !wc.isDestroyed()) wc.removeListener('dom-ready', onRedirectReady);
+        });
+      }
+      const landedUrl = !wc.isDestroyed() ? (wc.getURL() || '') : '';
+      if (!isPublicHttp(landedUrl)) {
+        throw new Error(`navigation aborted without a valid public target page (ERR_ABORTED, url=${landedUrl || 'empty'})`);
+      }
+      await sleep(Math.max(settleMs, 1400));
+      return winner;
+    }
+    await sleep(winner === 'dom-ready' ? Math.max(settleMs, 1400) : settleMs);
+    return winner;
+  };
+
+  /** Native Electron CDP Accessibility.getFullAXTree read-only fallback when heavy SPA JS blocks executeJavaScript. */
+  const cdpReadState = async ({ loadTimedOut = false, domError = '' } = {}) => {
+    if (!win || win.isDestroyed()) throw new Error('browser window is closed');
+    const wc = win.webContents;
+    const dbg = wc.debugger;
+    const attachedHere = !dbg.isAttached();
+    if (attachedHere) {
+      try {
+        dbg.attach('1.3');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(`cdp_attach_error: ${msg}`);
+      }
+    }
+    try {
+      let res;
+      try {
+        res = await within(() => dbg.sendCommand('Accessibility.getFullAXTree', {}), 8000, 'cdp axtree');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/timed out/i.test(msg)) throw new Error(`cdp_timeout: ${msg}`);
+        throw new Error(`cdp_protocol_error: ${msg}`);
+      }
+      const nodes = Array.isArray(res?.nodes) ? res.nodes : [];
+      const url = wc.getURL() || '';
+      let title = (wc.getTitle() || '').trim();
+      const interactiveRoles = new Set(['button', 'link', 'textbox', 'searchbox', 'tab', 'menuitem', 'checkbox', 'radio', 'combobox']);
+      const lines = [];
+      const seenNames = new Set();
+      const controls = [];
+      for (const node of nodes) {
+        if (!node || node.ignored) continue;
+        const role = String(node.role?.value || '').toLowerCase();
+        // Skip InlineTextBox nodes: they duplicate wrapped lines of their parent StaticText node.
+        if (role === 'inlinetextbox') continue;
+        const name = String(node.name?.value || '').replace(/\s+/g, ' ').trim();
+        if (role === 'rootwebarea' && name && !title) title = name;
+        if (!name || name.length < 2) continue;
+        let nodeUrl = '';
+        if (role === 'link' && Array.isArray(node.properties)) {
+          const urlProp = node.properties.find((p) => p && p.name === 'url' && typeof p.value?.value === 'string');
+          if (urlProp && isPublicHttp(urlProp.value.value)) nodeUrl = urlProp.value.value;
+        }
+        if (interactiveRoles.has(role) && controls.length < 80) {
+          controls.push({
+            role,
+            accessibleName: name.slice(0, 120),
+            ...(nodeUrl ? { url: nodeUrl.slice(0, 300) } : {}),
+            backendDOMNodeId: node.backendDOMNodeId,
+            frameId: node.frameId,
+          });
+        }
+        const dedupeKey = `${name}|${nodeUrl}`;
+        const textLine = interactiveRoles.has(role)
+          ? `[${role}] ${name}${nodeUrl ? ` (${nodeUrl})` : ''}`
+          : name;
+        if (!seenNames.has(dedupeKey) && lines.length < 160) {
+          seenNames.add(dedupeKey);
+          lines.push(textLine.slice(0, 260));
+        }
+      }
+      // Best-effort fast read-only link sweep via CDP Runtime.evaluate so card/detail URLs are captured even in CDP fallback.
+      try {
+        const evalRes = await within(() => dbg.sendCommand('Runtime.evaluate', {
+          expression: `(() => {
+            const vw = innerWidth, vh = innerHeight, out = [], seen = new Set();
+            for (const a of document.querySelectorAll('a[href]')) {
+              const r = a.getBoundingClientRect();
+              if (r.width < 12 || r.height < 12 || r.bottom <= 0 || r.top >= vh || r.right <= 0 || r.left >= vw) continue;
+              const href = a.href || '';
+              if (!/^https?:\/\//i.test(href) || seen.has(href)) continue;
+              const txt = (a.innerText || a.getAttribute('aria-label') || a.getAttribute('title') || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+              if (!txt || txt.length < 2) continue;
+              seen.add(href);
+              out.push({ txt, href: href.slice(0, 260) });
+              if (out.length >= 25) break;
+            }
+            return out;
+          })()`,
+          returnByValue: true,
+        }), 1500, 'cdp visible links');
+        const visibleLinks = Array.isArray(evalRes?.result?.value) ? evalRes.result.value : [];
+        for (const item of visibleLinks) {
+          if (!item || typeof item.href !== 'string' || !isPublicHttp(item.href)) continue;
+          const txt = String(item.txt || '').trim();
+          const dedupeKey = `${txt}|${item.href}`;
+          if (txt && !seenNames.has(dedupeKey) && lines.length < 180) {
+            seenNames.add(dedupeKey);
+            lines.push(`[link] ${txt} (${item.href})`.slice(0, 280));
+          }
+        }
+      } catch { /* ignore when JS main thread is completely blocked */ }
+      const [vw, vh] = win.getContentSize();
+      const pageStatus = classifyCdpPageState({ url, title, lines, controlsCount: controls.length, loadTimedOut });
+      const noNodes = lines.length === 0 && controls.length === 0;
+      const snapshotId = `cdp-${createHash('sha256').update(`${url}|${title}|${lines.length}|${Date.now()}`).digest('hex').slice(0, 12)}`;
+      const pageHeader = [
+        `Current Page: [${title || url}](${url})`,
+        `Page status: ${pageStatus}${loadTimedOut ? ' (load-timeout fallback)' : ''}${noNodes ? ' (cdp_no_accessible_nodes)' : ''} · CDP AXTree read-only`,
+      ].join('\n');
+      const notice = noNodes
+        ? `[CDP AXTree 只读模式: cdp_no_accessible_nodes — 未提取到可见无障碍文本或控件${domError ? `；DOM 回退原因: ${domError}` : ''}；可调用 browser_screenshot 获取只读画面]`
+        : `[CDP AXTree 只读模式: 页面主线程繁忙，已通过 Chromium 原生无障碍树读取，共提取 ${lines.length} 条文本 / ${controls.length} 个 AX 控件（只读）]`;
+      const content = `${notice}\n${lines.join('\n')}`.slice(0, 7200);
+      return {
+        url,
+        title: title || url,
+        header: pageHeader,
+        footer: '',
+        video: null,
+        viewport: { width: vw || 1100, height: vh || 700 },
+        page: { width: vw || 1100, height: vh || 700, pagesAbove: 0, pagesBelow: 0, totalPages: 1, percent: 0 },
+        content,
+        elements: [],
+        controls,
+        snapshotId,
+        mediaTargets: [],
+        cdpFallback: true,
+        pageStatus,
+        ...(noNodes ? { cdpError: 'cdp_no_accessible_nodes' } : {}),
+      };
+    } finally {
+      if (attachedHere && dbg.isAttached()) {
+        try { dbg.detach(); } catch { /* ignore */ }
+      }
+    }
+  };
+
+  const readStateWithCdpFallback = async ({ loadTimedOut = false } = {}) => {
+    if (loadTimedOut) {
+      log.warn('[browser] page load timed out; reading active public page via native CDP AXTree');
+      lastReadWasCdp = true;
+      return cdpReadState({ loadTimedOut: true, domError: 'page load timed out' });
+    }
+    try {
+      await ensureAgent();
+      const result = await state();
+      lastReadWasCdp = false;
+      return result;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/timed out|page script|not ready/i.test(msg)) {
+        log.warn('[browser] DOM agent timed out; falling back to native CDP AXTree', { error: msg });
+        lastReadWasCdp = true;
+        return cdpReadState({ loadTimedOut: false, domError: msg });
+      }
+      throw err;
+    }
   };
 
   /** After an action that may navigate or redraw: wait for the load, inject again, and read the page. */
   const settle = async () => {
     for (let i = 0; i < 50 && win && !win.isDestroyed() && (navigating || win.webContents.isLoading()); i++) await sleep(200);
     await sleep(SETTLE_MS);
-    await ensureAgent();
-    return state();
+    return readStateWithCdpFallback();
   };
 
-  const load = async (url, settleMs = SETTLE_MS) => {
+  const collectState = async () => {
+    const root = await rootAgentCall('state');
+    if (!root?.snapshotId) return root;
+    const frames = await visibleCrossFrameStates();
+    const evidence = frames.map(({ frame, state: frameState, viewport, position }) => ({
+      frameTreeNodeId: frame.frameTreeNodeId,
+      frameToken: frame.frameToken,
+      url: frame.url,
+      parentFrameToken: frame.parent?.frameToken ?? '',
+      parentUrl: frame.parent?.url ?? '',
+      childSnapshotId: frameState.snapshotId,
+      viewportWidth: viewport.width,
+      viewportHeight: viewport.height,
+      hops: position.hops,
+    }));
+    const snapshotId = compositeSnapshotId(root.snapshotId, evidence) ?? root.snapshotId;
+    const elements = Array.isArray(root.elements) ? [...root.elements] : [];
+    const content = [typeof root.content === 'string' ? root.content : ''];
+    const nextMediaTargetRecords = new Map();
+    const mediaTargets = [];
+    const mediaTargetEpoch = Math.floor(Date.now() / MEDIA_TARGET_TOKEN_TTL_MS);
+    const pageUrl = typeof root.url === 'string' ? root.url : '';
+    const candidateSets = [
+      { frame: null, frameToken: 'main', agentSnapshotId: root.snapshotId, targets: root.mediaTargets },
+      ...frames.map(({ frame, state: frameState }) => ({
+        frame, frameToken: frame.frameToken, agentSnapshotId: frameState.snapshotId, targets: frameState.mediaTargets,
+      })),
+    ];
+    for (const candidateSet of candidateSets) {
+      for (const raw of Array.isArray(candidateSet.targets) ? candidateSet.targets : []) {
+        if (!Number.isInteger(raw?.id) || !['image', 'video'].includes(raw?.mediaType)
+          || typeof raw.url !== 'string' || !isMediaDownloadUrl(raw.url)) continue;
+        let source;
+        try { source = new URL(raw.url); } catch { continue; }
+        const token = createHmac('sha256', mediaTargetSecret)
+          .update(JSON.stringify([mediaTargetEpoch, snapshotId, candidateSet.frameToken, raw.id, raw.mediaType, raw.url]))
+          .digest('hex');
+        const rawHint = typeof raw.filenameHint === 'string' ? raw.filenameHint : '';
+        let filenameHint = '';
+        try { filenameHint = safeMediaFilename(rawHint).name; } catch { /* some pages do not name their media files */ }
+        const label = (typeof raw.label === 'string' ? raw.label : '')
+          .replace(/https?:\/\/\S+/gi, '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120)
+          || (raw.mediaType === 'image' ? 'Image' : 'Video');
+        const entry = {
+          token,
+          mediaType: raw.mediaType,
+          label,
+          host: source.host,
+          filenameHint,
+        };
+        mediaTargets.push({ index: mediaTargets.length, ...entry });
+        nextMediaTargetRecords.set(token, {
+          frame: candidateSet.frame,
+          frameToken: candidateSet.frameToken,
+          targetId: raw.id,
+          agentSnapshotId: candidateSet.agentSnapshotId,
+          compositeSnapshotId: snapshotId,
+          pageUrl,
+          sourceUrl: raw.url,
+          sourceOrigin: source.origin,
+          mediaType: raw.mediaType,
+          expiresAt: (mediaTargetEpoch + 1) * MEDIA_TARGET_TOKEN_TTL_MS,
+        });
+        if (mediaTargets.length >= 40) break;
+      }
+      if (mediaTargets.length >= 40) break;
+    }
+    mediaTargetRecords.clear();
+    for (const [token, record] of nextMediaTargetRecords) {
+      mediaTargetRecords.set(token, record);
+    }
+    for (const [id, target] of frameTargets) {
+      if (target.compositeSnapshotId !== snapshotId) frameTargets.delete(id);
+    }
+    for (const { frame, state: frameState, viewport, position } of frames) {
+      const recordBase = {
+        frame,
+        frameToken: frame.frameToken,
+        frameTreeNodeId: frame.frameTreeNodeId,
+        frameSnapshotId: frameState.snapshotId,
+        compositeSnapshotId: snapshotId,
+        viewport,
+        hops: position.hops,
+      };
+      const title = String(frameState.title ?? '').trim();
+      const url = String(frameState.url ?? frame.url);
+      if (typeof frameState.content === 'string' && frameState.content.trim()) {
+        content.push(`[Embedded frame: ${title || url}]\n${frameState.content}`);
+      }
+      for (const element of Array.isArray(frameState.elements) ? frameState.elements : []) {
+        if (!Number.isInteger(element.id)) continue;
+        const id = frameTargetId(frame, element.id);
+        const record = { ...recordBase, id, localId: element.id, label: String(element.label ?? '') };
+        frameTargets.set(id, record);
+        elements.push({ id, label: record.label, ...(typeof element.pressed === 'boolean' ? { pressed: element.pressed } : {}) });
+      }
+    }
+    const { mediaTargets: _rootMediaTargets, ...publicRoot } = root;
+    const publicVideo = root.video && typeof root.video === 'object' ? { ...root.video, src: '' } : root.video;
+    const value = { ...publicRoot, video: publicVideo, content: content.join('\n\n'), elements, snapshotId, mediaTargets };
+    compositeStateCache = { root, frames, evidence, state: value, snapshotId };
+    return value;
+  };
+
+  const state = async () => collectState();
+
+  const resolveLocator = async (locator, expectedSnapshotId) => {
+    const current = await state();
+    if (!expectedSnapshotId || current?.snapshotId !== expectedSnapshotId || !compositeStateCache) {
+      return { ok: false, reason: 'stale-snapshot' };
+    }
+    const matches = [];
+    const rootResult = await rootAgentCall('resolveLocator', [locator, compositeStateCache.root.snapshotId]);
+    if (rootResult?.reason === 'ambiguous') return { ok: false, reason: 'ambiguous' };
+    if (rootResult?.ok === true) matches.push({ id: rootResult.id });
+    for (const { frame, state: frameState, viewport, position } of compositeStateCache.frames) {
+      let result;
+      try { result = await frameAgentCall(frame, 'resolveLocator', [locator, frameState.snapshotId]); }
+      catch { continue; }
+      if (result?.reason === 'ambiguous') return { ok: false, reason: 'ambiguous' };
+      if (result?.ok !== true) continue;
+      const id = frameTargetId(frame, result.id);
+      frameTargets.set(id, {
+        frame,
+        frameToken: frame.frameToken,
+        frameTreeNodeId: frame.frameTreeNodeId,
+        frameSnapshotId: frameState.snapshotId,
+        compositeSnapshotId: current.snapshotId,
+        viewport,
+        hops: position.hops,
+        id,
+        localId: result.id,
+        locator,
+      });
+      matches.push({ id });
+    }
+    if (matches.length > 1) return { ok: false, reason: 'ambiguous' };
+    if (!matches.length) return { ok: false, reason: rootResult?.reason === 'invalid' ? 'invalid' : 'none' };
+    return { ok: true, id: matches[0].id, snapshotId: current.snapshotId };
+  };
+
+  const frameElement = async (id) => {
+    const prior = compositeStateCache;
+    if (!prior) return null;
+    const frameTarget = frameTargets.get(id);
+    if (!frameTarget) {
+      try {
+        const value = await rootAgentCall('element', [id]);
+        if (!value || value.snapshotId !== prior.root.snapshotId) return null;
+        return { ...value, id, snapshotId: prior.snapshotId };
+      } catch { return null; }
+    }
+    const current = await state();
+    if (!prior || current?.snapshotId !== prior.snapshotId) return null;
+    try {
+      const value = await frameAgentCall(frameTarget.frame, 'element', [frameTarget.localId]);
+      if (!value) return null;
+      return { ...value, id, snapshotId: current.snapshotId };
+    } catch { return null; }
+  };
+
+  const frameMethod = async (method, id, expectedSnapshotId) => {
+    const prior = compositeStateCache;
+    if (!prior || (expectedSnapshotId && expectedSnapshotId !== prior.snapshotId)) {
+      return method === 'center' ? null : false;
+    }
+    const target = frameTargets.get(id);
+    if (!target) return rootAgentCall(method, [id, prior.root.snapshotId]);
+    const current = await state();
+    if (current?.snapshotId !== prior.snapshotId) {
+      return method === 'center' ? null : false;
+    }
+    let result;
+    try { result = await frameAgentCall(target.frame, method, [target.localId, target.frameSnapshotId]); }
+    catch { return method === 'center' ? null : false; }
+    if (method !== 'center' || !result) return result;
+    const mapped = await mapFramePointToMain(target.frame, result);
+    if (!mapped.ok) return null;
+    const after = await state();
+    return after?.snapshotId === prior.snapshotId ? { x: mapped.x, y: mapped.y } : null;
+  };
+
+  const frameScroll = async (options, expectedSnapshotId) => {
+    const prior = compositeStateCache;
+    if (!prior || (expectedSnapshotId && expectedSnapshotId !== prior.snapshotId)) {
+      return { success: false, message: 'stale snapshot' };
+    }
+    const index = Number.isInteger(options?.index) ? options.index : null;
+    const target = index === null ? null : frameTargets.get(index);
+    if (!target) return rootAgentCall('scroll', [options, prior.root.snapshotId]);
+    const current = await state();
+    if (current?.snapshotId !== prior.snapshotId) {
+      return { success: false, message: 'stale snapshot' };
+    }
+    return frameAgentCall(target.frame, 'scroll', [{ ...options, index: target.localId }, target.frameSnapshotId]);
+  };
+
+  const framePointTarget = async (x, y, expectedSnapshotId) => {
+    const current = await state();
+    if (!current?.snapshotId || current.snapshotId !== expectedSnapshotId || !compositeStateCache) {
+      return { ok: false, reason: 'stale-snapshot' };
+    }
+    const root = await rootAgentCall('pointTarget', [x, y, compositeStateCache.root.snapshotId]);
+    if (root?.ok === true) return { ...root, target: { ...root.target, snapshotId: current.snapshotId } };
+    return root;
+  };
+
+  const frameTextCenter = async (query) => {
+    const before = await state();
+    if (!before?.snapshotId || !compositeStateCache) return { ok: false, reason: 'stale-snapshot' };
+    const matches = [];
+    const root = await rootAgentCall('textCenter', [query]);
+    if (root?.ok === true) matches.push({ point: root, frame: null });
+    else if (root?.reason === 'ambiguous') return { ok: false, reason: 'ambiguous' };
+    for (const { frame, state: frameState } of compositeStateCache.frames) {
+      let point;
+      try { point = await frameAgentCall(frame, 'textCenter', [query]); }
+      catch { continue; }
+      if (point?.reason === 'ambiguous') return { ok: false, reason: 'ambiguous' };
+      if (point?.ok !== true) continue;
+      const mapped = await mapFramePointToMain(frame, point);
+      if (mapped.ok) matches.push({ point: mapped, frame, frameSnapshotId: frameState.snapshotId });
+    }
+    const after = await state();
+    if (after?.snapshotId !== before.snapshotId) return { ok: false, reason: 'stale-snapshot' };
+    if (matches.length > 1) return { ok: false, reason: 'ambiguous' };
+    if (!matches.length) return { ok: false, reason: root?.reason || 'none' };
+    activeTextFrame = matches[0].frame;
+    return { ok: true, x: matches[0].point.x, y: matches[0].point.y, snapshotId: before.snapshotId };
+  };
+
+  const frameClick = async (id, expectedSnapshotId) => {
+    const prior = compositeStateCache;
+    if (!prior || !expectedSnapshotId || prior.snapshotId !== expectedSnapshotId) {
+      return { success: false, message: 'stale snapshot' };
+    }
+    const target = frameTargets.get(id);
+    if (!target) return rootAgentCall('click', [id, prior.root.snapshotId]);
+    const before = await state();
+    if (!before?.snapshotId || before.snapshotId !== expectedSnapshotId) {
+      return { success: false, message: 'stale snapshot' };
+    }
+    if (target.compositeSnapshotId !== before.snapshotId || target.frame.isDestroyed() || target.frame.detached
+      || target.frame.frameToken !== target.frameToken) return { success: false, message: 'stale snapshot' };
+    const point = await frameAgentCall(target.frame, 'actionPoint', [target.localId, target.frameSnapshotId]);
+    if (point?.ok !== true) return { success: false, message: point?.reason || 'target is not actionable' };
+    const mapped = await mapFramePointToMain(target.frame, point);
+    if (!mapped.ok) return { success: false, message: mapped.reason || 'unsupported frame' };
+    const after = await state();
+    if (after?.snapshotId !== before.snapshotId || target.frame.isDestroyed() || target.frame.detached) {
+      return { success: false, message: 'stale snapshot' };
+    }
+    let dispatched = false;
+    try {
+      await frameAgentCall(target.frame, 'setAgentAction', [true]);
+      const x = Math.round(mapped.x), y = Math.round(mapped.y);
+      win.webContents.sendInputEvent({ type: 'mouseMove', x, y });
+      win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+      win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+      dispatched = true;
+      return { success: true, message: 'click dispatched through the current frame point' };
+    } catch (error) {
+      return { success: dispatched, message: String(error?.message ?? error) };
+    } finally {
+      await frameAgentCall(target.frame, 'setAgentAction', [false]).catch(() => undefined);
+    }
+  };
+
+  const resetFrameState = () => {
+    compositeStateCache = null;
+    frameTargets.clear();
+    activeTextFrame = null;
+  };
+
+  const load = async (url, settleMs = SETTLE_MS, destinationChecked = false) => {
     const target = httpUrl(url);
-    if (!target || !isPublicHttp(url)) throw new Error('only public http and https pages are opened');
+    if (!target) throw publicDestinationError('invalid-url');
+    if (!destinationChecked) {
+      const check = await publicDestinationCheck(target.href);
+      if (!check.allowed) throw publicDestinationError(check.reason, check.blockedFamilies);
+    }
     injected = false;
+    resetFrameState();
+    activeVisualCapture = null;
     navigating = true;
     const loaded = win.webContents.loadURL(target.href)
       .then(() => { navigating = false; })
       .catch((error) => { navigating = false; throw error; });
-    await waitForLoad(loaded, settleMs);
-    await ensureAgent();
-    return state();
-  };
-
-  const state = async () => {
-    const value = await agentCall('state');
-    return value;
+    let loadTimedOut = false;
+    try {
+      await waitForLoad(loaded, settleMs);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const currentUrl = win && !win.isDestroyed() ? (win.webContents.getURL() || '') : '';
+      if (/page load timed out/i.test(msg) && isPublicHttp(currentUrl)) {
+        log.warn('[browser] page load timed out on active public URL; falling back to read-only CDP state', { url: currentUrl });
+        loadTimedOut = true;
+      } else {
+        throw err;
+      }
+    }
+    return readStateWithCdpFallback({ loadTimedOut });
   };
 
   const capture = async () => {
@@ -163,137 +1259,1194 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
     return { base64: jpeg.toString('base64'), width: shown.getSize().width, height: shown.getSize().height };
   };
 
-  const press = async (key, index) => {
+  const captureForVisualClick = async () => {
+    await ensureAgent();
+    const before = await state();
+    const viewport = await agentCall('viewport');
+    if (!before?.snapshotId || !Number.isFinite(viewport?.width) || !Number.isFinite(viewport?.height)
+      || viewport.width <= 0 || viewport.height <= 0) throw new Error('the page has no stable screenshot viewport');
+    const image = await capture();
+    const after = await state();
+    const currentViewport = await agentCall('viewport');
+    if (!after?.snapshotId || after.snapshotId !== before.snapshotId || after.url !== before.url
+      || currentViewport?.width !== viewport.width || currentViewport?.height !== viewport.height) {
+      throw new Error('the page changed while the screenshot was taken; read it again');
+    }
+    const captureId = randomUUID();
+    activeVisualCapture = {
+      captureId,
+      url: after.url,
+      snapshotId: after.snapshotId,
+      viewportWidth: viewport.width,
+      viewportHeight: viewport.height,
+      imageWidth: image.width,
+      imageHeight: image.height,
+      createdAt: Date.now(),
+      used: false,
+    };
+    return { ...image, state: after, captureId, viewportWidth: viewport.width, viewportHeight: viewport.height };
+  };
+
+  const captureReadOnlyFallback = async (domError = '') => {
+    activeVisualCapture = null;
+    const image = await capture();
+    let pageState;
+    try {
+      pageState = await cdpReadState({ domError });
+    } catch (cdpErr) {
+      const url = win && !win.isDestroyed() ? (win.webContents.getURL() || '') : '';
+      const title = win && !win.isDestroyed() ? (win.webContents.getTitle() || '').trim() : '';
+      const [vw, vh] = win && !win.isDestroyed() ? win.getContentSize() : [image.width, image.height];
+      const cdpMsg = cdpErr instanceof Error ? cdpErr.message : String(cdpErr);
+      pageState = {
+        url,
+        title: title || url,
+        header: `Current Page: [${title || url}](${url})\nPage status: blank-or-error · read-only screenshot fallback (${cdpMsg})`,
+        content: `[只读截图模式: DOM 与 CDP 均不可用 (${cdpMsg})，仅提供当前同源页面画面作为只读证据]`,
+        footer: '',
+        video: null,
+        viewport: { width: vw || 1100, height: vh || 700 },
+        page: { width: vw || 1100, height: vh || 700, pagesAbove: 0, pagesBelow: 0, totalPages: 1, percent: 0 },
+        elements: [],
+        controls: [],
+        snapshotId: `cdp-shot-${createHash('sha256').update(`${url}|${title}|${Date.now()}`).digest('hex').slice(0, 12)}`,
+        mediaTargets: [],
+        cdpFallback: true,
+        cdpError: cdpMsg,
+      };
+    }
+    lastReadWasCdp = true;
+    const [vw, vh] = win && !win.isDestroyed() ? win.getContentSize() : [image.width, image.height];
+    return {
+      ...image,
+      state: pageState,
+      readOnly: true,
+      viewportWidth: vw || image.width,
+      viewportHeight: vh || image.height,
+    };
+  };
+
+  const inspectVisualPoint = async (message, allowUsed = false) => {
+    const capture = activeVisualCapture;
+    const x = Number(message.x), y = Number(message.y);
+    if (!capture || message.captureId !== capture.captureId || (capture.used && !allowUsed)
+      || Date.now() - capture.createdAt > 30_000) throw new Error('the screenshot capture expired; take a new screenshot');
+    if (message.snapshotId !== undefined && message.snapshotId !== capture.snapshotId) throw new Error('the screenshot snapshot does not match');
+    const mapped = imagePointToViewport(capture, { x, y });
+    if (!mapped) throw new Error('the screenshot point is outside the captured image');
+    if (!win || win.isDestroyed() || win.webContents.getURL() !== capture.url) throw new Error('the page changed after the screenshot');
+    await ensureAgent();
+    const page = await state();
+    const viewport = await agentCall('viewport');
+    if (page?.snapshotId !== capture.snapshotId || page.url !== capture.url
+      || viewport?.width !== capture.viewportWidth || viewport?.height !== capture.viewportHeight) {
+      throw new Error('the page or viewport changed after the screenshot');
+    }
+    const { x: cssX, y: cssY } = mapped;
+    const point = await agentCall('pointTarget', [cssX, cssY, capture.snapshotId]);
+    if (point?.ok !== true || !point.target?.token || point.target.snapshotId !== capture.snapshotId) {
+      throw new Error(point?.reason || 'the screenshot point is not a current interactive target');
+    }
+    return { capture, cssX, cssY, target: point.target };
+  };
+
+  const press = async (key, index, expectedSnapshotId) => {
+    if (expectedSnapshotId && await agentCall('snapshot') !== expectedSnapshotId) throw new Error('the page changed; read it again');
     if (index !== undefined) {
-      const focused = await agentCall('focus', [index]);
-      if (!focused) throw new Error(`no element at index ${index}`);
+      const focused = await agentCall('focus', [index, expectedSnapshotId]);
+      if (!focused) throw new Error(`no element at index ${index} or the page changed`);
     }
     const codes = { Enter: 'Enter', Escape: 'Escape', Tab: 'Tab', Space: 'Space', Backspace: 'Backspace', ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right', PageUp: 'PageUp', PageDown: 'PageDown' };
     const code = codes[key];
     if (!code) throw new Error(`key ${key} is not one of ${Object.keys(codes).join(', ')}`);
     win.webContents.sendInputEvent({ type: 'keyDown', keyCode: code });
+    if (key === 'Enter') win.webContents.sendInputEvent({ type: 'char', keyCode: code });
     win.webContents.sendInputEvent({ type: 'keyUp', keyCode: code });
     await sleep(250);
   };
 
   const closeWindow = () => {
+    if (pendingImageDownload) finishImageDownload(pendingImageDownload, new Error('browser window closed'));
+    if (pendingMediaDownload) cancelMediaDownload(pendingMediaDownload.id, new Error('browser window closed during download'));
+    clearStagedChatGPTImages();
     if (win && !win.isDestroyed()) win.destroy();
     win = null;
     injected = false;
+    resetFrameState();
+    activeVisualCapture = null;
   };
 
-  const ensureWindow = () => {
+  const ensureNetworkRoute = (ses) => {
+    if (networkReady) return networkReady;
+    networkReady = (async () => {
+      await ses.setProxy({ mode: 'system' });
+      await ses.closeAllConnections();
+    })().catch((error) => {
+      networkReady = null;
+      throw error;
+    });
+    return networkReady;
+  };
+
+  const ensureWindow = async () => {
     if (win && !win.isDestroyed()) return win;
-    const area = screen.getPrimaryDisplay().workArea;
-    const width = Math.min(WINDOW_WIDTH, Math.max(680, area.width - 160));
-    const height = Math.min(WINDOW_HEIGHT, Math.max(520, area.height - 200));
-    const ses = session.fromPartition(PARTITION);
-    ses.setSpellCheckerEnabled(false);
-    // only the page script's own recording may ask for display media; everything else stays denied
-    const capturePermission = (permission, details) => {
-      if (!audioCaptureRequested) return false;
-      if (permission === 'display-capture') return true;
-      if (permission !== 'media') return false;
-      // getDisplayMedia asks with no media types; a direct getUserMedia names audio or video
-      const types = details && details.mediaTypes;
-      return !Array.isArray(types) || types.length === 0;
-    };
-    ses.setPermissionRequestHandler((_contents, permission, callback, details) => callback(capturePermission(permission, details)));
-    ses.setPermissionCheckHandler((_contents, permission) => audioCaptureRequested && (permission === 'display-capture' || permission === 'media'));
-    ses.setDisplayMediaRequestHandler((request, callback) => {
-      const frame = request.frame;
-      if (!audioCaptureRequested || !frame) { callback({}); return; }
-      // the whole tab's audio, not this machine's or another window's; echo off keeps it silent
-      callback({ audio: frame });
-    });
-    ses.setDevicePermissionHandler(() => false);
-    ses.on('will-download', (event) => event.preventDefault());
-    // no request of this window reaches this machine or the local network, not even a subresource
-    ses.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*'] }, (details, callback) => callback({ cancel: !isPublicHttp(details.url) }));
-    win = new BrowserWindow({
-      width, height,
-      x: Math.max(area.x, area.x + area.width - width - 48),
-      // leave the bottom of the screen to the pet
-      y: Math.max(area.y, area.y + area.height - height - 120),
-      minWidth: 640, minHeight: 480,
-      title: 'Coo', icon,
-      show: false,
-      autoHideMenuBar: true,
-      backgroundColor: '#0f1115',
-      webPreferences: {
-        partition: PARTITION,
-        contextIsolation: true,
-        nodeIntegration: false,
-        sandbox: true,
-        spellcheck: false,
-        backgroundThrottling: false,
-        webviewTag: false,
-        navigateOnDragDrop: false,
-      },
-    });
-    const wc = win.webContents;
-    wc.setUserAgent(userAgent());
-    wc.setAudioMuted(muted);
-    wc.setWindowOpenHandler(({ url }) => {
-      if (isPublicHttp(url)) void load(url).catch((error) => log.warn('[browser] popup load failed', error.message));
-      return { action: 'deny' };
-    });
-    const onlyPublic = (event, url) => { if (!isPublicHttp(url)) event.preventDefault(); };
-    wc.on('will-navigate', onlyPublic);
-    wc.on('will-redirect', onlyPublic);
-    wc.on('will-frame-navigate', (event) => {
-      if (event.isMainFrame || /^about:(blank|srcdoc)$/.test(event.url)) return;
-      if (!isPublicHttp(event.url)) event.preventDefault();
-    });
-    wc.on('will-attach-webview', (event) => event.preventDefault());
-    wc.on('will-prevent-unload', (event) => event.preventDefault());
-    // a page does not take the whole screen from the person; video stays in Coo's window
-    wc.on('enter-html-full-screen', () => { if (win && !win.isDestroyed()) win.setFullScreen(false); });
-    // only a new main document replaces the page script; iframes and in-page routes keep it
-    wc.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
-      if (!isMainFrame || isInPlace) return;
-      injected = false;
-      navigating = true;
-      audioCaptureRequested = false;
-      restoreMute();
-    });
-    wc.on('did-finish-load', () => { injected = false; navigating = false; });
-    wc.on('did-fail-load', (_event, code, description, url, isMainFrame) => {
-      if (!isMainFrame) return;
-      navigating = false;
-      if (code !== -3) log.warn('[browser] page failed', { code, description, url });
-    });
-    wc.on('render-process-gone', (_event, details) => log.warn('[browser] renderer gone', details));
-    wc.on('page-title-updated', (event, title) => {
-      event.preventDefault();
-      const shown = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 80);
-      win?.setTitle(shown ? `Coo · ${shown}` : 'Coo');
-    });
-    win.once('ready-to-show', () => win?.showInactive());
-    win.on('closed', () => {
-      win = null;
-      injected = false;
-      navigating = false;
-      audioCaptureRequested = false;
-      send?.({ type: 'companion:browser-event', event: 'closed' });
-    });
-    return win;
+    if (creatingWindow) return creatingWindow;
+    creatingWindow = (async () => {
+      const area = screen.getPrimaryDisplay().workArea;
+      const width = Math.min(WINDOW_WIDTH, Math.max(680, area.width - 160));
+      const height = Math.min(WINDOW_HEIGHT, Math.max(520, area.height - 200));
+      const ses = session.fromPartition(partition);
+      await ensureNetworkRoute(ses);
+      ses.setSpellCheckerEnabled(false);
+      // Allow Google account/verification pages to use the camera for login identity checks.
+      const isGoogleCameraOrigin = (rawUrl) => {
+        try {
+          const u = new URL(String(rawUrl || ''));
+          return u.protocol === 'https:' && (u.hostname === 'google.com' || u.hostname.endsWith('.google.com'));
+        } catch { return false; }
+      };
+      // only the page script's own recording may ask for display media; Google login verification may use camera
+      const capturePermission = (permission, details) => {
+        if (!audioCaptureRequested) return false;
+        if (permission === 'display-capture') return true;
+        if (permission !== 'media') return false;
+        // getDisplayMedia asks with no media types; a direct getUserMedia names audio or video
+        const types = details && details.mediaTypes;
+        return !Array.isArray(types) || types.length === 0;
+      };
+      ses.setPermissionRequestHandler((contents, permission, callback, details) => {
+        const origin = details?.requestingUrl || contents?.getURL?.() || '';
+        if (permission === 'media' && isGoogleCameraOrigin(origin)) {
+          if (process.platform === 'darwin' && typeof systemPreferences?.askForMediaAccess === 'function') {
+            void systemPreferences.askForMediaAccess('camera').then((ok) => callback(!!ok), () => callback(false));
+            return;
+          }
+          callback(true);
+          return;
+        }
+        callback(capturePermission(permission, details));
+      });
+      ses.setPermissionCheckHandler((contents, permission, requestingOrigin) => {
+        if (permission === 'media' && isGoogleCameraOrigin(requestingOrigin || contents?.getURL?.() || '')) {
+          return true;
+        }
+        return audioCaptureRequested && (permission === 'display-capture' || permission === 'media');
+      });
+      ses.setDisplayMediaRequestHandler((request, callback) => {
+        const frame = request.frame;
+        if (!audioCaptureRequested || !frame) { callback({}); return; }
+        // the whole tab's audio, not this machine's or another window's; echo off keeps it silent
+        callback({ audio: frame });
+      });
+      ses.setDevicePermissionHandler(() => false);
+      ses.on('will-download', (event, item, contents) => {
+        if (pendingImageDownload) handleImageDownload(event, item, contents);
+        else handleMediaDownload(event, item, contents);
+      });
+      // Check the session's resolved endpoints before every HTTP request, including frame subresources.
+      ses.webRequest.onBeforeRequest({ urls: ['http://*/*', 'https://*/*', 'ws://*/*', 'wss://*/*'] }, (details, callback) => {
+        if (isWebSocketRequest(details)) { callback({ cancel: true }); return; }
+        const pending = pendingMediaDownload;
+        // A direct download can redirect before `will-download`; reject its cross-origin follow-up request here.
+        if (pending && pending.rejectedRedirect && sameMediaRequestUrl(details.url, pending.rejectedRedirect)) {
+            pending.dispatched = true;
+            callback({ cancel: true });
+            pending.errorKind = 'failed';
+            pending.safeError = 'the redirect left the approved source host';
+            if (pending.item) cancelMediaDownload(pending.id, new Error('redirect source changed'), 'failed');
+            else finishMediaDownload(pending, new Error('redirect source changed'));
+            return;
+        }
+        void isPublicDestination(details.url)
+          .then((allowed) => callback({ cancel: !allowed }))
+          .catch(() => callback({ cancel: true }));
+      });
+      ses.webRequest.onBeforeRedirect({ urls: ['http://*/*', 'https://*/*'] }, (details) => {
+        const pending = pendingMediaDownload;
+        if (!pending || ![...pending.allowedRedirectUrls].some((url) => sameMediaRequestUrl(details.url, url))) return;
+        let redirectOrigin = '';
+        try { redirectOrigin = new URL(details.redirectURL).origin; } catch { /* the next request is refused by the URL guard */ }
+        if (!isMediaDownloadUrl(details.redirectURL) || redirectOrigin !== pending.sourceOrigin) {
+          pending.rejectedRedirect = details.redirectURL;
+          return;
+        }
+        const normalized = normalizedMediaRequestUrl(details.redirectURL);
+        if (normalized) pending.allowedRedirectUrls.add(normalized);
+      });
+      win = new BrowserWindow({
+        width, height,
+        x: Math.max(area.x, area.x + area.width - width - 48),
+        // leave the bottom of the screen to the pet
+        y: Math.max(area.y, area.y + area.height - height - 120),
+        minWidth: 640, minHeight: 480,
+        title: 'Coo', icon,
+        show: false,
+        autoHideMenuBar: true,
+        backgroundColor: '#0f1115',
+        webPreferences: {
+          partition,
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: true,
+          spellcheck: false,
+          backgroundThrottling: false,
+          webviewTag: false,
+          navigateOnDragDrop: false,
+        },
+      });
+      const wc = win.webContents;
+      wc.setWebRTCIPHandlingPolicy('disable_non_proxied_udp');
+      // Keep Electron's native untouched User-Agent: stripping Electron/app tokens into a stock Chrome UA
+      // triggers Google accounts.google.com /v3/signin/rejected ("This browser or app may not be secure").
+      wc.setAudioMuted(muted);
+      wc.setWindowOpenHandler(({ url }) => {
+        if (isPublicHttp(url)) void load(url).catch((error) => log.warn('[browser] popup load failed', error.message));
+        return { action: 'deny' };
+      });
+      const onlyPublic = (event, url) => { if (!isPublicHttp(url)) event.preventDefault(); };
+      wc.on('will-navigate', onlyPublic);
+      wc.on('will-redirect', onlyPublic);
+      wc.on('will-frame-navigate', (event) => {
+        activeVisualCapture = null;
+        if (event.isMainFrame || /^about:(blank|srcdoc)$/.test(event.url)) return;
+        if (!isPublicHttp(event.url)) event.preventDefault();
+      });
+      wc.on('did-navigate-in-page', () => {
+        navigationGeneration++;
+        activeVisualCapture = null;
+        if (pendingMediaDownload) cancelMediaDownload(pendingMediaDownload.id, new Error('the Browser page changed during download'));
+      });
+      wc.on('will-attach-webview', (event) => event.preventDefault());
+      wc.on('will-prevent-unload', (event) => event.preventDefault());
+      // a page does not take the whole screen from the person; video stays in Coo's window
+      wc.on('enter-html-full-screen', () => { if (win && !win.isDestroyed()) win.setFullScreen(false); });
+      // only a new main document replaces the page script; iframes and in-page routes keep it
+      wc.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
+        if (!isMainFrame || isInPlace) return;
+        documentGeneration++;
+        navigationGeneration++;
+        if (pendingMediaDownload) cancelMediaDownload(pendingMediaDownload.id, new Error('the Browser page changed during download'));
+        injected = false;
+        navigating = true;
+        resetFrameState();
+        activeVisualCapture = null;
+        audioCaptureRequested = false;
+        restoreMute();
+      });
+      wc.on('did-finish-load', () => { injected = false; navigating = false; });
+      wc.on('did-fail-load', (_event, code, description, url, isMainFrame) => {
+        if (!isMainFrame) return;
+        navigating = false;
+        if (code !== -3) log.warn('[browser] page failed', { code, description, url });
+      });
+      wc.on('render-process-gone', (_event, details) => log.warn('[browser] renderer gone', details));
+      wc.on('page-title-updated', (event, title) => {
+        event.preventDefault();
+        const shown = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+        win?.setTitle(shown ? `Coo · ${shown}` : 'Coo');
+      });
+      win.once('ready-to-show', () => win?.showInactive());
+      win.on('closed', () => {
+        if (pendingMediaDownload) cancelMediaDownload(pendingMediaDownload.id, new Error('browser window closed during download'));
+        clearStagedChatGPTImages();
+        win = null;
+        injected = false;
+        resetFrameState();
+        activeVisualCapture = null;
+        navigating = false;
+        audioCaptureRequested = false;
+        send?.({ type: 'companion:browser-event', event: 'closed' });
+      });
+      return win;
+    })();
+    try {
+      return await creatingWindow;
+    } finally {
+      creatingWindow = null;
+    }
   };
 
   const open = async (message) => {
     if (typeof message.muted === 'boolean') muted = message.muted;
-    const target = httpUrl(message.url);
-    if (!target || !isPublicHttp(message.url)) throw new Error('only public http and https pages are opened');
-    ensureWindow();
+    let rawUrl = message.url;
+    try {
+      const parsed = new URL(String(rawUrl || ''));
+      if (DEFAULT_GEMINI_ACCOUNT_INDEX > 0 && parsed.protocol === 'https:' && parsed.hostname.toLowerCase() === 'gemini.google.com'
+        && (parsed.pathname === '/' || parsed.pathname === '' || parsed.pathname === '/app' || parsed.pathname === '/app/')) {
+        parsed.pathname = `/u/${DEFAULT_GEMINI_ACCOUNT_INDEX}/app`;
+        rawUrl = parsed.href;
+      }
+    } catch { /* fall through to standard validation */ }
+    const target = httpUrl(rawUrl);
+    if (!target || !isPublicHttp(target.href)) throw publicDestinationError(target ? 'url-policy' : 'invalid-url');
+    await ensureNetworkRoute(session.fromPartition(partition));
+    const check = await publicDestinationCheck(target.href);
+    if (!check.allowed) throw publicDestinationError(check.reason, check.blockedFamilies);
+    await ensureWindow();
     if (win.isMinimized()) win.restore();
     if (!win.isVisible()) win.showInactive();
     win.webContents.setAudioMuted(muted);
-    return load(target.href, 900);
+    // Reuse active Douyin Creator Center tab when already on the same route to avoid ~18.8s cold SPA reload.
+    const currentHref = win.webContents.getURL() || '';
+    if (message.forceReload !== true && isDouyinPageUrl(currentHref) && isDouyinPageUrl(target.href)) {
+      try {
+        const cur = new URL(currentHref);
+        const sameRoute = cur.origin === target.origin && cur.pathname === target.pathname && cur.search === target.search;
+        if (sameRoute) {
+          return readStateWithCdpFallback();
+        }
+      } catch { /* fall through to load */ }
+    }
+    return load(target.href, 900, true);
+  };
+
+  const generateChatGPTImage = async (message) => {
+    if (!win || !isChatGPTPageUrl(win.webContents.getURL())) throw new Error('open chatgpt.com in this browser first');
+    const prompt = typeof message.prompt === 'string' ? message.prompt.trim() : '';
+    if (!prompt || prompt.length > 2000) throw new Error('prompt must be 1 to 2000 characters');
+    const taskId = message.taskId;
+    const promptDigest = message.promptDigest;
+    if (!validChatGPTImageTaskId(taskId) || typeof promptDigest !== 'string' || !/^[a-f0-9]{64}$/.test(promptDigest)) {
+      throw new Error('the approved image task identity is invalid');
+    }
+    if (createHash('sha256').update(prompt).digest('hex') !== promptDigest) throw new Error('the image prompt changed after approval');
+    if (chatGPTImageTasks.has(taskId)) throw new Error('this image task was already dispatched');
+    await ensureAgent();
+    const initialUrl = win.webContents.getURL();
+    const initialOrigin = new URL(initialUrl).origin;
+    const initialDocumentGeneration = documentGeneration;
+    const target = await agentCall('chatGPTComposer');
+    if (!target?.ok) throw new Error(target?.reason || 'the ChatGPT message box could not be identified');
+    if ((message.composerId && target.id !== message.composerId)
+      || (message.snapshotId && target.snapshotId !== message.snapshotId)) throw new Error('the ChatGPT composer changed after approval');
+    const before = await agentCall('draft', [target.id]).catch(() => '');
+    await agentCall('prepareInput', [target.id]).catch(() => undefined);
+    const taskStart = await agentCall('chatGPTImageTaskStart', [taskId]);
+    if (!taskStart?.ok) throw new Error(taskStart?.reason || 'the ChatGPT conversation could not be bound to this image task');
+
+    const singleLine = prompt.replace(/\s*\n+\s*/g, ' ').trim();
+    const fullPrompt = message.mode === 'edit' ? singleLine : `Create an image based on this prompt: ${singleLine}`;
+    const normDraft = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const expectedPrefix = normDraft(singleLine).slice(0, 16);
+    await agentCall('setAgentAction', [true]);
+    try {
+      const boxPt = await win.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector('#prompt-textarea, [role="textbox"][contenteditable="true"], textarea');
+        if (!el) return null;
+        el.scrollIntoView({ block: 'center', inline: 'nearest' });
+        el.focus();
+        const r = el.getBoundingClientRect();
+        return r.width > 8 && r.height > 8 ? { x: Math.round(r.left + Math.min(r.width * 0.5, 160)), y: Math.round(r.top + r.height / 2) } : null;
+      })()`, true).catch(() => null) || await agentCall('center', [target.id]).catch(() => null);
+      if (boxPt && Number.isFinite(boxPt.x) && Number.isFinite(boxPt.y)) {
+        win.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(boxPt.x), y: Math.round(boxPt.y) });
+        win.webContents.sendInputEvent({ type: 'mouseDown', x: Math.round(boxPt.x), y: Math.round(boxPt.y), button: 'left', clickCount: 1 });
+        win.webContents.sendInputEvent({ type: 'mouseUp', x: Math.round(boxPt.x), y: Math.round(boxPt.y), button: 'left', clickCount: 1 });
+        await sleep(160);
+      }
+      await win.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector('#prompt-textarea, [role="textbox"][contenteditable="true"], textarea');
+        if (!el) return;
+        el.focus();
+        if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+          el.value = '';
+        } else {
+          document.execCommand('selectAll', false);
+          document.execCommand('delete', false);
+        }
+      })()`, true).catch(() => undefined);
+      await sleep(100);
+      win.webContents.insertText(fullPrompt);
+      await sleep(250);
+      await win.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector('#prompt-textarea, [role="textbox"][contenteditable="true"], textarea');
+        if (!el) return;
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: ${JSON.stringify(fullPrompt)} }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      })()`, true).catch(() => undefined);
+      await sleep(150);
+      const draft = await win.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector('#prompt-textarea, [role="textbox"][contenteditable="true"], textarea');
+        if (!el) return '';
+        return el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement ? el.value : (el.innerText || el.textContent || '');
+      })()`, true).catch(() => '');
+      if (expectedPrefix && !normDraft(draft).includes(expectedPrefix)) {
+        throw new Error(`the visible ChatGPT draft did not match the image prompt (got: ${normDraft(draft).slice(0, 60)})`);
+      }
+      let sendPt = null;
+      for (let i = 0; i < 8; i++) {
+        sendPt = await win.webContents.executeJavaScript(`(() => {
+          const selectors = [
+            'button[data-testid="send-button"]',
+            'button[data-testid="fruitjuice-send-button"]',
+            'button[aria-label*="发送"]',
+            'button[aria-label*="Send" i]',
+            'form button[type="submit"]',
+          ];
+          for (const sel of selectors) {
+            const btn = document.querySelector(sel);
+            if (!btn || btn.disabled || btn.getAttribute('aria-disabled') === 'true') continue;
+            const r = btn.getBoundingClientRect();
+            if (r.width > 8 && r.height > 8) return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+          }
+          return null;
+        })()`, true).catch(() => null);
+        if (sendPt) break;
+        await sleep(200);
+      }
+      if (sendPt) {
+        win.webContents.sendInputEvent({ type: 'mouseMove', x: sendPt.x, y: sendPt.y });
+        win.webContents.sendInputEvent({ type: 'mouseDown', x: sendPt.x, y: sendPt.y, button: 'left', clickCount: 1 });
+        win.webContents.sendInputEvent({ type: 'mouseUp', x: sendPt.x, y: sendPt.y, button: 'left', clickCount: 1 });
+        await sleep(450);
+      }
+      const stillDraft = await win.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector('#prompt-textarea, [role="textbox"][contenteditable="true"], textarea');
+        if (!el) return '';
+        return (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement ? el.value : (el.innerText || el.textContent || '')).trim();
+      })()`, true).catch(() => '');
+      if (stillDraft) {
+        await win.webContents.executeJavaScript(`(() => {
+          const el = document.querySelector('#prompt-textarea, [role="textbox"][contenteditable="true"], textarea');
+          if (el) el.focus();
+        })()`, true).catch(() => undefined);
+        await press('Enter');
+        await sleep(450);
+        await win.webContents.executeJavaScript(`(() => {
+          const btn = document.querySelector('button[data-testid="send-button"], button[data-testid="fruitjuice-send-button"], button[aria-label*="发送"], button[aria-label*="Send" i], form button[type="submit"]');
+          if (btn && !btn.disabled && (btn.offsetWidth || btn.offsetHeight)) btn.click();
+          else document.querySelector('form')?.requestSubmit?.();
+        })()`, true).catch(() => undefined);
+      }
+    } finally {
+      await agentCall('setAgentAction', [false]).catch(() => undefined);
+    }
+
+    let outcome = null;
+    const submitDeadline = Date.now() + 8000;
+    while (Date.now() < submitDeadline) {
+      outcome = await agentCall('chatGPTSubmission', [taskId, fullPrompt]).catch(() => null);
+      if (outcome?.submitted === true) break;
+      await sleep(300);
+    }
+    const page = await state().catch(() => null);
+    const liveOrigin = (() => { try { return new URL(win.webContents.getURL()).origin; } catch { return ''; } })();
+    const pageOrigin = (() => { try { return page?.url ? new URL(page.url).origin : ''; } catch { return ''; } })();
+    const confirmed = outcome?.submitted === true && documentGeneration === initialDocumentGeneration
+      && page && pageOrigin === initialOrigin && liveOrigin === initialOrigin
+      && Number.isSafeInteger(outcome.userTurnIndex) && outcome.userTurnIndex >= 0;
+    let task = { taskId, promptDigest, status: 'unknown', expectedOutputCount: 1 };
+    if (confirmed) {
+      const userTurnDigest = chatGPTTurnDigest(taskId, outcome.userTurnMarker || '', outcome.userTurnIndex);
+      const evidenceDigest = createHash('sha256').update(JSON.stringify([taskId, userTurnDigest, page.url])).digest('hex');
+      task = { taskId, promptDigest, status: 'prompt_submitted', expectedOutputCount: 1, userTurnDigest, evidenceDigest };
+      chatGPTImageTasks.set(taskId, {
+        taskId,
+        promptDigest,
+        status: 'prompt_submitted',
+        expectedOutputCount: 1,
+        userTurnDigest,
+        webContentsId: win.webContents.id,
+        documentGeneration,
+        navigationGeneration,
+        pageUrl: page.url,
+        evidenceDigest,
+        imageCount: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      const cutoff = Date.now() - CHATGPT_IMAGE_TASK_TTL_MS;
+      for (const [id, record] of chatGPTImageTasks) if (record.updatedAt < cutoff) chatGPTImageTasks.delete(id);
+      while (chatGPTImageTasks.size > CHATGPT_IMAGE_TASK_MAX) chatGPTImageTasks.delete(chatGPTImageTasks.keys().next().value);
+      recordThreadUrlForActiveTask('chatgpt', page.url, message.taskSlug);
+    }
+    const screenshot = confirmed ? await capture().catch(() => null) : null;
+    return {
+      submitted: confirmed,
+      task,
+      state: page,
+      ...(screenshot ?? {}),
+    };
+  };
+
+  const chatGPTImageTaskStatus = async (message) => {
+    const taskId = message.taskId;
+    const promptDigest = message.promptDigest;
+    const task = chatGPTImageTasks.get(taskId);
+    if (!task || typeof promptDigest !== 'string' || promptDigest !== task.promptDigest) {
+      return { taskId: validChatGPTImageTaskId(taskId) ? taskId : '', status: 'unknown', expectedOutputCount: 1 };
+    }
+    if (['image_available', 'failed', 'unknown'].includes(task.status)) return publicChatGPTImageTask(task);
+    if (Date.now() - task.updatedAt > CHATGPT_IMAGE_TASK_TTL_MS) {
+      task.status = 'unknown';
+      task.updatedAt = Date.now();
+      return publicChatGPTImageTask(task);
+    }
+    if (!win || win.isDestroyed() || win.webContents.id !== task.webContentsId
+      || documentGeneration !== task.documentGeneration || navigationGeneration !== task.navigationGeneration
+      || win.webContents.getURL() !== task.pageUrl) {
+      task.status = 'unknown';
+      task.updatedAt = Date.now();
+      return publicChatGPTImageTask(task);
+    }
+    try {
+      await ensureAgent();
+      const observed = await agentCall('chatGPTImageTaskStatus', [taskId]);
+      const states = new Set(['prompt_submitted', 'generating', 'image_available', 'unknown', 'failed']);
+      if (!states.has(observed?.status)) throw new Error('the page did not return a valid image task state');
+      task.status = observed.status;
+      task.imageCount = Number.isSafeInteger(observed.imageCount) && observed.imageCount >= 0 ? observed.imageCount : 0;
+      task.evidenceDigest = createHash('sha256').update(JSON.stringify([
+        taskId,
+        task.userTurnDigest,
+        task.status,
+        observed.imageSizes ?? [],
+      ])).digest('hex');
+      task.updatedAt = Date.now();
+      return publicChatGPTImageTask(task);
+    } catch {
+      task.status = 'unknown';
+      task.updatedAt = Date.now();
+      return publicChatGPTImageTask(task);
+    }
+  };
+
+  const stageChatGPTImage = async (message) => {
+    if (!win || !isChatGPTPageUrl(win.webContents.getURL())) throw new Error('the current page is not ChatGPT');
+    const index = Number.isInteger(message.index) && message.index >= 0 ? message.index : null;
+    if (index === null) throw new Error('image save target needs a page element number');
+    await ensureAgent();
+    if (!await agentCall('chatGPTImageSaveTarget', [index, message.snapshotId])) throw new Error('the selected control is not a visible ChatGPT image save button');
+    const dir = mediaDir();
+    if (typeof dir !== 'string' || !dir.trim()) throw new Error('the video media directory is unavailable');
+    const stageDir = join(dirname(dir), 'work', 'browser-image-staging');
+    mkdirSync(stageDir, { recursive: true });
+    if (!stagedChatGPTImages.size) clearOrphanedChatGPTImages(stageDir);
+    const transfer = waitForImageDownload(stageDir);
+    let stagedPath = '';
+    try {
+      await agentCall('setAgentAction', [true]);
+      try {
+        const answer = await agentCall('click', [index, message.snapshotId]);
+        if (answer?.success === false) throw new Error(answer.message || 'the image save button could not be clicked');
+      } finally {
+        await agentCall('setAgentAction', [false]).catch(() => undefined);
+      }
+      const saved = await transfer.promise;
+      stagedPath = join(stageDir, saved.file);
+      const verified = verifyGeneratedImage(stagedPath, saved.mime);
+      const destination = generatedImagePath(dir, saved.mime);
+      const stageToken = randomUUID();
+      const page = await settle();
+      const pageUrl = win.webContents.getURL();
+      if (!page?.snapshotId || page.url !== pageUrl || !isChatGPTPageUrl(pageUrl)) throw new Error('the ChatGPT page changed while the image was staged');
+      stagedChatGPTImages.set(stageToken, {
+        stagedPath,
+        destinationPath: destination.file,
+        file: destination.name,
+        mime: saved.mime,
+        bytes: verified.bytes,
+        digest: verified.digest,
+        pageUrl,
+        snapshotId: page.snapshotId,
+        expiresAt: Date.now() + 5 * 60_000,
+      });
+      const screenshot = await capture().catch(() => null);
+      return {
+        stageToken,
+        file: destination.name,
+        bytes: verified.bytes,
+        mime: saved.mime,
+        digest: verified.digest,
+        ...(screenshot ?? {}),
+        ...(page ? { state: page } : {}),
+      };
+    } catch (error) {
+      transfer.cancel(error);
+      if (stagedPath) { try { unlinkSync(stagedPath); } catch { /* the failed transfer may already have removed it */ } }
+      throw error;
+    }
+  };
+
+  const commitStagedChatGPTImage = async (message) => {
+    const stageToken = typeof message.stageToken === 'string' ? message.stageToken : '';
+    const staged = stagedChatGPTImages.get(stageToken);
+    if (!staged) throw new Error('the staged ChatGPT image is unavailable');
+    stagedChatGPTImages.delete(stageToken);
+    if (Date.now() > staged.expiresAt) {
+      try { unlinkSync(staged.stagedPath); } catch { /* expired file may already be gone */ }
+      throw new Error('the staged ChatGPT image expired; inspect the page and start again');
+    }
+    if (!win || win.isDestroyed() || win.webContents.getURL() !== staged.pageUrl || !isChatGPTPageUrl(staged.pageUrl)) {
+      try { unlinkSync(staged.stagedPath); } catch { /* a staged image may already be gone */ }
+      throw new Error('the ChatGPT page changed after the image approval');
+    }
+    if (message.file !== staged.file || message.bytes !== staged.bytes || message.digest !== staged.digest
+      || message.mime !== staged.mime || message.snapshotId !== staged.snapshotId) {
+      try { unlinkSync(staged.stagedPath); } catch { /* a staged image may already be gone */ }
+      throw new Error('the staged image does not match the approved file');
+    }
+    try {
+      await ensureAgent();
+      if (await agentCall('snapshot') !== staged.snapshotId) throw new Error('the ChatGPT page changed after the image approval');
+      const current = verifyGeneratedImage(staged.stagedPath, staged.mime);
+      if (current.bytes !== staged.bytes || current.digest !== staged.digest) throw new Error('the staged image changed after approval');
+    } catch (error) {
+      try { unlinkSync(staged.stagedPath); } catch { /* a staged image may already be gone */ }
+      throw error;
+    }
+    let copied = false;
+    try {
+      copyFileSync(staged.stagedPath, staged.destinationPath, constants.COPYFILE_EXCL);
+      copied = true;
+      const saved = verifyGeneratedImage(staged.destinationPath, staged.mime);
+      if (saved.bytes !== staged.bytes || saved.digest !== staged.digest) throw new Error('the saved image does not match the approved file');
+      unlinkSync(staged.stagedPath);
+      return { file: staged.file, bytes: saved.bytes, mime: staged.mime, digest: saved.digest };
+    } catch (error) {
+      if (copied) { try { unlinkSync(staged.destinationPath); } catch { /* remove only the file copied above */ } }
+      try { unlinkSync(staged.stagedPath); } catch { /* a staged image may already be gone */ }
+      throw error;
+    }
+  };
+
+  const discardStagedChatGPTImage = (message) => {
+    const stageToken = typeof message.stageToken === 'string' ? message.stageToken : '';
+    const staged = stagedChatGPTImages.get(stageToken);
+    if (!staged) return { discarded: false };
+    stagedChatGPTImages.delete(stageToken);
+    try { unlinkSync(staged.stagedPath); } catch { /* staged file may already be gone */ }
+    return { discarded: true };
+  };
+
+  const saveWebImageDirect = async (provider, message) => {
+    const checkUrl = provider === 'gemini' ? isGeminiPageUrl : isChatGPTPageUrl;
+    const checkDownloadUrl = provider === 'gemini' ? isGeminiImageDownloadUrl : isChatGPTImageDownloadUrl;
+    const checkTarget = provider === 'gemini' ? 'geminiImageSaveTarget' : 'chatGPTImageSaveTarget';
+    if (!win || !checkUrl(win.webContents.getURL())) throw new Error(`the current page is not ${provider}`);
+    const dir = mediaDir();
+    if (typeof dir !== 'string' || !dir.trim()) throw new Error('the media directory is unavailable');
+    const taskSlug = typeof message.taskSlug === 'string' && message.taskSlug.trim() ? sanitizeSegment(message.taskSlug, '') : activeImageTaskSlug;
+    if (taskSlug) activeImageTaskSlug = taskSlug;
+    await ensureAgent();
+    // Primary path: extract the latest generated image from the active conversation turn via page-context fetch
+    // or authenticated Electron session.fetch (with provider Referer & allowlist check).
+    try {
+      const extracted = await agentCall('extractLatestGeneratedImage', [provider]);
+      let bytesBuf = null;
+      let mime = typeof extracted?.mime === 'string' && extracted.mime.startsWith('image/') ? extracted.mime : 'image/png';
+      if (extracted?.base64) {
+        bytesBuf = Buffer.from(extracted.base64, 'base64');
+      } else if (typeof extracted?.url === 'string' && /^https?:\/\//i.test(extracted.url) && checkDownloadUrl(extracted.url)) {
+        const referer = provider === 'gemini' ? 'https://gemini.google.com/' : 'https://chatgpt.com/';
+        const res = await win.webContents.session.fetch(extracted.url, {
+          credentials: 'include',
+          headers: { referer, accept: 'image/avif,image/webp,image/png,image/jpeg,*/*' },
+          signal: AbortSignal.timeout(20_000),
+        });
+        if (res.ok) {
+          const ct = String(res.headers.get('content-type') || '').toLowerCase().split(';')[0].trim();
+          if (ct.startsWith('image/')) mime = ct;
+          bytesBuf = Buffer.from(await res.arrayBuffer());
+        }
+      }
+      if (bytesBuf && bytesBuf.length > 0 && bytesBuf.length <= MAX_IMAGE_BYTES) {
+        const detected = imageFormat(bytesBuf);
+        if (detected) {
+          mime = detected === 'jpeg' ? 'image/jpeg' : `image/${detected}`;
+          const target = generatedImagePath(dir, mime, {
+            provider,
+            taskSlug,
+            versionName: typeof message.versionName === 'string' ? message.versionName : '',
+            final: message.final === true,
+          });
+          writeFileSync(target.file, bytesBuf);
+          try {
+            const verified = verifyGeneratedImage(target.file, mime);
+            recordThreadUrlForActiveTask(provider, win.webContents.getURL(), taskSlug);
+            const page = await settle().catch(() => null);
+            const screenshot = await capture().catch(() => null);
+            return { file: target.name, path: target.file, bytes: verified.bytes, mime: target.mime, digest: verified.digest, ...(screenshot ?? {}), ...(page ? { state: page } : {}) };
+          } catch {
+            try { unlinkSync(target.file); } catch { /* ignore */ }
+          }
+        }
+      }
+    } catch { /* fall back to clicking the page download control */ }
+
+    const index = Number.isInteger(message.index) && message.index >= 0 ? message.index : null;
+    const validIndexedSave = index !== null && await agentCall(checkTarget, [index, message.snapshotId]).catch(() => false);
+    if (!validIndexedSave && provider !== 'gemini') {
+      if (index === null) throw new Error(`no generated ${provider} image found yet; wait for generation to finish and read the page again`);
+      throw new Error(`the selected control is not a visible ${provider} image save button`);
+    }
+    const transfer = waitForImageDownload(dir, {
+      provider,
+      taskSlug,
+      versionName: typeof message.versionName === 'string' ? message.versionName : '',
+      final: message.final === true,
+      timeoutMs: 25_000,
+    });
+    try {
+      await agentCall('setAgentAction', [true]);
+      try {
+        if (validIndexedSave) {
+          const answer = await agentCall('click', [index, message.snapshotId]);
+          if (answer?.success === false) throw new Error(answer.message || 'the image save button could not be clicked');
+        } else {
+          // Gemini fallback: hover the latest generated image to reveal its overlay download button, then click it.
+          let loc = await agentCall('findLatestGeminiDownloadButton').catch(() => null);
+          if (loc?.imgPt && Number.isFinite(loc.imgPt.x) && Number.isFinite(loc.imgPt.y)) {
+            win.webContents.sendInputEvent({ type: 'mouseMove', x: loc.imgPt.x, y: loc.imgPt.y });
+            await sleep(300);
+            loc = await agentCall('findLatestGeminiDownloadButton').catch(() => loc);
+          }
+          if (loc?.buttonPt && Number.isFinite(loc.buttonPt.x) && Number.isFinite(loc.buttonPt.y)) {
+            win.webContents.sendInputEvent({ type: 'mouseMove', x: loc.buttonPt.x, y: loc.buttonPt.y });
+            win.webContents.sendInputEvent({ type: 'mouseDown', x: loc.buttonPt.x, y: loc.buttonPt.y, button: 'left', clickCount: 1 });
+            win.webContents.sendInputEvent({ type: 'mouseUp', x: loc.buttonPt.x, y: loc.buttonPt.y, button: 'left', clickCount: 1 });
+          } else {
+            const clicked = await agentCall('clickLatestGeminiDownloadButton').catch(() => false);
+            if (!clicked) throw new Error('no generated gemini image or download button found yet; wait for generation to finish and read the page again');
+          }
+        }
+      } finally {
+        await agentCall('setAgentAction', [false]).catch(() => undefined);
+      }
+      const saved = await transfer.promise;
+      recordThreadUrlForActiveTask(provider, win.webContents.getURL(), taskSlug);
+      const page = await settle().catch(() => null);
+      const screenshot = await capture().catch(() => null);
+      return { file: saved.file, path: saved.path, bytes: saved.bytes, mime: saved.mime, digest: saved.digest, ...(screenshot ?? {}), ...(page ? { state: page } : {}) };
+    } catch (error) {
+      transfer.cancel(error);
+      throw error;
+    }
+  };
+
+  const generateGeminiImage = async (message) => {
+    if (!win || !isGeminiPageUrl(win.webContents.getURL())) throw new Error('open gemini.google.com in this browser first');
+    const prompt = typeof message.prompt === 'string' ? message.prompt.trim() : '';
+    if (!prompt || prompt.length > 2000) throw new Error('prompt must be 1 to 2000 characters');
+    const taskId = message.taskId;
+    const promptDigest = message.promptDigest;
+    if (!validChatGPTImageTaskId(taskId) || typeof promptDigest !== 'string' || !/^[a-f0-9]{64}$/.test(promptDigest)) {
+      throw new Error('the image task identity is invalid');
+    }
+    await ensureAgent();
+    const initialUrl = win.webContents.getURL();
+    const initialOrigin = new URL(initialUrl).origin;
+    const initialDocumentGeneration = documentGeneration;
+    const target = await agentCall('geminiComposer');
+    if (!target?.ok) throw new Error(target?.reason || 'the Gemini prompt box could not be identified');
+    const prep = await agentCall('prepareGeminiInput');
+    if (!prep || prep === false) throw new Error('the Gemini prompt box could not be focused');
+    const taskStart = await agentCall('geminiImageTaskStart', [taskId]);
+    if (!taskStart?.ok) throw new Error(taskStart?.reason || 'the Gemini conversation could not be bound to this image task');
+    const singleLine = prompt.replace(/\s*\n+\s*/g, ' ').trim();
+    const fullPrompt = message.mode === 'edit' ? singleLine : `请生成一张图片：${singleLine}`;
+    await agentCall('setAgentAction', [true]);
+    try {
+      if (prep && Number.isFinite(prep.x) && Number.isFinite(prep.y)) {
+        win.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(prep.x), y: Math.round(prep.y) });
+        win.webContents.sendInputEvent({ type: 'mouseDown', x: Math.round(prep.x), y: Math.round(prep.y), button: 'left', clickCount: 1 });
+        win.webContents.sendInputEvent({ type: 'mouseUp', x: Math.round(prep.x), y: Math.round(prep.y), button: 'left', clickCount: 1 });
+        await sleep(150);
+      }
+      await win.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector('rich-textarea [contenteditable="true"], .ql-editor[contenteditable="true"], [role="textbox"][contenteditable="true"], textarea');
+        if (!el) return;
+        el.focus();
+        if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+          el.value = '';
+        } else {
+          document.execCommand('selectAll', false);
+          document.execCommand('delete', false);
+        }
+      })()`, true).catch(() => undefined);
+      await sleep(100);
+      win.webContents.insertText(fullPrompt);
+      await sleep(220);
+      await agentCall('notifyGeminiInput', [fullPrompt]).catch(() => undefined);
+      let sendPt = null;
+      for (let i = 0; i < 8; i++) {
+        sendPt = await agentCall('geminiSendButtonPoint').catch(() => null);
+        if (sendPt && Number.isFinite(sendPt.x) && Number.isFinite(sendPt.y)) break;
+        await sleep(200);
+      }
+      if (sendPt && Number.isFinite(sendPt.x) && Number.isFinite(sendPt.y)) {
+        win.webContents.sendInputEvent({ type: 'mouseMove', x: sendPt.x, y: sendPt.y });
+        win.webContents.sendInputEvent({ type: 'mouseDown', x: sendPt.x, y: sendPt.y, button: 'left', clickCount: 1 });
+        win.webContents.sendInputEvent({ type: 'mouseUp', x: sendPt.x, y: sendPt.y, button: 'left', clickCount: 1 });
+        await sleep(350);
+      }
+      const clickedSend = await agentCall('clickGeminiSendIfDraftRemains').catch(() => null);
+      if (clickedSend?.reason === 'no-send-button') await press('Enter');
+      await sleep(800);
+    } finally {
+      await agentCall('setAgentAction', [false]).catch(() => undefined);
+    }
+    const outcome = await agentCall('geminiSubmission', [taskId, fullPrompt]);
+    const page = await state().catch(() => null);
+    const confirmed = outcome?.submitted === true && documentGeneration === initialDocumentGeneration
+      && page && new URL(page.url).origin === initialOrigin
+      && Number.isSafeInteger(outcome.userTurnIndex) && outcome.userTurnIndex >= 0;
+    let task = { taskId, promptDigest, status: 'unknown', expectedOutputCount: 1 };
+    if (confirmed) {
+      const userTurnDigest = chatGPTTurnDigest(taskId, outcome.userTurnMarker || '', outcome.userTurnIndex);
+      const evidenceDigest = createHash('sha256').update(JSON.stringify([taskId, userTurnDigest, page.url])).digest('hex');
+      task = { taskId, promptDigest, status: 'prompt_submitted', expectedOutputCount: 1, userTurnDigest, evidenceDigest };
+      geminiImageTasks.set(taskId, {
+        taskId, promptDigest, status: 'prompt_submitted', expectedOutputCount: 1, userTurnDigest,
+        webContentsId: win.webContents.id, documentGeneration, navigationGeneration, pageUrl: page.url,
+        evidenceDigest, imageCount: 0, createdAt: Date.now(), updatedAt: Date.now(),
+      });
+      while (geminiImageTasks.size > CHATGPT_IMAGE_TASK_MAX) geminiImageTasks.delete(geminiImageTasks.keys().next().value);
+      recordThreadUrlForActiveTask('gemini', page.url, message.taskSlug);
+    }
+    const screenshot = confirmed ? await capture().catch(() => null) : null;
+    return { submitted: confirmed, task, state: page, ...(screenshot ?? {}) };
+  };
+
+  const geminiImageTaskStatus = async (message) => {
+    const taskId = message.taskId;
+    const task = geminiImageTasks.get(taskId);
+    if (!task) return { taskId: validChatGPTImageTaskId(taskId) ? taskId : '', status: 'unknown', expectedOutputCount: 1 };
+    if (['image_available', 'failed', 'unknown'].includes(task.status)) return publicChatGPTImageTask(task);
+    if (!win || win.isDestroyed() || win.webContents.id !== task.webContentsId || documentGeneration !== task.documentGeneration) {
+      task.status = 'unknown';
+      task.updatedAt = Date.now();
+      return publicChatGPTImageTask(task);
+    }
+    try {
+      await ensureAgent();
+      const observed = await agentCall('geminiImageTaskStatus', [taskId]);
+      const states = new Set(['prompt_submitted', 'generating', 'image_available', 'unknown', 'failed']);
+      if (!states.has(observed?.status)) throw new Error('invalid gemini task state');
+      task.status = observed.status;
+      task.imageCount = Number.isSafeInteger(observed.imageCount) && observed.imageCount >= 0 ? observed.imageCount : 0;
+      task.evidenceDigest = createHash('sha256').update(JSON.stringify([taskId, task.userTurnDigest, task.status, observed.imageSizes ?? []])).digest('hex');
+      task.updatedAt = Date.now();
+      return { ...publicChatGPTImageTask(task), ...(observed.reason ? { reason: observed.reason } : {}) };
+    } catch {
+      task.status = 'unknown';
+      task.updatedAt = Date.now();
+      return publicChatGPTImageTask(task);
+    }
+  };
+
+  const imageWorkspace = (message) => {
+    const dir = mediaDir();
+    if (typeof dir !== 'string' || !dir.trim()) throw new Error('the media directory is unavailable');
+    const action = typeof message.action === 'string' ? message.action : 'list';
+    const tasksRoot = join(dir, 'tasks');
+    mkdirSync(tasksRoot, { recursive: true });
+    const summarizeTask = (name) => {
+      const tDir = join(tasksRoot, name);
+      const vDir = join(tDir, 'versions');
+      const fDir = join(tDir, 'final');
+      const versions = existsSync(vDir) ? readdirSync(vDir).filter((f) => !f.startsWith('.')).map((f) => `tasks/${name}/versions/${f}`) : [];
+      const final = existsSync(fDir) ? readdirSync(fDir).filter((f) => !f.startsWith('.')).map((f) => `tasks/${name}/final/${f}`) : [];
+      const state = readTaskState(dir, name);
+      return { taskSlug: name, versions, final, state };
+    };
+    const buildResumeHint = ({ versions, final, state }) => {
+      const parts = [];
+      if (final.length) parts.push(`已有终稿 ${final.join(', ')}，可直接用于上传或展示`);
+      else if (versions.length) parts.push(`已有历史版本 ${versions.join(', ')}，可直接复用或 promote_final，无需重复从零生成`);
+      if (state?.chatgptThreadUrl) parts.push(`ChatGPT 原会话: ${state.chatgptThreadUrl}`);
+      if (state?.geminiThreadUrl) parts.push(`Gemini 原会话: ${state.geminiThreadUrl}`);
+      return parts.length ? `可续接历史资产：${parts.join('；')}。如需改图请直接 browser_open 打开原会话并用 mode="edit"，不要新建重复对话。` : '';
+    };
+    if (action === 'list' && !message.taskSlug) {
+      const tasks = readdirSync(tasksRoot, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+      const details = tasks.map(summarizeTask);
+      return { mediaDir: dir, tasks, details };
+    }
+    const slug = sanitizeSegment(message.taskSlug, '');
+    if (!slug) throw new Error('taskSlug is required');
+    activeImageTaskSlug = slug;
+    const taskDir = join(tasksRoot, slug);
+    const versionsDir = join(taskDir, 'versions');
+    const finalDir = join(taskDir, 'final');
+    mkdirSync(versionsDir, { recursive: true });
+    mkdirSync(finalDir, { recursive: true });
+    if (typeof message.chatgptThreadUrl === 'string' || typeof message.geminiThreadUrl === 'string') {
+      updateTaskState(dir, slug, {
+        ...(typeof message.chatgptThreadUrl === 'string' ? { chatgptThreadUrl: message.chatgptThreadUrl } : {}),
+        ...(typeof message.geminiThreadUrl === 'string' ? { geminiThreadUrl: message.geminiThreadUrl } : {}),
+      });
+    }
+    const currentState = readTaskState(dir, slug);
+    const versionsList = readdirSync(versionsDir).filter((f) => !f.startsWith('.')).map((f) => `tasks/${slug}/versions/${f}`);
+    const finalList = readdirSync(finalDir).filter((f) => !f.startsWith('.')).map((f) => `tasks/${slug}/final/${f}`);
+    const resumeHint = buildResumeHint({ versions: versionsList, final: finalList, state: currentState });
+    if (action === 'init' || action === 'update_brief') {
+      const briefPath = join(taskDir, 'brief.md');
+      const content = typeof message.brief === 'string' ? message.brief.trim() : '';
+      if (content) writeFileSync(briefPath, `${content}\n`, 'utf8');
+      return { taskSlug: slug, taskDir, briefPath: existsSync(briefPath) ? briefPath : null, versions: versionsList, final: finalList, state: currentState, ...(resumeHint ? { resumeHint } : {}) };
+    }
+    if (action === 'promote_final') {
+      const sourceRel = typeof message.sourceFile === 'string' ? message.sourceFile.trim() : '';
+      if (!sourceRel || sourceRel.includes('..')) throw new Error('invalid sourceFile');
+      const sourcePath = sourceRel.startsWith('tasks/') ? join(dir, sourceRel) : join(versionsDir, basename(sourceRel));
+      if (!existsSync(sourcePath)) throw new Error(`source file not found: ${sourceRel}`);
+      const targetName = typeof message.finalName === 'string' && message.finalName.trim()
+        ? basename(message.finalName.trim())
+        : basename(sourcePath);
+      const destPath = join(finalDir, targetName);
+      copyFileSync(sourcePath, destPath);
+      const updatedFinal = readdirSync(finalDir).filter((f) => !f.startsWith('.')).map((f) => `tasks/${slug}/final/${f}`);
+      return { taskSlug: slug, promoted: `tasks/${slug}/final/${targetName}`, final: updatedFinal, state: currentState };
+    }
+    return {
+      taskSlug: slug,
+      brief: existsSync(join(taskDir, 'brief.md')) ? readFileSync(join(taskDir, 'brief.md'), 'utf8') : '',
+      versions: versionsList,
+      final: finalList,
+      state: currentState,
+      ...(resumeHint ? { resumeHint } : {}),
+    };
+  };
+
+  const uploadMedia = async (message) => {
+    if (!win || !isDouyinPageUrl(win.webContents.getURL())) throw new Error('open a Douyin upload page first');
+    if (!Number.isInteger(message.fileId) || message.fileId < 0) throw new Error('a current file input id is required');
+    const dir = mediaDir();
+    if (typeof dir !== 'string' || !dir.trim()) throw new Error('the video media directory is unavailable');
+    const files = await resolveUploadFiles(dir, message.files);
+    if (message.skipExpectedCheck !== true) {
+      const expectedFiles = Array.isArray(message.expectedFiles) ? message.expectedFiles : [];
+      if (expectedFiles.length !== files.length || expectedFiles.some((item, index) => !item || item.path !== files[index]?.name
+        || item.bytes !== files[index]?.bytes || item.digest !== files[index]?.digest || item.mime !== files[index]?.mime)) {
+        throw new Error('the selected media changed after approval');
+      }
+    }
+    const targetCompatible = (t) => {
+      if (!t?.ok) return false;
+      if (!t.multiple && files.length > 1) return false;
+      if (files.some((file) => !acceptsUpload(t.accept, file))) return false;
+      return true;
+    };
+    const locateLiveFileInput = async (fileId) => {
+      try {
+        await ensureAgent();
+        const t = await agentCall('fileInputTarget', [fileId]);
+        if (t?.ok && (message.skipExpectedCheck !== true || targetCompatible(t))) return t;
+        if (t?.token) {
+          await win.webContents.executeJavaScript(`document.querySelector('input[type="file"][data-coo-upload-token="${t.token}"]')?.removeAttribute('data-coo-upload-token')`, true).catch(() => undefined);
+        }
+      } catch { /* fall back to direct lightweight DOM query */ }
+      const wantMulti = files.length > 1;
+      const wantImage = files.every((file) => /^image\//i.test(file.mime || ''));
+      for (let waitPass = 0; waitPass < 10; waitPass++) {
+        const token = `coo-upload-${randomUUID()}`;
+        const found = await win.webContents.executeJavaScript(`(() => {
+          const all = Array.from(document.querySelectorAll('input[type="file"]')).filter((el) => el.isConnected && !el.disabled);
+          if (!all.length) return null;
+          const wantImage = ${JSON.stringify(wantImage)};
+          const wantMulti = ${JSON.stringify(wantMulti)};
+          const pick = (wantImage && wantMulti && all.find((el) => /image/i.test(el.accept) && el.multiple))
+            || (wantImage && all.find((el) => /image/i.test(el.accept)))
+            || (wantMulti && all.find((el) => el.multiple))
+            || all[0];
+          if (!pick) return null;
+          pick.setAttribute('data-coo-upload-token', ${JSON.stringify(token)});
+          return { ok: true, token: ${JSON.stringify(token)}, accept: pick.accept || '', multiple: !!pick.multiple, snapshotId: 'live-dom', id: ${Number(fileId) || 0} };
+        })()`, true).catch(() => null);
+        if (found?.ok) return found;
+        await sleep(250);
+      }
+      return { ok: false, reason: 'no enabled file input found on the Douyin upload page' };
+    };
+    const target = await locateLiveFileInput(message.fileId);
+    if (!target?.ok) throw new Error(target?.reason || 'the file input changed; read the page again');
+    const resolvedId = typeof target.id === 'number' ? target.id : message.fileId;
+    const beforeUrl = win.webContents.getURL();
+    try {
+      if (!target.multiple && files.length > 1) throw new Error('the page input accepts one file at a time');
+      const refused = files.find((file) => !acceptsUpload(target.accept, file));
+      if (refused) throw new Error(`${refused.name} does not match the page input accept value`);
+      if (!isDouyinPageUrl(beforeUrl)) throw new Error('the upload page changed; read it again');
+      await setFileInputFiles(win.webContents.debugger, target.token, files.map((file) => file.path));
+    } finally {
+      await win.webContents.executeJavaScript(`document.querySelector('input[type="file"][data-coo-upload-token="${target.token}"]')?.removeAttribute('data-coo-upload-token')`, true).catch(() => undefined);
+    }
+    const expected = files.map((file) => file.visibleName);
+    const expectedCount = files.length;
+    let confirmed = false;
+    let observedCount = 0;
+    let navigatedToImageEditorAt = 0;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const currentUrl = win.webContents.getURL();
+      const jumpedToEditor = /\/creator-micro\/content\/(?:publish-media\/image-text|post\/image)|\/post\/image|\/publish-media|\/publish/i.test(currentUrl);
+      if (jumpedToEditor && !navigatedToImageEditorAt) navigatedToImageEditorAt = Date.now();
+
+      if (!jumpedToEditor && attempt < 6) {
+        const selection = await agentCall('fileInputSelection', [resolvedId]).catch(() => null);
+        if (Array.isArray(selection?.names) && selection.names.join('\n') === expected.join('\n')) {
+          confirmed = true;
+          observedCount = expectedCount;
+          break;
+        }
+      }
+
+      if (attempt >= 1 || jumpedToEditor) {
+        const editorState = await win.webContents.executeJavaScript(`(() => {
+          const txt = (document.body?.innerText || '').replace(/\\s+/g, ' ');
+          if (/上传失败|上传出错|格式不支持|文件过大/.test(txt)) return { failed: true, count: 0, inEditor: false, hasFormInputs: false };
+          const imgs = Array.from(document.querySelectorAll('img')).filter((img) => {
+            if (!img.complete || img.naturalWidth < 40 || img.naturalHeight < 40) return false;
+            const r = img.getBoundingClientRect();
+            const src = img.currentSrc || img.src || '';
+            if (r.width < 36 || r.height < 36) return false;
+            if (/avatar|logo|icon/i.test((img.alt || '') + ' ' + (img.className || ''))) return false;
+            return /^blob:|^data:image\\//i.test(src) || /tos-cn|douyinpic|byteimg|pstatp|douyin\\.com|creator-media|ibytedtos|bytedance|zijieapi/i.test(src);
+          });
+          let count = imgs.length;
+          if (count < ${expectedCount}) {
+            const bgCards = Array.from(document.querySelectorAll('[class*="image-item"], [class*="pic-item"], [class*="img-card"], [class*="preview-item"], [style*="background-image"]'))
+              .filter((el) => {
+                const r = el.getBoundingClientRect();
+                const bg = getComputedStyle(el).backgroundImage || '';
+                return r.width >= 36 && r.height >= 36 && /url\\(/i.test(bg) && !/avatar|logo|icon/i.test(el.className || '');
+              });
+            count = Math.max(count, bgCards.length);
+          }
+          const hasFormInputs = Boolean(document.querySelector('input[placeholder*="标题"], .zone-container[contenteditable="true"], [contenteditable="true"]'));
+          const inEditor = /\\/post\\/image|\\/publish-media|\\/publish/.test(location.pathname) || /添加作品描述|作品标题|编辑图片|替换图片|重新上传/.test(txt);
+          return { failed: false, count, inEditor, hasFormInputs };
+        })()`, true).catch(() => null);
+        if (editorState?.failed) {
+          throw new Error('the Douyin page reported an upload failure; inspect the page before retrying');
+        }
+        if (editorState) observedCount = Math.max(observedCount, editorState.count || 0);
+        const navigated = currentUrl !== beforeUrl && isDouyinPageUrl(currentUrl);
+        if (editorState && editorState.count >= expectedCount && (navigated || editorState.inEditor || jumpedToEditor)) {
+          confirmed = true;
+          break;
+        }
+        if (jumpedToEditor && navigatedToImageEditorAt && Date.now() - navigatedToImageEditorAt >= 1200
+          && editorState && (editorState.count >= 1 || editorState.hasFormInputs || editorState.inEditor)) {
+          confirmed = true;
+          observedCount = Math.max(observedCount, expectedCount);
+          break;
+        }
+      }
+      await sleep(250);
+    }
+    if (!confirmed) throw new Error('the page did not confirm the selected files; read the page before deciding whether to try again');
+    const currentUrl = win.webContents.getURL();
+    const page = message.skipExpectedCheck === true ? null : await settle().catch(() => null);
+    return {
+      status: 'OK',
+      files: files.map((file) => file.name),
+      url: currentUrl,
+      imageCount: observedCount || expectedCount,
+      navigated: currentUrl !== beforeUrl,
+      ...(page ? { state: page } : {}),
+    };
+  };
+
+  const inspectUpload = async (message) => {
+    if (!win || !isDouyinPageUrl(win.webContents.getURL())) throw new Error('open a Douyin upload page first');
+    if (!Number.isInteger(message.fileId) || message.fileId < 0) throw new Error('a current file input id is required');
+    const dir = mediaDir();
+    if (typeof dir !== 'string' || !dir.trim()) throw new Error('the video media directory is unavailable');
+    const files = await resolveUploadFiles(dir, message.files);
+    let target = null;
+    try {
+      await ensureAgent();
+      target = await agentCall('fileInputTarget', [message.fileId]);
+    } catch { /* fall back to direct lightweight DOM query */ }
+    if (!target?.ok) {
+      target = await win.webContents.executeJavaScript(`(() => {
+        const all = Array.from(document.querySelectorAll('input[type="file"]')).filter((el) => el.isConnected && !el.disabled);
+        const pick = all.find((el) => /image/i.test(el.accept) && el.multiple) || all.find((el) => /image/i.test(el.accept)) || all[0] || null;
+        if (!pick) return null;
+        return { ok: true, token: '', accept: pick.accept || '', multiple: !!pick.multiple, snapshotId: 'live-dom', id: ${Number(message.fileId) || 0} };
+      })()`, true).catch(() => null);
+    }
+    if (!target?.ok) throw new Error(target?.reason || 'no enabled file input found on the Douyin upload page');
+    if (target.token) {
+      await win.webContents.executeJavaScript(`document.querySelector('input[type="file"][data-coo-upload-token="${target.token}"]')?.removeAttribute('data-coo-upload-token')`, true).catch(() => undefined);
+    }
+    if (!target.multiple && files.length > 1) throw new Error('the page input accepts one file at a time');
+    const refused = files.find((file) => !acceptsUpload(target.accept, file));
+    if (refused) throw new Error(`${refused.name} does not match the page input accept value`);
+    if (!isDouyinPageUrl(win.webContents.getURL())) throw new Error('the upload page changed; read it again');
+    return {
+      url: win.webContents.getURL(),
+      snapshotId: target.snapshotId || 'live-dom',
+      fileId: typeof target.id === 'number' ? target.id : message.fileId,
+      accept: target.accept,
+      multiple: target.multiple,
+      account: null,
+      files: files.map((file) => ({ path: file.name, bytes: file.bytes, digest: file.digest, mime: file.mime })),
+    };
+  };
+
+  const inspectUploadProgress = async (message) => {
+    if (!win || !isDouyinPageUrl(win.webContents.getURL())) throw new Error('open a Douyin Creator Center upload page first');
+    if (!Number.isInteger(message.fileId) || message.fileId < 0) throw new Error('a current file input id is required');
+    await ensureAgent();
+    return agentCall('uploadObservation', [message.fileId]);
   };
 
   const result = async (message) => {
     const op = message.op;
+    if (!['state', 'screenshot', 'inspect-screenshot-point', 'click-screenshot-point', 'element', 'active', 'read', 'find', 'resolveLocator'].includes(op)) {
+      activeVisualCapture = null;
+    }
     if (op === 'open') return open(message);
+    if (op === 'chatgpt-composer') {
+      if (!win || !isChatGPTPageUrl(win.webContents.getURL())) throw new Error('open chatgpt.com in this browser first');
+      await ensureAgent();
+      const target = await agentCall('chatGPTComposer');
+      if (!target?.ok || (typeof target.id !== 'number' && typeof target.id !== 'string') || typeof target.snapshotId !== 'string') {
+        throw new Error(target?.reason || 'the ChatGPT message box could not be identified');
+      }
+      return { id: target.id, snapshotId: target.snapshotId };
+    }
+    if (op === 'chatgpt-generate-image') return generateChatGPTImage(message);
+    if (op === 'chatgpt-image-status') return chatGPTImageTaskStatus(message);
+    if (op === 'stage-chatgpt-image') return stageChatGPTImage(message);
+    if (op === 'commit-staged-chatgpt-image') return commitStagedChatGPTImage(message);
+    if (op === 'discard-staged-chatgpt-image') return discardStagedChatGPTImage(message);
+    if (op === 'save-chatgpt-image-direct') return saveWebImageDirect('chatgpt', message);
+    if (op === 'gemini-composer') {
+      if (!win || !isGeminiPageUrl(win.webContents.getURL())) throw new Error('open gemini.google.com in this browser first');
+      await ensureAgent();
+      const target = await agentCall('geminiComposer');
+      if (!target?.ok) throw new Error(target?.reason || 'the Gemini prompt box could not be identified');
+      return { id: target.id, snapshotId: target.snapshotId };
+    }
+    if (op === 'gemini-generate-image') return generateGeminiImage(message);
+    if (op === 'gemini-image-status') return geminiImageTaskStatus(message);
+    if (op === 'save-gemini-image-direct') return saveWebImageDirect('gemini', message);
+    if (op === 'image-workspace') return imageWorkspace(message);
+    if (op === 'download-media') return downloadMedia(message);
+    if (op === 'inspect-upload') return inspectUpload(message);
+    if (op === 'inspect-upload-progress') return inspectUploadProgress(message);
+    if (op === 'upload-media') return uploadMedia(message);
+    if (op.startsWith('douyin-')) {
+      const douyinOps = createDouyinOpsHandlers({
+        getWin: () => win,
+        openUrl: (url, opts) => open({ url, muted, ...(opts || {}) }),
+        uploadMedia,
+        settle,
+        capture,
+      });
+      if (op === 'douyin-check-account') return douyinOps.checkAccount(message);
+      if (op === 'douyin-fill-post') return douyinOps.fillPost(message);
+      if (op === 'douyin-select-music') return douyinOps.selectMusic(message);
+      if (op === 'douyin-publish-post') return douyinOps.publishPost(message);
+      if (op === 'douyin-check-posts') return douyinOps.checkPosts(message);
+      if (op === 'douyin-prepare-post') return douyinOps.preparePost(message);
+      if (op === 'douyin-fetch-comments') return douyinOps.fetchComments(message);
+      if (op === 'douyin-reply-comment') return douyinOps.replyComment(message);
+    }
     if (op === 'close') { closeWindow(); return { closed: true }; }
     if (op === 'state') return { open: !!win && !win.isDestroyed(), url: win?.webContents.getURL() ?? '', title: win?.getTitle() ?? '' };
     if (!win || win.isDestroyed()) throw new Error('browser window is closed');
@@ -327,13 +2480,22 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
         restoreMute();
       }
     }
-    if (op === 'read') { await ensureAgent(); return state(); }
+    if (op === 'read') { return readStateWithCdpFallback(); }
+    const targetsControl = op === 'element' || op === 'resolveLocator' || op === 'input' || op === 'hover'
+      || ((op === 'click' || op === 'scroll' || op === 'press') && message.index != null);
+    const requestedSnapshotId = message.snapshotId ?? message.expectedSnapshotId;
+    if (requestedSnapshotId?.startsWith?.('cdp-') || (lastReadWasCdp && targetsControl)) {
+      throw new Error('read_only_unactionable: read the current DOM before using a control target');
+    }
     if (op === 'text') { await ensureAgent(); return agentCall('text'); }
     if (op === 'element') { await ensureAgent(); return agentCall('element', [message.index]); }
+    if (op === 'resolveLocator') { await ensureAgent(); return agentCall('resolveLocator', [message.locator, message.expectedSnapshotId]); }
+    if (op === 'active') { await ensureAgent(); return agentCall('active'); }
     if (op === 'share') {
       await ensureAgent();
       const point = await agentCall('shareCenter');
-      if (!point || typeof point.x !== 'number' || typeof point.y !== 'number') throw new Error('no share control on this page');
+      if (!point?.ok) throw new Error(point?.reason === 'ambiguous' ? 'ambiguous share target' : 'no share control on this page');
+      if (await agentCall('snapshot') !== point.snapshotId) throw new Error('the page changed; read it again');
       const x = Math.round(point.x), y = Math.round(point.y);
       // The panel renders a moment after the pointer arrives; polling avoids clicking a panel that is still opening.
       const opened = async () => {
@@ -344,12 +2506,17 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
         return false;
       };
       // Douyin and Bilibili open their share panel on hover; a click would close it again on Douyin.
-      win.webContents.sendInputEvent({ type: 'mouseMove', x, y });
-      if (!await opened()) {
-        // Other sites may open the same panel on a click; Douyin never reaches this branch because its hover opened it.
-        win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
-        win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
-        if (!await opened()) throw new Error('the share panel did not open');
+      await agentCall('setAgentAction', [true]);
+      try {
+        win.webContents.sendInputEvent({ type: 'mouseMove', x, y });
+        if (!await opened()) {
+          // Other sites may open the same panel on a click; Douyin opens it on hover.
+          win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+          win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+          if (!await opened()) throw new Error('the share panel did not open');
+        }
+      } finally {
+        await agentCall('setAgentAction', [false]).catch(() => undefined);
       }
       return { answer: { success: true, message: 'share panel opened' }, state: await settle() };
     }
@@ -357,30 +2524,86 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
       await ensureAgent();
       if (typeof message.text === 'string' && message.text.trim()) {
         const point = await agentCall('textCenter', [message.text.trim()]);
-        if (!point || typeof point.x !== 'number' || typeof point.y !== 'number') throw new Error(`no visible element with text ${message.text.trim()}`);
+        if (!point?.ok) throw new Error(point?.reason === 'ambiguous' ? 'ambiguous text target' : point?.reason === 'file' ? 'file chooser target is blocked' : `no visible element with text ${message.text.trim()}`);
+        if (await agentCall('snapshot') !== point.snapshotId) throw new Error('the page changed; read it again');
         const x = Math.round(point.x), y = Math.round(point.y);
-        // Some controls only respond to a real click, so this path moves the pointer and clicks at the element's center.
-        win.webContents.sendInputEvent({ type: 'mouseMove', x, y });
-        await sleep(200);
-        win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
-        win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
-        await sleep(250);
+        await agentCall('setAgentAction', [true]);
+        try {
+          win.webContents.sendInputEvent({ type: 'mouseMove', x, y });
+          await sleep(200);
+          const currentPoint = await agentCall('textCenter', [message.text.trim()]);
+          if (!currentPoint?.ok || currentPoint.snapshotId !== point.snapshotId
+            || Math.abs(currentPoint.x - point.x) > 0.5 || Math.abs(currentPoint.y - point.y) > 0.5) {
+            throw new Error('the target changed or became blocked before the click; read the page again');
+          }
+          win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+          win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+          await sleep(250);
+        } finally {
+          await agentCall('setAgentAction', [false]).catch(() => undefined);
+        }
         return { answer: { success: true, message: `clicked ${message.text.trim()}` }, state: await settle() };
       }
-      const answer = await agentCall('click', [message.index]);
-      return { answer, state: await settle() };
+      await agentCall('setAgentAction', [true]);
+      try {
+        let answer = await agentCall('click', [message.index, message.snapshotId]);
+        if (answer?.success === false && answer.message === 'target is not actionable: dom-changed') {
+          await sleep(120);
+          answer = await agentCall('click', [message.index, message.snapshotId]);
+          if (answer?.success === false && answer.message === 'target is not actionable: dom-changed') {
+            const point = await agentCall('center', [message.index, message.snapshotId]);
+            if (point && typeof point.x === 'number' && typeof point.y === 'number') {
+              const x = Math.round(point.x), y = Math.round(point.y);
+              win.webContents.sendInputEvent({ type: 'mouseMove', x, y });
+              await sleep(60);
+              win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+              win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+              await sleep(200);
+              answer = { success: true, message: `clicked element ${message.index} (after dom-changed)` };
+            }
+          }
+        }
+        if (answer?.success === false) throw new Error(answer.message || 'click refused');
+        return { answer, state: await settle() };
+      } finally {
+        await agentCall('setAgentAction', [false]).catch(() => undefined);
+      }
     }
     if (op === 'input') {
       await ensureAgent();
-      if (!await agentCall('prepareInput', [message.index])) throw new Error(`element ${message.index} is not a text box`);
+      if (!await agentCall('prepareInput', [message.index, message.snapshotId])) throw new Error(`element ${message.index} is not a text box or the page changed`);
       // Editors keep their own state; only real text insertion updates it.
-      win.webContents.insertText(String(message.text ?? ''));
-      await sleep(150);
+      await agentCall('setAgentAction', [true]);
+      try {
+        const isContentEditable = await win.webContents.executeJavaScript('Boolean(document.activeElement && document.activeElement.isContentEditable)', true).catch(() => false);
+        if (isContentEditable) {
+          win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Backspace' });
+          win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' });
+          await sleep(60);
+        }
+        win.webContents.insertText(String(message.text ?? ''));
+        await sleep(150);
+        if (isContentEditable) {
+          await win.webContents.executeJavaScript(`(() => {
+            const el = document.activeElement;
+            if (!el || !el.isContentEditable) return;
+            const sel = window.getSelection();
+            if (!sel) return;
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            range.collapse(false);
+            sel.removeAllRanges();
+            sel.addRange(range);
+          })()`, true).catch(() => undefined);
+        }
+      } finally {
+        await agentCall('setAgentAction', [false]).catch(() => undefined);
+      }
       return { state: await settle() };
     }
     if (op === 'hover') {
       await ensureAgent();
-      const point = await agentCall('center', [message.index]);
+      const point = await agentCall('center', [message.index, message.snapshotId]);
       if (!point || typeof point.x !== 'number' || typeof point.y !== 'number') throw new Error(`no element at index ${message.index}`);
       // A real pointer move is what turns CSS :hover on; the page's synthetic events do not.
       win.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(point.x), y: Math.round(point.y) });
@@ -389,27 +2612,92 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
     }
     if (op === 'scroll') {
       await ensureAgent();
-      const answer = await agentCall('scroll', [{ down: message.down !== false, numPages: Number(message.pages) || 1, ...(Number.isInteger(message.index) ? { index: message.index } : {}) }]);
+      const answer = await agentCall('scroll', [{ down: message.down !== false, numPages: Number(message.pages) || 1, ...(Number.isInteger(message.index) ? { index: message.index } : {}) }, message.snapshotId]);
       return { answer, state: await settle() };
+    }
+    if (op === 'inspect-screenshot-point') {
+      return inspectVisualPoint(message);
+    }
+    if (op === 'click-screenshot-point') {
+      let before;
+      try {
+        before = await inspectVisualPoint(message);
+        if (before.target.token !== message.targetToken) throw new Error('the screenshot target changed before approval');
+      } catch (error) {
+        return { answer: { success: false, message: String(error?.message ?? error) }, state: await state().catch(() => null) };
+      }
+      const capture = before.capture;
+      capture.used = true;
+      let dispatched = false;
+      try {
+        await agentCall('setAgentAction', [true]);
+      } catch (error) {
+        activeVisualCapture = null;
+        return { answer: { success: false, message: String(error?.message ?? error) }, state: await state().catch(() => null) };
+      }
+      try {
+        const x = Math.round(before.cssX), y = Math.round(before.cssY);
+        win.webContents.sendInputEvent({ type: 'mouseMove', x, y });
+        await sleep(120);
+        let current;
+        try { current = await inspectVisualPoint(message, true); }
+        catch (error) {
+          return { answer: { success: false, message: String(error?.message ?? error) }, state: await state().catch(() => null) };
+        }
+        if (current.target.token !== before.target.token
+          || Math.abs(current.cssX - before.cssX) > 0.5 || Math.abs(current.cssY - before.cssY) > 0.5) {
+          return { answer: { success: false, message: 'the target changed after pointer movement; take a new screenshot' }, state: await state().catch(() => null) };
+        }
+        dispatched = true;
+        win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+        win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+        await sleep(250);
+      } catch (error) {
+        if (dispatched) return { answer: { success: true, message: 'click dispatched; page result unavailable' }, state: null };
+        return { answer: { success: false, message: String(error?.message ?? error) }, state: await state().catch(() => null) };
+      } finally {
+        await agentCall('setAgentAction', [false]).catch(() => undefined);
+        if (activeVisualCapture === capture) activeVisualCapture = null;
+      }
+      try { return { answer: { success: true, message: 'screenshot target clicked once' }, state: await settle() }; }
+      catch { return { answer: { success: true, message: 'click dispatched; page result unavailable' }, state: null }; }
     }
     if (op === 'press') {
       await ensureAgent();
-      await press(message.key, message.index);
+      await agentCall('setAgentAction', [true]);
+      try {
+        await press(message.key, message.index, message.snapshotId);
+      } finally {
+        await agentCall('setAgentAction', [false]).catch(() => undefined);
+      }
       return { state: await settle() };
     }
     if (op === 'play') {
       await ensureAgent();
       const answer = await agentCall('play', [message.pause === true]);
       await sleep(200);
-      return { answer, state: await state() };
+      const safeAnswer = answer && typeof answer === 'object' && answer.video && typeof answer.video === 'object'
+        ? { ...answer, video: { ...answer.video, src: '' } }
+        : answer;
+      return { answer: safeAnswer, state: await state() };
     }
     if (op === 'screenshot') {
-      await ensureAgent();
-      return { ...(await capture()), state: await state() };
+      try {
+        return await captureForVisualClick();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/timed out|page script|not ready|no stable screenshot viewport/i.test(msg)) {
+          log.warn('[browser] visual-click screenshot unavailable; falling back to read-only screenshot', { error: msg });
+          return captureReadOnlyFallback(msg);
+        }
+        throw err;
+      }
     }
     if (op === 'back') {
       if (!win.webContents.navigationHistory.canGoBack()) return { back: false, state: await state() };
       injected = false;
+      resetFrameState();
+      activeVisualCapture = null;
       navigating = true;
       win.webContents.navigationHistory.goBack();
       await sleep(1200);
@@ -429,11 +2717,17 @@ function createBrowserHost({ appRoot, icon, log = console, send }) {
         send?.({ type: 'companion:browser-result', id: message.id, ok: false, error: String(error?.message ?? error) });
       }
     },
+    cancel(id) {
+      cancelMediaDownload(id, new Error('the Browser download was interrupted'));
+    },
     close() {
       closeWindow();
+      if (proxyLoginHandler) app.removeListener('login', proxyLoginHandler);
+      proxyLoginHandler = null;
+      void egressProxy?.close();
     },
     get open() { return !!win && !win.isDestroyed(); },
   };
 }
 
-module.exports = { createBrowserHost };
+module.exports = { createBrowserHost, classifyCdpPageState };

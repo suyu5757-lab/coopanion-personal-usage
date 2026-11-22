@@ -82,7 +82,7 @@ async function prompt(id, params) {
       fail(id, 'fake failure');
       return;
     }
-    if (text.includes('WRITE')) {
+    if (text.includes('WRITE') && text.lastIndexOf('WRITE') > text.lastIndexOf('RUN_COMMAND')) {
       const name = /WRITE\s+(\S+)/.exec(text)?.[1] ?? 'hello.txt';
       const path = join(session.cwd, name);
       toolCall(sessionId, path);
@@ -116,6 +116,27 @@ async function prompt(id, params) {
       } catch (error) {
         toolUpdate(sessionId, 'failed', path);
         chunk(sessionId, `Could not write: ${error.message}`);
+      }
+      active.delete(sessionId);
+      respond(id, { stopReason: 'end_turn' });
+      return;
+    }
+    if (text.includes('RUN_COMMAND') && text.lastIndexOf('RUN_COMMAND') > text.lastIndexOf('WRITE')) {
+      const command = /RUN_COMMAND\s+(.+)/.exec(text)?.[1] ?? 'printf hello';
+      const decision = await request('session/request_permission', {
+        sessionId,
+        toolCall: { toolCallId: 'call_cmd', title: command, kind: 'execute', rawInput: { command } },
+        options: [
+          { optionId: 'once', name: 'Allow once', kind: 'allow_once' },
+          { optionId: 'always', name: 'Allow always', kind: 'allow_always' },
+          { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
+        ],
+      });
+      if (decision?.outcome?.outcome === 'selected' && decision.outcome.optionId === 'once') {
+        commandCall(sessionId, command, 'command finished');
+        chunk(sessionId, 'Done');
+      } else {
+        chunk(sessionId, 'Denied');
       }
       active.delete(sessionId);
       respond(id, { stopReason: 'end_turn' });

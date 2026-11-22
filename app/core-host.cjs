@@ -28,6 +28,8 @@ const { join } = require('node:path');
 
 const CRASH_WINDOW_MS = 5 * 60_000;
 const MAX_CRASHES = 5;
+// Core can wait 30 seconds for bot.shutdown() and stats.stop() before it exits.
+const CORE_SHUTDOWN_GRACE_MS = 35_000;
 /**
  * The waits before starting again after a child that exited before it was ready with ERR_MODULE_NOT_FOUND, which is
  * what a start meets while the runtime's files are still being written. These exits do not count toward MAX_CRASHES;
@@ -134,10 +136,14 @@ class CoreHost extends EventEmitter {
         this.emit('update-install');
       } else if (msg?.type === 'companion:releases') {
         this.emit('releases');
+      } else if (msg?.type === 'companion:notify' && typeof msg.body === 'string') {
+        this.emit('notify', { title: typeof msg.title === 'string' ? msg.title : '', body: msg.body });
       } else if (msg?.type === 'companion:browse' && typeof msg.url === 'string') {
         this.emit('browse', msg.url);
       } else if (msg?.type === 'companion:browser' && typeof msg.id === 'number') {
         this.emit('browser', msg);
+      } else if (msg?.type === 'companion:browser-cancel' && typeof msg.id === 'number') {
+        this.emit('browser-cancel', msg.id);
       }
     });
     const exited = (code, signal, startFailed) => {
@@ -204,7 +210,7 @@ class CoreHost extends EventEmitter {
   }
 
   /** Asks for a clean shutdown, then forces termination after `graceMs` and waits up to 5 s for exit. */
-  async stop(graceMs = 12_000) {
+  async stop(graceMs = CORE_SHUTDOWN_GRACE_MS) {
     this.stopping = true;
     const child = this.child;
     if (!child) return;

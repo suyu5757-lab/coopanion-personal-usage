@@ -4,7 +4,7 @@ export const S: Partial<typeof en> = {
   title: 'Computersteuerung',
   enabled: 'Coo diesen Computer benutzen lassen',
   control: 'Maus und Tastatur erlauben',
-  controlHint: 'Wenn aus, kann Coo nur auf den Bildschirm schauen.',
+  controlHint: "Diese Integrationsversion erlaubt Bildschirm- und Fensteransichten. Maus- und Tastatureingaben sind vorübergehend nicht verfügbar.",
   permission: 'Wann du gefragt wirst',
   levels: { 'ask-each-turn': 'Jede Runde', 'ask-before-acting': 'Vor dem Handeln', 'ask-once': 'Einmal', 'never-ask': 'Nie' },
   levelHints: {

@@ -2,8 +2,9 @@
  * Builds what the app runs from source:
  *
  * 1. `build/cortico/`: `vendor/cortico` without the built-in platform Worlds (minecraft, qq, bilibili,
- *    websearch, the WebUI fixture), the llamacpp provider, the other bots, and repository tooling
- *    (`console` stays: core/companion.ts mounts it). Its `src/web/client` is vendor's as it is.
+ *    websearch, the WebUI fixture), the other bots, and repository tooling
+ *    (`console` stays: core/companion.ts mounts it; the llamacpp provider stays: core/companion.ts
+ *    imports it at load). Its `src/web/client` is vendor's as it is.
  *    Cortico's own `buildWeb` builds its WebUI and the panel bundles of the Persona and the
  *    built-in Worlds, which the settings window loads through the manifest; its stylesheet is built
  *    with Tailwind;
@@ -39,7 +40,6 @@ const DROP = new Set([
   'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.json', 'tsconfig.web.json', 'vitest.config.ts', 'start.bat', 'start.sh',
   'AGENTS.md', 'CLAUDE.md', 'CODE_OF_CONDUCT.md', 'CONTRIBUTING.md', 'SECURITY.md', '.env', '.gitignore', '.gitattributes',
   'src/worlds/minecraft', 'src/worlds/qq', 'src/worlds/bilibili', 'src/worlds/websearch', 'src/worlds/webui-fixture',
-  'src/providers/llamacpp',
   'bots/corti-soulmate', 'bots/cortiv',
 ]);
 
@@ -94,6 +94,21 @@ await esbuild.build({
   logLevel: 'warning',
 });
 
+const BROWSER_AGENT_GEMINI_SRC = join(ROOT, 'app', 'browser-agent', 'gemini-bridge.ts');
+if (existsSync(BROWSER_AGENT_GEMINI_SRC)) {
+  await esbuild.build({
+    entryPoints: [BROWSER_AGENT_GEMINI_SRC],
+    outfile: join(ROOT, 'build', 'browser-agent-gemini.js'),
+    bundle: true,
+    format: 'iife',
+    target: 'es2022',
+    platform: 'browser',
+    minify: false,
+    legalComments: 'inline',
+    logLevel: 'warning',
+  });
+}
+
 const PANELS_OUT = join(ROOT, 'build', 'panels', 'coopanion');
 rmSync(PANELS_OUT, { recursive: true, force: true });
 await esbuild.build({
@@ -127,7 +142,7 @@ await esbuild.build({
   jsx: 'automatic',
   define: {
     COOPANION_VERSION: JSON.stringify(version),
-    COOPANION_CHANNEL: JSON.stringify(process.env.COOPANION_CHANNEL === 'steam' ? 'steam' : 'github'),
+    COOPANION_CHANNEL: JSON.stringify(process.env.COOPANION_CHANNEL === 'test' ? 'test' : process.env.COOPANION_CHANNEL === 'acceptance' ? 'acceptance' : process.env.COOPANION_CHANNEL === 'steam' ? 'steam' : 'github'),
     'process.env.NODE_ENV': '"production"',
   },
   logLevel: 'warning',

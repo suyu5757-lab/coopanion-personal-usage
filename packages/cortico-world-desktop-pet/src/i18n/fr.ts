@@ -3,6 +3,7 @@ import type { PetText } from './index.ts';
 
 const fr: Translation<PetText> = {
   defaultUser: 'Partenaire',
+  sessionArchived: "La conversation précédente a été archivée. Une nouvelle conversation a commencé.",
 
   menu: {
     quit: 'Quitter',

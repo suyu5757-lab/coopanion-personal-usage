@@ -25,6 +25,7 @@ import { standardUsage, unknownMeters, type GenerateOptions, type TokenMeters } 
 import type { ModelSpec } from 'cortico/core/types.ts';
 import { requestContext, requestSpec } from 'cortico/providers/transport/native-input.ts';
 import type { CompatMediaOptions } from 'cortico/providers/transport/history.ts';
+import type { EffortMap } from '../vendors.ts';
 
 type MessageParam = Anthropic.Beta.Messages.BetaMessageParam;
 type ContentBlockParam = Anthropic.Beta.Messages.BetaContentBlockParam;
@@ -223,8 +224,10 @@ function strayText(result: ToolResultParam): ContentBlockParam {
 }
 
 /** `thinking` and `output_config.effort` for the profile; thinking off uses the cheapest form the model accepts. */
-function thinkingParams(spec: ModelSpec): { thinking?: Anthropic.Beta.Messages.BetaThinkingConfigParam; effort?: string; betas: string[] } {
-  const effort = spec.reasoningEffort && EFFORTS.has(spec.reasoningEffort) ? spec.reasoningEffort : undefined;
+function thinkingParams(spec: ModelSpec, map?: EffortMap): { thinking?: Anthropic.Beta.Messages.BetaThinkingConfigParam; effort?: string; betas: string[] } {
+  const level = spec.reasoningEffort && EFFORTS.has(spec.reasoningEffort) ? spec.reasoningEffort : undefined;
+  const mapped = level && map ? map[level as keyof EffortMap] : level;
+  const effort = mapped === null ? undefined : mapped ?? level;
   const adaptive = { type: 'adaptive', block_binding: { prefix_mismatch_behavior: 'drop_block' } } as const;
   if (!spec.thinking) {
     if (ALWAYS_THINKS.test(spec.model)) return { thinking: adaptive, effort: 'low', betas: [THINKING_BINDING_BETA] };
@@ -258,9 +261,9 @@ export interface ClaudeBody {
  * breakpoint follows the conversation's last block, so each request reads the prefix the previous
  * one wrote. Sampling parameters are not sent: current models reject non-default values.
  */
-export function claudeRequest(request: Request, options: GenerateOptions, opts: { media?: CompatMediaOptions; keepThinking?: () => boolean } = {}): ClaudeBody {
+export function claudeRequest(request: Request, options: GenerateOptions, opts: { media?: CompatMediaOptions; keepThinking?: () => boolean; effort?: EffortMap } = {}): ClaudeBody {
   const spec = requestSpec(request, options);
-  const { thinking, effort, betas } = thinkingParams(spec);
+  const { thinking, effort, betas } = thinkingParams(spec, opts.effort);
   const { system, messages } = claudeInput(request, options, { ...opts, replayThinking: thinking?.type === 'adaptive' });
   const params: ClaudeBody['params'] = {
     model: spec.model,

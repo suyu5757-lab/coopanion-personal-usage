@@ -36,6 +36,12 @@ export const S: Partial<typeof en> = {
   undoAll: "Alle Änderungen verwerfen",
   undoAllHint: "Stellt den zuletzt gespeicherten Inhalt wieder her. Rückgängig bringt die Änderungen zurück.",
   saveToFile: "Speichern",
+  attestLocal: "Lokale Konfiguration bestätigen",
+  attestTitle: "Aktuelle lokale Konfiguration bestätigen",
+  attestBody: "Speichert Prüfsumme und Zeitpunkt der aktuellen lokalen Persona-Dateien als Bestätigung in den Einstellungen. Daraus wird keine im Gespräch gesagte Aussage, und es wird nicht in das Langzeitgedächtnis geschrieben. Eine spätere Dateiänderung verlangt eine erneute Bestätigung.",
+  attestDone: (n: number) => `${n} lokale Konfigurationsdatei(en) bestätigt.`,
+  attestNone: "Keine lokale Konfiguration zu bestätigen; dies sind die mitgelieferten Versionen.",
+  attestFailed: (msg: string) => `Bestätigung fehlgeschlagen: ${msg}`,
   // index.ts
   title: 'System-Prompt',
   introDesc: "Strg+S speichert Vorlagen; „Jetzt anwenden“ aktualisiert den Prompt des aktuellen Gesprächs. Generierte Abschnitte sind schreibgeschützt.",

@@ -3,6 +3,7 @@ import type { PetText } from './index.ts';
 
 const ko: Translation<PetText> = {
   defaultUser: '짝꿍',
+  sessionArchived: "이전 대화를 보관하고 새 대화를 시작했습니다.",
 
   menu: {
     quit: '종료',

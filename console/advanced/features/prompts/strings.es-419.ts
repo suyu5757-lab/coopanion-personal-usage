@@ -36,6 +36,12 @@ export const S: Partial<typeof en> = {
   undoAll: "Revertir todos los cambios",
   undoAllHint: "Restaura el último contenido guardado. Deshacer permite recuperar los cambios.",
   saveToFile: "Guardar",
+  attestLocal: "Confirmar configuración local",
+  attestTitle: "Confirmar la configuración local actual",
+  attestBody: "Registra el resumen y la hora de los archivos de personalidad locales actuales como una confirmación hecha en Ajustes. No se convierte en algo que dijiste en la conversación ni se escribe en la memoria a largo plazo. Si editas un archivo después, hay que confirmarlo de nuevo.",
+  attestDone: (n: number) => `Se confirmaron ${n} archivo(s) de configuración local.`,
+  attestNone: "No hay configuración local que confirmar; son las versiones integradas.",
+  attestFailed: (msg: string) => `Error al confirmar: ${msg}`,
   // index.ts
   title: 'Prompt del sistema',
   introDesc: "Ctrl+S guarda las plantillas; “Aplicar ahora” actualiza el prompt de la conversación actual. Las secciones generadas son de solo lectura.",

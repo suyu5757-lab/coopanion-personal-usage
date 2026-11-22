@@ -4,11 +4,11 @@
  * same the guide on the desktop uses). Only the provider package's browser-safe files are imported.
  */
 import { get, post } from '../../base/api.ts';
-import { connectChatGPT, connectVendor, testEndpoint, type ConnectResult, type WebUiCall } from 'cortico-provider-coo/src/connect.ts';
+import { connectChatGPT, connectVendor, testEndpoint, type ConnectResult, type VendorConnectOptions, type WebUiCall } from 'cortico-provider-coo/src/connect.ts';
 
-export { connectionVendor, defaultRegion, localized, regionsOf, siteOf, vendorName, vendorsFor, type Region, type Vendor } from 'cortico-provider-coo/src/vendors.ts';
+export { connectionVendor, defaultRegion, localized, regionsOf, siteOf, vendorEntry, vendorName, vendorsFor, type Protocol, type Region, type Vendor } from 'cortico-provider-coo/src/vendors.ts';
 export { VENDOR_ICONS } from 'cortico-provider-coo/src/icons.ts';
-export { connectChatGPT, connectVendor, testEndpoint, type ConnectResult };
+export { connectChatGPT, connectVendor, testEndpoint, type ConnectResult, type VendorConnectOptions };
 
 export interface Status {
   loop?: { paused?: boolean };

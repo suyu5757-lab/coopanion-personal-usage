@@ -37,4 +37,4 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -B -m unittest discover -s personal-voice -p test_adapter.py
+      - run: python -B -m unittest discover -s personal-voice -p 'test_*.py'

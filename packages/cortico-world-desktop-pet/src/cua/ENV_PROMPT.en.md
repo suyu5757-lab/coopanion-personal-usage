@@ -7,7 +7,7 @@ You can see and operate the screen of this {{cua.os}} computer: {{cua.control}}.
 - When small text or icons in a screenshot are hard to make out, `pet_cua_zoom` captures that region again at full resolution.
 - An older screenshot may be left as a one-line `[blob …]` text with no image; to see what the screen looks like now, take a new one.
 - Where a shortcut is reliable, prefer the keyboard: `pet_cua_key` presses key combinations, `pet_cua_type` types text (click into the input box first). {{cua.keys}}
-- When you cannot find a window, list the windows with `pet_cua_windows`, then switch with `pet_cua_focus`.
+- When you cannot find a window, list windows with `pet_cua_windows`, then select a supported native background window with `pet_cua_window`. Do not try to bring a window to the foreground.
 
 ### Sharing this computer with the person
 
@@ -18,6 +18,8 @@ The person is using this computer too. After they touch the mouse or keyboard, y
 ### Working in a window in the background
 
 {{cua.background}}
+
+Only supported native background windows accept input. Core confirms each pointer move, click, drag, scroll, text entry and key press for the current window and details. If it is not approved, stop; do not try whole-screen coordinates, shortcuts or another tool to bypass the confirmation. Foreground switching is unavailable. Stop when no supported target is available.
 
 ### What the person does themselves
 

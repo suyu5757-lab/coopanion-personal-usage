@@ -1,3 +1,4 @@
+import { GROWTH_POLICY_FILE } from './growth/policies.ts';
 /**
  * The app's Core process: Cormini as the Persona, the console, desktop-pet, coopanion and browser Worlds,
  * Coo Pet Provider (DeepSeek and the other model services Coo offers) and its `chatgpt` module (a ChatGPT
@@ -40,8 +41,9 @@
  * `{ type: 'companion:locked', pid, file }` when another process holds the data directory, and
  * `{ type: 'companion:ports-busy', from, to }` when every console port Cortico tried could not be listened on.
  */
-import { readdirSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { delimiter, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { BotDefinition } from 'cortico/bot.ts';
 import { createBot } from 'cortico/bot.ts';
@@ -54,35 +56,60 @@ import { secretReader } from 'cortico/core/secrets.ts';
 import type { Core } from 'cortico/core/core.ts';
 import type { CoreConfig, UsageRecord } from 'cortico/core/types.ts';
 import { loadDeployment } from 'cortico/deploy.ts';
-import { loadExtensions, readInstalled, type ExtensionSet } from 'cortico/extensions.ts';
+import { extensionsDir, loadExtensions, readInstalled, type ExtensionSet } from 'cortico/extensions.ts';
 import { deploymentRoot, providersRoot, repoRoot } from 'cortico/paths.ts';
 import { providerModules, registerProviderModules } from 'cortico/providers/registry.ts';
+import LLAMACPP_PROVIDER from 'cortico/providers/llamacpp/index.ts';
+import RESPONSES_PROVIDER from 'cortico/providers/openai-responses-compat/index.ts';
 import { withWorlds, type WorldDefinition, type WorldSection } from 'cortico/world.ts';
+import { ActionGate } from './action-gate.ts';
+import { authorizeFileSystemAction, authorizeFileSystemActionEx, type FileSystemActionAuthorizationRequest, type WorkspaceAuthorization } from './action-authorization.ts';
+import { actionReceiptDuplicateKey } from './action-receipts.ts';
+import { TaskContinuationJournal } from './task-continuation.ts';
+import { isWorkspaceAppendPreapproved, parseWorkspaceAppendPaths } from './workspace-append-approval.ts';
+import { WorkspacePermissionStore, type WorkspacePrompt, type WorkspacePromptAnswer } from './workspace-permissions.ts';
 import { InstanceLockedError } from 'cortico/core/instance-lock.ts';
 import { CONSOLE } from 'cortico/worlds/console/definition.ts';
-import { desktopPetDefinition, figurePacks, type DesktopPetWorld } from 'cortico-world-desktop-pet';
+import { desktopPetDefinition, figurePacks, isSupportedCuaTarget, DESKTOP_PET_TRUSTED_TEMPLATE_DIGESTS, type DesktopPetWorld } from 'cortico-world-desktop-pet';
 import CODEX from 'cortico-world-codex';
-import { opencodeDefinition } from 'cortico-world-opencode';
+import { insideRoot, opencodeDefinition, OPENCODE_DEFAULTS, readConfig as readOpencodeConfig, workRoots as opencodeWorkRoots, type OpencodeConfigSection } from 'cortico-world-opencode';
 import COO, { CHATGPT, CHATGPT_PROVIDER, signedIn, usageLimited, vendorOf } from 'cortico-provider-coo';
 import { appWebUiAsset, bundledWebUiAssets } from './bundled-panels.ts';
 import { followPetLook } from './console-theme.ts';
+import { coopanionWorldPromptTrust, withTrustedConsoleVariables, withTrustedWorldVariables } from './world-prompt-trust.ts';
 import { askForKey, guideDone, markDone, runGuide, type GuideDeps } from './guide.ts';
 import { NOTICE_ID, noticeDefinition, type NoticeWorld } from './notice.ts';
 import { browserDefinition, BROWSER_ID } from './browser/definition.ts';
+import { BROWSER_TOOL_DECLS } from './browser/tools.ts';
+const BROWSER_TOOL_NAMES = new Set(BROWSER_TOOL_DECLS.map((decl) => decl.name));
 import { BrowserBridge } from './browser/bridge.ts';
+import { BrowserTaskActionJournal } from './browser/task-actions.ts';
+import { hashContent } from './browser/actions.ts';
 import { readSelfTime, SELF_TIME_DEFAULTS } from './browser/config.ts';
-import { GROWTH_DEFAULTS, readGrowth } from './growth/config.ts';
+import { readResourcePressure, selfTimeScheduleNeedsRearm, selfTimeTickDelayMs } from './resource-pressure.ts';
+import { GROWTH_DEFAULTS, migrateLegacyGrowthConfig, readGrowth } from './growth/config.ts';
+import { isTrustedGrowthToolText } from './growth/review.ts';
+import { isTrustedEndTurnReceipt, sourceMapEndTurnReceipts } from './end-turn-evidence.ts';
+import { isTrustedMemorySearchNotice, isTrustedMemoryWriteReceipt } from './memory/model-text.ts';
+import { videoConfigGroup, videoDefinition, VIDEO_ID } from './video/definition.ts';
+import { animeStudioConfigGroup, animeStudioDefinition, ANIME_STUDIO_ID } from './anime-studio/definition.ts';
+import { ANIME_STUDIO_TOOL_DECLS } from './anime-studio/tools.ts';
+
+const ANIME_STUDIO_TOOL_NAMES = new Set(ANIME_STUDIO_TOOL_DECLS.map((t) => t.name));
 import { coreText } from './i18n/index.ts';
 import { petToolDescriber } from './pet-status.ts';
 import { appLanguage, modelLanguage, replyLanguage } from './language.ts';
 import { CONSOLE_PORT, DEPLOYMENT, DISPLAY_NAME, followLanguage as followPersonaLanguage, personaOf, seed } from './seed.ts';
-import { coopanionPersona, type CoopanionPersona, type MemoryDeps } from './persona.ts';
+import { coopanionPersona, isTrustedPartnerReadText, type CoopanionPersona, type MemoryDeps } from './persona.ts';
+import { COOPANION_TOOL_SCHEMA_DIGESTS } from './tool-schema-roots.ts';
+import { auditVoiceWorlds, isVoiceToolReceipt, prepareVoiceWorlds } from './voice-tool-trust.ts';
 import { HindsightMemory } from './memory/hindsight.ts';
 import { RelationshipJournal } from './memory/journal.ts';
 import { AffinitySync } from './memory/affinity-sync.ts';
 import { loadHindsightConfig, type HindsightFileConfig } from './memory/config.ts';
 import { hindsightConfigGroup } from './memory/config-group.ts';
 import { memoryToolDescribes } from './memory/tools.ts';
+import { PromptProvenance } from './prompt-provenance.ts';
 import { cleanSpeech } from './memory/format.ts';
 import type { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import type { contextStageConfigGroup } from '../vendor/cortico/bots/cormini/persona/config.ts';
@@ -100,6 +127,7 @@ function hasKey(config: CoreConfig): boolean {
 
 /** The app's version, as the Electron main process passes it; `dev` in a development run. */
 const APP_VERSION = process.env.COOPANION_VERSION ?? 'dev';
+const TEST_CHANNEL = process.env.CORTICO_TEST_CHANNEL === '1';
 /** The program directory; crash reports name files relative to it. */
 const APP_ROOT = fileURLToPath(new URL('../', import.meta.url));
 /** How long the pet page gets to show up on a first start before the settings window opens instead. */
@@ -153,13 +181,20 @@ function companionGroup(language: Language): ConfigGroup {
         // Cormini copies `rounds` when the bot is built, so a change applies from the next start
         'rounds.soft': { type: 'integer', title: s.roundsSoft.title, minimum: 1, 'x-suffix': s.roundsSoft.suffix, 'x-hot': false, description: s.roundsSoft.description },
         'rounds.hard': { type: 'integer', title: s.roundsHard.title, minimum: 1, 'x-suffix': s.roundsHard.suffix, 'x-hot': false, description: s.roundsHard.description },
+        'companion.workspaceAppendPath': { type: 'string', title: s.workspaceAppendPath.title, description: s.workspaceAppendPath.description, 'x-hot': true },
         'companion.selfTime.enabled': { type: 'boolean', title: s.selfTime.title, description: s.selfTime.description, 'x-hot': true },
         'companion.selfTime.afterMinutes': { type: 'integer', title: s.selfTime.after, minimum: 1, maximum: 240, 'x-suffix': s.selfTime.minutes, 'x-hot': true, description: s.selfTime.afterDescription },
         'companion.selfTime.sessionMinutes': { type: 'integer', title: s.selfTime.session, minimum: 5, maximum: 60, 'x-suffix': s.selfTime.minutes, 'x-hot': true, description: s.selfTime.sessionDescription },
         'companion.selfTime.sessionUnlimited': { type: 'boolean', title: s.selfTime.unlimited, description: s.selfTime.unlimitedDescription, 'x-hot': true },
+        'companion.selfTime.topics': { type: 'string', title: s.selfTime.topics, description: s.selfTime.topicsDescription, 'x-hot': true },
         'companion.selfTime.sound': { type: 'boolean', title: s.selfTime.sound, description: s.selfTime.soundDescription, 'x-hot': true },
         'companion.selfTime.actions': { type: 'boolean', title: s.selfTime.actions, description: s.selfTime.actionsDescription, 'x-hot': true },
+        'companion.selfTime.imageGeneration': { type: 'boolean', title: s.selfTime.imageGeneration, description: s.selfTime.imageGenerationDescription, 'x-hot': true },
+        'companion.selfTime.imageSaving': { type: 'boolean', title: s.selfTime.imageSaving, description: s.selfTime.imageSavingDescription, 'x-hot': true },
+        'companion.selfTime.mediaUpload': { type: 'boolean', title: s.selfTime.mediaUpload, description: s.selfTime.mediaUploadDescription, 'x-hot': true },
+        'companion.selfTime.mediaDownload': { type: 'boolean', title: s.selfTime.mediaDownload, description: s.selfTime.mediaDownloadDescription, 'x-hot': true },
         'companion.growth.enabled': { type: 'boolean', title: s.growth.title, description: s.growth.description, 'x-hot': true },
+        'companion.growth.autoApply': { type: 'boolean', title: s.growth.autoApply, description: s.growth.autoApplyDescription, 'x-hot': true },
         'companion.growth.everyDays': { type: 'integer', title: s.growth.every, minimum: 1, maximum: 60, 'x-suffix': s.growth.days, description: s.growth.everyDescription, 'x-hot': true },
       },
     },
@@ -433,6 +468,80 @@ export async function main(): Promise<void> {
   let telemetry: Telemetry | null = null;
   let config: CoreConfig | null = null;
   let notice: NoticeWorld | null = null;
+  let personaWorkspaceRoot = '';
+  const opencodeSettings = (): OpencodeConfigSection => {
+    const raw = config
+      ? getByPath(config as unknown as Record<string, unknown>, 'worlds.opencode') as Partial<OpencodeConfigSection> | undefined
+      : undefined;
+    return readOpencodeConfig({ ...OPENCODE_DEFAULTS, ...(raw ?? {}), enabled: raw?.enabled === true });
+  };
+  const allowedOpencodeRoots = () => opencodeWorkRoots(opencodeSettings()).map((root) => {
+    try { return realpathSync(root); } catch { return resolve(root); }
+  });
+  const canonicalRoot = (root: string) => {
+    try { return realpathSync(root); } catch { return resolve(root); }
+  };
+  const home = deploymentRoot();
+  const deployDir = join(home, DEPLOYMENT);
+  const promptProvenance = new PromptProvenance();
+  const videoWorkspaceRoot = join(deployDir, 'video');
+  /** Set once the durable policy store exists; the gate only reads it during a later action. */
+  let workspacePolicyGeneration = (): string => '';
+  const gate = new ActionGate({
+    platformWrites: () => readSelfTime(config).actions,
+    imageGeneration: () => readSelfTime(config).imageGeneration,
+    imageSaving: () => readSelfTime(config).imageSaving,
+    mediaUpload: () => readSelfTime(config).mediaUpload,
+    mediaDownload: () => readSelfTime(config).mediaDownload,
+    computerInput: () => getByPath((config ?? {}) as unknown as Record<string, unknown>, 'worlds.desktop-pet.cua.control') === true,
+    desktopTargetAllowed: isSupportedCuaTarget,
+    fileSystemActionAllowed: (target, action) => {
+      if (target.operation !== action) return false;
+      if (target.source === 'opencode-acp') {
+        return opencodeSettings().enabled && insideRoot(allowedOpencodeRoots(), target.workspaceRoot);
+      }
+      if (target.source === 'persona-workspace') {
+        if (target.instanceId === 'coopanion-growth-policy') return action === 'file-write' && target.path === GROWTH_POLICY_FILE && canonicalRoot(target.workspaceRoot) === canonicalRoot(deployDir);
+        return action === 'file-write' && !!personaWorkspaceRoot
+          && canonicalRoot(target.workspaceRoot) === canonicalRoot(personaWorkspaceRoot);
+      }
+      return action === 'file-write' && canonicalRoot(target.workspaceRoot) === canonicalRoot(videoWorkspaceRoot)
+        && (target.path.startsWith('renders/') || target.path.startsWith('media/prepared/'));
+    },
+    fileSystemPermissionGeneration: () => JSON.stringify({
+      opencode: opencodeSettings().enabled ? allowedOpencodeRoots() : [],
+      personaWorkspaceRoot: personaWorkspaceRoot ? canonicalRoot(personaWorkspaceRoot) : '',
+      videoWorkspaceRoot: canonicalRoot(videoWorkspaceRoot),
+      workspacePolicy: workspacePolicyGeneration(),
+      growthAutoApply: readGrowth(config).autoApply === true,
+    }),
+  });
+  /** Rules, the pending queue and daily quota for Coo's own low-risk workspace writes. */
+  const workspacePermissions = new WorkspacePermissionStore({
+    file: join(deployDir, 'workspace-permissions.json'),
+    timezone: () => config?.timezone ?? 'UTC',
+    onPending: (pending) => {
+      const text = coreText(language()).workspaceAction;
+      process.send?.({ type: 'companion:notify', title: text.pendingTitle, body: text.pendingBody(pending.count, pending.path) });
+    },
+  });
+  workspacePolicyGeneration = () => workspacePermissions.generation();
+  const actionReceiptFile = join(deployDir, 'browser', 'task-actions.json');
+  const taskJournalFile = join(deployDir, 'browser', 'task-journal.json');
+  let actionReceipts: BrowserTaskActionJournal | null = null;
+  let taskJournal: TaskContinuationJournal | null = null;
+  let activeResumeTaskId: string | null = null;
+  try {
+    actionReceipts = new BrowserTaskActionJournal(actionReceiptFile);
+    actionReceipts.recoverInterrupted();
+  } catch { actionReceipts = null; /* Browser and CUA writes fail closed if the ledger is unreadable */ }
+  try {
+    taskJournal = new TaskContinuationJournal(taskJournalFile);
+    taskJournal.recoverAfterRestart();
+    activeResumeTaskId = taskJournal.findResumableTask()?.taskId ?? null;
+  } catch { taskJournal = null; }
+  const desktopInputInstanceId = randomUUID();
+  const cuaTaskGrants = new Map<string, string>();
   const browserBridge = new BrowserBridge();
   /** The introduction is running: the settings it makes are not told as changes. */
   let guiding = false;
@@ -445,14 +554,27 @@ export async function main(): Promise<void> {
   /** Figure pack directories besides the data directory's `figures/`, from the main process (the Steam Workshop's, app/steam.cjs). */
   const packRoots = (process.env.COOPANION_PACK_ROOTS ?? '').split(delimiter).filter(Boolean);
   const DESKTOP_PET = desktopPetDefinition({
+    cuaDriver: {
+      binaryPath: process.env.CORTICO_CUA_DRIVER_BIN ?? '',
+      endpoint: 'unix-socket',
+      socketPath: process.env.CORTICO_CUA_DRIVER_SOCKET ?? '',
+      session: process.env.CORTICO_CUA_DRIVER_SESSION ?? '',
+      lifecycle: 'external-managed',
+    },
     // `displayName` of the live config: a rename reaches the menu header, the chat page and computer use's question without a restart
-    botName: () => config?.displayName ?? DISPLAY_NAME,
+    botName: () => DISPLAY_NAME,
     packRoots: () => packRoots,
     describeTool: petToolDescriber(language),
     // the menu's header lends pause/resume, settings and quit; its dress tile opens the settings window's dress page, the typing bubble's expand button its chat page
     controls: {
       isPaused: () => bus?.isPaused() ?? false,
-      setPaused: (paused) => bus?.setPaused(paused),
+      setPaused: (paused) => {
+        if (paused) {
+          for (const taskId of cuaTaskGrants.keys()) gate.revokeTask(taskId);
+          cuaTaskGrants.clear();
+        }
+        bus?.setPaused(paused);
+      },
       openSettings: () => process.send?.({ type: 'companion:open', path: '' }),
       openChat: () => process.send?.({ type: 'companion:open', path: '#/chat' }),
       openDress: () => process.send?.({ type: 'companion:open', path: '#/dress' }),
@@ -473,14 +595,197 @@ export async function main(): Promise<void> {
       telemetry?.count('cuaAsked');
       if (answer === 'yes') telemetry?.count('cuaGranted');
     },
+    cuaInstanceId: desktopInputInstanceId,
+    revokeCuaTask: (taskId) => {
+      cuaTaskGrants.delete(taskId);
+      gate.revokeTask(taskId);
+      if (activeResumeTaskId === taskId) activeResumeTaskId = null;
+      taskJournal?.cancelTask(taskId, 'revoked by CUA or user');
+    },
+    suspendCuaTask: (taskId) => {
+      cuaTaskGrants.delete(taskId);
+      gate.revokeTask(taskId);
+    },
+    resumeCuaTaskId: () => activeResumeTaskId,
+    allowsOrdinaryCuaInput: ({ tool, target, expectedChange }) =>
+      !bus?.isPaused() && gate.allowsOrdinaryDesktopStep(tool, { target, expectedChange, risk: 'REVERSIBLE_LOCAL' }),
+    authorizeCuaInput: async (request) => {
+      const receipts = actionReceipts;
+      if (!receipts || bus?.isPaused()) return null;
+      const ordinary = gate.allowsOrdinaryDesktopStep(request.tool, {
+        target: request.target,
+        expectedChange: request.expectedChange,
+        risk: request.risk ?? 'EXTERNAL_MUTATION',
+      });
+      const risk = ordinary ? 'REVERSIBLE_LOCAL' : request.risk ?? 'EXTERNAL_MUTATION';
+      const payloadDigest = hashContent(request.taskText);
+      const duplicateKey = actionReceiptDuplicateKey('computer-input', request.target, payloadDigest, request.expectedChange);
+      const journalTask = taskJournal?.ensureTask({
+        taskId: request.taskId,
+        objective: `${request.target.bundleId}:${request.tool}`,
+        scope: 'desktop-ordinary-cua',
+        allowedImpact: ['computer-input'],
+      });
+      const taskEpoch = journalTask?.generation ?? 1;
+      let receipt;
+      try {
+        receipt = receipts.begin({
+          taskId: request.taskId,
+          intent: 'computer-input',
+          action: request.tool,
+          risk,
+          target: request.target,
+          payloadDigest,
+          files: [],
+          duplicateKey,
+        });
+        receipts.awaitingApproval(receipt.id);
+      } catch {
+        return null;
+      }
+      const matchedPlanned = taskJournal?.findPlannedStep(request.taskId, request.tool, request.target.bundleId) ?? null;
+      const journalStepId = matchedPlanned?.stepId ?? receipt.id;
+      if (!matchedPlanned) {
+        taskJournal?.planStep(request.taskId, {
+          stepId: journalStepId,
+          intent: 'computer-input',
+          tool: request.tool,
+          target: { surface: 'desktop', bundleId: request.target.bundleId, snapshotRef: request.target.snapshotId },
+          payloadDigest,
+        });
+      }
+      let authorization;
+      try {
+        if (ordinary) {
+          const ruleId = 'desktop-ordinary-background';
+          authorization = await gate.requestDesktopStep({
+            taskId: receipt.id,
+            taskText: request.tool,
+            expectedChange: request.expectedChange,
+            risk,
+            target: request.target,
+            expiresInMs: 30_000,
+            maxSteps: 1,
+            policyRuleId: ruleId,
+          }, async () => ({ approved: !bus?.isPaused(), channel: 'durable-rule', ruleId }));
+        } else if (request.reuseTaskGrant) {
+          const grantId = cuaTaskGrants.get(request.taskId);
+          authorization = grantId ? gate.authorizeDesktopTaskStep(grantId, {
+            target: request.target,
+            expectedChange: request.expectedChange,
+            risk,
+          }) : null;
+          if (!authorization) cuaTaskGrants.delete(request.taskId);
+        } else if (request.maxSteps > 1 || request.unbounded) {
+          const handle = await gate.requestDesktopTaskGrant({
+            taskId: request.taskId,
+            taskText: request.taskText,
+            risk,
+            target: request.target,
+            expiresInMs: request.expiresInMs,
+            maxSteps: request.maxSteps,
+            unbounded: request.unbounded,
+          }, request.confirmInCoreUi);
+          if (handle) {
+            cuaTaskGrants.set(request.taskId, handle.grantId);
+            authorization = gate.authorizeDesktopTaskStep(handle.grantId, {
+              target: request.target,
+              expectedChange: request.expectedChange,
+              risk,
+            });
+            if (!authorization) {
+              cuaTaskGrants.delete(request.taskId);
+              handle.revoke();
+            }
+          } else {
+            authorization = null;
+          }
+        } else {
+          authorization = await gate.requestDesktopStep({
+            taskId: request.taskId,
+            taskText: request.taskText,
+            expectedChange: request.expectedChange,
+            risk,
+            target: request.target,
+            expiresInMs: request.expiresInMs,
+            maxSteps: 1,
+          }, request.confirmInCoreUi);
+        }
+      } catch {
+        receipts.finish(receipt.id, 'cancelled', 'the Core task grant could not be created');
+        taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'cancelled', note: 'grant creation failed' });
+        return null;
+      }
+      if (!authorization) {
+        receipts.finish(receipt.id, 'cancelled', 'the Core task grant was not approved');
+        taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'cancelled', note: 'grant not approved' });
+        return null;
+      }
+      try {
+        receipts.acting(receipt.id, authorization.grantDigest, authorization.approvedAt, authorization.expiresAt, Date.now(), {
+          channel: authorization.approvalChannel,
+          ...(ordinary ? { ruleId: 'desktop-ordinary-background' } : {}),
+        });
+      } catch {
+        authorization.revoke();
+        receipts.finish(receipt.id, 'cancelled', 'the approved grant could not be recorded');
+        taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'cancelled', note: 'acting record failed' });
+        return null;
+      }
+      return {
+        consume: (target, expectedChange) => {
+          if (bus?.isPaused()) {
+            authorization.revoke();
+            receipts.finish(receipt.id, 'cancelled', 'the desktop task is paused');
+            taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'cancelled', note: 'paused' });
+            return false;
+          }
+          const consumed = authorization.consume(target, expectedChange);
+          if (!consumed) {
+            receipts.finish(receipt.id, 'cancelled', 'the target evidence changed before dispatch');
+            taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'cancelled', note: 'target changed' });
+          } else {
+            taskJournal?.markDispatched(request.taskId, journalStepId, receipt.id, taskEpoch);
+          }
+          return consumed;
+        },
+        revoke: () => {
+          authorization.revoke();
+          receipts.finish(receipt.id, 'cancelled', 'the CUA step was revoked before dispatch');
+          taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'cancelled', note: 'revoked' });
+        },
+        complete: (result) => {
+          const now = Date.now();
+          const evidence = {
+            source: 'cua-driver',
+            status: result.effect,
+            summary: result.effect,
+            ...(result.summary ? { digest: hashContent(result.summary) } : {}),
+            observedAt: now,
+          };
+          try {
+            const note = `CUA driver effect: ${result.effect}`;
+            if (result.outcome === 'ui-observed') {
+              receipts.complete(receipt.id, { phase: 'verified', dispatchState: 'delivered', outcome: 'ui-observed', note, evidence }, now);
+              taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'verified', externalCheckDigest: evidence.digest, note }, now);
+              if (activeResumeTaskId === request.taskId && taskJournal?.getTask(request.taskId)?.status === 'completed') activeResumeTaskId = null;
+            } else if (result.outcome === 'cancelled') {
+              receipts.complete(receipt.id, { phase: 'cancelled', dispatchState: 'not-dispatched', outcome: 'cancelled', note, evidence }, now);
+              taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'cancelled', note }, now);
+            } else {
+              receipts.complete(receipt.id, { phase: 'unknown', dispatchState: result.dispatchState, outcome: 'unknown', note, evidence }, now);
+              taskJournal?.recordReceipt(request.taskId, journalStepId, taskEpoch, { status: 'unknown', note }, now);
+            }
+          } catch { /* an acting receipt remains unresolved and recovers as unknown */ }
+        },
+      };
+    },
     onBotChange: () => (notice as NoticeWorld | null)?.acceptCurrent(),
     onSkin: (skin) => followPetLook(join(deploymentRoot(), DEPLOYMENT), skin, (pet as DesktopPetWorld | null)?.packs() ?? [], language()),
   });
-  const home = deploymentRoot();
   // the system's language, as the Electron main process read it; Chinese when the Core runs without it
   const system = process.env.COOPANION_SYSTEM_LANGUAGE;
   seed(home, isLanguage(system) ? system : 'zh');
-  const deployDir = join(home, DEPLOYMENT);
   const NOTICE = noticeDefinition({
     version: APP_VERSION,
     notesDir: join(APP_ROOT, 'docs', 'releases'),
@@ -497,23 +802,103 @@ export async function main(): Promise<void> {
   /** Coopanion's config group; the console reads this object, retitled in place when the app language changes. */
   const settingsGroup = companionGroup('zh');
   const hindsightGroup = hindsightConfigGroup('zh');
+  const videoGroup = videoConfigGroup('zh');
+  const animeStudioGroup = animeStudioConfigGroup('zh');
   const longTerm = new HindsightMemory();
   const journal = new RelationshipJournal();
   const affinitySync = new AffinitySync();
+  const promptWorkspaceWrite: WorkspacePrompt = async (prompt) => {
+    if (!pet) return 'unavailable';
+    const text = coreText(language()).workspaceAction;
+    const label = prompt.operation === 'delete' ? text.deleteFile
+      : prompt.operation === 'append' ? text.appendFile : text.fileWrite;
+    const details = `${prompt.path} — ${prompt.bytes} bytes — sha256 ${prompt.digest}`;
+    const scope = prompt.ruleEligible
+      ? `\n\n${text.alwaysScope(prompt.scope)}`
+      : `\n\n${text.highRisk}`;
+    const question = text.question(label, prompt.path, details) + scope;
+    const answer = await pet.confirm(question, prompt.ruleEligible ? [text.yes, text.always, text.no] : [text.yes, text.no]);
+    return (answer === 'dismissed' ? 'no' : answer) as WorkspacePromptAnswer;
+  };
+  /** OpenCode and video worlds keep their own per-operation confirmation; no durable rule applies. */
+  const confirmWorldWorkspaceAction = async (request: Pick<FileSystemActionAuthorizationRequest, 'action' | 'target' | 'taskText' | 'files'>): Promise<boolean> => {
+    const text = coreText(language()).workspaceAction;
+    const label = request.action === 'file-write' ? text.fileWrite : text.commandExecution;
+    const target = request.target.path === '.' ? request.target.workspaceRoot : join(request.target.workspaceRoot, request.target.path);
+    const files = request.files.map((file) => `${file.path} — ${file.bytes} bytes — sha256 ${file.digest}`).join('\n');
+    const details = [request.taskText, ...(files ? [`Approved files:\n${files}`] : [])].join('\n');
+    return (await pet?.confirm(text.question(label, target, details), [text.yes, text.no]) ?? 'unavailable') === 'yes';
+  };
+  const authorizeWorkspaceWrite = async (request: FileSystemActionAuthorizationRequest): Promise<WorkspaceAuthorization> => {
+    const appendPaths = parseWorkspaceAppendPaths(getByPath(
+      (config ?? {}) as unknown as Record<string, unknown>,
+      'companion.workspaceAppendPath',
+    ));
+    if (isWorkspaceAppendPreapproved({
+      action: request.action,
+      actionName: request.actionName,
+      expectedChange: request.expectedChange,
+      target: request.target,
+      files: request.files,
+    }, personaWorkspaceRoot, appendPaths, canonicalRoot)) {
+      return { decision: 'AUTO_ALLOW', reason: 'legacy-append-path', channel: 'durable-rule', ruleId: 'legacy-append-path' };
+    }
+    const file = request.files[0];
+    return workspacePermissions.authorize({
+      workspaceRoot: request.target.workspaceRoot,
+      absolutePath: join(request.target.workspaceRoot, request.target.path),
+      path: request.target.path,
+      tool: request.actionName,
+      operation: request.operation ?? 'create',
+      targetState: request.targetState ?? 'absent',
+      baseDigest: request.baseDigest ?? null,
+      payloadDigest: request.payloadDigest,
+      payloadBytes: file?.bytes ?? 0,
+      deltaBytes: request.deltaBytes ?? (file?.bytes ?? 0),
+      mime: file?.mime ?? '',
+      source: request.target.source,
+      taskId: request.taskId,
+      sessionId: request.sessionId ?? 'main',
+      background: request.background ?? true,
+    }, promptWorkspaceWrite);
+  };
+
   const base = await cormini({
+    canonicalPersona: true,
     memory: longTerm,
+    reloadPrefix: async () => { await core?.loop.reloadSystemPrefix(); },
+    sourceSafeToolResults: true,
     selfTime: () => readSelfTime(config),
     modelLanguage: () => modelLanguage(config?.language),
     growth: () => readGrowth(config),
     growthStateFile: join(deployDir, 'growth.json'),
-    paused: () => core?.bus.isPaused() === true,
+    authorizeGrowthPolicyAction: request => authorizeFileSystemActionEx(actionReceipts, gate, request, {
+      authorize: async candidate => ({
+        decision: candidate.target.instanceId === 'coopanion-growth-policy'
+          && candidate.target.path === GROWTH_POLICY_FILE && canonicalRoot(candidate.target.workspaceRoot) === canonicalRoot(deployDir)
+          && candidate.action === 'file-write' && candidate.files.length === 1 && candidate.files[0]?.path === GROWTH_POLICY_FILE
+          && (readGrowth(config).autoApply === true || ['growth-policy-revoke', 'growth-policy-focus-context', 'growth-policy-owner-review'].includes(candidate.actionName))
+          ? 'AUTO_ALLOW' : 'DENY',
+        reason: 'bounded-growth-policy-target', channel: 'durable-rule', ruleId: 'growth-controlled-policy',
+      }),
+    }),
+    paused: () => core?.bus.isPaused() === true || readResourcePressure().paused,
     timezone: () => config?.timezone ?? 'UTC',
+    authorizeWorkspaceAction: (request) => authorizeFileSystemActionEx(
+      actionReceipts,
+      gate,
+      request,
+      { authorize: authorizeWorkspaceWrite },
+    ),
+    actionReceipts: () => actionReceipts,
+    workspacePermissions,
+    promptProvenance,
   });
   /** Coo's Persona, once the bot is built. */
   let coo: CoopanionPersona | null = null;
   const definitionBase: BotDefinition<CorminiConfig> = {
     ...base.definition,
-    declares: [CONSOLE.id, DESKTOP_PET.id, NOTICE.id, BROWSER_ID],
+    declares: [CONSOLE.id, DESKTOP_PET.id, NOTICE.id, BROWSER_ID, VIDEO_ID, ANIME_STUDIO_ID],
     // Cormini's tools under the same names; the memory differs by PARTNER.md and the version history
     describe: {
       tools: [...(base.definition.describe?.tools ?? []), ...memoryToolDescribes({ memory: () => null })],
@@ -527,23 +912,37 @@ export async function main(): Promise<void> {
     defaults: () => ({
       ...base.definition.defaults(),
       displayName: DISPLAY_NAME,
-      web: { port: CONSOLE_PORT, theme: 'mint' },
+      web: { port: TEST_CHANNEL ? 0 : CONSOLE_PORT, theme: 'mint' },
       // Cormini's 6/12 end a computer-use task partway through; 20/40 are the caps the desktop-pet
       // e2e harnesses give their persona
       rounds: { soft: 20, hard: 40 },
       context: { ...base.definition.defaults().context, maxTokens: 128_000, keepRatio: 0.25 },
-      companion: { telemetry: true, contextRing: false, selfTime: { ...SELF_TIME_DEFAULTS }, growth: { ...GROWTH_DEFAULTS } },
+      companion: {
+        telemetry: !TEST_CHANNEL,
+        contextRing: false,
+        selfTime: { ...SELF_TIME_DEFAULTS, enabled: false, actions: false },
+        workspaceAppendPath: '',
+        growth: { ...GROWTH_DEFAULTS, enabled: false },
+      },
     }),
     // Cormini's own build with Coo's Persona class; the workspace is snapshotted before Coo can write to it
     build: (loaded, worlds) => {
       const cfg = loaded.config;
+      cfg.displayName = DISPLAY_NAME;
       const memoryOverrides = getByPath(loaded.config as unknown as Record<string, unknown>, 'hindsight') as Partial<HindsightFileConfig> | undefined;
       const memoryConfig = loadHindsightConfig(loaded.rootDir, memoryOverrides);
       const memoryLog = {
         warn: (message: string, data?: unknown) => console.warn(message, data ?? ''),
         error: (message: string, data?: unknown) => console.error(message, data ?? ''),
       };
+      // W4 compatibility: an old dual-track switch may still be in config.json. It is read by
+      // nothing now; workspace files are never historical sources, and the value cannot re-open
+      // the old path. The line is auditable and does not rewrite the person's config.
+      if (getByPath(loaded.config as unknown as Record<string, unknown>, 'w3.legacyReadMode') !== undefined) {
+        memoryLog.warn('[memory] w3.legacyReadMode is ignored after W4; workspace files are never historical memory');
+      }
       longTerm.configure(loaded.rootDir, memoryLog, memoryOverrides);
+      promptProvenance.configure({ rootDir: loaded.rootDir, memoryDir: loaded.memoryDir });
       affinitySync.configure({ file: join(loaded.dataDir, 'affinity-events.jsonl'), memory: longTerm, log: memoryLog });
       journal.configure({
         memory: longTerm,
@@ -559,20 +958,84 @@ export async function main(): Promise<void> {
         worlds,
         orientationOverrideFile: join(loaded.rootDir, 'prompts', 'ORIENTATION.md'),
         firstTurnDir: join(loaded.rootDir, 'prompts'),
-        tickDelayMs: () => {
-          const self = readSelfTime(cfg);
-          if (self.enabled) return self.afterMinutes * 60_000;
-          return cfg.tick?.intervalMinutes === null || cfg.tick?.intervalMinutes === undefined ? null : cfg.tick.intervalMinutes * 60_000;
-        },
+        tickDelayMs: () => selfTimeTickDelayMs(readSelfTime(cfg), cfg.tick?.intervalMinutes, readResourcePressure().paused),
       });
+      sourceMapEndTurnReceipts(persona);
+      personaWorkspaceRoot = loaded.memoryDir;
       persona.snapshot(APP_VERSION);
       coo = persona;
+      const voiceTrust = auditVoiceWorlds(worlds, voiceTrustInput);
+      console.info('[voice-trust] 执行目标核对', { report: voiceTrust });
       return {
         persona,
+        requireCompleteEvidence: true,
+        trustedToolSchemaDigests: [...COOPANION_TOOL_SCHEMA_DIGESTS, ...voiceTrust.digests],
+        trustedProviderModules: [LLAMACPP_PROVIDER, RESPONSES_PROVIDER, COO, CHATGPT_PROVIDER],
+        worldPromptTrust: (world) => {
+          const trust = world === pet
+            ? { templateDigests: DESKTOP_PET_TRUSTED_TEMPLATE_DIGESTS, independentVariables: true }
+            : coopanionWorldPromptTrust(world);
+          return trust ? {
+            ...trust,
+            deploymentOverride: (path: string, digest: string) => promptProvenance.verifyWorldTemplate(world.id, path, digest),
+          } : undefined;
+        },
+        worldEventTrust: (world, event) => (world === pet
+          && (['desktop-pet.message', 'desktop-pet.speech', 'desktop-pet.touch', 'desktop-pet.self', 'desktop-pet.figure'].includes(event.type)
+            || (['desktop-pet.answer', 'desktop-pet.guide-answer'].includes(event.type) && pet.admitUserAnswer(event))))
+          || (world.id === BROWSER_ID && ['browser.closed', 'browser.unresolved'].includes(event.type)),
+        worldToolOutcomeTrust: (world, tool, outcome) => (world === pet && (
+          (tool === 'pet_say' && pet.admitSayReceipt(outcome))
+          || (tool === 'pet_ask' && pet.admitAskReceipt(outcome))
+          || (tool === 'pet_act' && pet.admitActReceipt(outcome))
+          // Every other pet tool (move/set/quiet and the CUA helpers) answers with a Host-rendered
+          // template about the pet's own screen or settings; without admission the next request
+          // would be blocked for a line the Host itself wrote.
+          || !['pet_say', 'pet_ask', 'pet_act'].includes(tool)
+        )) || (
+          // Browser World outcomes are Host-formatted readouts/receipts for Cortico's evidence gate
+          // only; third-party page content never enters user-input spans and never authorizes writes
+          // (all external writes remain gated by ActionGate + Core UI confirmation).
+          world.id === BROWSER_ID && BROWSER_TOOL_NAMES.has(tool) && typeof outcome.text === 'string'
+        ) || (
+          world.id === ANIME_STUDIO_ID && ANIME_STUDIO_TOOL_NAMES.has(tool) && typeof outcome.text === 'string'
+        ) || ((world.id === 'tts' || world.id === 'audio-play') && isVoiceToolReceipt(tool, outcome)),
+        worldDeferredTrust: (world, type, rendered) => notice !== null && world === notice
+          && ((type === 'coopanion.updated' && notice.admitUpdate(rendered))
+            || (type === 'coopanion.guide' && notice.admitGuideSummary(rendered))
+            || (type === 'coopanion.settings-changed' && notice.admitSettingsChange(rendered))
+            || ((type === 'coopanion.alarm' || type === 'coopanion.alarm-cancelled') && notice.admitAlarmNotice(rendered))),
+        toolTextTrust: (tool, text) => isTrustedEndTurnReceipt(tool, text)
+          || isTrustedMemorySearchNotice(tool, text) || isTrustedMemoryWriteReceipt(tool, text) || isTrustedGrowthToolText(tool, text)
+          || (coo?.trustWorkspaceToolText(tool, text) ?? false)
+          || (tool === 'read_file' && isTrustedPartnerReadText(text)),
+        onPromptWrite: ({ key, path, content }) => {
+          const effective = key === 'orientation' || key === 'constitution' ? content.trim() : content;
+          promptProvenance.attest({ key, path, content: effective });
+        },
+        onPromptReset: ({ key }) => {
+          promptProvenance.revoke(key);
+        },
+        onPromptAttest: (documents) => {
+          const attested: string[] = [];
+          const skipped: string[] = [];
+          for (const doc of documents) {
+            const effective = doc.key === 'orientation' || doc.key === 'constitution' ? doc.content.trim() : doc.content;
+            if (promptProvenance.attest({ key: doc.key, path: doc.path, content: effective })) attested.push(doc.key);
+            else skipped.push(doc.key);
+          }
+          const partner = join(loaded.memoryDir, 'PARTNER.md');
+          try {
+            if (existsSync(partner) && promptProvenance.attest({
+              key: 'partner', path: partner, content: readFileSync(partner, 'utf8'),
+            })) attested.push('partner');
+          } catch { /* the partner file stays un-attested; its paragraphs remain withheld */ }
+          return { attested, skipped };
+        },
         onStart: () => persona.startRhythm(),
         onStop: () => { persona.stopRhythm(); persona.stopGrowth(); },
         webUi: {
-          configGroups: [base.contextGroup, settingsGroup, hindsightGroup],
+          configGroups: [base.contextGroup, settingsGroup, hindsightGroup, videoGroup, animeStudioGroup],
           status: () => ({ context: { maxTokens: cfg.context.maxTokens, softRatio: cfg.context.softRatio } }),
           configOptions: (kind) => (kind === LANGUAGE_OPTIONS ? LANGUAGES.map((value) => ({ value, label: LANGUAGE_NAMES[value] })) : []),
         },
@@ -584,6 +1047,14 @@ export async function main(): Promise<void> {
     selfTime: () => readSelfTime(config),
     modelLanguage: () => modelLanguage(config?.language),
     language: () => language(),
+    gate,
+    ask: (question, choices) => pet?.confirm(question, choices) ?? Promise.resolve('unavailable'),
+    journalFile: join(deployDir, 'browser', 'actions.json'),
+    replyJournalFile: join(deployDir, 'browser', 'replies.json'),
+    taskJournalFile: join(deployDir, 'browser', 'task-actions.json'),
+    workspaceDir: join(deployDir, 'workspace'),
+    mediaDir: join(deployDir, 'data', 'video', 'media'),
+    ...(actionReceipts ? { taskJournal: actionReceipts } : {}),
     transcribe: (pcm) => pet
       ? pet.transcribePcm(pcm)
       : Promise.resolve({ text: '', error: 'the desktop pet is not running' }),
@@ -593,27 +1064,100 @@ export async function main(): Promise<void> {
     modelLanguage: () => modelLanguage(config?.language),
     // the avatar beside the pet; the task itself does not depend on the page being connected
     onState: (state) => pet?.guest(state),
+    authorizeAction: (request, confirmInCoreUi) => authorizeFileSystemAction(actionReceipts, gate, request, confirmInCoreUi),
+    confirmAction: confirmWorldWorkspaceAction,
   });
-  const bundled = [CONSOLE, DESKTOP_PET, NOTICE, BROWSER, OPENCODE, CODEX] as WorldDefinition<WorldSection>[];
+  const VIDEO = videoDefinition({
+    modelLanguage: () => modelLanguage(config?.language),
+    language: () => language(),
+    ffmpegPath: () => String(getByPath(config as unknown as Record<string, unknown>, 'worlds.video.ffmpegPath') ?? ''),
+    ffprobePath: () => String(getByPath(config as unknown as Record<string, unknown>, 'worlds.video.ffprobePath') ?? ''),
+    authorizeAction: (request, confirmInCoreUi) => authorizeFileSystemAction(actionReceipts, gate, request, confirmInCoreUi),
+    confirmAction: confirmWorldWorkspaceAction,
+  });
+  const ANIME_STUDIO = animeStudioDefinition({
+    modelLanguage: () => modelLanguage(config?.language),
+    language: () => language(),
+    command: () => String(getByPath(config as unknown as Record<string, unknown>, 'worlds.anime-studio.command') ?? ''),
+    scriptPath: () => String(getByPath(config as unknown as Record<string, unknown>, 'worlds.anime-studio.scriptPath') ?? ''),
+    comfyuiUrl: () => String(getByPath(config as unknown as Record<string, unknown>, 'worlds.anime-studio.comfyuiUrl') ?? ''),
+    timeoutMs: () => {
+      const raw = Number(getByPath(config as unknown as Record<string, unknown>, 'worlds.anime-studio.timeoutMs'));
+      return Number.isFinite(raw) && raw > 0 ? raw : 60_000;
+    },
+  });
+  const ANIME_STUDIO_TRUSTED = {
+    ...ANIME_STUDIO,
+    create: (ctx: Parameters<typeof ANIME_STUDIO.create>[0]) => withTrustedWorldVariables(ANIME_STUDIO.create(ctx)),
+  } as WorldDefinition<WorldSection>;
+  const CONSOLE_TRUSTED = {
+    ...CONSOLE,
+    create: (ctx: Parameters<typeof CONSOLE.create>[0]) => withTrustedConsoleVariables(CONSOLE.create(ctx)),
+  } as WorldDefinition<WorldSection>;
+  const OPENCODE_TRUSTED = {
+    ...OPENCODE,
+    create: (ctx: Parameters<typeof OPENCODE.create>[0]) => withTrustedWorldVariables(OPENCODE.create(ctx)),
+  } as WorldDefinition<WorldSection>;
+  const CODEX_TRUSTED = {
+    ...CODEX,
+    create: (ctx: Parameters<typeof CODEX.create>[0]) => withTrustedWorldVariables(CODEX.create(ctx)),
+  } as WorldDefinition<WorldSection>;
+  const bundled = [CONSOLE_TRUSTED, DESKTOP_PET, NOTICE, BROWSER, OPENCODE_TRUSTED, CODEX_TRUSTED, VIDEO, ANIME_STUDIO_TRUSTED] as WorldDefinition<WorldSection>[];
 
+  // Owner decision (Rev29): QQ is no longer a product capability. The package stays installed
+  // for the later retirement inventory, but it is never imported, registered, initialized or
+  // shown as an available World, and it gets no tool schema trust root.
+  const RETIRED_EXTENSION_PACKAGES = ['cortico-world-qq'] as const;
   // extension providers must be registered before endpoints are resolved
   const extensions = await loadExtensions(repoRoot(), {
     reserved: bundled.map((w) => w.id),
     reservedProviders: [...providerModules.map((m) => m.id), COO.id, CHATGPT_PROVIDER.id],
+    retiredPackages: RETIRED_EXTENSION_PACKAGES,
   });
   registerProviderModules([COO, CHATGPT_PROVIDER, ...extensions.providers]);
   extensions.webUiAssets.push(...bundledWebUiAssets([
     { id: DESKTOP_PET.id, packageName: 'cortico-world-desktop-pet' },
   ]), ...appWebUiAsset(NOTICE_ID, join(APP_ROOT, 'build', 'panels', 'coopanion'), APP_VERSION));
-  const definition = withWorlds(definitionBase, [...bundled, ...extensions.worlds]);
+  // Owner decision (Rev29 §0W): the two local voice tools get a production schema root, and only
+  // after the installed package, its source bytes and the World that would execute them match the
+  // approved identity. The wrapper narrows each World to the approved tool and enforces this
+  // round's request scope. `tts_control` and `audio_watch` never reach the model.
+  const voiceTrustInput = {
+    extensionsDir: extensionsDir(repoRoot(), process.env),
+    log: { warn: (message: string, data?: unknown) => console.warn(message, data ?? '') },
+  };
+  const voiceWorlds = prepareVoiceWorlds(extensions.worlds, voiceTrustInput);
+  console.info('[voice-trust] 启动核对', { report: voiceWorlds.report });
+  // The streamvoice template is reviewed for Voice V5; its rendered config values are local
+  // settings, not model output. Without this registration the strict evidence gate blocks every
+  // request before dispatch as soon as streamvoice is enabled.
+  const streamVoiceDefinition = voiceWorlds.definitions.find((world) => world.id === 'streamvoice');
+  const STREAMVOICE_TRUSTED = streamVoiceDefinition
+    ? {
+        ...streamVoiceDefinition,
+        create: (ctx: Parameters<typeof streamVoiceDefinition.create>[0]) => withTrustedWorldVariables(streamVoiceDefinition.create(ctx)),
+      } as WorldDefinition<WorldSection>
+    : undefined;
+  const definition = withWorlds(definitionBase, [
+    ...bundled,
+    ...voiceWorlds.definitions.map((world) => (world.id === 'streamvoice' && STREAMVOICE_TRUSTED ? STREAMVOICE_TRUSTED : world)),
+  ]);
 
   const loaded = loadDeployment(definition, deployDir, repoRoot(), join(repoRoot(), 'bots', 'cormini'), providersRoot());
+  const growthDisabled = migrateLegacyGrowthConfig(loaded.rootDir, loaded.config, {
+    warn: (message, data) => console.warn(message, data ?? ''),
+  });
+  if (growthDisabled) console.info('[growth] disabled the previously saved schedule until G2 acceptance');
   config = loaded.config;
   Object.assign(settingsGroup, companionGroup(language()));
   Object.assign(hindsightGroup, hindsightConfigGroup(language()));
+  Object.assign(videoGroup, videoConfigGroup(language()));
+  Object.assign(animeStudioGroup, animeStudioConfigGroup(language()));
   watchLanguage(loaded.config, (next) => {
     Object.assign(settingsGroup, companionGroup(next));
     Object.assign(hindsightGroup, hindsightConfigGroup(next));
+    Object.assign(videoGroup, videoConfigGroup(next));
+    Object.assign(animeStudioGroup, animeStudioConfigGroup(next));
     followPersonaLanguage(loaded.memoryDir, next);
     process.send?.({ type: 'companion:language', language: next });
     (pet as DesktopPetWorld | null)?.refresh();
@@ -628,12 +1172,15 @@ export async function main(): Promise<void> {
   const bot = createBot(loaded, definition, { extensions });
   bus = bot.core.bus;
   core = bot.core;
-  // turning time of her own on, or changing its quiet interval, re-arms the heartbeat now instead of at its policy recheck
+  // Setting changes and pressure transitions re-arm the heartbeat before its 30-minute policy recheck.
   let rhythm = readSelfTime(loaded.config);
+  let memoryPaused = readResourcePressure().paused;
   const rhythmTimer = setInterval(() => {
     const next = readSelfTime(loaded.config);
-    if (next.enabled === rhythm.enabled && next.afterMinutes === rhythm.afterMinutes) return;
+    const nextMemoryPaused = readResourcePressure().paused;
+    if (!selfTimeScheduleNeedsRearm(rhythm, next, memoryPaused, nextMemoryPaused)) return;
     rhythm = next;
+    memoryPaused = nextMemoryPaused;
     coo?.restartRhythm();
   }, 1000);
   rhythmTimer.unref();
@@ -666,7 +1213,7 @@ export async function main(): Promise<void> {
         : input.tool === 'pet_ask' && typeof input.args.question === 'string'
           ? cleanSpeech(input.args.question)
           : '';
-      if (said) longTerm.retainCoo(said, { session: input.role, callId: entry.call, timestamp: entry.ts });
+      if (said) coo?.retainCooOutput(said, { session: input.role, callId: entry.call, timestamp: entry.ts });
     }
     return entry;
   };
@@ -695,14 +1242,45 @@ export async function main(): Promise<void> {
   journal.start();
   affinitySync.start();
   process.send?.({ type: 'companion:ready', port, dataDir: loaded.dataDir, keyMissing, language: language() });
+  if (taskJournal && activeResumeTaskId && !bus?.isPaused()) {
+    const resumeTaskId = activeResumeTaskId;
+    void (async () => {
+      const decision = await taskJournal.planResume(resumeTaskId, async (step) => {
+        if (step.target.path && existsSync(step.target.path) && step.externalCheckDigest) {
+          const digest = hashContent(readFileSync(step.target.path, 'utf8'));
+          if (digest === step.externalCheckDigest) return { state: 'verified', digest, note: 'read-only disk SHA matched on restart' };
+        }
+        return { state: 'unknown', note: 'unverified step requires explicit read-only check before retry' };
+      });
+      console.info('[cua-resume] planResume', decision);
+      if (!decision || !decision.nextStep || decision.status === 'cancelled' || decision.status === 'completed') {
+        if (activeResumeTaskId === resumeTaskId) activeResumeTaskId = null;
+        return;
+      }
+      await sleep(1500);
+      const livePet = pet as DesktopPetWorld | null;
+      if (!livePet || bus?.isPaused()) return;
+      const next = decision.nextStep;
+      const targetHint = next.target.bundleId ? `${next.target.bundleId}${next.target.windowTitle ? ` (${next.target.windowTitle})` : ''}` : '目标普通窗口';
+      const resumePrompt = [
+        `[系统自动续作 taskId=${decision.taskId} generation=${decision.generation}] Core 重启恢复：已验证跳过步骤 [${decision.skippedStepIds.join(', ')}]（严禁重复执行）。`,
+        `请只使用 pet_cua_* 工具重新发现当前窗口（不要复用重启前旧 windowId），选中 ${targetHint}，执行待完成步骤 ${next.stepId}（工具=${next.tool}，意图=${next.intent}），并在动作前后各调用一次 pet_cua_accessibility 回读状态变化，最后简短汇报结果。`,
+      ].join('\n');
+      await livePet.pushContinuationResume(resumePrompt, { taskId: decision.taskId, stepId: next.stepId, generation: decision.generation });
+    })().catch((err) => console.warn('[cua-resume] 续作编排失败', String(err)));
+  }
   const guideDeps: GuideDeps = {
     pet: () => pet,
     console: `http://127.0.0.1:${port}`,
     doneFile: join(deployDir, GUIDE_FILE),
     workspace: loaded.memoryDir,
     whale: process.env.COOPANION_CHANNEL !== 'steam',
+    canonicalPersona: true,
     openDress: () => process.send?.({ type: 'companion:open', path: '#/dress' }),
-    onEnd: (end) => (notice as NoticeWorld | null)?.guideEnded(end),
+    onEnd: (end) => {
+      (notice as NoticeWorld | null)?.guideEnded(end);
+      for (const answer of end.answers ?? []) pet?.publishDialogAnswer(answer.answer, answer.step);
+    },
     track: (type, fields) => stats.event(type, fields),
     language,
     modelLanguage: () => modelLanguage(loaded.config.language),
@@ -717,6 +1295,7 @@ export async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     clearInterval(rhythmTimer);
+    clearInterval(growthTimer);
     journal.stop();
     affinitySync.stop();
     const done = await Promise.race([

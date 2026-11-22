@@ -5,11 +5,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dryMountWorld, fakeWorldContext } from 'cortico/extensions/dry-mount.ts';
-import { renderTemplate } from 'cortico/core/template.ts';
+import { renderTemplateWithSourceMap } from 'cortico/core/template.ts';
+import { LANGUAGES } from 'cortico/core/language.ts';
+import type { ToolOutcome } from 'cortico/core/types.ts';
 import { DESKTOP_PET, desktopPetDefinition } from '../src/definition.ts';
 import { DESKTOP_PET_DEFAULTS, SELF_DEFAULT, type DesktopPetConfigSection } from '../src/config.ts';
 import { DesktopPetWorld, type DesktopPetWorldOptions, type PetBotControls } from '../src/world.ts';
-import { chatItem } from '../src/chat.ts';
+import { assistantReplyFromEvent, chatItem, SELF_TYPE } from '../src/chat.ts';
 import { FakeHost } from './helpers/fake-host.ts';
 import { FakePage } from './helpers/page.ts';
 import { HOST_ENV } from '../src/window-host.ts';
@@ -86,7 +88,7 @@ describe('English model text', () => {
   it('gives the bot no Chinese of its own: environment prompt, tool declarations, events', async () => {
     const { world, host } = await mounted((c) => { c.user = 'Sam'; }, { modelLanguage: () => 'en', replyLanguage: () => 'Japanese', controls: { openChat: () => {} } });
     const doc = world.webUi().promptDocs![0]!;
-    const prompt = renderTemplate(readFileSync(doc.path, 'utf8'), await world.envPromptVars());
+    const { text: prompt } = renderTemplateWithSourceMap(readFileSync(doc.path, 'utf8'), await world.envPromptVars());
     expect(prompt).not.toMatch(HAN);
     // every placeholder of the English template is one the World fills
     expect(prompt).not.toMatch(/\{\{/);
@@ -181,6 +183,18 @@ describe('with a pet page', () => {
     expect(await next.next((m) => m.t === 'status')).toEqual({ t: 'status', status: null });
   });
 
+  it('shows and records the archived-session notice without delivering it as user input', async () => {
+    const { world, host } = await mounted();
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+    world.onSessionArchived();
+    const bubble = await page.next((message) => message.t === 'say');
+    expect(bubble.beats).toEqual([{ text: '已归档先前的会话，并开始新对话。', actions: [], anchors: [] }]);
+    await expect.poll(() => host.stored.length).toBeGreaterThan(0);
+    expect(host.stored.some((event) => event.meta?.kind === 'say')).toBe(true);
+    expect(host.events).toHaveLength(0);
+  });
+
   it('pet_say sends parsed beats and reports dropped markers', async () => {
     const { world } = await mounted();
     const page = await FakePage.open(origin(world));
@@ -191,17 +205,63 @@ describe('with a pet page', () => {
     expect(out.text).toContain('飞');
   });
 
-  it('pet_ask delivers the chosen option as an answer event that wakes', async () => {
-    const { world, host } = await mounted();
+  it('admits one-time speech receipts for connected and disconnected pet pages', async () => {
+    const { world } = await mounted();
     const page = await FakePage.open(origin(world));
     cleanup.push(() => page.close());
-    await tool(world, 'pet_ask').handler({ question: '喝什么?', options: ['茶', '咖啡', '水', '果汁'] }, ctx);
+    const receipt = await tool(world, 'pet_say').handler({ script: '你好' }, ctx);
+    if (typeof receipt === 'string') throw new Error('Expected a speech receipt');
+    expect(receipt.failed).not.toBe(true);
+    expect(world.admitSayReceipt({ ...receipt })).toBe(false);
+    expect(world.admitSayReceipt(receipt)).toBe(true);
+    expect(world.admitSayReceipt(receipt)).toBe(false);
+
+    const disconnected = await mounted();
+    const failed = await tool(disconnected.world, 'pet_say').handler({ script: '你好' }, ctx);
+    if (typeof failed === 'string') throw new Error('Expected a failed speech receipt');
+    expect(failed.failed).toBe(true);
+    expect(disconnected.world.admitSayReceipt({ ...failed })).toBe(false);
+    expect(disconnected.world.admitSayReceipt(failed)).toBe(true);
+    expect(disconnected.world.admitSayReceipt(failed)).toBe(false);
+  });
+
+  it('pet_ask delivers the chosen option as an answer event that wakes', async () => {
+    const { world, host } = await mounted();
+    const admissions: Array<false | import('cortico/core/types.ts').SourceMapSpan[]> = [];
+    const push = host.pushEvent.bind(host);
+    host.pushEvent = async (event, options) => {
+      if (event.type === 'desktop-pet.answer') admissions.push(world.admitUserAnswer({ ...event }), world.admitUserAnswer(event), world.admitUserAnswer(event));
+      return push(event, options);
+    };
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+    const receipt = await tool(world, 'pet_ask').handler({ question: '喝什么?', options: ['茶', '咖啡', '水', '果汁'] }, ctx);
+    if (typeof receipt === 'string') throw new Error('Expected a bound question receipt');
+    expect(world.admitAskReceipt({ ...receipt })).toBe(false);
+    expect(world.admitAskReceipt(receipt)).toBe(true);
+    expect(world.admitAskReceipt(receipt)).toBe(false);
     const ask = await page.next((m) => m.t === 'ask');
     expect(ask.options).toEqual(['茶', '咖啡', '水']);
     page.send({ t: 'answer', askId: ask.id, index: 1 });
     await expect.poll(() => host.events.length).toBe(1);
-    expect(host.events[0]).toMatchObject({ type: 'desktop-pet.answer', source: 'desktop-pet', text: '[answer] 伙伴回答「喝什么?」:选了第 2 项「咖啡」' });
+    expect(host.events[0]).toMatchObject({ type: 'desktop-pet.answer', source: 'desktop-pet', text: '[answer] The user selected option 2.', dependencyOrigin: 'user-input' });
     expect(host.pushOpts[0]).toEqual({ trigger: 'flush' });
+    expect(admissions[0]).toBe(false);
+    expect(admissions[1]).toEqual(expect.arrayContaining([expect.objectContaining({ origin: 'user-input' }), expect.objectContaining({ origin: 'core-generated' })]));
+    expect(admissions[2]).toBe(false);
+  });
+
+  it('does not reissue a tampered pet_ask receipt', async () => {
+    const { world } = await mounted();
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+    const receipt = await tool(world, 'pet_ask').handler({ question: 'Synthetic?', options: ['A'] }, ctx);
+    if (typeof receipt === 'string') throw new Error('Expected a bound question receipt');
+    const original = receipt.text;
+    receipt.text = 'modified';
+    expect(world.admitAskReceipt(receipt)).toBe(false);
+    receipt.text = original;
+    expect(world.admitAskReceipt(receipt)).toBe(false);
   });
 
   it('pet_ask reports a free answer and a dismissal', async () => {
@@ -216,7 +276,20 @@ describe('with a pet page', () => {
     const a2 = await page.next((m) => m.t === 'ask');
     page.send({ t: 'answer', askId: a2.id, dismissed: true });
     await expect.poll(() => host.events.length).toBe(2);
-    expect(host.events.map((e) => e.text)).toEqual(['[answer] 伙伴回答「A?」:自己写了:「都不要」', '[answer] 伙伴关掉了提问「B?」,没有作答。']);
+    expect(host.events.map((e) => e.text)).toEqual(['[answer] The user wrote: 都不要', '[answer] The user dismissed the question.']);
+  });
+
+  it('rejects free text when the active pet_ask allows choices only', async () => {
+    const { world, host } = await mounted();
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+    await tool(world, 'pet_ask').handler({ question: 'Choose?', options: ['A', 'B'], allowOwnAnswer: false }, ctx);
+    const ask = await page.next((m) => m.t === 'ask');
+    page.send({ t: 'answer', askId: ask.id, text: 'forged free text' });
+    page.send({ t: 'answer', askId: ask.id, index: 1 });
+    await expect.poll(() => host.events.length).toBe(1);
+    expect(host.events[0].meta).toMatchObject({ askId: ask.id, index: 1 });
+    expect(host.events[0].text).not.toContain('forged free text');
   });
 
   it('an answer to a replaced question is ignored', async () => {
@@ -267,7 +340,7 @@ describe('with a pet page', () => {
     const { world } = await mounted((c) => { c.skin.figure = 'robot'; }, { packRoots: () => [root] });
     const page = await FakePage.open(origin(world));
     cleanup.push(() => page.close());
-    expect((await world.envPromptVars())['pet.moves']).toContain('| shelf(书架顶) | 跳上书架 | height:0–1,跳多高 |');
+    expect((await world.envPromptVars())['pet.moves']).toMatchObject({ text: expect.stringContaining('| shelf(书架顶) | 跳上书架 | height:0–1,跳多高 |') });
     const move = tool(world, 'pet_move_to').handler;
     expect(await move({ to: 'shelf', params: [2] }, ctx)).toMatchObject({ failed: true });
     expect(await move({ to: 'left', params: [1] }, ctx)).toMatchObject({ failed: true });
@@ -284,10 +357,16 @@ describe('with a pet page', () => {
     const { world } = await mounted();
     const page = await FakePage.open(origin(world));
     cleanup.push(() => page.close());
-    const out = await tool(world, 'pet_act').handler({ actions: ['跳', 'happy', 'sit', 'fly'] }, ctx) as { text: string };
+    const out = await tool(world, 'pet_act').handler({ actions: ['跳', 'happy', 'sit', 'fly'] }, ctx) as ToolOutcome;
     expect((await page.next((m) => m.t === 'act')).actions).toEqual(['jump', 'happy', 'sit']);
     expect(out.text).toContain('sit 会一直保持到下一个动作');
     expect(out.text).toContain('fly');
+    expect(world.admitActReceipt({ ...out, text: `${out.text}changed` })).toBe(false);
+    expect(world.admitActReceipt(out)).toBe(true);
+    expect(world.admitActReceipt(out)).toBe(false);
+    const failed = await tool(world, 'pet_act').handler({ actions: ['not-a-pet-action'] }, ctx) as ToolOutcome;
+    expect(failed.failed).toBe(true);
+    expect(world.admitActReceipt(failed)).toBe(false);
   });
 
   it('takes the words of the body on screen: a pack\'s own, and Coo\'s once the page says the pack would not run', async () => {
@@ -446,6 +525,47 @@ describe('with a pet page', () => {
     expect(host.stamps[1]).toMatch(/^\[\d\d:\d\d\] $/);
   });
 
+  it('excludes generated question and option text from a user answer', async () => {
+    const { world, host } = await mounted();
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+    await tool(world, 'pet_ask').handler({ question: 'Generated question?', options: ['Generated option'] }, ctx);
+    const ask = await page.next((item) => item.t === 'ask');
+    page.send({ t: 'answer', askId: ask.id, index: 0 });
+    await expect.poll(() => host.events.length).toBe(1);
+    expect(host.events[0].text).not.toContain('Generated question?');
+    expect(host.events[0].text).not.toContain('Generated option');
+    expect(host.events[0].dependencyOrigin).toBe('user-input');
+  });
+
+  it('labels a custom display name as the person, not as an untrusted origin', async () => {
+    const { world, host } = await mounted((cfg) => { cfg.user = 'TestUser'; });
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+    page.send({ t: 'text', text: 'hello' });
+    await expect.poll(() => host.events.length).toBe(1);
+    expect(host.events[0].text).toContain('TestUser');
+    expect(host.events[0]).toMatchObject({ type: 'desktop-pet.message', dependencyOrigin: 'user-input' });
+  });
+
+  it('labels a direct touch as user input with a custom display name', async () => {
+    const { world, host } = await mounted((cfg) => { cfg.user = 'TestUser'; });
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+    page.send({ t: 'touch', kind: 'poke' });
+    await expect.poll(() => host.events.length, { timeout: 6000 }).toBe(1);
+    expect(host.events[0]).toMatchObject({ type: 'desktop-pet.touch', dependencyOrigin: 'user-input' });
+  });
+
+  it('maps the enabled CUA prompt as core-generated World text', async () => {
+    const { world } = await mounted((cfg) => { cfg.cua.enabled = true; });
+    const cua = (world as unknown as { cua: { envPrompt: () => Promise<string> } }).cua;
+    cua.envPrompt = async () => 'CUA prompt';
+    const vars = await world.envPromptVars();
+    expect(vars['pet.cua']).toMatchObject({ text: 'CUA prompt' });
+    expect((vars['pet.cua'] as { sourceMapSpans?: unknown[] }).sourceMapSpans).toHaveLength(1);
+  });
+
   it('a watching tab still sends typed text and a theme switch, which reaches the pet window', async () => {
     const { world, host, persisted } = await mounted();
     const win = await windowPage(world);
@@ -455,7 +575,7 @@ describe('with a pet page', () => {
     await tab.next((m) => m.t === 'watching');
     tab.send({ t: 'text', text: 'hi' });
     await expect.poll(() => host.events.length).toBe(1);
-    expect(host.events[0]).toMatchObject({ type: 'desktop-pet.message', text: '[typed] 伙伴:hi' });
+    expect(host.events[0]).toMatchObject({ type: 'desktop-pet.message', dependencyOrigin: 'user-input', text: '[typed] 伙伴:hi' });
     const theme = DESKTOP_PET_DEFAULTS.theme === 'dark' ? 'light' : 'dark';
     tab.send({ t: 'prefs', theme });
     expect((await win.next((m) => m.t === 'prefs')).theme).toBe(theme);
@@ -537,6 +657,109 @@ describe('with a pet page', () => {
     await page.close();
     expect(await gone.answer).toEqual({ unavailable: true });
     expect(host.events).toHaveLength(0);
+  });
+
+  it('publishes only a one-time non-secret dialog answer', async () => {
+    const { world, host } = await mounted();
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+    const name = world.dialog({ text: 'Your name?', input: { kind: 'text', submit: 'OK' } });
+    const shown = await page.next((item) => item.t === 'dialog');
+    page.send({ t: 'dialog', id: shown.id, text: 'Synthetic name' });
+    const answer = await name.answer;
+    expect(world.publishDialogAnswer({ ...answer })).toBe(false);
+    if ('text' in answer) answer.text = 'tampered after acceptance';
+    expect(world.publishDialogAnswer(answer, 'name')).toBe(true);
+    expect(world.publishDialogAnswer(answer)).toBe(false);
+    await expect.poll(() => host.events.length).toBe(1);
+    expect(host.events[0]).toMatchObject({ type: 'desktop-pet.guide-answer', dependencyOrigin: 'user-input',
+      text: '[guide answer] For name, The user wrote: Synthetic name' });
+    const secret = world.dialog({ text: 'Key?', input: { kind: 'text', submit: 'OK', secret: true } });
+    const secretShown = await page.next((item) => item.t === 'dialog');
+    page.send({ t: 'dialog', id: secretShown.id, text: 'synthetic-secret' });
+    expect(world.publishDialogAnswer(await secret.answer)).toBe(false);
+    expect(host.events).toHaveLength(1);
+    const choice = world.dialog({ text: 'Movement?', input: { kind: 'choices', confirm: 'OK', options: [
+      { label: 'still', motion: 'still' }, { label: 'sometimes', motion: 'walk' }, { label: 'often', motion: 'run' },
+    ] } });
+    const choiceShown = await page.next((item) => item.t === 'dialog' && item.id !== secretShown.id && item.id !== shown.id);
+    page.send({ t: 'dialog', id: choiceShown.id, index: 2 });
+    expect(world.publishDialogAnswer(await choice.answer, 'roam')).toBe(true);
+    await expect.poll(() => host.events.length).toBe(2);
+    expect(host.events[1]!.text).toContain('For roam, The user selected option 3 (Coo runs back and forth).');
+  });
+
+  it('adds English meanings for the Guide choices that change Coo behavior', async () => {
+    const { world, host } = await mounted();
+    const admissions: Array<false | import('cortico/core/types.ts').SourceMapSpan[]> = [];
+    const push = host.pushEvent.bind(host);
+    host.pushEvent = async (event, options) => {
+      if (event.type === 'desktop-pet.guide-answer') admissions.push(world.admitUserAnswer({ ...event }), world.admitUserAnswer(event), world.admitUserAnswer(event));
+      return push(event, options);
+    };
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+
+    const language = world.dialog({
+      text: 'Language?',
+      input: { kind: 'choices', confirm: 'OK', options: LANGUAGES.map((code) => ({ label: code })) },
+    });
+    const languageDialog = await page.next((item) => item.t === 'dialog' && item.text === 'Language?');
+    page.send({ t: 'dialog', id: languageDialog.id, index: LANGUAGES.indexOf('en') });
+    expect(world.publishDialogAnswer(await language.answer, 'language')).toBe(true);
+    await expect.poll(() => host.events.length).toBe(1);
+    expect(host.events[0]!.text).toContain('For language, The user selected option 3 (the app language is English).');
+    expect(admissions[0]).toBe(false);
+    expect(admissions[1]).toMatchObject([
+      { origin: 'core-generated' }, { origin: 'user-input' }, { origin: 'core-generated' },
+    ]);
+    expect(admissions[2]).toBe(false);
+
+    const persona = world.dialog({
+      text: 'Persona?',
+      input: { kind: 'choices', confirm: 'OK', options: [
+        { label: 'Coo', icon: 'persona_coo' }, { label: 'Grail', icon: 'persona_grail' },
+      ] },
+    });
+    const personaDialog = await page.next((item) => item.t === 'dialog' && item.text === 'Persona?');
+    page.send({ t: 'dialog', id: personaDialog.id, index: 1 });
+    expect(world.publishDialogAnswer(await persona.answer, 'persona-pick')).toBe(true);
+    await expect.poll(() => host.events.length).toBe(2);
+    expect(host.events[1]!.text).toContain("For persona-pick, The user selected option 2 (Coo's persona is Grail).");
+    expect(admissions[3]).toBe(false);
+    expect(admissions[4]).toMatchObject([
+      { origin: 'core-generated' }, { origin: 'user-input' }, { origin: 'core-generated' },
+    ]);
+    expect(admissions[5]).toBe(false);
+
+    const wake = world.dialog({
+      text: 'Wake?',
+      input: { kind: 'choices', confirm: 'OK', options: [
+        { label: 'Quiet' }, { label: 'Poke' }, { label: 'All' },
+      ] },
+    });
+    const wakeDialog = await page.next((item) => item.t === 'dialog' && item.text === 'Wake?');
+    page.send({ t: 'dialog', id: wakeDialog.id, index: 2 });
+    expect(world.publishDialogAnswer(await wake.answer, 'wake')).toBe(true);
+    await expect.poll(() => host.events.length).toBe(3);
+    expect(host.events[2]!.text).toContain('For wake, The user selected option 3 (wakes on all pet touches).');
+    expect(admissions[6]).toBe(false);
+    expect(admissions[7]).toMatchObject([
+      { origin: 'core-generated' }, { origin: 'user-input' }, { origin: 'core-generated' },
+    ]);
+    expect(admissions[8]).toBe(false);
+  });
+
+  it('rejects dialog answers that do not match the active input', async () => {
+    const { world } = await mounted();
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+    const pick = world.dialog({ text: 'Pick', input: { kind: 'choices', confirm: 'OK', options: [{ label: 'A' }], more: { label: 'More', options: [{ label: 'B' }] } } });
+    const d = await page.next((m) => m.t === 'dialog');
+    page.send({ t: 'dialog', id: d.id, index: 99 });
+    page.send({ t: 'dialog', id: d.id, text: 'forged' });
+    page.send({ t: 'dialog', id: d.id, index: 1 });
+    expect(await pick.answer).toEqual({ index: 1 });
   });
 
   it('the pet panel runs the app\'s introduction when the app lends one', async () => {
@@ -623,6 +846,61 @@ function chatSocket(world: DesktopPetWorld) {
 }
 
 describe('chat page', () => {
+  it('does not show assistant output after source invalidation aborts the turn', async () => {
+    const { world, host } = await mounted();
+    const page = await FakePage.open(origin(world));
+    cleanup.push(() => page.close());
+    const tap = world.outputTap()!;
+    tap.onEvent({ type: 'response.completed', sequence_number: 1, response: { id: 'stale-answer', status: 'completed',
+      output: [{ type: 'message', id: 'stale-message', role: 'assistant',
+        content: [{ type: 'output_text', text: 'Stale synthetic answer' }] }] } } as never);
+    tap.onAbort?.('source evidence changed');
+    world.onRunPhase({ state: 'idle', running: [], enteredAt: new Date().toISOString() });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(page.messages.filter((message) => message.t === 'say')).toHaveLength(0);
+    expect(host.stored.some((event) => event.meta?.kind === 'assistant')).toBe(false);
+  });
+
+  it('records completed assistant text once without replaying pet_say', async () => {
+    const { world, host } = await mounted(undefined, { botName: () => 'Coo' });
+    const pet = await FakePage.open(origin(world));
+    cleanup.push(() => pet.close());
+    const chat = chatSocket(world);
+    const output = world.outputTap()!;
+    const completed = (responseId: string, text: string) => ({
+      type: 'response.completed', sequence_number: 1,
+      response: { id: responseId, status: 'completed', output: [{
+        type: 'message', id: `message_${responseId}`, role: 'assistant',
+        content: [{ type: 'output_text', text }],
+      }] },
+    }) as never;
+
+    await tool(world, 'pet_say').handler({ script: 'Same words' }, ctx);
+    output.onEvent(completed('response_same', 'Same words'));
+    world.onRunPhase({ state: 'idle', round: 1, running: [], enteredAt: new Date().toISOString() });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(host.stored.filter((event) => event.type === SELF_TYPE && event.meta?.kind === 'assistant')).toHaveLength(0);
+
+    world.onRunPhase({ state: 'delivering', round: 2, running: [], enteredAt: new Date().toISOString() });
+    const final = completed('response_answer', 'A final assistant answer');
+    expect(assistantReplyFromEvent(final)).toEqual({ responseId: 'response_answer', text: 'A final assistant answer' });
+    output.onEvent(final);
+    output.onEvent(final);
+    world.onRunPhase({ state: 'idle', round: 2, running: [], enteredAt: new Date().toISOString() });
+    await expect.poll(() => host.stored.filter((event) => event.type === SELF_TYPE && event.meta?.kind === 'assistant'))
+      .toHaveLength(1);
+    await expect.poll(() => chat.last('item')).toMatchObject({ item: { kind: 'assistant', text: 'A final assistant answer' } });
+    expect(host.stored.filter((event) => event.type === SELF_TYPE && event.meta?.kind === 'assistant')).toHaveLength(1);
+    await expect.poll(() => pet.messages.filter((message) => message.t === 'say')).toHaveLength(2);
+    const bubbles = pet.messages.filter((message) => message.t === 'say');
+    expect(bubbles[1].beats).toEqual([{ text: 'A final assistant answer', actions: [], anchors: [] }]);
+
+    chat.send({ t: 'hello' });
+    await expect.poll(() => chat.last('init')).toBeDefined();
+    expect((chat.last('init')!.items as Array<Record<string, unknown>>).filter((item) => item.kind === 'assistant'))
+      .toMatchObject([{ text: 'A final assistant answer' }]);
+  });
+
   it('a typed message waits on the page until delivered; a withdrawn one leaves the history, the pet\'s lines stay', async () => {
     const { world, host } = await mounted(undefined, { botName: () => 'Coo' });
     const page = await FakePage.open(origin(world));
@@ -632,7 +910,7 @@ describe('chat page', () => {
     chat.send({ t: 'send', id: 1, text: '帮我看看这个报错' });
     await expect.poll(() => chat.last('sent')).toMatchObject({ id: 1 });
     const sent = host.events.at(-1)!;
-    expect(sent).toMatchObject({ type: 'desktop-pet.message', text: '[typed] 伙伴:帮我看看这个报错', meta: { via: 'chat' } });
+    expect(sent).toMatchObject({ type: 'desktop-pet.message', dependencyOrigin: 'user-input', text: '[typed] 伙伴:帮我看看这个报错', meta: { via: 'chat' } });
     expect(host.pushOpts.at(-1)).toEqual({ trigger: 'preempt' });
     expect(chat.last('item')).toMatchObject({ pending: true, item: { kind: 'user', cursor: sent.cursor } });
     world.onEventsSettled([sent], 'delivered');

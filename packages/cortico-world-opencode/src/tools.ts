@@ -19,7 +19,7 @@ export const OPENCODE_TOOL_DECLS: ReadonlyArray<Omit<ToolDef, 'handler'>> = [
   {
     name: 'opencode_answer',
     tags: ['act'],
-    description: 'Answer a pending opencode permission request. Call it only after the person chose an option in your pet_ask bubble. once allows this request, always allows matching requests for this session, reject refuses it.',
+    description: 'Answer a pending opencode permission request in a standalone host. Coopanion Core handles file and command approval directly; this tool is omitted there.',
     parameters: {
       type: 'object',
       properties: {

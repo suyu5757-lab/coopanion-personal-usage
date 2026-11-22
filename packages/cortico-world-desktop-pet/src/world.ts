@@ -22,12 +22,14 @@ import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import type {
-  BlobInput, EventEnvelope, Logger, OutputTap, RunPhase, ToolCallContext, ToolDef, ToolOutcome, TriggerMode, World, WorldWebUiDecl,
-  WorldHost, WorldLamp, WorldPanelDecl, WorldStreamSocket,
+  BlobInput, EventEnvelope, Logger, OutputTap, RunPhase, SourceMapSpan, ToolCallContext, ToolDef, ToolOutcome, TriggerMode, World, WorldWebUiDecl,
+  WorldEnvPromptValue, WorldEnvPromptVars, WorldHost, WorldLamp, WorldPanelDecl, WorldStreamSocket,
 } from 'cortico/core/types.ts';
+import { digestText } from 'cortico/core/evidence.ts';
 import { nowIso, shortTime } from 'cortico/core/util.ts';
-import type { Language } from 'cortico/core/language.ts';
+import { LANGUAGES, type Language } from 'cortico/core/language.ts';
 import type { DeepPartial } from 'cortico/world.ts';
+import { CuaDriver, type CuaDriverOptions } from './cua/driver.ts';
 import {
   DESKTOP_PET_ID, MAX_HOVER_BUTTONS, PET_ACTIONS, SELF_KEYS, TOUCH_KINDS, USER_MAX, asrEngineFor, desktopPetConfigGroups, directSettings,
   hoverButtonList, selfAdjustMode, speechFor, touchWakes,
@@ -46,17 +48,85 @@ import { Packer, Segmenter, rmsDb, type SegmentConfig, type SegmentSink, type Ut
 import { comboLabel, hotkeyBadge, hotkeyLabel, parseHotkey, splitTaps, watchHotkey, type KeyWatcher } from './asr/hotkey.ts';
 import { joinSpeech, looksHallucinated, type TranscribeResult } from './asr/result.ts';
 import { toSimplified } from './asr/simplify.ts';
-import { estimateSeconds, parseActions, parseScript, vocabChange, vocabTable, type VocabWord } from './script.ts';
-import { ActivityGroup, ChatSockets, SELF_TYPE, chatHistory, chatItem, chatRefs, type ChatFigure } from './chat.ts';
+import { estimateSeconds, parseActions, parseScript, parseScriptWithSpans, vocabChange, vocabTable, type BeatSpan, type VocabWord } from './script.ts';
+import { ActivityGroup, ChatSockets, SELF_TYPE, assistantReplyFromEvent, chatHistory, chatItem, chatRefs, type ChatFigure } from './chat.ts';
 import { ASK_OPTION_MAX, petToolDecls } from './tools.ts';
 import { COO, figurePacks, lookOf, modelName, nameIn, packFor, type FigurePack, type MoveTarget, type PackScan } from './packs.ts';
 import { moveChange, moveTable, readMove } from './moves.ts';
-import { Cua } from './cua/cua.ts';
+import { Cua, type CuaInputAuthorization, type CuaInputGrantRequest } from './cua/cua.ts';
 import { CUA_OFF_TOOL_DECLS } from './cua/tools.ts';
 import type { Answer } from './cua/engine-ipc.ts';
 import { PackImporter } from './pack-import.ts';
 import { dressTable, planSettings, type SettingChange } from './self.ts';
 import { MODEL_TEXT, type ModelLanguage, type ModelText } from './model-text.ts';
+
+type GuideChoiceSnapshot = {
+  options: Array<Pick<PetDialogChoice, 'icon' | 'motion'>>;
+  more?: { options: Array<Pick<PetDialogChoice, 'icon' | 'motion'>> };
+};
+
+const GUIDE_LANGUAGE_NAMES: Readonly<Record<Language, string>> = {
+  zh: 'Simplified Chinese',
+  'zh-Hant': 'Traditional Chinese',
+  en: 'English',
+  ja: 'Japanese',
+  ko: 'Korean',
+  fr: 'French',
+  de: 'German',
+  'es-419': 'Latin American Spanish',
+  'pt-BR': 'Brazilian Portuguese',
+  it: 'Italian',
+  ru: 'Russian',
+};
+const GUIDE_PERSONA_NAMES: Readonly<Record<string, string>> = {
+  coo: 'Coo',
+  grail: 'Grail',
+  forge: 'Forge',
+  heart: 'Heart',
+  winter: 'Winter',
+  whale: 'the whale',
+};
+const GUIDE_ROAM_MEANINGS: Readonly<Record<NonNullable<PetDialogChoice['motion']>, string>> = {
+  still: 'Coo stays still',
+  walk: 'Coo strolls now and then',
+  run: 'Coo runs back and forth',
+};
+const GUIDE_WAKE_MEANINGS = [
+  'does not wake on pet touches',
+  'wakes on pokes',
+  'wakes on all pet touches',
+] as const;
+
+function snapshotGuideChoices(input: PetDialogInput | undefined): GuideChoiceSnapshot | undefined {
+  if (input?.kind !== 'choices') return undefined;
+  const snapshot = (choice: PetDialogChoice): Pick<PetDialogChoice, 'icon' | 'motion'> => ({
+    ...(choice.icon?.startsWith('persona_') ? { icon: choice.icon } : {}),
+    ...(choice.motion === undefined ? {} : { motion: choice.motion }),
+  });
+  return {
+    options: input.options.map(snapshot),
+    ...(input.more ? { more: { options: input.more.options.map(snapshot) } } : {}),
+  };
+}
+
+function guideChoiceMeaning(step: string, index: number, input?: GuideChoiceSnapshot): string | undefined {
+  const options = input ? [...input.options, ...(input.more?.options ?? [])] : [];
+  const option = options[index];
+  if (step === 'language' && input && !input.more && input.options.length === LANGUAGES.length) {
+    const language = LANGUAGES[index];
+    return language ? 'the app language is ' + GUIDE_LANGUAGE_NAMES[language] : undefined;
+  }
+  if (step === 'persona-pick') {
+    const id = option?.icon?.startsWith('persona_') ? option.icon.slice('persona_'.length) : undefined;
+    const name = id ? GUIDE_PERSONA_NAMES[id] : undefined;
+    return name ? "Coo's persona is " + name : undefined;
+  }
+  if (step === 'roam' && option?.motion) return GUIDE_ROAM_MEANINGS[option.motion];
+  if (step === 'wake' && input && !input.more && input.options.length === GUIDE_WAKE_MEANINGS.length) {
+    return GUIDE_WAKE_MEANINGS[index];
+  }
+  return undefined;
+}
 
 /** The console panels, titled in `language`. */
 function desktopPetPanelDecls(language: Language = 'zh'): WorldPanelDecl[] {
@@ -79,6 +149,23 @@ const ENV_PROMPT_FILES: Record<ModelLanguage, string> = {
   zh: fileURLToPath(new URL('./ENV_PROMPT.md', import.meta.url)),
   en: fileURLToPath(new URL('./ENV_PROMPT.en.md', import.meta.url)),
 };
+
+const ENV_PROMPT_DIGESTS: Record<ModelLanguage, string> = {
+  zh: 'c80f4ca22a0696255bdb7a484236a8689a94782287ef2a5772ae81e5d51cb414',
+  en: '4613c67b5c89e65439dbd47386b6647937fe4253205e24b9e38e5c57707e85a2',
+};
+
+export const DESKTOP_PET_TRUSTED_TEMPLATE_DIGESTS: readonly string[] = Object.values(ENV_PROMPT_DIGESTS);
+
+const PACK_PROMPT_DIGESTS = new Set([
+  '5a957ce5fe90f29fa0c026031f5980a157ac8cfcb050a004cbebf7ad355c6133',
+  'a697de3bc0f85e5e87032970d823f165533c41ff170251006ce16d53104cb246',
+  '1886ee017df8548461e67f022dece8c3e2db717061383f2d64a5d3ed953a8782',
+]);
+
+function promptValue(text: string, verified: boolean): WorldEnvPromptValue {
+  return { text, ...(verified && text ? { sourceMapSpans: [{ start: 0, end: text.length, digest: digestText(text), origin: 'core-generated' }] } : {}) };
+}
 
 /** Longest `pet_quiet`: a quiet that outlasts a day is a setting, which `pet_set` changes. */
 const QUIET_MAX_MIN = 24 * 60;
@@ -242,6 +329,21 @@ export interface DesktopPetWorldOptions {
   replyLanguage?: () => string | null;
   /** Called with each answer to computer use's question, asked in the pet's bubble. */
   onCuaAnswer?: (answer: Answer) => void;
+  /** Core's fail-closed check for every input tool while no task-grant bridge is configured. */
+  allowCuaInput?: (tool: string) => boolean;
+  /** Identifies this Core run in native-window evidence. */
+  cuaInstanceId?: string;
+  /** Core confirms and issues a task-level or single-step grant for a supported native target. */
+  allowsOrdinaryCuaInput?: (request: Pick<CuaInputGrantRequest, 'tool' | 'target' | 'expectedChange'>) => boolean;
+  authorizeCuaInput?: (request: CuaInputGrantRequest) => Promise<CuaInputAuthorization | null>;
+  /** Explicitly cancels an active desktop CUA task grant and its continuation state. */
+  revokeCuaTask?: (taskId: string) => void;
+  /** Suspends ephemeral in-memory CUA grants on shutdown/window switch without cancelling persisted tasks. */
+  suspendCuaTask?: (taskId: string) => void;
+  /** Returns the persisted resumable CUA task ID on startup, if any. */
+  resumeCuaTaskId?: () => string | null;
+  /** Exact app-managed Cua Driver endpoint and session. */
+  cuaDriver?: CuaDriverOptions;
 }
 
 type SherpaEngine = Exclude<AsrEngine, 'system'>;
@@ -259,6 +361,7 @@ interface PendingAsk {
   id: string;
   question: string;
   options: string[];
+  allowOwn: boolean;
 }
 
 interface TouchBatch {
@@ -362,7 +465,12 @@ export class DesktopPetWorld implements World {
   private micState: { state: string; detail: string | null } = { state: 'off', detail: null };
   private devices: Array<{ id: string; label: string }> = [];
   private readonly confirms = new Map<string, PendingConfirm>();
-  private readonly dialogs = new Map<string, (a: PetDialogAnswer) => void>();
+  private readonly dialogs = new Map<string, { settle: (a: PetDialogAnswer) => void; accept: (a: PetDialogAnswer) => boolean; remember: (a: PetDialogAnswer) => void }>();
+  private readonly admittedDialogAnswers = new WeakMap<object, { text: string; input?: GuideChoiceSnapshot }>();
+  private readonly admittedAnswers = new WeakMap<object, SourceMapSpan[]>();
+  private readonly admittedAskReceipts = new WeakSet<object>();
+  private readonly admittedSayReceipts = new WeakMap<object, string>();
+  private readonly admittedActReceipts = new WeakMap<object, string>();
   /** The talk key is down (hold) or was switched on (toggle). */
   private talking = false;
   /** With `micOnPress`: the page keeps the microphone open from the talk key's press until MIC_RELEASE_MS after its release. */
@@ -388,6 +496,22 @@ export class DesktopPetWorld implements World {
   private phase: RunPhase | null = null;
   /** The person's messages (typed, spoken) not yet delivered to the bot, by cursor. */
   private readonly pendingChat = new Set<number>();
+  private readonly assistantResponseIds = new Set<string>();
+  private readonly pendingAssistantResponses: Array<{ responseId: string; text: string }> = [];
+  private readonly spokenThisTurn = new Set<string>();
+  private assistantFlush: Promise<void> = Promise.resolve();
+  /** Serializes assistant bubble sends so multiple replies in one turn never overtake each other. */
+  private assistantBubbleChain: Promise<void> = Promise.resolve();
+  /** Bumped whenever a new user turn starts or a round is preempted, cancelling stale say bubbles. */
+  private sayEpoch = 0;
+  /** Tracks whether we are already inside a `delivering` (round=undefined) notification to avoid duplicate clears. */
+  private inDeliveringBatch = false;
+  /** Current OpenResponses generation id observed on the trusted outputTap stream. */
+  private activeResponseId: string | null = null;
+  /** Trusted FIFO queue of pet_say calls observed on outputTap in this response. */
+  private readonly pendingSayCalls: Array<{ generationId: string | null; outputIndex: number; callId?: string }> = [];
+  /** Bounded desensitized voice-bubble sync trace reported by the pet page (no raw text). */
+  private readonly syncTrace: Array<Record<string, unknown>> = [];
   /** The first cursor of this run: Core queues this World's undelivered events from before it again at start. */
   private startCursor = 0;
   /** Text the bubble's expand button carried, until a chat page takes it. */
@@ -402,9 +526,17 @@ export class DesktopPetWorld implements World {
     this.cfg = opts.cfg;
     this.cua = new Cua({
       cfg: () => this.cfg.cua,
+      driver: () => new CuaDriver(opts.cuaDriver),
       botName: opts.botName,
       modelLanguage: () => this.language,
       language: () => this.appLanguage,
+      allowInput: opts.allowCuaInput,
+      instanceId: opts.cuaInstanceId,
+      allowsOrdinaryInput: opts.allowsOrdinaryCuaInput,
+      authorizeInput: opts.authorizeCuaInput,
+      revokeInputTask: opts.revokeCuaTask,
+      suspendInputTask: opts.suspendCuaTask,
+      initialTaskId: opts.resumeCuaTaskId,
       askPermission: async (question, choices) => {
         const answer = await this.confirm(question, choices);
         if (answer === 'unavailable') return null;
@@ -479,13 +611,12 @@ export class DesktopPetWorld implements World {
   }
 
   /** The pack of the figure the skin asks for (Coo for one that is not installed); null only when even Coo's would not load. */
-  private currentPack(): FigurePack | null {
+  private currentPack(packs = this.packs()): FigurePack | null {
     const figure = this.cfg.skin.figure ?? COO;
-    return packFor(this.packs(), figure === this.figureFailed ? COO : figure);
+    return packFor(packs, figure === this.figureFailed ? COO : figure);
   }
   /** The words the body on screen does: its pack's vocabulary, less the words its body said it does not know. */
-  private vocab(): VocabWord[] {
-    const pack = this.currentPack();
+  private vocab(pack = this.currentPack()): VocabWord[] {
     if (!pack) return [];
     const known = this.bodyWords.get(pack.id);
     return known ? pack.manifest.vocab.filter((w) => known.has(w.id)) : pack.manifest.vocab;
@@ -670,7 +801,7 @@ export class DesktopPetWorld implements World {
     this.micReleaseTimer = null;
     for (const c of this.confirms.values()) { clearTimeout(c.timer); c.resolve('unavailable'); }
     this.confirms.clear();
-    for (const d of this.dialogs.values()) d({ unavailable: true });
+    for (const d of this.dialogs.values()) d.settle({ unavailable: true });
     this.dialogs.clear();
     for (const w of this.walks.values()) { clearTimeout(w.timer); w.resolve(this.t.walkWorldStopped); }
     this.walks.clear();
@@ -706,21 +837,185 @@ export class DesktopPetWorld implements World {
     return { text: this.t.cuaSettingsOpened(this.userName) };
   }
 
+  private voiceSyncBridge(): { activeGenerationId?: string | null; recentJobs?: Array<Record<string, unknown>> } | null {
+    const bridge = (globalThis as Record<symbol, unknown>)[Symbol.for('coopanion.voiceSync.v1')];
+    return bridge && typeof bridge === 'object' ? (bridge as { activeGenerationId?: string | null; recentJobs?: Array<Record<string, unknown>> }) : null;
+  }
+
+  private buildBindings(
+    utteranceId: string,
+    spans: readonly BeatSpan[],
+    generationId: string | null,
+    outputIndex: number | null,
+    sayEpoch: number,
+  ): Array<Record<string, unknown>> {
+    const segmentPrefix = generationId && outputIndex !== null ? `${generationId}#${outputIndex}:` : undefined;
+    return spans.map((span, i) => ({
+      bubbleId: `${utteranceId}:b${i}`,
+      sayEpoch,
+      scriptStart: span.scriptStart,
+      scriptEnd: span.scriptEnd,
+      ...(generationId ? { generationId } : {}),
+      ...(outputIndex !== null ? { outputIndex, contentOrdinal: outputIndex } : {}),
+      ...(segmentPrefix ? { segmentPrefix } : {}),
+    }));
+  }
+
   outputTap(): OutputTap | undefined {
-    if (!this.server.petConnected) return undefined;
+    if (!this.server.petConnected && this.chat.size === 0) return undefined;
     return {
-      // the pet shows nothing of the stream itself; its tools act when they run
       externalizes: () => false,
-      onEvent: (event) => this.status.onEvent(event),
+      onEvent: (event) => {
+        this.status.onEvent(event);
+        const ev = event as unknown as {
+          type?: string;
+          output_index?: number;
+          response?: { id?: string };
+          item?: { type?: string; name?: string; call_id?: string };
+        };
+        if (ev.type === 'response.created') {
+          this.activeResponseId = ev.response?.id || this.voiceSyncBridge()?.activeGenerationId || null;
+          this.pendingSayCalls.length = 0;
+        } else if (ev.type === 'response.output_item.added' && ev.item?.type === 'function_call' && ev.item.name === 'pet_say') {
+          const genId = this.activeResponseId || this.voiceSyncBridge()?.activeGenerationId || null;
+          this.pendingSayCalls.push({
+            generationId: genId,
+            outputIndex: typeof ev.output_index === 'number' ? ev.output_index : 0,
+            ...(ev.item.call_id ? { callId: ev.item.call_id } : {}),
+          });
+          this.pendingSayCalls.sort((a, b) => a.outputIndex - b.outputIndex);
+        } else if (ev.type === 'response.failed' || ev.type === 'error') {
+          this.activeResponseId = null;
+          this.pendingSayCalls.length = 0;
+        }
+        const reply = assistantReplyFromEvent(event);
+        if (!reply || this.assistantResponseIds.has(reply.responseId)) return;
+        this.assistantResponseIds.add(reply.responseId);
+        if (this.assistantResponseIds.size > 1024) this.assistantResponseIds.delete(this.assistantResponseIds.values().next().value!);
+        this.pendingAssistantResponses.push(reply);
+      },
+      onAbort: () => {
+        for (const reply of this.pendingAssistantResponses) this.assistantResponseIds.delete(reply.responseId);
+        this.pendingAssistantResponses.length = 0;
+        this.pendingSayCalls.length = 0;
+        this.activeResponseId = null;
+        this.inDeliveringBatch = false;
+        this.clearQueuedSayBubbles();
+      },
     };
+  }
+
+  private clearQueuedSayBubbles(): void {
+    this.sayEpoch++;
+    this.busyUntil = 0;
+    this.server.sendPet({ t: 'say-clear', epoch: this.sayEpoch });
+  }
+
+  onSessionArchived(): void {
+    const text = this.ui.sessionArchived;
+    const id = nextId('s');
+    this.server.sendPet({
+      t: 'say',
+      id,
+      epoch: this.sayEpoch,
+      beats: [{ text, actions: [], anchors: [] }],
+      bindings: this.buildBindings(id, [{ scriptStart: 0, scriptEnd: text.length }], null, null, this.sayEpoch),
+    });
+    void this.record({ kind: 'say', beats: [{ text }] }, text);
   }
 
   onRunPhase(phase: RunPhase): void {
     this.phase = phase;
     this.status.onPhase(phase);
+    if (phase.state === 'delivering' && phase.round === undefined) {
+      // Do not wipe active bubbles on internal/background batches; explicit preemption clears via onAbort.
+      if (!this.inDeliveringBatch) {
+        this.inDeliveringBatch = true;
+      }
+    } else if (phase.state !== 'delivering') {
+      this.inDeliveringBatch = false;
+    }
     if (this.activity.observe(phase, Date.now())) this.chat.broadcast({ t: 'activity', steps: this.activity.steps, startedAt: this.activity.startedAt });
-    if (phase.state === 'idle') void this.closeActivity();
+    if (phase.state === 'idle') {
+      const replies = this.pendingAssistantResponses.splice(0);
+      const spoken = new Set(this.spokenThisTurn);
+      this.spokenThisTurn.clear();
+      void this.closeActivity();
+      const visible = replies.filter((reply) => {
+        const beats = parseScript(reply.text, this.vocab()).beats.map((b) => b.text.trim()).filter(Boolean);
+        // A reply that only repeats what a pet_say bubble already said (markers ignored) is not a second bubble.
+        return beats.length > 0 && !beats.every((text) => spoken.has(text));
+      });
+      const epoch = this.sayEpoch;
+      for (const reply of visible) {
+        this.assistantBubbleChain = this.assistantBubbleChain
+          .then(() => this.sendAssistantBubble(reply.text, epoch, reply.responseId))
+          .catch((err: unknown) => this.log?.warn(`气泡发送失败:${(err as Error).message}`));
+      }
+      if (visible.length > 0) this.assistantFlush = this.assistantFlush.then(async () => {
+        for (const reply of visible) await this.record({ kind: 'assistant', responseId: reply.responseId }, reply.text);
+      }).catch((err: unknown) => this.log?.warn(`回复没能保存:${(err as Error).message}`));
+    }
     this.chat.broadcast({ t: 'phase', phase });
+  }
+
+  /**
+   * The assistant's plain reply is a bubble too. Wait until its own E12 audio starts (preferring
+   * trusted `generationId` match) before showing it, so a long pet_say bubble is not replaced while
+   * its voice is still speaking. Transient clock errors do not fake idle.
+   */
+  private async sendAssistantBubble(text: string, epoch = this.sayEpoch, responseId: string | null = null): Promise<void> {
+    const target = process.env.COOPANION_MLX_URL || 'http://127.0.0.1:9882';
+    const started = Date.now();
+    let consecutiveErrors = 0;
+    while (Date.now() - started < 60_000) {
+      if (epoch !== this.sayEpoch) return;
+      try {
+        const res = await fetch(`${target}/clock`, { signal: AbortSignal.timeout(600) });
+        if (!res.ok) {
+          if (++consecutiveErrors >= 3) break;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          continue;
+        }
+        consecutiveErrors = 0;
+        const clock = await res.json() as { playing?: boolean; current?: { text?: string; generationId?: string } | null; queue?: Array<{ generationId?: string }> };
+        const current = clock.current;
+        if (!clock.playing || !current) break;
+        if (responseId && current.generationId) {
+          if (current.generationId === responseId) break;
+        } else {
+          const currentText = current.text ?? '';
+          const clean = (value: string): string => value
+            .replace(/【[^】]*】/g, ' ')
+            .replace(/<[^<>\n]{1,32}>/g, ' ')
+            .replace(/https?:\/\/\S+/g, ' ')
+            .replace(/[\p{Extended_Pictographic}\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}]/gu, ' ')
+            .replace(/[*_`~#>|]+/g, ' ')
+            .replace(/\s+/g, '');
+          const want = clean(text), got = clean(currentText);
+          const enough = want.length >= 8;
+          if (enough && got && (got === want
+            || (want.startsWith(got) && got.length >= 12)
+            || (got.startsWith(want) && want.length >= 12))) break;
+        }
+      } catch {
+        if (++consecutiveErrors >= 3) break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    if (epoch !== this.sayEpoch) return;
+    const { beats, spans } = parseScriptWithSpans(text, this.vocab());
+    if (!beats.length) return;
+    const id = nextId('s');
+    const genId = responseId || this.voiceSyncBridge()?.activeGenerationId || null;
+    this.server.sendPet({
+      t: 'say',
+      id,
+      epoch,
+      ...(genId ? { generationId: genId, outputIndex: -1 } : {}),
+      beats,
+      bindings: this.buildBindings(id, spans, genId, genId ? -1 : null, epoch),
+    });
   }
 
   /**
@@ -1108,16 +1403,26 @@ export class DesktopPetWorld implements World {
       }
       case 'control': return this.onControl(String(msg.action));
       case 'dialog': {
-        const settle = this.dialogs.get(String(msg.id));
-        if (!settle) return;
-        this.dialogs.delete(String(msg.id));
-        settle(typeof msg.index === 'number' ? { index: msg.index }
+        const dialog = this.dialogs.get(String(msg.id));
+        if (!dialog) return;
+        const answer: PetDialogAnswer = typeof msg.index === 'number' ? { index: msg.index }
           : typeof msg.text === 'string' ? { text: msg.text.slice(0, 2000) }
-          : msg.alt ? { alt: true } : msg.closed ? { closed: true } : { done: true });
+          : msg.alt ? { alt: true } : msg.closed ? { closed: true } : { done: true };
+        if (!dialog.accept(answer)) return;
+        dialog.remember(answer);
+        this.dialogs.delete(String(msg.id));
+        dialog.settle(answer);
         return;
       }
       case 'commit': return this.commitSpeech();
       case 'cancel': return this.cancelSpeech();
+      case 'sync-trace': {
+        if (msg.entry && typeof msg.entry === 'object') {
+          this.syncTrace.push(msg.entry as Record<string, unknown>);
+          if (this.syncTrace.length > 128) this.syncTrace.shift();
+        }
+        return;
+      }
     }
   }
 
@@ -1160,10 +1465,29 @@ export class DesktopPetWorld implements World {
     let settle: (a: PetDialogAnswer) => void = () => {};
     const answer = new Promise<PetDialogAnswer>((resolve) => { settle = resolve; });
     if (!this.server.sendPet({ t: 'dialog', id, ...d, input, actions })) settle({ unavailable: true });
-    else this.dialogs.set(id, settle);
+    else {
+      const activeInput = input ? structuredClone(input) : undefined;
+      const closable = d.closable === true;
+      this.dialogs.set(id, { settle, accept: (a) => {
+        if ('closed' in a) return closable;
+        if ('index' in a) {
+          if (activeInput?.kind !== 'buttons' && activeInput?.kind !== 'choices') return false;
+          const count = activeInput.options.length + (activeInput.kind === 'choices' ? activeInput.more?.options.length ?? 0 : 0);
+          return Number.isInteger(a.index) && a.index >= 0 && a.index < count;
+        }
+        if ('text' in a) return activeInput?.kind === 'text';
+        if ('alt' in a) return activeInput?.kind === 'text' && !!activeInput.alt;
+        return 'done' in a && !activeInput;
+      }, remember: (a) => {
+        if ('index' in a) this.admittedDialogAnswers.set(a, { text: '[guide answer] The user selected option ' + (a.index + 1) + '.', input: snapshotGuideChoices(activeInput) });
+        else if ('text' in a && activeInput?.kind === 'text' && !activeInput.secret) {
+          this.admittedDialogAnswers.set(a, { text: '[guide answer] The user wrote: ' + a.text });
+        }
+      } });
+    }
     // a page that never reports back (a tab put to sleep) does not hold a line with nothing to answer forever
     if (!d.input && this.dialogs.has(id)) {
-      const timer = setTimeout(() => this.dialogs.get(id)?.({ done: true }), 5000 + d.text.length / DIALOG_CPS * 1000);
+      const timer = setTimeout(() => this.dialogs.get(id)?.settle({ done: true }), 5000 + d.text.length / DIALOG_CPS * 1000);
       void answer.finally(() => { clearTimeout(timer); this.dialogs.delete(id); });
     }
     return {
@@ -1173,7 +1497,7 @@ export class DesktopPetWorld implements World {
         const s = this.dialogs.get(id);
         this.dialogs.delete(id);
         this.server.sendPet({ t: 'dialog-close', id });
-        s?.({ done: true });
+        s?.settle({ done: true });
       },
     };
   }
@@ -1185,7 +1509,7 @@ export class DesktopPetWorld implements World {
 
   private onPageGone(): void {
     this.log?.info('桌宠页面断开');
-    for (const [id, d] of this.dialogs) { d({ unavailable: true }); this.dialogs.delete(id); }
+    for (const [id, d] of this.dialogs) { d.settle({ unavailable: true }); this.dialogs.delete(id); }
     for (const [id, w] of this.walks) { clearTimeout(w.timer); w.resolve(this.t.walkWindowGone); this.walks.delete(id); }
     for (const [id, c] of this.confirms) { clearTimeout(c.timer); c.resolve('unavailable'); this.confirms.delete(id); }
     this.segmenter.flush();
@@ -1196,22 +1520,21 @@ export class DesktopPetWorld implements World {
   private onAnswer(msg: Record<string, unknown>, from: 'pet' | 'chat'): void {
     const ask = this.ask;
     if (!ask || ask.id !== msg.askId) return;
-    const t = this.t;
     if (msg.dismissed) {
       this.setAsk(null);
-      void this.push('desktop-pet.answer', 'desktop-pet.answer', t.answerClosed(this.userName, ask.question), 'debounce', { meta: { askId: ask.id, dismissed: true } });
+      void this.push('desktop-pet.answer', 'desktop-pet.answer', '[answer] The user dismissed the question.', 'debounce', { meta: { askId: ask.id, dismissed: true } }, true);
       return;
     }
     const index = typeof msg.index === 'number' && ask.options[msg.index] !== undefined ? msg.index : null;
-    const text = typeof msg.text === 'string' ? msg.text.trim().slice(0, 500) : '';
+    const text = ask.allowOwn && typeof msg.text === 'string' ? msg.text.trim().slice(0, 500) : '';
     if (index === null && !text) return;
     this.setAsk(null);
     if (from === 'chat') this.server.sendPet({ t: 'ask-close', id: ask.id });
-    const line = index !== null
-      ? t.answerPicked(this.userName, ask.question, index + 1, ask.options[index]!)
-      : t.answerWrote(this.userName, ask.question, text);
+    const prefix = index !== null ? '[answer] The user selected option ' : '[answer] The user wrote: ';
+    const userValue = index !== null ? String(index + 1) : text;
+    const line = prefix + userValue + (index !== null ? '.' : '');
     void this.push('desktop-pet.answer', 'desktop-pet.answer', line, 'flush',
-      { meta: { askId: ask.id, ...(index !== null ? { index } : { text }) } });
+      { meta: { askId: ask.id, ...(index !== null ? { index } : { text }) } }, { start: prefix.length, end: prefix.length + userValue.length });
   }
 
   private onTouch(msg: PageMessage): void {
@@ -1278,14 +1601,91 @@ export class DesktopPetWorld implements World {
    * Delivers an event to the bot. `meta` carries what the chat page shows of it; the person's
    * messages stay pending on the page until Core reports them delivered.
    */
+  /** Pushes a Core-originated continuation wake after restart for a verified resumable CUA task. */
+  async pushContinuationResume(text: string, meta: Record<string, unknown>): Promise<boolean> {
+    const e = await this.push('desktop-pet.message', 'desktop-pet.resume', text, 'flush', { meta: { via: 'resume', ...meta } });
+    return e !== null;
+  }
+
+  /** Publishes only a validated, non-secret answer received from the dialog page. */
+  publishDialogAnswer(answer: PetDialogAnswer, step = ''): boolean {
+    const admitted = this.admittedDialogAnswers.get(answer);
+    this.admittedDialogAnswers.delete(answer);
+    if (!admitted) return false;
+    const original = admitted.text;
+    const knownSteps = new Set(['language', 'hello', 'name', 'source', 'persona-pick', 'roam', 'wake',
+      'vendor', 'model', 'key', 'chatgpt', 'voice-download', 'talk', 'buttons', 'persona', 'finish']);
+    const subject = knownSteps.has(step) ? ` For ${step},` : '';
+    const selectedPrefix = '[guide answer] The user selected option ';
+    const typedPrefix = '[guide answer] The user wrote: ';
+    const selected = original.startsWith(selectedPrefix);
+    const value = selected ? original.slice(selectedPrefix.length, -1) : original.slice(typedPrefix.length);
+    if (!value || (!selected && !original.startsWith(typedPrefix))) return false;
+    const index = selected ? Number(value) - 1 : -1;
+    const prefix = `[guide answer]${subject} The user ${selected ? 'selected option ' : 'wrote: '}`;
+    const meaning = selected ? guideChoiceMeaning(step, index, admitted.input) : undefined;
+    const suffix = selected ? (meaning ? ' (' + meaning + ').' : '.') : '';
+    const text = prefix + value + suffix;
+    void this.push('desktop-pet.guide-answer', 'desktop-pet.guide-answer', text, 'debounce', {}, { start: prefix.length, end: prefix.length + value.length });
+    return true;
+  }
+
+  /** Admits one-time speech receipts produced by this World. */
+  admitSayReceipt(outcome: ToolOutcome): boolean {
+    const expected = this.admittedSayReceipts.get(outcome);
+    if (expected === undefined) return false;
+    this.admittedSayReceipts.delete(outcome);
+    return outcome.text === expected;
+  }
+
+  /** Admits the fixed receipt produced after the pet accepted a question. */
+  admitAskReceipt(outcome: ToolOutcome): boolean {
+    if (!this.admittedAskReceipts.has(outcome)) return false;
+    this.admittedAskReceipts.delete(outcome);
+    return outcome.text === '[pet_ask] Question displayed; the answer arrives as an event.';
+  }
+
+  /** Admits only the one-time receipt from a pet action that the page accepted. */
+  admitActReceipt(outcome: ToolOutcome): boolean {
+    const expected = this.admittedActReceipts.get(outcome);
+    if (expected === undefined) return false;
+    this.admittedActReceipts.delete(outcome);
+    return outcome.failed !== true && outcome.text === expected;
+  }
+
+  /** Admits only a pending question's validated, one-time UI answer. */
+  admitUserAnswer(event: object): false | SourceMapSpan[] {
+    const spans = this.admittedAnswers.get(event);
+    this.admittedAnswers.delete(event);
+    return spans ?? false;
+  }
+
   private async push(
     type: string, senderKey: string, text: string, trigger: TriggerMode,
     extra: { meta?: Record<string, unknown>; blobs?: BlobInput[] } = {},
+    admittedAnswer: false | true | { start: number; end: number } = false,
   ): Promise<EventEnvelope | null> {
     const host = this.host;
     if (!host) return null;
     try {
-      const e = await host.pushEvent({ type, source: this.id, senderKey, ts: nowIso(this.opts.timezone), text: this.stamp() + text, ...extra }, { trigger });
+      const directUserInput = type === 'desktop-pet.message' || type === 'desktop-pet.speech' || type === 'desktop-pet.touch';
+      const stamp = this.stamp();
+      const event = { type, source: this.id, senderKey, ts: nowIso(this.opts.timezone), text: stamp + text,
+        ...(directUserInput || admittedAnswer ? { dependencyOrigin: 'user-input' as const } : {}), ...extra };
+      if (admittedAnswer) {
+        const range = admittedAnswer === true ? { start: 0, end: text.length } : admittedAnswer;
+        const start = stamp.length + range.start;
+        const end = stamp.length + range.end;
+        const spans: SourceMapSpan[] = [];
+        const add = (from: number, to: number, origin: 'user-input' | 'core-generated') => {
+          if (to > from) spans.push({ start: from, end: to, digest: digestText(event.text.slice(from, to)), origin });
+        };
+        add(0, start, 'core-generated');
+        add(start, end, 'user-input');
+        add(end, event.text.length, 'core-generated');
+        this.admittedAnswers.set(event, spans);
+      }
+      const e = await host.pushEvent(event, { trigger });
       const item = chatItem(e);
       if (!item) return e;
       const pending = item.kind === 'user' && e.contextDelivery === 'deliver';
@@ -1715,10 +2115,28 @@ export class DesktopPetWorld implements World {
     const script = typeof args.script === 'string' ? args.script : '';
     const shown = this.shownImages(args.images);
     if (!shown.ok) return { text: shown.reason, failed: true };
-    const { beats, dropped } = parseScript(script, this.vocab());
+    const { beats, spans, dropped } = parseScriptWithSpans(script, this.vocab());
     const spoken = beats.some((b) => b.text || b.actions.length || b.anchors.length);
     if (!spoken && shown.blobs.length === 0) return { text: this.t.sayEmpty, failed: true };
-    if (spoken && !this.server.sendPet({ t: 'say', id: nextId('s'), beats })) return this.notConnected('pet_say');
+    const callMeta = this.pendingSayCalls.shift();
+    const generationId = callMeta?.generationId || this.activeResponseId || this.voiceSyncBridge()?.activeGenerationId || null;
+    const outputIndex = callMeta ? callMeta.outputIndex : (generationId ? 0 : null);
+    const utteranceId = nextId('s');
+    const bindings = this.buildBindings(utteranceId, spans, generationId, outputIndex, this.sayEpoch);
+    if (spoken && !this.server.sendPet({
+      t: 'say',
+      id: utteranceId,
+      epoch: this.sayEpoch,
+      ...(generationId ? { generationId } : {}),
+      ...(outputIndex !== null ? { outputIndex } : {}),
+      beats,
+      bindings,
+    })) {
+      const receipt: ToolOutcome = { text: this.t.notConnected('pet_say', null, this.userName), failed: true };
+      this.admittedSayReceipts.set(receipt, receipt.text);
+      return receipt;
+    }
+    if (spoken) for (const beat of beats) if (beat.text.trim()) this.spokenThisTurn.add(beat.text.trim());
     void this.closeActivity();
     void this.record({ kind: 'say', beats: beats.map((b) => ({ text: b.text, ...moodOf(b.actions, this.vocab()) })) }, beats.map((b) => b.text).join(''), shown.blobs);
     if (!spoken) return { text: this.t.imagesShown(shown.blobs.length, this.chat.size > 0) };
@@ -1728,7 +2146,13 @@ export class DesktopPetWorld implements World {
     this.busyUntil = Math.max(now, this.busyUntil) + selfSec * 1000;
     const replaced = this.ask?.question ?? null;
     if (this.ask) this.setAsk(null);
-    return { text: this.t.sayReceipt({ waitSec, selfSec, chatOpen: this.chat.size > 0, replaced, dropped, images: shown.blobs.length }) };
+    // The test channel has no trusted Assembly-side World tool-text policy yet; its receipt would
+    // otherwise enter the next round as unknown-derived tool text. Suppress only this test channel
+    // receipt; the speech itself and all source verification remain unchanged.
+    if (process.env.CORTICO_TEST_CHANNEL === '1') return { text: '' };
+    const receipt: ToolOutcome = { text: this.t.sayReceipt({ waitSec, selfSec, chatOpen: this.chat.size > 0, replaced, dropped, images: shown.blobs.length }) };
+    this.admittedSayReceipts.set(receipt, receipt.text);
+    return receipt;
   }
 
   /**
@@ -1759,11 +2183,13 @@ export class DesktopPetWorld implements World {
     if (options.length === 0 && !allowOwn) return { text: this.t.askNoWay, failed: true };
     const id = nextId('a');
     if (!this.server.sendPet({ t: 'ask', id, question, options, own: allowOwn })) return this.notConnected('pet_ask');
-    const replaced = this.ask?.question ?? null;
-    this.setAsk({ id, question, options });
+    this.setAsk({ id, question, options, allowOwn });
+    this.spokenThisTurn.add(question.trim());
     void this.closeActivity();
     void this.record({ kind: 'ask', askId: id, question, options, own: allowOwn }, question);
-    return { text: this.t.askReceipt({ replaced, cut: raw.length > 3, chatOpen: this.chat.size > 0 }) };
+    const receipt: ToolOutcome = { text: '[pet_ask] Question displayed; the answer arrives as an event.' };
+    this.admittedAskReceipts.add(receipt);
+    return receipt;
   }
 
   /**
@@ -1878,26 +2304,34 @@ export class DesktopPetWorld implements World {
     if (!actions.length) return { text: this.t.actNone(dropped), failed: true };
     if (!this.server.sendPet({ t: 'act', id: nextId('c'), actions })) return this.notConnected('pet_act');
     const lasting = actions.filter((a) => vocab.find((v) => v.id === a)?.lasting);
-    return { text: this.t.actReceipt(actions, lasting, dropped) };
+    const receipt: ToolOutcome = { text: this.t.actReceipt(actions, lasting, dropped) };
+    this.admittedActReceipts.set(receipt, receipt.text);
+    return receipt;
   }
 
   /* ---------- prompt ---------- */
 
-  async envPromptVars(): Promise<Record<string, string>> {
+  async envPromptVars(): Promise<WorldEnvPromptVars> {
     const { language, t } = this;
     const user = this.userName;
     const reply = this.opts.replyLanguage?.() ?? null;
+    const packs = this.packs();
+    const pack = this.currentPack(packs);
+    const verifiedPack = pack === null || PACK_PROMPT_DIGESTS.has(pack.manifestDigest ?? '');
+    const cua = this.cuaOn
+      ? promptValue(await this.cua.envPrompt(), true)
+      : promptValue(this.cua.unsupported() === null ? t.cuaOff(user, this.cuaCanOpen) : '', true);
     return {
-      'pet.cua': this.cuaOn ? await this.cua.envPrompt() : this.cua.unsupported() === null ? t.cuaOff(user, this.cuaCanOpen) : '',
-      'pet.user': user,
-      'pet.vocab': vocabTable(this.vocab(), language),
-      'pet.moves': moveTable(this.moves(), language),
-      'pet.voice': this.cfg.asr.enabled ? t.on : t.off,
-      'pet.body': this.bodyText(this.currentPack()),
-      'pet.dress': dressTable(this.packs(), language),
-      'pet.self': this.selfText(),
-      'pet.chat': this.opts.controls?.openChat ? t.chatPage(user) : '',
-      'pet.reply': reply ? t.reply(user, reply) : '',
+      'pet.cua': cua,
+      'pet.user': promptValue(user, true),
+      'pet.vocab': promptValue(vocabTable(this.vocab(pack), language), verifiedPack),
+      'pet.moves': promptValue(moveTable(pack?.manifest.moves ?? [], language), verifiedPack),
+      'pet.voice': promptValue(this.cfg.asr.enabled ? t.on : t.off, true),
+      'pet.body': promptValue(this.bodyText(pack), verifiedPack),
+      'pet.dress': promptValue(dressTable(packs, language), packs.every((entry) => PACK_PROMPT_DIGESTS.has(entry.manifestDigest ?? ''))),
+      'pet.self': promptValue(this.selfText(), true),
+      'pet.chat': promptValue(this.opts.controls?.openChat ? t.chatPage(user) : '', true),
+      'pet.reply': promptValue(reply ? t.reply(user, reply) : '', true),
     };
   }
 
@@ -1952,6 +2386,7 @@ export class DesktopPetWorld implements World {
         key: `worlds.${DESKTOP_PET_ID}.envPrompt`,
         ...c.envPrompt,
         path: this.envPromptFile(),
+        sourceDigest: this.envPromptFile() === ENV_PROMPT_FILES.en ? ENV_PROMPT_DIGESTS.en : ENV_PROMPT_DIGESTS.zh,
         role: 'envPrompt',
         vars: ['pet.user', 'pet.vocab', 'pet.moves', 'pet.voice', 'pet.body', 'pet.dress', 'pet.self', 'pet.chat', 'pet.reply', 'pet.cua']
           .map((name) => ({ name, description: c.vars[name] ?? name, ...(name === 'pet.vocab' || name === 'pet.moves' || name === 'pet.dress' || name === 'pet.cua' ? { multiline: true } : {}) })),
@@ -2053,6 +2488,7 @@ export class DesktopPetWorld implements World {
       selfAdjust: { mode: selfAdjustMode(this.cfg.selfAdjust), custom: this.selfCustom() },
       /** The Habits page's typing key: the setting, the keys named in the app language, and why it cannot be read. */
       typeKey: { ...this.cfg.typeKey, keyLabel: comboLabel(this.cfg.typeKey.hotkey, process.platform, this.ui), problem: this.typeKeyProblem },
+      syncTrace: this.syncTrace.slice(-32),
     };
   }
 

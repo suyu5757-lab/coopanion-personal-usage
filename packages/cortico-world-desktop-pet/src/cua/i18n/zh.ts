@@ -10,6 +10,8 @@ export default {
     once: (who: string, minutes: number) => `${who} 想操作你的鼠标和键盘。接下来 ${minutes} 分钟内都可以吗？`,
     acting: (who: string) => `${who} 想操作你的鼠标和键盘。这一次可以吗？`,
     /** 两个按钮:桌宠气泡和系统对话框共用;caption 是系统对话框的标题(桌宠页不在时才弹) */
+    action: (who: string, action: string, target: string, detail: string) => `${who}申请执行电脑操作：${action}。目标：${target}。内容：${detail}。只批准这一次吗？`,
+    actions: { click: '点击', move: '移动指针', drag: '拖拽', scroll: '滚动', type: '输入文字', key: '按键', focus: '切换窗口到前台', foreground: '改为前台操作' },
     caption: '电脑操作',
     yes: '可以',
     no: '这次不行',
@@ -39,7 +41,7 @@ export default {
     group: '电脑操作',
     enabled: { title: '启用电脑操作' },
     control: { title: '允许操作鼠标和键盘', description: '关闭后只能截图和列出窗口。' },
-    permission: { title: '询问时机', description: 'ask-each-turn：每轮查看屏幕或操作前都询问；ask-before-acting：查看屏幕不询问，每轮操作鼠标键盘前询问；ask-once：查看屏幕不询问，操作前询问一次，同意后在「同意有效期」内不再询问；never-ask：从不询问。' },
+    permission: { title: '询问时机', description: 'ask-each-turn：每轮查看屏幕或操作前都询问；ask-before-acting：查看屏幕不询问，每轮操作鼠标键盘前询问；ask-once：查看屏幕不询问，操作前询问一次，同意后在「同意有效期」内不再询问；never-ask：从不询问。执行输入动作前还会单独展示本次目标与内容并逐次确认；never-ask 不会跳过这些确认。' },
     grantMinutes: { title: '同意有效期', suffix: '分钟', description: '只对 ask-once 有效。' },
     userIdleMs: { title: '让位时长', description: '你操作鼠标或键盘后，需静止这么久才继续操作。' },
     maxYieldWaitMs: { title: '让位最多等待' },

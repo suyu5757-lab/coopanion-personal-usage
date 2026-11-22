@@ -342,6 +342,46 @@ export class PetServer {
       return this.sendFile(res, full, PACK_CSP, req.headers.origin === 'null');
     }
     if (req.method === 'GET' && path === '/api/state') return json(res, 200, this.opts.snapshot());
+    // The E12 voice worker's playback clock, proxied so the pet page can type with the audible voice.
+    // Distinguishes genuine idle (`clockStatus: 'ok', playing: false`) from upstream faults (`timeout` / `unavailable` / `error`).
+    if (req.method === 'GET' && path === '/api/clock') {
+      const target = process.env.COOPANION_MLX_URL || 'http://127.0.0.1:9882';
+      try {
+        const r = await fetch(`${target}/clock`, { signal: AbortSignal.timeout(500) });
+        if (!r.ok) {
+          return json(res, 200, {
+            ok: false,
+            clockStatus: 'error',
+            httpStatus: r.status,
+            playing: false,
+            current: null,
+            queue: [],
+            recent_finished: [],
+          });
+        }
+        const data = await r.json() as Record<string, unknown>;
+        return json(res, 200, {
+          ...data,
+          ok: true,
+          clockStatus: 'ok',
+          playing: Boolean(data.playing),
+          current: data.current ?? null,
+          queue: Array.isArray(data.queue) ? data.queue : [],
+          recent_finished: Array.isArray(data.recent_finished) ? data.recent_finished : [],
+        });
+      } catch (err) {
+        const name = (err as { name?: string } | null)?.name ?? '';
+        const clockStatus = name === 'TimeoutError' || name === 'AbortError' ? 'timeout' : 'unavailable';
+        return json(res, 200, {
+          ok: false,
+          clockStatus,
+          playing: false,
+          current: null,
+          queue: [],
+          recent_finished: [],
+        });
+      }
+    }
     if (req.method === 'GET' && path === '/api/avatar') {
       const bytes = this.opts.avatarFile ? await readFile(this.opts.avatarFile).catch(() => null) : null;
       if (!bytes) { res.writeHead(404).end(); return; }

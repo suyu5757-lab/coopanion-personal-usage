@@ -4,7 +4,7 @@ export const S: Partial<typeof en> = {
   title: '컴퓨터 사용',
   enabled: 'Coo가 이 컴퓨터를 사용하도록 허용',
   control: '마우스와 키보드 허용',
-  controlHint: '끄면 Coo는 화면을 보는 것만 할 수 있습니다.',
+  controlHint: "이 통합 후보 버전에서는 화면과 창만 볼 수 있습니다. 마우스와 키보드 입력은 현재 사용할 수 없습니다.",
   permission: '먼저 물어볼 때',
   levels: { 'ask-each-turn': '매 턴', 'ask-before-acting': '조작 전', 'ask-once': '한 번', 'never-ask': '묻지 않음' },
   levelHints: {

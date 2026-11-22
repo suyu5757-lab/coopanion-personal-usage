@@ -1,5 +1,6 @@
 import type { ConfigGroup } from 'cortico/core/config-schema.ts';
 import type { Language } from 'cortico/core/language.ts';
+import { DEFAULT_RECALL_TIMEOUT_MS, MAX_CONFIGURED_RECALL_TIMEOUT_MS, MAX_SOURCE_FACTS_TOKEN_BUDGET } from './recall-limits.ts';
 import { memoryStorageText } from './strings.ts';
 
 const zh = {
@@ -15,7 +16,15 @@ const zh = {
   maxTokens: '每轮注入上限',
   maxTokensDesc: 'recall 每次最多带回多少 token 的记忆，默认 900。',
   timeout: 'recall 超时（毫秒）',
-  timeoutDesc: '超过这个时间就跳过本轮记忆，默认 800。',
+  timeoutDesc: `超过这个时间就跳过本轮记忆，默认 ${DEFAULT_RECALL_TIMEOUT_MS} 毫秒。`,
+  domainSupplement: '领域记忆补充',
+  domainSupplementDesc: '默认关闭。开启后在普通 Recall 之后增加一次有限的相关领域查询，只追加通过来源回读验证的新片段。',
+  domainSupplementSources: '领域补充来源上限',
+  domainSupplementSourcesDesc: '每轮最多追加几条已验证的领域来源，默认 2。',
+  domainSupplementChars: '领域补充字符上限',
+  domainSupplementCharsDesc: '每轮追加的领域补充正文上限，默认 1200 字符。',
+  domainSupplementTimeout: '领域补充总超时（毫秒）',
+  domainSupplementTimeoutDesc: '领域补充查询、回读和定型的总时间上限，超时只保留普通 Recall 基线。',
   affection: '每日关系日记',
   affectionDesc: '每天把好感事件、关系变化和长期记忆整理成一篇日记写进 Hindsight；后台静默运行。',
 };
@@ -33,16 +42,39 @@ const en: typeof zh = {
   maxTokens: 'Recall token budget',
   maxTokensDesc: 'How much memory text one recall may bring back. Default 900.',
   timeout: 'Recall timeout (ms)',
-  timeoutDesc: 'Skip memory for this turn after this long. Default 800.',
+  timeoutDesc: `Skip memory for this turn after this long. Default ${DEFAULT_RECALL_TIMEOUT_MS} ms.`,
+  domainSupplement: 'Domain memory supplement',
+  domainSupplementDesc: 'Off by default. When on, one bounded domain query runs after ordinary Recall and appends only new spans verified by a source readback.',
+  domainSupplementSources: 'Domain supplement source limit',
+  domainSupplementSourcesDesc: 'Maximum verified domain sources appended per turn. Default 2.',
+  domainSupplementChars: 'Domain supplement character limit',
+  domainSupplementCharsDesc: 'Maximum appended domain-supplement text per turn. Default 1200 characters.',
+  domainSupplementTimeout: 'Domain supplement total timeout (ms)',
+  domainSupplementTimeoutDesc: 'Total time for the domain query, readbacks and finalization. On timeout only the ordinary Recall baseline is kept.',
   affection: 'Daily relationship journal',
   affectionDesc: 'Once a day, turn affection events, relationship changes and long-term memories into a journal entry in Hindsight. Runs silently in the background.',
 };
 
 const TEXT = { zh, en };
 
+const SOURCE_FACTS_TEXT: Record<Language, { title: string; description: string }> = {
+  en: { title: 'Supporting source token budget', description: 'Token budget for facts supporting recalled observations, independent of the recall text budget.' },
+  zh: { title: '来源事实 token 上限', description: '召回汇总记忆时附带来源事实的 token 上限，独立于主结果预算。' },
+  'zh-Hant': { title: '來源事實 token 上限', description: '召回彙總記憶時附帶來源事實的 token 上限，獨立於主要結果預算。' },
+  ja: { title: '根拠となる事実のトークン上限', description: '想起した観察を裏付ける事実のトークン上限。想起本文の予算とは独立しています。' },
+  ko: { title: '근거 사실 토큰 한도', description: '회상된 관찰을 뒷받침하는 사실의 토큰 한도이며 회상 본문 예산과 별개입니다.' },
+  fr: { title: 'Budget de tokens des faits sources', description: 'Budget des faits étayant les observations rappelées, indépendant du budget du texte rappelé.' },
+  de: { title: 'Tokenbudget für Quellenfakten', description: 'Budget für Fakten, die abgerufene Beobachtungen belegen, unabhängig vom Budget des Erinnerungstexts.' },
+  'es-419': { title: 'Presupuesto de tokens de fuentes', description: 'Límite de los hechos que respaldan las observaciones recuperadas, independiente del texto recordado.' },
+  'pt-BR': { title: 'Orçamento de tokens dos fatos de origem', description: 'Limite dos fatos que sustentam as observações recuperadas, independente do texto da memória.' },
+  it: { title: 'Budget di token dei fatti di origine', description: 'Limite dei fatti a sostegno delle osservazioni richiamate, indipendente dal testo della memoria.' },
+  ru: { title: 'Бюджет токенов исходных фактов', description: 'Бюджет фактов, подтверждающих извлечённые наблюдения, независимо от бюджета текста памяти.' },
+};
+
 export function hindsightConfigGroup(language: Language): ConfigGroup {
   const t = TEXT[language === 'zh' || language === 'zh-Hant' ? 'zh' : 'en'];
   const s = memoryStorageText(language);
+  const sourceFacts = SOURCE_FACTS_TEXT[language];
   return {
     id: 'hindsight',
     owner: 'persona',
@@ -56,7 +88,12 @@ export function hindsightConfigGroup(language: Language): ConfigGroup {
         'hindsight.apiUrl': { type: 'string', title: t.apiUrl, description: t.apiUrlDesc, 'x-hot': false },
         'hindsight.bankId': { type: 'string', title: t.bankId, description: t.bankIdDesc, 'x-hot': false },
         'hindsight.recall.maxTokens': { type: 'integer', title: t.maxTokens, description: t.maxTokensDesc, minimum: 200, maximum: 4000, 'x-hot': false },
-        'hindsight.recall.timeoutMs': { type: 'integer', title: t.timeout, description: t.timeoutDesc, minimum: 100, maximum: 5000, 'x-hot': false },
+        'hindsight.recall.maxSourceFactsTokens': { type: 'integer', title: sourceFacts.title, description: sourceFacts.description, minimum: 1, maximum: MAX_SOURCE_FACTS_TOKEN_BUDGET, 'x-hot': false },
+        'hindsight.recall.timeoutMs': { type: 'integer', title: t.timeout, description: t.timeoutDesc, minimum: 100, maximum: MAX_CONFIGURED_RECALL_TIMEOUT_MS, 'x-hot': false },
+        'hindsight.domainSupplement.enabled': { type: 'boolean', title: t.domainSupplement, description: t.domainSupplementDesc, 'x-hot': false },
+        'hindsight.domainSupplement.maxSupplementSources': { type: 'integer', title: t.domainSupplementSources, description: t.domainSupplementSourcesDesc, minimum: 1, maximum: 10, 'x-hot': false },
+        'hindsight.domainSupplement.maxSupplementChars': { type: 'integer', title: t.domainSupplementChars, description: t.domainSupplementCharsDesc, minimum: 200, maximum: 4000, 'x-hot': false },
+        'hindsight.domainSupplement.timeoutMs': { type: 'integer', title: t.domainSupplementTimeout, description: t.domainSupplementTimeoutDesc, minimum: 100, maximum: 20_000, 'x-hot': false },
         'hindsight.affection.enabled': { type: 'boolean', title: t.affection, description: t.affectionDesc, 'x-hot': false },
       },
     },

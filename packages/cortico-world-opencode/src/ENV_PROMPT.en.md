@@ -17,10 +17,7 @@ A small terminal sits beside you: opencode, a coding agent that reads code, edit
 
 ## Permissions
 
-- Before writing a file or running a command it sends `opencode.permission` with the original command, paths and options.
-- Repeat the command and paths unchanged in a `pet_ask` bubble; use the options allow once, allow always, or reject.
-- After the person answers, call `opencode_answer` with the event's `taskId` and `choice` once, always or reject.
-- You never approve on the person's behalf. If nobody answers, the task stops by itself.
+{{opencode.permissionFlow}}
 
 ## Working directories
 

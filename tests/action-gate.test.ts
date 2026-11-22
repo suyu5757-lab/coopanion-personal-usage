@@ -1,0 +1,430 @@
+import { describe, expect, it } from 'vitest';
+import { ActionGate } from '../core/action-gate.ts';
+
+const gate = (policy: { writes: boolean; imageGeneration?: boolean; imageSaving?: boolean; mediaUpload?: boolean; mediaDownload?: boolean; input?: boolean }) => new ActionGate({
+  platformWrites: () => policy.writes,
+  imageGeneration: () => policy.imageGeneration ?? false,
+  imageSaving: () => policy.imageSaving ?? false,
+  mediaUpload: () => policy.mediaUpload ?? false,
+  mediaDownload: () => policy.mediaDownload ?? false,
+  computerInput: () => policy.input ?? true,
+  desktopTargetAllowed: () => false,
+});
+
+describe('action gate', () => {
+  it('lets reading through whatever the settings say', () => {
+    expect(gate({ writes: false, input: false }).check({ surface: 'browser', tool: 'browser_read', impact: 'read' })).toEqual({ allow: true });
+    expect(gate({ writes: false, input: false }).check({ surface: 'desktop', tool: 'pet_cua_screenshot', impact: 'read' })).toEqual({ allow: true });
+  });
+
+  it('refuses a site write while the browser is read-only, and allows it once the setting is on', () => {
+    const policy = { writes: false };
+    const g = gate(policy);
+    expect(g.check({ surface: 'browser', tool: 'browser_click', impact: 'platform-write', target: '点赞 12' }))
+      .toMatchObject({ allow: false, refusal: 'read-only' });
+    policy.writes = true;
+    expect(g.check({ surface: 'browser', tool: 'browser_click', impact: 'platform-write' })).toEqual({ allow: true });
+  });
+
+  it('does not let the social-action preference enable image generation, saving or media upload', () => {
+    const g = gate({ writes: true });
+    expect(g.check({ surface: 'browser', tool: 'browser_chatgpt_generate_image', impact: 'image-generation' }))
+      .toMatchObject({ allow: false, refusal: 'not-armed' });
+    expect(g.check({ surface: 'browser', tool: 'browser_save_chatgpt_image', impact: 'image-saving' }))
+      .toMatchObject({ allow: false, refusal: 'not-armed' });
+    expect(g.check({ surface: 'browser', tool: 'browser_upload_media', impact: 'media-upload' }))
+      .toMatchObject({ allow: false, refusal: 'not-armed' });
+  });
+
+  it('checks image generation, saving and upload preferences independently', () => {
+    const policy = { writes: false, imageGeneration: true, imageSaving: false, mediaUpload: true };
+    const g = gate(policy);
+    expect(g.check({ surface: 'browser', tool: 'browser_chatgpt_generate_image', impact: 'image-generation' }).allow).toBe(true);
+    expect(g.check({ surface: 'browser', tool: 'browser_save_chatgpt_image', impact: 'image-saving' }).allow).toBe(false);
+    expect(g.check({ surface: 'browser', tool: 'browser_upload_media', impact: 'media-upload' }).allow).toBe(true);
+    policy.imageSaving = true;
+    expect(g.check({ surface: 'browser', tool: 'browser_save_chatgpt_image', impact: 'image-saving' }).allow).toBe(true);
+  });
+
+  it('keeps media downloads separately disabled until their own setting is enabled', () => {
+    const policy = { writes: true, mediaUpload: true, mediaDownload: false };
+    const g = gate(policy);
+    expect(g.check({ surface: 'browser', tool: 'browser_download_media', impact: 'media-download' }))
+      .toMatchObject({ allow: false, refusal: 'not-armed' });
+    policy.mediaDownload = true;
+    expect(g.check({ surface: 'browser', tool: 'browser_download_media', impact: 'media-download' })).toEqual({ allow: true });
+  });
+
+  it('reads the live settings at each check instead of caching the first answer', () => {
+    let writes = false;
+    const g = new ActionGate({ platformWrites: () => writes, imageGeneration: () => false, imageSaving: () => false, mediaUpload: () => false, computerInput: () => true, desktopTargetAllowed: () => false });
+    expect(g.check({ surface: 'browser', tool: 'browser_share', impact: 'platform-write' }).allow).toBe(false);
+    writes = true;
+    expect(g.check({ surface: 'browser', tool: 'browser_share', impact: 'platform-write' }).allow).toBe(true);
+  });
+
+  it('refuses payment, login and private messages even with everything switched on', () => {
+    const g = gate({ writes: true, input: true });
+    for (const impact of ['sensitive'] as const) {
+      const verdict = g.check({ surface: 'browser', tool: 'browser_click', impact, target: '立即购买' });
+      expect(verdict).toMatchObject({ allow: false, refusal: 'sensitive' });
+    }
+    expect(g.check({ surface: 'desktop', tool: 'pet_cua_click', impact: 'sensitive' })).toMatchObject({ allow: false, refusal: 'sensitive' });
+  });
+
+  it('refuses computer input while the person has it off', () => {
+    const verdict = gate({ writes: true, input: false }).check({ surface: 'desktop', tool: 'pet_cua_type', impact: 'computer-input' });
+    expect(verdict).toMatchObject({ allow: false, refusal: 'not-armed' });
+    expect(verdict.allow === false && verdict.detail).toContain('pet_cua_type');
+  });
+
+  it('requires a Core confirmation and a current one-use ticket for a desktop task step', async () => {
+    let input = true;
+    const g = new ActionGate({
+      platformWrites: () => false,
+      imageGeneration: () => false,
+      imageSaving: () => false,
+      mediaUpload: () => false,
+      computerInput: () => input,
+      desktopTargetAllowed: (candidate) => candidate.bundleId === 'com.example.Editor',
+    });
+    const target = {
+      surface: 'desktop' as const,
+      instanceId: 'run-test',
+      bundleId: 'com.example.Editor',
+      executablePath: '/Applications/Editor.app/Contents/MacOS/Editor',
+      pid: 11,
+      ownerPid: 11,
+      processStart: '2026-10-28T00:00:00Z',
+      windowId: 3,
+      bounds: { x: 0, y: 0, width: 600, height: 400 },
+      display: null,
+      space: null,
+      snapshotId: 'snapshot-1',
+      captureId: 'capture-1',
+      route: 'background-ax' as const,
+      source: 'cua-driver' as const,
+    };
+    const task = {
+      taskId: 'session:round-1',
+      taskText: 'Type the reviewed paragraph in the editor.',
+      risk: 'REVERSIBLE_LOCAL' as const,
+      target,
+      actions: ['computer-input'],
+      expiresInMs: 30_000,
+      maxSteps: 2,
+    };
+    const step = { action: 'computer-input', target, expectedChange: 'type reviewed paragraph' };
+
+    expect(await g.requestTaskGrant(task, async () => false, 1_000)).toBeNull();
+    const grant = await g.requestTaskGrant(task, async () => true, 2_000);
+    expect(grant).not.toBeNull();
+    expect(grant).toMatchObject({ risk: 'REVERSIBLE_LOCAL' });
+    const higherRiskGrant = await g.requestTaskGrant({ ...task, risk: 'EXTERNAL_MUTATION' }, async () => true, 2_001);
+    expect(higherRiskGrant?.digest).not.toBe(grant?.digest);
+    const ticket = g.issueStepTicket(grant!.id, step, 2_001);
+    expect(ticket).not.toBeNull();
+    expect(g.consumeStepTicket(ticket!.id, step, 2_002)).toBe(true);
+    expect(g.consumeStepTicket(ticket!.id, step, 2_003)).toBe(false);
+
+    const nextTicket = g.issueStepTicket(grant!.id, step, 2_004);
+    input = false;
+    expect(g.consumeStepTicket(nextTicket!.id, step, 2_005)).toBe(false);
+  });
+
+  it('holds a desktop ticket until dispatch and binds it to the approved snapshot and change', async () => {
+    const g = new ActionGate({
+      platformWrites: () => false,
+      imageGeneration: () => false,
+      imageSaving: () => false,
+      mediaUpload: () => false,
+      computerInput: () => true,
+      desktopTargetAllowed: (target) => target.bundleId === 'com.example.Editor',
+    });
+    const target = {
+      surface: 'desktop' as const,
+      instanceId: 'run-test',
+      bundleId: 'com.example.Editor',
+      executablePath: '/Applications/Editor.app/Contents/MacOS/Editor',
+      pid: 11,
+      ownerPid: 11,
+      processStart: '2026-10-28T00:00:00Z',
+      windowId: 3,
+      bounds: { x: 0, y: 0, width: 600, height: 400 },
+      display: null,
+      space: null,
+      snapshotId: 'snapshot-1',
+      captureId: 'capture-1',
+      route: 'background-ax' as const,
+      source: 'cua-driver' as const,
+    };
+    const request = {
+      taskId: 'desktop:edit-once',
+      taskText: 'Type the approved sentence in the editor.',
+      expectedChange: 'type the approved sentence',
+      risk: 'REVERSIBLE_LOCAL' as const,
+      target,
+      expiresInMs: 30_000,
+      maxSteps: 1 as const,
+    };
+
+    await expect(g.requestDesktopStep(request, async () => false)).resolves.toBeNull();
+    const stale = await g.requestDesktopStep(request, async () => true);
+    expect(stale).not.toBeNull();
+    expect(stale!.consume({ ...target, captureId: 'capture-2' }, request.expectedChange)).toBe(false);
+    expect(stale!.consume(target, request.expectedChange)).toBe(false);
+
+    const current = await g.requestDesktopStep({ ...request, taskId: 'desktop:edit-current' }, async () => true);
+    expect(current!.consume(target, request.expectedChange)).toBe(true);
+    expect(current!.consume(target, request.expectedChange)).toBe(false);
+  });
+
+  it('binds a one-step workspace grant to the allowed root, file snapshot and exact payload', async () => {
+    const target = {
+      surface: 'filesystem' as const,
+      instanceId: 'opencode-task-1',
+      workspaceRoot: '/tmp/coopanion-work',
+      path: 'src/main.ts',
+      operation: 'file-write' as const,
+      snapshotId: 'before-hash',
+      source: 'opencode-acp' as const,
+    };
+    const file = { path: 'src/main.ts', digest: 'a'.repeat(64), bytes: 42, mime: 'text/plain' };
+    const request = {
+      taskId: 'opencode-task-1:file-write-1',
+      taskText: 'Write src/main.ts in the allowed workspace.',
+      expectedChange: 'write src/main.ts sha256:aaaaaaaa',
+      risk: 'REVERSIBLE_LOCAL' as const,
+      target,
+      action: 'file-write' as const,
+      files: [file],
+      expiresInMs: 30_000,
+      maxSteps: 1 as const,
+    };
+    const gate = new ActionGate({
+      platformWrites: () => false,
+      imageGeneration: () => false,
+      imageSaving: () => false,
+      mediaUpload: () => false,
+      computerInput: () => false,
+      desktopTargetAllowed: () => false,
+      fileSystemActionAllowed: (candidate, action) => candidate.workspaceRoot === '/tmp/coopanion-work' && action === 'file-write',
+      fileSystemPermissionGeneration: () => 'roots-v1',
+    });
+
+    const changedPayload = await gate.requestFileSystemStep(request, async () => true);
+    expect(changedPayload).not.toBeNull();
+    expect(changedPayload!.consume(target, request.expectedChange, [{ ...file, digest: 'b'.repeat(64) }])).toBe(false);
+
+    const current = await gate.requestFileSystemStep({ ...request, taskId: 'opencode-task-1:file-write-2' }, async () => true);
+    expect(current).not.toBeNull();
+    expect(current!.consume({ ...target, snapshotId: 'changed-before-dispatch' }, request.expectedChange, [file])).toBe(false);
+
+    const authorized = await gate.requestFileSystemStep({ ...request, taskId: 'opencode-task-1:file-write-3' }, async () => true);
+    expect(authorized).not.toBeNull();
+    expect(authorized!.consume(target, request.expectedChange, [file])).toBe(true);
+    expect(authorized!.consume(target, request.expectedChange, [file])).toBe(false);
+  });
+
+  it('does not issue a desktop grant when computer input is turned off during approval', async () => {
+    let computerInput = true;
+    let answer!: (approved: boolean) => void;
+    const approval = new Promise<boolean>((resolve) => { answer = resolve; });
+    const g = new ActionGate({
+      platformWrites: () => false,
+      imageGeneration: () => false,
+      imageSaving: () => false,
+      mediaUpload: () => false,
+      computerInput: () => computerInput,
+      desktopTargetAllowed: () => true,
+    });
+    const target = {
+      surface: 'desktop' as const,
+      instanceId: 'run-test',
+      bundleId: 'com.example.Editor',
+      executablePath: '/Applications/Editor.app/Contents/MacOS/Editor',
+      pid: 11,
+      ownerPid: 11,
+      processStart: '2026-10-28T00:00:00Z',
+      windowId: 3,
+      bounds: { x: 0, y: 0, width: 600, height: 400 },
+      display: null,
+      space: null,
+      snapshotId: 'snapshot-1',
+      captureId: 'capture-1',
+      route: 'background-ax' as const,
+      source: 'cua-driver' as const,
+    };
+    const pending = g.requestDesktopStep({
+      taskId: 'desktop:edit-once',
+      taskText: 'Type the approved sentence in the editor.',
+      expectedChange: 'type the approved sentence',
+      risk: 'REVERSIBLE_LOCAL',
+      target,
+      expiresInMs: 30_000,
+      maxSteps: 1,
+    }, () => approval);
+
+    computerInput = false;
+    answer(true);
+    await expect(pending).resolves.toBeNull();
+  });
+
+  it('rejects an unsupported desktop app before asking for a task grant', async () => {
+    let confirmed = 0;
+    const g = new ActionGate({
+      platformWrites: () => false,
+      imageGeneration: () => false,
+      imageSaving: () => false,
+      mediaUpload: () => false,
+      computerInput: () => true,
+      desktopTargetAllowed: (target) => target.bundleId === 'com.example.Editor',
+    });
+    const target = {
+      surface: 'desktop' as const,
+      instanceId: 'run-test',
+      bundleId: 'com.apple.Safari',
+      executablePath: '/Applications/Safari.app/Contents/MacOS/Safari',
+      pid: 11,
+      ownerPid: 11,
+      processStart: '2026-10-28T00:00:00Z',
+      windowId: 3,
+      bounds: { x: 0, y: 0, width: 600, height: 400 },
+      display: null,
+      space: null,
+      snapshotId: 'snapshot-1',
+      captureId: 'capture-1',
+      route: 'background-ax' as const,
+      source: 'cua-driver' as const,
+    };
+
+    await expect(g.requestTaskGrant({
+      taskId: 'desktop:browser-window', taskText: 'Click this browser window.', risk: 'EXTERNAL_MUTATION', target,
+      actions: ['computer-input'], expiresInMs: 30_000, maxSteps: 1,
+    }, async () => { confirmed++; return true; }, 1_000)).resolves.toBeNull();
+    expect(confirmed).toBe(0);
+  });
+
+  it('does not let image generation permission grant an upload action', async () => {
+    const g = new ActionGate({
+      platformWrites: () => false,
+      imageGeneration: () => true,
+      imageSaving: () => false,
+      mediaUpload: () => false,
+      computerInput: () => false,
+      desktopTargetAllowed: () => false,
+    });
+    const target = {
+      surface: 'browser' as const,
+      instanceId: 'browser-run',
+      origin: 'https://chatgpt.com',
+      url: 'https://chatgpt.com/c/test',
+      accountRef: 'account-1',
+      snapshotId: 'snapshot-1',
+      formId: 'composer',
+      control: 'image prompt',
+    };
+    await expect(g.requestTaskGrant({
+      taskId: 'browser:round-1', taskText: 'Submit this image prompt.', risk: 'EXTERNAL_MUTATION', target,
+      actions: ['media-upload'], expiresInMs: 30_000, maxSteps: 1,
+    }, async () => true, 1_000)).resolves.toBeNull();
+  });
+
+  it('does not let a Browser grant authorize CUA or a CUA grant authorize Browser', async () => {
+    const g = new ActionGate({
+      platformWrites: () => true,
+      imageGeneration: () => true,
+      imageSaving: () => true,
+      mediaUpload: () => true,
+      computerInput: () => true,
+      desktopTargetAllowed: (candidate) => candidate.bundleId === 'com.example.Editor',
+    });
+    const browserTarget = {
+      surface: 'browser' as const,
+      instanceId: 'browser-run',
+      origin: 'https://chatgpt.com',
+      url: 'https://chatgpt.com/c/test',
+      accountRef: 'account-1',
+      snapshotId: 'snapshot-1',
+      formId: 'media',
+      control: 'save image',
+    };
+    const desktopTarget = {
+      surface: 'desktop' as const,
+      instanceId: 'run-test',
+      bundleId: 'com.example.Editor',
+      executablePath: '/Applications/Editor.app/Contents/MacOS/Editor',
+      pid: 11,
+      ownerPid: 11,
+      processStart: '2026-10-28T00:00:00Z',
+      windowId: 3,
+      bounds: { x: 0, y: 0, width: 600, height: 400 },
+      display: null,
+      space: null,
+      snapshotId: 'snapshot-1',
+      captureId: 'capture-1',
+      route: 'background-ax' as const,
+      source: 'cua-driver' as const,
+    };
+    const webGrant = await g.requestTaskGrant({
+      taskId: 'browser:save-image', taskText: 'Save this verified image.', risk: 'REVERSIBLE_LOCAL', target: browserTarget,
+      actions: ['image-saving'], expiresInMs: 30_000, maxSteps: 1,
+    }, async () => true, 1_000);
+    expect(webGrant).not.toBeNull();
+    expect(g.issueStepTicket(webGrant!.id, {
+      action: 'image-saving', target: desktopTarget, expectedChange: 'save this file',
+    }, 1_001)).toBeNull();
+
+    const desktopGrant = await g.requestTaskGrant({
+      taskId: 'desktop:edit-text', taskText: 'Edit this local document.', risk: 'REVERSIBLE_LOCAL', target: desktopTarget,
+      actions: ['computer-input'], expiresInMs: 30_000, maxSteps: 1,
+    }, async () => true, 2_000);
+    expect(desktopGrant).not.toBeNull();
+    expect(g.issueStepTicket(desktopGrant!.id, {
+      action: 'computer-input', target: browserTarget, expectedChange: 'type into the page',
+    }, 2_001)).toBeNull();
+    expect(g.check({ surface: 'desktop', tool: 'pet_cua_type', impact: 'computer-input' }))
+      .toMatchObject({ allow: false, refusal: 'unverified-target' });
+  });
+
+  it('revokes grants and pending tickets when the live permission generation changes', async () => {
+    let imageSaving = true;
+    const g = new ActionGate({
+      platformWrites: () => false,
+      imageGeneration: () => false,
+      imageSaving: () => imageSaving,
+      mediaUpload: () => false,
+      computerInput: () => false,
+      desktopTargetAllowed: () => false,
+    });
+    const target = {
+      surface: 'browser' as const,
+      instanceId: 'browser-run',
+      origin: 'https://chatgpt.com',
+      url: 'https://chatgpt.com/c/test',
+      accountRef: 'account-1',
+      snapshotId: 'snapshot-1',
+      formId: 'video-media-folder',
+      control: 'save-image-sha256',
+    };
+    const grant = await g.requestTaskGrant({
+      taskId: 'browser:save-image', taskText: 'Save the verified image.', risk: 'REVERSIBLE_LOCAL', target,
+      actions: ['image-saving'], files: [{ path: 'image.png', digest: 'a'.repeat(64), bytes: 100, mime: 'image/png' }],
+      expiresInMs: 30_000, maxSteps: 1,
+    }, async () => true, 1_000);
+    const step = {
+      action: 'image-saving', target, expectedChange: 'save image',
+      files: [{ path: 'image.png', digest: 'a'.repeat(64), bytes: 100, mime: 'image/png' }],
+    };
+    const ticket = g.issueStepTicket(grant!.id, step, 1_001);
+    imageSaving = false;
+    expect(g.consumeStepTicket(ticket!.id, step, 1_002)).toBe(false);
+    imageSaving = true;
+    expect(g.issueStepTicket(grant!.id, step, 1_003)).toBeNull();
+  });
+
+  it('refuses a surface and impact pair it does not know', () => {
+    expect(gate({ writes: true }).check({ surface: 'desktop', tool: 'some_tool', impact: 'platform-write' }))
+      .toMatchObject({ allow: false, refusal: 'not-armed' });
+  });
+});

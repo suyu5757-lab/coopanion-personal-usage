@@ -6,6 +6,7 @@
 export default {
   /** 没设称呼时,事件和气泡里对使用者的称呼 */
   defaultUser: '伙伴',
+  sessionArchived: "已归档先前的会话，并开始新对话。",
 
   /** 桌宠菜单与气泡 */
   menu: {

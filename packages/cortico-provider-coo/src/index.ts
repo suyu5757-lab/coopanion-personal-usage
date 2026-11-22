@@ -19,6 +19,8 @@
  */
 import type { ProviderModule, ProviderInstance } from 'cortico/providers/base.ts';
 import type { LLMProviderEntry, ReasoningTier } from 'cortico/core/types.ts';
+import type { GenerateOptions } from 'cortico/core/generation.ts';
+import type { Request } from 'cortico/protocol/open-responses/index.ts';
 import type { ConfigGroup } from 'cortico/core/config-schema.ts';
 import type { Language } from 'cortico/core/language.ts';
 import { isContextOverflow } from 'cortico/providers/transport/errors.ts';
@@ -29,7 +31,10 @@ import { GeminiProvider, listGeminiModels } from './gemini/client.ts';
 import { vendorPrices } from './pricing.ts';
 import { VendorResponses } from './responses.ts';
 import { cooText } from './strings.ts';
-import { PROTOCOLS, VENDORS, effortOf, locate, siteOf, vendorOf, vendorName, type Language as VendorLanguage, type Protocol } from './vendors.ts';
+import { goEffortMap, goMessagesBaseUrl, goModelMetadata, goRequestUrl, isGoModelId, isGoRequestUrl, normalizeGoBaseUrl, OPENCODE_GO, OPENCODE_GO_SECRET, type GoModel } from './opencode-go.ts';
+import { coopanionUserAgent, fetchGoCatalog, goHeaders, goLoopbackSimulatorEnabled, goSessionHeader, GoClient, readGoCatalog, redactSecret, writeGoCatalog } from './opencode-go-catalog.ts';
+import { PROTOCOLS, VENDORS, effortOf, isOpenCodeGoUrl, locate, siteOf, vendorOf, vendorName, type Language as VendorLanguage, type Protocol } from './vendors.ts';
+import { RuntimeModeClient, runtimeModeSetting } from './runtime-mode.ts';
 
 /** vendors.ts spells out Cortico's `Language`; this stops compiling when the two differ. */
 const SAME_LANGUAGES: [Language, VendorLanguage] extends [VendorLanguage, Language] ? true : never = true;
@@ -80,10 +85,14 @@ const MODELS_MAX = 2000;
 export const protocolOf = (entry: LLMProviderEntry): Protocol =>
   cooOptions(entry).protocol ?? locate(entry.baseUrl)?.site.protocol ?? 'responses';
 
+/** The metadata of each Go model the catalogues have reported this process; the key is never in it. */
+const GO_MODELS = new Map<string, GoModel>();
+
 /** A listed service reads images on the models it lists; any other URL on every model. */
 function readsImages(entry: LLMProviderEntry, model: string | undefined): boolean {
   if (!model) return false;
   const vendor = vendorOf(entry.baseUrl);
+  if (vendor?.id === OPENCODE_GO) return GO_MODELS.get(model)?.inputImages ?? entry.multimodal === true;
   return vendor ? (vendor.vision ?? []).includes(model) : true;
 }
 
@@ -117,7 +126,7 @@ function normalize(entry: LLMProviderEntry): LLMProviderEntry {
 export const COO = {
   id: 'coo',
   title: 'Coo Pet Provider',
-  description: 'DeepSeek, Qwen, Kimi, GLM, Doubao, MiniMax, StepFun, Baidu Qianfan, OpenRouter, OpenAI, Anthropic, Gemini and xAI.',
+  description: 'DeepSeek, Qwen, Kimi, GLM, Doubao, MiniMax, StepFun, Baidu Qianfan, OpenRouter, OpenCode Go, OpenAI, Anthropic, Gemini and xAI.',
   describe: { protocols: ['openai-responses', 'openai-chat', 'anthropic-messages', 'gemini'], auth: ['api-key'], local: false, input: ['text', 'image'] },
   localize: (language) => {
     const t = cooText(language);
@@ -134,6 +143,10 @@ export const COO = {
     if (protocol !== undefined && !PROTOCOLS.includes(protocol))
       throw new Error(cooText(language).badProtocol(PROTOCOLS.join(' / ')));
     if (plainRemote(entry.baseUrl)) throw new Error(cooText(language).httpRemote);
+    if (entry.secret === OPENCODE_GO_SECRET || isOpenCodeGoUrl(entry.baseUrl)) {
+      if (entry.secret !== OPENCODE_GO_SECRET || !normalizeGoBaseUrl(entry.baseUrl, null, goLoopbackSimulatorEnabled()))
+        throw new Error('OpenCode Go requires its API key and an approved Go endpoint');
+    }
   },
   accepts: (entry, spec, mime) => entry.multimodal === true && mime.startsWith('image/') && readsImages(entry, spec.model),
   prices: (entry, _request, at) => vendorPrices(vendorOf(entry.baseUrl)?.id, at.startedAt),
@@ -145,25 +158,90 @@ export const COO = {
       client.respond = () => Promise.reject(new Error(cooText('en').httpRemote));
       return { client };
     }
-    const apiKey = entry.secret ? host.secret(entry.secret) : undefined;
-    const current = () => host.currentEntry?.() ?? entry;
     const located = locate(entry.baseUrl);
     const vendor = located?.vendor ?? null;
-    const protocol = protocolOf(entry);
+    const go = vendor?.id === OPENCODE_GO;
+    const allowGoLoopback = goLoopbackSimulatorEnabled();
+    if (entry.secret === OPENCODE_GO_SECRET && !go)
+      throw new Error('OpenCode Go API key cannot be used with this endpoint');
+    if (go && (entry.secret !== OPENCODE_GO_SECRET || !normalizeGoBaseUrl(entry.baseUrl, null, allowGoLoopback)))
+      throw new Error('OpenCode Go requires its API key and an approved Go endpoint');
+    const apiKey = entry.secret ? host.secret(entry.secret) : undefined;
+    const current = () => host.currentEntry?.() ?? entry;
+    const goModels = new Map<string, GoModel>();
+    if (go) for (const model of readGoCatalog(host.stateDir, allowGoLoopback)) {
+      goModels.set(model.id, model);
+      GO_MODELS.set(model.id, model);
+    }
+    const modelName = entry.spec?.model ?? '';
+    const goModel = go ? goModels.get(modelName) : undefined;
+    const protocol = cooOptions(entry).protocol ?? (go ? goModel?.protocol ?? 'chat' : located?.site.protocol ?? 'responses');
     const media = { enabled: () => current().multimodal === true && readsImages(current(), current().spec?.model), read: host.readBlob };
-    const compatibilityKey = () => [vendor?.id ?? 'coo', name, ...(protocol === 'responses' ? [] : [protocol])];
-    const stated = (model: string) => vendor?.contextWindows?.[model];
+    const compatibilityKey = () => [vendor?.id ?? 'coo', name, ...(protocol === 'responses' ? [] : [protocol]), ...(go ? [goModels.get(current().spec?.model ?? modelName)?.baseUrl ?? current().baseUrl] : [])];
+    const stated = (model: string) => go ? goModels.get(model)?.contextWindow : vendor?.contextWindows?.[model];
     // the listing carries the windows the vendor table states, so the console fills them in instead of asking
     const withStated = <M extends { id: string; contextWindow?: number }>(models: M[]) =>
       models.map((model) => (stated(model.id) ? { ...model, contextWindow: stated(model.id) } : model));
+    const modelBaseUrl = go ? goModel?.baseUrl ?? entry.baseUrl : entry.baseUrl;
+    const transportBaseUrl = protocol === 'anthropic' && go ? goMessagesBaseUrl(modelBaseUrl) : modelBaseUrl;
+    const goPreDispatchGuard = go ? (request: Request, options: GenerateOptions) => {
+      const modelId = request.model ?? current().spec?.model ?? modelName;
+      const listed = goModels.get(modelId);
+      if (!isGoModelId(modelId) || !listed?.protocol || !listed.baseUrl)
+        throw new Error('OpenCode Go request requires a validated catalogue model');
+      if (listed.protocol !== protocol || listed.baseUrl !== modelBaseUrl
+        || !normalizeGoBaseUrl(current().baseUrl, null, allowGoLoopback))
+        throw new Error('OpenCode Go request does not match the selected catalogue route');
+      goRequestUrl(listed.baseUrl, protocol, modelId, Boolean(options.onEvent), allowGoLoopback);
+    } : undefined;
+    const goRequestUrlGuard = go ? (url: string, request: Request, options: GenerateOptions) => {
+      const modelId = request.model ?? current().spec?.model ?? modelName;
+      const listed = goModels.get(modelId);
+      if (!listed?.protocol || !listed.baseUrl || listed.protocol !== protocol
+        || !isGoRequestUrl(url, listed.baseUrl, protocol, modelId, Boolean(options.onEvent), allowGoLoopback)) {
+        throw new Error('OpenCode Go request target failed final validation');
+      }
+    } : undefined;
+    const configuredOutputCap = Number(process.env.COOPANION_GO_MAX_OUTPUT_TOKENS);
+    const goMaxOutputTokens = go && process.env.CORTICO_TEST_CHANNEL === '1'
+      && Number.isInteger(configuredOutputCap) && configuredOutputCap > 0
+      ? Math.min(1024, configuredOutputCap) : undefined;
+    const extraHeaders = go ? { 'User-Agent': coopanionUserAgent() } : undefined;
+    const requestHeaders = go
+      ? (options: GenerateOptions) => ({ 'x-opencode-session': goSessionHeader(options.sessionId, name) })
+      : undefined;
+    const wrap = (client: ProviderInstance['client']) => go
+      ? new GoClient(client, apiKey, () => current().spec?.model ?? modelName, goPreDispatchGuard, goMaxOutputTokens, host.log)
+      : client;
+    /** The catalogue is the model list; it also records each row's protocol and effort map for later requests. */
+    const listGoModels = async () => {
+      try {
+        const models = await fetchGoCatalog(entry.baseUrl, apiKey, fetch, allowGoLoopback);
+        writeGoCatalog(host.stateDir, models, allowGoLoopback);
+        goModels.clear();
+        for (const model of models) {
+          goModels.set(model.id, model);
+          GO_MODELS.set(model.id, model);
+        }
+        return models.map(goModelMetadata);
+      } catch (error) {
+        throw new Error(redactSecret(error instanceof Error ? error.message : String(error), apiKey));
+      }
+    };
+    const effort = (model: string) => go
+      ? goEffortMap(goModels.get(model))
+      : (located ? effortOf(located.vendor, located.site, model) : undefined);
 
     if (protocol === 'anthropic') {
-      const client = new ClaudeProvider({ baseUrl: entry.baseUrl, apiKey, keepThinking: host.keepThinking, log: host.log, media });
+      const client = new ClaudeProvider({
+        baseUrl: transportBaseUrl, apiKey, keepThinking: host.keepThinking, log: host.log, media, effort,
+        ...(go ? { auth: 'bearer' as const } : {}), extraHeaders, requestHeaders, requestUrlGuard: goRequestUrlGuard,
+      });
       const windows = new Map<string, number | undefined>();
       return {
-        client, compatibilityKey,
+        client: wrap(client), compatibilityKey,
         contextWindow: (model) => stated(model) ?? windows.get(model),
-        listModels: async () => {
+        listModels: go ? listGoModels : async () => {
           const models = [];
           for await (const model of client.client().models.list()) {
             // the SDK pages on while the service says there is more
@@ -179,35 +257,46 @@ export const COO = {
     }
     if (protocol === 'gemini') {
       const windows = new Map<string, number | undefined>();
+      const client = new GeminiProvider({
+        baseUrl: transportBaseUrl, apiKey, media, keepThinking: host.keepThinking, log: host.log, effort,
+        ...(go ? { auth: 'bearer' as const } : {}), extraHeaders, requestHeaders, requestUrlGuard: goRequestUrlGuard,
+      });
       return {
-        client: new GeminiProvider({ baseUrl: entry.baseUrl, apiKey, media, keepThinking: host.keepThinking, log: host.log }),
+        client: wrap(client),
         compatibilityKey,
         contextWindow: (model) => stated(model) ?? windows.get(model),
-        listModels: async () => {
+        listModels: go ? listGoModels : async () => {
           const models = await listGeminiModels(entry.baseUrl, apiKey ?? '');
           for (const model of models) windows.set(model.id, model.contextWindow);
           return withStated(models);
         },
       };
     }
-    const effort = (model: string) => (located ? effortOf(located.vendor, located.site, model) : undefined);
-    const headers: Record<string, string> = apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
-    const catalog = new ModelCatalog(() => ({ baseUrl: entry.baseUrl, headers }));
+    const headers: Record<string, string> = go
+      ? goHeaders(apiKey)
+      : apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
+    const catalog = new ModelCatalog(() => ({ baseUrl: transportBaseUrl, headers }));
+    const client = protocol === 'chat'
+      ? new VendorChat({ baseUrl: transportBaseUrl, apiKey, media, keepThinking: host.keepThinking, log: host.log, effort, syntheticReasoning: vendor?.syntheticReasoning, extraHeaders, requestHeaders, requestUrlGuard: goRequestUrlGuard })
+      : new VendorResponses({
+        baseUrl: transportBaseUrl,
+        apiKey,
+        log: host.log,
+        media,
+        keepThinking: host.keepThinking,
+        reasoningReplay: vendor?.encryptedReasoning ? 'encrypted' : 'plaintext',
+        sendSyntheticReasoning: vendor?.syntheticReasoning,
+        extraHeaders,
+      }, { effort, lenientReasoning: vendor?.lenientReasoning, nonStreamingResponses: vendor?.nonStreamingResponses, toolOutputText: vendor?.toolOutputText, requestHeaders, requestUrlGuard: goRequestUrlGuard });
+    const policy = runtimeModeSetting(entry.options);
+    const wrapped = wrap(client);
     return {
-      listModels: async () => withStated(await catalog.list()),
+      listModels: go ? listGoModels : async () => withStated(await catalog.list()),
       contextWindow: (model) => stated(model) ?? catalog.contextWindow(model),
       compatibilityKey,
-      client: protocol === 'chat'
-        ? new VendorChat({ baseUrl: entry.baseUrl, apiKey, media, keepThinking: host.keepThinking, log: host.log, effort, syntheticReasoning: vendor?.syntheticReasoning })
-        : new VendorResponses({
-          baseUrl: entry.baseUrl,
-          apiKey,
-          log: host.log,
-          media,
-          keepThinking: host.keepThinking,
-          reasoningReplay: vendor?.encryptedReasoning ? 'encrypted' : 'plaintext',
-          sendSyntheticReasoning: vendor?.syntheticReasoning,
-        }, { effort, lenientReasoning: vendor?.lenientReasoning, nonStreamingResponses: vendor?.nonStreamingResponses, toolOutputText: vendor?.toolOutputText }),
+      client: policy
+        ? new RuntimeModeClient(wrapped, policy, effort, () => current().spec?.model ?? modelName)
+        : wrapped,
     };
   },
 } satisfies ProviderModule;
@@ -215,7 +304,11 @@ export const COO = {
 export default COO;
 export { OFF_PEAK } from './pricing.ts';
 export {
-  CHATGPT, VENDORS, defaultRegion, localized, siteOf, vendorEntry, vendorName, vendorOf, vendorsFor,
+  GoCatalogError, coopanionUserAgent, fetchGoCatalog, goHeaders, goSessionHeader, readGoCatalog, redactSecret, writeGoCatalog,
+} from './opencode-go-catalog.ts';
+export { GO_TIERS, OPENCODE_GO, goEffortMap, goModelMetadata, goModelsUrl, goRequestUrl, isGoModelId, isGoRequestUrl, normalizeGoBaseUrl, goTierSupport, parseOpenCodeGoModels, type GoModel, type GoTier } from './opencode-go.ts';
+export {
+  CHATGPT, VENDORS, defaultRegion, isOpenCodeGoUrl, localized, siteOf, vendorEntry, vendorName, vendorOf, vendorsFor,
   type Language, type Localized, type Protocol, type Region, type Site, type Vendor,
 } from './vendors.ts';
 export { VENDOR_ICONS } from './icons.ts';

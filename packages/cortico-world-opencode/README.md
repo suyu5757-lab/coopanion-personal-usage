@@ -1,11 +1,12 @@
+# `packages/cortico-world-opencode/src/definition.ts` and `src/world.ts`
+
 # cortico-world-opencode
 
-The opencode World, declared in `src/definition.ts` and run by `src/world.ts`.
-
-Coo can hand a coding task to a local `opencode` through the Agent Client Protocol. opencode works
-inside the directories the person allowed; every file write and command it wants to run arrives as
-a permission request, which Coo relays to the person with the original command unchanged. Results
-come back as World events.
+Coo can hand a coding task to a local `opencode` through the Agent Client Protocol. In Coopanion,
+Core confirms each command and file write for one dispatch, binds the grant to the allowed workspace,
+and stores the action receipt. The exact payload received through `fs/write_text_file` is checked
+against its grant, then read back for evidence. The standalone `opencode_answer` flow
+is available only when the World is used without Coopanion Core authorization.
 
 ## Configuration
 
@@ -20,15 +21,14 @@ under `worlds.opencode`:
 | `permissionMinutes` | how long a permission request waits for the person |
 | `askSensitive` | force opencode to ask before writing, running commands or fetching pages |
 
-`opencode` must be signed in already (`opencode auth login`). The World never passes `--auto` and
-never answers a permission request on the person's behalf.
+`opencode` must be signed in already (`opencode auth login`). The World never passes `--auto`.
 
 ## Behavior
 
-The World exposes `opencode_task`, `opencode_answer`, `opencode_stop`, `opencode_status` and `opencode_review`. A task
-starts an `opencode acp` child process in the chosen directory, sends one prompt asynchronously and
-returns at once. Progress that needs a decision arrives as `opencode.permission`; the turn ends with
-`opencode.result` or `opencode.failed`. The result event carries the summary, changed files with line counts and the commands run;
+With Coopanion Core authorization, the World exposes `opencode_task`, `opencode_stop`, `opencode_status`
+and `opencode_review`; standalone use also exposes `opencode_answer`. A task starts an `opencode acp`
+child process in the chosen directory, sends one prompt asynchronously and returns at once. The turn
+ends with `opencode.result` or `opencode.failed`. The result event carries the summary, changed files with line counts and the commands run;
 `opencode_review` shows the old and new text of each change. The bot reviews the result and either
 accepts it or resumes the same session with specific fixes. The World also tells the app to show the
 small opencode avatar beside the pet (`onState` in `src/definition.ts`), which produces the boot,

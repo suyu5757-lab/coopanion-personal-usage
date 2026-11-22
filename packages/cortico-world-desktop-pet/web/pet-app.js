@@ -18,6 +18,7 @@ import { COO_CSS, PALETTES, mini, normalizeSkin, skinCss } from './coo/coo.js';
 import { loadBody } from './body-host.js';
 import { accentColors, announcePainted, dressFloor, glowColor, lightWall, modeButton, setGlow } from './stage.js';
 import { bindAppearance } from './appearance.js';
+import { createVoiceSyncState, normalizeClockSnapshot, stepVoiceSync } from './voice-sync.js';
 
 const $ = (s) => document.querySelector(s);
 const host = window.petHost || null;
@@ -401,7 +402,29 @@ function onOrder(m) {
     // the settings window's 「在桌面上隐藏」: the same as the menu's 「隐藏」
     case 'hide': host?.hide?.(); break;
     case 'type': openTyping(); break;
-    case 'say': dropAsks(); queue.push({ kind: 'say', id: m.id, beats: m.beats, i: -1 }); holdRoam(20); break;
+    case 'say': {
+      if (typeof m.epoch === 'number' && m.epoch < activeSayEpoch) break;
+      if (typeof m.epoch === 'number') activeSayEpoch = Math.max(activeSayEpoch, m.epoch);
+      dropAsks();
+      const entry = { kind: 'say', id: m.id, epoch: typeof m.epoch === 'number' ? m.epoch : activeSayEpoch, generationId: m.generationId || null, outputIndex: typeof m.outputIndex === 'number' ? m.outputIndex : null, beats: m.beats, bindings: Array.isArray(m.bindings) ? m.bindings : null, i: -1 };
+      if (entry.generationId && typeof entry.outputIndex === 'number' && entry.outputIndex >= 0) {
+        let insertAt = queue.length;
+        for (let idx = queue.length - 1; idx >= 0; idx--) {
+          const q = queue[idx];
+          if (q.kind === 'say' && q.epoch === entry.epoch && q.generationId === entry.generationId && typeof q.outputIndex === 'number' && q.outputIndex > entry.outputIndex) {
+            insertAt = idx;
+          } else if (q.kind === 'say' && q.epoch === entry.epoch && q.generationId === entry.generationId) {
+            break;
+          }
+        }
+        queue.splice(insertAt, 0, entry);
+      } else {
+        queue.push(entry);
+      }
+      holdRoam(20);
+      break;
+    }
+    case 'say-clear': dropSays(typeof m.epoch === 'number' ? m.epoch : null); break;
     case 'ask': dropAsks(); queue.push({ kind: 'ask', id: m.id, question: m.question, options: m.options || [], own: m.own !== false }); holdRoam(20); break;
     case 'confirm': dropAsks(); queue.push({ kind: 'ask', confirm: true, id: m.id, question: m.question, options: m.options, own: false }); holdRoam(20); break;
     case 'walk': walk(m); break;
@@ -483,6 +506,18 @@ function dropAsks() {
   if (item && item.kind === 'ask' && !item.answered && !item.confirm) closeBubble();
 }
 
+/** Highest sayEpoch accepted by this page; older say messages are dropped on arrival. */
+let activeSayEpoch = 0;
+/** A new user turn or preempted round clears leftover say bubbles so old lines never resume after the new reply. */
+function dropSays(clearEpoch = null) {
+  if (typeof clearEpoch === 'number') activeSayEpoch = Math.max(activeSayEpoch, clearEpoch);
+  for (let i = queue.length - 1; i >= 0; i--) {
+    if (queue[i].kind !== 'say') continue;
+    if (clearEpoch === null || typeof queue[i].epoch !== 'number' || queue[i].epoch < clearEpoch) queue.splice(i, 1);
+  }
+  if (item && item.kind === 'say' && (clearEpoch === null || typeof item.epoch !== 'number' || item.epoch < clearEpoch)) closeBubble();
+}
+
 function openBubble(kind, html) {
   bubble.className = 'bubble ' + kind;
   bubble.removeAttribute('aria-label');
@@ -533,7 +568,7 @@ function releaseKeys(it) {
 
 function startItem(it) {
   item = it;
-  if (it.kind === 'say' || it.kind === 'ask') answerLines(it);
+  if (it.kind === 'ask' && !it.confirm) answerLines(it);
   if (it.kind === 'dialog') { openDialog(it); return; }
   if (it.kind === 'ask') {
     openBubble('ask', `<button class="b-close" type="button" aria-label="${esc(t('bubble.close'))}">×</button><p class="b-text"></p><div class="b-opts" hidden></div>`);
@@ -543,28 +578,125 @@ function startItem(it) {
   }
 }
 
+/* ---------- E12 voice clock: the bubble types naturally with the audible voice ---------- */
+const e12Clock = { at: 0, busy: false, data: null, gotAt: 0 };
+/** Desensitized voice-bubble sync trace ring buffer (no raw text). */
+const voiceSyncTrace = [];
+window.__petVoiceSyncTrace = voiceSyncTrace;
+function recordVoiceSyncTrace(entry) {
+  voiceSyncTrace.push(entry);
+  if (voiceSyncTrace.length > 128) voiceSyncTrace.shift();
+  send({ t: 'sync-trace', entry });
+}
+function pollE12Clock() {
+  const now = performance.now();
+  if (e12Clock.busy || now - e12Clock.at < 180) return;
+  e12Clock.busy = true; e12Clock.at = now;
+  fetch('/api/clock', { cache: 'no-store' })
+    .then((r) => (r.ok ? r.json() : { ok: false, clockStatus: 'error', httpStatus: r.status, playing: false, current: null, queue: [], recent_finished: [] }))
+    .then((d) => { e12Clock.data = normalizeClockSnapshot(d); e12Clock.gotAt = performance.now(); })
+    .catch(() => { e12Clock.data = normalizeClockSnapshot(null); e12Clock.gotAt = performance.now(); })
+    .finally(() => { e12Clock.busy = false; });
+}
+function paintBubble(it, text) {
+  const p = bubble.querySelector('.b-text');
+  if (!p) return;
+  if (it.marks?.length) p.innerHTML = marked(text, it.shown, it.marks);
+  else p.replaceChildren(linked(text, it.shown));
+}
+function fireBeatAnchors(it, b) {
+  while (it.fired < (b.anchors?.length || 0) && b.anchors[it.fired].at <= it.shown) acts.push(...b.anchors[it.fired++].actions);
+}
+/**
+ * Follow the worker's playback clock via the unified voice-sync state machine.
+ * Returns true while voice sync owns the bubble; false when degraded/text-only fallback drives typing.
+ */
+function stepSayWithVoice(it, b, dt) {
+  const s = it.sync;
+  if (!s || s.off) return false;
+  pollE12Clock();
+  const fresh = e12Clock.data && performance.now() - e12Clock.gotAt < 1800
+    ? e12Clock.data
+    : normalizeClockSnapshot(null);
+  const prevMode = s.syncMode;
+  const res = stepVoiceSync(s, fresh, T, dt);
+  if (res.shown > it.shown) {
+    it.shown = Math.min(b.text.length, res.shown);
+    paintBubble(it, b.text);
+    fireBeatAnchors(it, b);
+  }
+  if (res.syncMode !== prevMode || res.beatDone) {
+    const boundIds = [...s.jobs.keys()];
+    const segIds = [...s.jobs.values()].map((r) => r.segmentId).filter(Boolean);
+    recordVoiceSyncTrace({
+      ts: Date.now(),
+      bubbleId: s.bubbleId,
+      generationId: s.generationId,
+      outputIndex: s.outputIndex,
+      sayEpoch: s.sayEpoch,
+      jobIds: boundIds,
+      segmentIds: segIds,
+      syncMode: res.syncMode,
+      reason: res.reason,
+      clockStatus: fresh.clockStatus,
+      shownLen: it.shown,
+      totalLen: b.text.length,
+      beatDone: res.beatDone,
+      cancelled: res.cancelled,
+    });
+  }
+  if (res.beatDone) {
+    if (!res.cancelled && it.shown < b.text.length) {
+      it.shown = b.text.length;
+      paintBubble(it, b.text);
+      fireBeatAnchors(it, b);
+    }
+    it.beatDone = true;
+    it.holdUntil = T + res.holdSeconds;
+    it.hoverSince = null;
+    return true;
+  }
+  return res.handled;
+}
+
+/** Max seconds a hovered link may delay an actively queued next say bubble (infinite when nothing waits). */
+const LINK_HOVER_QUEUE_CAP_S = 10;
 function stepDialog(dt) {
   if (!item && queue.length && at() && !at().busy) startItem(queue.shift());
   const it = item;
   if (!it) return;
   if (it.kind === 'say') {
     if (it.i < 0 || it.beatDone) {
-      // a bubble with a link stays while the pointer is on it, so the link can be clicked
-      if (it.beatDone && (T < it.holdUntil || (bubble.matches(':hover') && bubble.querySelector('a')))) return;
+      // Keep the 0.45s completion hold and link-hover keep-alive, but cap hover hold if another say waits.
+      if (it.beatDone) {
+        if (T < it.holdUntil) return;
+        const hoveringLink = bubble.matches(':hover') && !!bubble.querySelector('a');
+        if (hoveringLink) {
+          if (it.hoverSince == null) it.hoverSince = T;
+          const nextWaiting = it.i + 1 < it.beats.length || queue.some((q) => q.kind === 'say');
+          if (!nextWaiting || T - it.hoverSince < LINK_HOVER_QUEUE_CAP_S) return;
+        } else {
+          it.hoverSince = null;
+        }
+      }
       it.i++;
       it.beatDone = false;
+      it.hoverSince = null;
       if (it.i >= it.beats.length) { closeBubble(); return; }
       const b = it.beats[it.i];
       let lead = 0;
       for (const a of b.actions || []) { acts.push(a); lead = .45; }
-      it.shown = 0; it.acc = 0; it.fired = 0; it.startAt = T + lead;
-      if (b.text) { openBubble('say', '<p class="b-text"></p>'); sfx.pop(); } else { bubble.hidden = true; }
+      it.shown = 0; it.acc = 0; it.fired = 0; it.startAt = T + lead; it.sync = null; it.syncBeat = -1;
+      if (b.text) { answerLines(it); openBubble('say', '<p class="b-text"></p>'); sfx.pop(); } else { bubble.hidden = true; }
       return;
     }
     const b = it.beats[it.i];
     if (T < it.startAt) return;
     if (!b.text) { it.beatDone = true; it.holdUntil = T + .8 / prefs.bubbleSpeed; return; }
-    typeText(it, b.text, dt, b.anchors || []);
+    if (it.syncBeat !== it.i) { it.syncBeat = it.i; const bind = it.bindings?.[it.i]; it.sync = createVoiceSyncState(bind ? { ...b, ...bind } : b, T, e12Clock.data); }
+    const voiced = stepSayWithVoice(it, b, dt);
+    if (it.beatDone) return;
+    if (!voiced) typeText(it, b.text, dt, b.anchors || []);
     if (it.shown >= b.text.length && !it.beatDone) {
       it.beatDone = true;
       const last = it.i === it.beats.length - 1;
@@ -1048,9 +1180,14 @@ function withdrawLine(cursor) {
   const line = lines.find((l) => l.cursor === cursor);
   if (line) fadeLine(line);
 }
-/** Coo starts speaking or asking (`it`): the settled lines not answered yet are answered by it. */
+/** Coo starts speaking or asking (`it`): fade out settled user temporary bubbles smoothly right away. */
 function answerLines(it) {
-  for (const line of lines) if (!line.live && !line.reply) line.reply = it;
+  if (!it || (it.kind !== 'say' && (it.kind !== 'ask' || it.confirm))) return;
+  for (const line of lines) {
+    if (line.live || line.reply) continue;
+    line.reply = it;
+    fadeLine(line);
+  }
 }
 /** Rows of text a line shows: its text (pet.css clamps it at MAX_ROWS), plus the image line. */
 function rowsOf(line) {
@@ -1061,18 +1198,16 @@ function rowsOf(line) {
   return Math.max(1, Math.round(p.getBoundingClientRect().height / lh)) + hint;
 }
 function stepLines() {
-  // Coo is still on it: working, or with speech queued
-  const busy = !!status.wanted || queue.some((q) => q.kind === 'say' || q.kind === 'ask');
-  let held = -1, answered = -1;
+  // Unanswered user bubbles stay while Coo is still thinking or has a non-confirm reply queued.
+  const busy = !!status.wanted || queue.some((q) => q.kind === 'say' || (q.kind === 'ask' && !q.confirm));
+  let held = -1;
   lines.forEach((line, i) => {
-    if (line.live) return;
-    const r = line.reply;
-    if (r ? r.endedAt === undefined : busy) held = i;
-    else if (r && T >= r.endedAt + REPLIED_FADE) answered = i;
+    if (line.live || line.fadeAt !== null) return;
+    if (!line.reply && busy) held = i;
   });
   lines.forEach((line, i) => {
     if (line.fadeAt !== null || line.live || i <= held) return;
-    if (i <= answered || (!line.reply && T >= line.settledAt + UNANSWERED_FADE)) fadeLine(line);
+    if (line.reply || T >= line.settledAt + UNANSWERED_FADE) fadeLine(line);
   });
   const up = lines.filter((l) => l.fadeAt === null);
   let rows = up.reduce((n, l) => n + rowsOf(l), 0);

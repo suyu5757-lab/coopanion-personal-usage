@@ -58,9 +58,20 @@ export interface Beat {
   anchors: Anchor[];
 }
 
+export interface BeatSpan {
+  /** UTF-16 start offset in the marker-stripped script (same coordinate space as StreamVoice chunker). */
+  scriptStart: number;
+  /** UTF-16 end offset in the marker-stripped script (exclusive). */
+  scriptEnd: number;
+}
+
 export interface ParsedScript {
   beats: Beat[];
   dropped: string[];
+}
+
+export interface ParsedScriptWithSpans extends ParsedScript {
+  spans: BeatSpan[];
 }
 
 export const INLINE_TAG_MAX = 32;
@@ -76,19 +87,48 @@ function words(inner: string, dropped: string[], vocab: readonly VocabWord[]): s
   return out;
 }
 
-export function parseScript(script: string, vocab: readonly VocabWord[]): ParsedScript {
+const BROKEN_UNICODE = /\uFFFD|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/** Removes upstream-corrupted UTF-8 replacement characters (U+FFFD) and lone surrogates from visible bubble text. */
+export function sanitizeBubbleText(text: string): string {
+  return text.replace(BROKEN_UNICODE, '');
+}
+
+function isBrokenCodeUnit(text: string, index: number): boolean {
+  const code = text.charCodeAt(index);
+  if (code === 0xFFFD) return true;
+  if (code >= 0xD800 && code <= 0xDBFF) {
+    const next = index + 1 < text.length ? text.charCodeAt(index + 1) : 0;
+    return next < 0xDC00 || next > 0xDFFF;
+  }
+  if (code >= 0xDC00 && code <= 0xDFFF) {
+    const prev = index > 0 ? text.charCodeAt(index - 1) : 0;
+    return prev < 0xD800 || prev > 0xDBFF;
+  }
+  return false;
+}
+
+export function parseScriptWithSpans(script: string, vocab: readonly VocabWord[]): ParsedScriptWithSpans {
   const dropped: string[] = [];
-  const beats: Beat[] = [];
+  const entries: Array<{ beat: Beat; rawStart: number; rawEnd: number }> = [];
   let cur: Beat = { actions: [], text: '', anchors: [] };
+  let curRawStart = 0;
+  let strippedOffset = 0;
   let i = 0;
   while (i < script.length) {
     const ch = script[i];
     if (ch === '【') {
       const end = script.indexOf('】', i + 1);
-      if (end < 0) { cur.text += script.slice(i); break; }
+      if (end < 0) {
+        const tail = script.slice(i);
+        cur.text += sanitizeBubbleText(tail);
+        strippedOffset += tail.length;
+        break;
+      }
       const acts = words(script.slice(i + 1, end), dropped, vocab);
-      if (cur.text.trim() || cur.actions.length || cur.anchors.length) beats.push(cur);
+      if (cur.text.trim() || cur.actions.length || cur.anchors.length) entries.push({ beat: cur, rawStart: curRawStart, rawEnd: strippedOffset });
       cur = { actions: acts, text: '', anchors: [] };
+      curRawStart = strippedOffset;
       i = end + 1;
       continue;
     }
@@ -96,21 +136,53 @@ export function parseScript(script: string, vocab: readonly VocabWord[]): Parsed
       const close = ch === '<' ? '>' : '＞';
       const end = script.indexOf(close, i + 1);
       const inner = end < 0 ? '' : script.slice(i + 1, end);
-      if (end < 0 || inner.length > INLINE_TAG_MAX || /\n/.test(inner)) { cur.text += ch; i++; continue; }
+      if (end < 0 || inner.length > INLINE_TAG_MAX || /\n/.test(inner)) { cur.text += ch; strippedOffset++; i++; continue; }
       const acts = words(inner, dropped, vocab);
       if (acts.length) cur.anchors.push({ at: cur.text.length, actions: acts });
       i = end + 1;
       continue;
     }
-    cur.text += ch;
+    if (!isBrokenCodeUnit(script, i)) cur.text += ch;
+    strippedOffset++;
     i++;
   }
-  if (cur.text.trim() || cur.actions.length || cur.anchors.length) beats.push(cur);
-  for (const b of beats) {
+  if (cur.text.trim() || cur.actions.length || cur.anchors.length) entries.push({ beat: cur, rawStart: curRawStart, rawEnd: strippedOffset });
+  const spans: BeatSpan[] = [];
+  for (const entry of entries) {
+    const b = entry.beat;
     const lead = b.text.length - b.text.trimStart().length;
+    const trail = b.text.length - b.text.trimEnd().length;
     b.text = b.text.trim();
+    const scriptStart = entry.rawStart + lead;
+    const scriptEnd = Math.max(scriptStart, entry.rawEnd - trail);
+    spans.push({ scriptStart, scriptEnd });
     for (const a of b.anchors) a.at = Math.max(0, Math.min(b.text.length, a.at - lead));
   }
+  // A marker like 【look】 before the sentence's own 。 creates a second beat whose text is only
+  // punctuation. Merge that punctuation into the previous balloon instead of showing a lone 。 bubble.
+  const punctuationOnly = (text: string): boolean => !/[^\s，。！？；：、…—·,.!?;:]/u.test(text);
+  const mergedBeats: Beat[] = [];
+  const mergedSpans: BeatSpan[] = [];
+  for (let idx = 0; idx < entries.length; idx++) {
+    const b = entries[idx]!.beat;
+    const sp = spans[idx]!;
+    if (b.text && punctuationOnly(b.text)) {
+      const prev = mergedBeats[mergedBeats.length - 1];
+      const prevSpan = mergedSpans[mergedSpans.length - 1];
+      if (prev && prevSpan) {
+        prev.text += b.text;
+        prevSpan.scriptEnd = Math.max(prevSpan.scriptEnd, sp.scriptEnd);
+      }
+      continue;
+    }
+    mergedBeats.push(b);
+    mergedSpans.push(sp);
+  }
+  return { beats: mergedBeats, spans: mergedSpans, dropped };
+}
+
+export function parseScript(script: string, vocab: readonly VocabWord[]): ParsedScript {
+  const { beats, dropped } = parseScriptWithSpans(script, vocab);
   return { beats, dropped };
 }
 

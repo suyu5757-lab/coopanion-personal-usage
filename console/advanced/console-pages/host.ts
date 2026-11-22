@@ -110,6 +110,8 @@ export class ConsolePageHost {
         if (page.kind !== 'memory') continue;
         for (const panel of page.panels ?? []) {
           if (panel.id === 'hindsight' && panel.builtin === undefined) panel.builtin = 'hindsight';
+          if (panel.id === 'action-receipts' && panel.builtin === undefined) panel.builtin = 'action-receipts';
+          if (panel.id === 'workspace-permissions' && panel.builtin === undefined) panel.builtin = 'workspace-permissions';
         }
       }
       this.snapshot = next;

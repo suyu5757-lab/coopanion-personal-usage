@@ -36,6 +36,12 @@ export const S: Partial<typeof en> = {
   undoAll: "모든 수정 되돌리기",
   undoAllHint: "마지막으로 저장한 내용으로 되돌립니다. 실행 취소로 수정을 복구할 수 있습니다.",
   saveToFile: "저장",
+  attestLocal: "로컬 설정 확인",
+  attestTitle: "현재 로컬 설정 확인",
+  attestBody: "현재 로컬 인격 설정 파일의 내용 다이제스트와 시각을 설정 화면에서 확인한 기록으로 남깁니다. 대화에서 말한 것이 되지 않으며 장기 기억에 쓰지 않습니다. 나중에 파일을 수정하면 다시 확인해야 합니다.",
+  attestDone: (n: number) => `로컬 설정 ${n}개를 확인했습니다.`,
+  attestNone: "확인할 로컬 설정이 없습니다. 현재는 내장 버전입니다.",
+  attestFailed: (msg: string) => `확인 실패: ${msg}`,
   // index.ts
   title: '시스템 프롬프트',
   introDesc: 'Ctrl+S로 템플릿을 저장하고, "지금 적용"을 누르면 현재 대화의 프롬프트가 업데이트됩니다. 자동 생성된 섹션은 읽기 전용입니다.',

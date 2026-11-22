@@ -85,6 +85,8 @@ export async function mountPrompts(ctx: FeatureContext): Promise<void> {
   function controls(): void {
     for (const button of actions.querySelectorAll<HTMLButtonElement>('button')) button.disabled = changingSession;
     save.disabled = restore.disabled = changingSession || dirty.size === 0 || !!savePromise;
+    const attestButton = actions.querySelector<HTMLButtonElement>('[data-attest]');
+    if (attestButton) attestButton.disabled = changingSession || dirty.size > 0 || !!savePromise || attesting;
     undoStep.disabled = changingSession || !editor.canUndo();
   }
   function state(): void {
@@ -127,7 +129,34 @@ export async function mountPrompts(ctx: FeatureContext): Promise<void> {
   restore.disabled = true;
   const save = ui.button(S.saveToFile, { size: 'sm', onClick: () => { void saveAll(); } });
   save.title = 'Ctrl / ⌘ + S';
-  actions.append(expand, undoStep, restore, save);
+  let attesting = false;
+  const attest = ui.button(S.attestLocal, { size: 'sm', onClick: () => { void attestLocal(); } });
+  attest.title = S.attestBody;
+  attest.dataset.attest = '1';
+  async function attestLocal(): Promise<void> {
+    if (attesting || changingSession || dirty.size) return;
+    if (!await ui.confirm({ title: S.attestTitle, body: S.attestBody })) return;
+    attesting = true;
+    controls();
+    try {
+      const out = await post<{ attested?: string[]; skipped?: string[] }>('/api/prompts/attest', { confirm: true }, { signal });
+      if (signal.aborted) return;
+      const count = out?.attested?.length ?? 0;
+      if (count > 0) {
+        pendingApply = true;
+        say(S.attestDone(count));
+        editor.setSaveState('saved');
+      } else {
+        say(S.attestNone);
+      }
+    } catch (error) {
+      if (!signal.aborted) say(S.attestFailed(String(error)), true);
+    } finally {
+      attesting = false;
+      if (!signal.aborted) controls();
+    }
+  }
+  actions.append(expand, undoStep, restore, save, attest);
   toolbar.append(status, actions);
 
   /**

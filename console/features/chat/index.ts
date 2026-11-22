@@ -37,6 +37,7 @@ export interface Touch { kind: string; count: number; woke: boolean; crashed: bo
 interface Refs { withdrawn?: number[]; delivered?: Array<[number, number]> }
 type ChatItem =
   | { kind: 'user'; cursor: number; ts: string; via: 'chat' | 'bubble' | 'voice'; text: string; images?: WireImage[]; at?: number }
+  | { kind: 'assistant'; cursor: number; ts: string; text: string }
   | { kind: 'answer'; cursor: number; ts: string; askId: string; index?: number; text?: string; dismissed?: true }
   | { kind: 'touch'; cursor: number; ts: string; touch?: Touch; text?: string }
   | { kind: 'figure'; cursor: number; ts: string; figure: { kind: string; name: Record<string, string> } }
@@ -68,7 +69,7 @@ async function mount(ctx: PageContext): Promise<void> {
   const view = ui.h('div', 'chatview');
   root.append(view);
 
-  let bot = 'Coo';
+  let bot = '曦';
   let paused = false;
   let phase: RunPhase | null = null;
   let live: { steps: string[]; startedAt: number } | null = null;
@@ -288,7 +289,13 @@ async function mount(ctx: PageContext): Promise<void> {
       if (it.kind === 'user') { group = null; thread.append(userNode(it)); continue; }
       if (it.kind === 'touch') { group = null; thread.append(ui.h('div', 'chat-note', it.touch ? S.touch(it.touch, bot) : it.text ?? '')); continue; }
       if (it.kind === 'figure') { group = null; thread.append(ui.h('div', 'chat-note', S.figure(it.figure.kind, localName(it.figure.name), bot))); continue; }
-      if (it.kind === 'say') {
+      if (it.kind === 'assistant') {
+        const row = ui.h('div', 'sayrow');
+        const answer = ui.h('div', 'pet-bubble say assistant');
+        answer.append(linked(it.text));
+        row.append(answer);
+        cooBody().append(row);
+      } else if (it.kind === 'say') {
         const body = cooBody();
         for (const beat of it.beats) {
           const row = ui.h('div', 'sayrow');

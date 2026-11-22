@@ -30,6 +30,7 @@
  */
 import { fork, type ChildProcess } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import type { Logger, ToolCallContext, ToolDef, ToolOutcome, WorldHost, WorldLamp } from 'cortico/core/types.ts';
@@ -39,7 +40,8 @@ import { childExecArgv } from 'cortico/extensions/runtime.ts';
 import type { CuaConfig, PermissionLevel } from './config.ts';
 import { cuaText, type CuaText } from './i18n/index.ts';
 import { CUA_TOOL_DECLS } from './tools.ts';
-import { CuaDriver, driverKeyChords, DriverFailure, type CuaDriverLike, type DriverAction, type DriverCapture } from './driver.ts';
+import { CuaDriver, driverKeyChords, DriverFailure, type CuaDriverLike, type DriverAction, type DriverCapture, type DriverElement } from './driver.ts';
+import { isSupportedCuaTarget } from './target-policy.ts';
 import { fit } from './engine/image.ts';
 import { parseKeys } from './engine/keys.ts';
 import { MODEL_TEXT, type ModelLanguage, type ModelText } from './model-text.ts';
@@ -71,6 +73,67 @@ export interface CuaOptions {
   language?: () => Language;
   /** The background window driver; tests pass a fake. Default: Cua Driver through the installed CLI. */
   driver?: () => CuaDriverLike;
+  /** Distinguishes windows belonging to separate app data roots and driver sessions. */
+  instanceId?: string;
+  /** Core's fail-closed check for every input tool while no task-grant bridge is configured. */
+  allowInput?: (tool: string) => boolean;
+  /** Core verifies the native target, obtains approval and consumes a one-use step ticket. */
+  allowsOrdinaryInput?: (request: Pick<CuaInputGrantRequest, 'tool' | 'target' | 'expectedChange'>) => boolean;
+  authorizeInput?: (request: CuaInputGrantRequest) => Promise<CuaInputAuthorization | null>;
+  /** Explicitly cancels an active desktop task grant and its persisted continuation state. */
+  revokeInputTask?: (taskId: string) => void;
+  /** Suspends ephemeral in-memory grants on shutdown or window switch without cancelling persisted task state. */
+  suspendInputTask?: (taskId: string) => void;
+  /** Restores an interrupted resumable logical task ID from Core's persistent task journal on startup. */
+  initialTaskId?: () => string | null;
+}
+
+export interface CuaDesktopTargetEvidence {
+  surface: 'desktop';
+  instanceId: string;
+  bundleId: string;
+  executablePath: string;
+  pid: number;
+  ownerPid: number;
+  processStart: string;
+  windowId: number;
+  bounds: { x: number; y: number; width: number; height: number };
+  display: string | null;
+  space: string | null;
+  snapshotId: string;
+  captureId: string;
+  element?: { role: string; label: string; token: string };
+  route: 'background-ax' | 'background-window-pixel';
+  source: 'cua-driver';
+}
+
+/** The app assembly turns one exact user approval into a Core grant and one-use step ticket. */
+export interface CuaInputGrantRequest {
+  tool: string;
+  taskId: string;
+  taskText: string;
+  expectedChange: string;
+  risk?: 'REVERSIBLE_LOCAL' | 'EXTERNAL_MUTATION';
+  target: CuaDesktopTargetEvidence;
+  expiresInMs: number;
+  maxSteps: number;
+  unbounded?: boolean;
+  reuseTaskGrant?: boolean;
+  confirmInCoreUi: () => Promise<boolean>;
+}
+
+export interface CuaInputCompletion {
+  dispatchState: 'not-dispatched' | 'delivered' | 'unknown';
+  outcome: 'ui-observed' | 'unknown' | 'cancelled';
+  effect: string;
+  summary: string;
+}
+
+/** Core holds this capability until CUA reaches the input dispatch boundary. */
+export interface CuaInputAuthorization {
+  consume(target: CuaDesktopTargetEvidence | null, expectedChange: string): boolean;
+  revoke(): void;
+  complete?(result: CuaInputCompletion): void;
 }
 
 /** The person did not allow this turn's computer use. */
@@ -96,9 +159,17 @@ const screenOf = (r: ScreenInfo): ScreenInfo => ({ displays: r.displays, layout:
 interface WindowTarget {
   handle: string;
   pid: number;
+  ownerPid: number | null;
   windowId: number;
   title: string;
   captureId: string;
+  snapshotId: string;
+  bounds: DriverCapture['bounds'];
+  processIdentity: DriverCapture['processIdentity'];
+  elements: DriverElement[];
+  truncated: boolean;
+  truncationReason: string | null;
+  elementsComplete: boolean | null;
   width: number;
   height: number;
 }
@@ -108,6 +179,28 @@ const windowGone = (err: unknown) => err instanceof DriverFailure && /window_id_
 
 /** Whether an error says the capture a pixel action was aimed at is no longer the current one. */
 const captureStale = (err: unknown) => err instanceof DriverFailure && /capture_not_found|capture_expired|stale.*capture|capture.*stale/i.test(`${err.code} ${err.message}`);
+const backgroundUnavailable = (err: unknown) => err instanceof DriverFailure && err.code === 'background_unavailable';
+
+/** Short single-action ticket lifetime; never used to terminate a goal-scoped task. */
+const SINGLE_STEP_TICKET_MS = 30_000;
+
+/** Shortcuts that close/quit/delete/submit or escalate privilege always require fresh single-step approval. */
+function isSensitiveKeySpec(spec: string): boolean {
+  const normalized = spec.toLowerCase().replace(/\s+/g, '');
+  return /(?:^|,)(?:(?:cmd|command|meta|super)\+(?:q|w|delete|backspace|return|enter|shift\+delete|shift\+q|option\+esc|alt\+esc)|ctrl\+alt\+delete|alt\+f4)(?:$|,)/.test(normalized);
+}
+
+interface ActiveTaskGrant {
+  taskId: string;
+  scopeKey: string;
+}
+
+interface ApprovedInput {
+  digest: string;
+  frame: string;
+  used: boolean;
+  authorization?: CuaInputAuthorization;
+}
 
 /** `p`'s value, or null when `signal` aborts first. */
 function untilAborted<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T | null> {
@@ -149,12 +242,16 @@ export class Cua {
   private driverClient: CuaDriverLike | null = null;
   /** The window background actions act on; null means the whole screen. */
   private target: WindowTarget | null = null;
+  /** Active task-level authorization for low-risk background steps on the bound window. */
+  private activeTask: ActiveTaskGrant | null = null;
+  /** Persistent logical task ID across ordinary multi-step and cross-app work until cancelled/stopped. */
+  private logicalTaskId: string | null = null;
 
   constructor(private readonly opts: CuaOptions) {}
 
   /** The background window driver. */
   private get driver(): CuaDriverLike {
-    return this.driverClient ??= this.opts.driver?.() ?? new CuaDriver('coo');
+    return this.driverClient ??= this.opts.driver?.() ?? new CuaDriver();
   }
 
   /** Why a window cannot be selected for background work; null when it can. */
@@ -209,7 +306,56 @@ export class Cua {
     return this.screenAsked;
   }
 
+  /** Returns the current logical task ID, restoring any resumable task from Core before creating a new one. */
+  currentTaskId(): string {
+    if (!this.logicalTaskId) {
+      const resumed = this.opts.initialTaskId?.() ?? null;
+      this.logicalTaskId = resumed || randomUUID();
+    }
+    return this.logicalTaskId;
+  }
+
+  /** Suspends ephemeral in-memory grants on process shutdown/restart WITHOUT cancelling persisted task state. */
+  suspendForShutdown(): void {
+    const ids = new Set<string>();
+    if (this.activeTask) {
+      ids.add(this.activeTask.taskId);
+      this.activeTask = null;
+    }
+    if (this.logicalTaskId) {
+      ids.add(this.logicalTaskId);
+      this.logicalTaskId = null;
+    }
+    for (const taskId of ids) this.opts.suspendInputTask?.(taskId);
+  }
+
+  /** Explicitly cancels and revokes any active task-level desktop authorization and rotates the logical task ID. */
+  cancelActiveTask(): void {
+    const ids = new Set<string>();
+    if (this.activeTask) {
+      ids.add(this.activeTask.taskId);
+      this.activeTask = null;
+    }
+    if (this.logicalTaskId) {
+      ids.add(this.logicalTaskId);
+      this.logicalTaskId = null;
+    }
+    for (const taskId of ids) this.opts.revokeInputTask?.(taskId);
+  }
+
+  private taskScopeKey(evidence: CuaDesktopTargetEvidence): string {
+    return JSON.stringify([
+      evidence.instanceId,
+      evidence.bundleId,
+      evidence.executablePath,
+      evidence.ownerPid,
+      evidence.processStart,
+      evidence.windowId,
+    ]);
+  }
+
   async stop(): Promise<void> {
+    this.suspendForShutdown();
     this.target = null;
     await this.endEngine(this.t.worldStopped);
     this.host = null;
@@ -217,6 +363,7 @@ export class Cua {
 
   /** Computer use was switched off: the engine process ends, and the next call starts another. */
   switchedOff(): Promise<void> {
+    this.cancelActiveTask();
     this.target = null;
     return this.endEngine(this.t.switchedOff);
   }
@@ -268,8 +415,8 @@ export class Cua {
    * Sends one request to the engine. When `signal` aborts after the request went out, the engine
    * gets a cancel and the call still resolves with what the engine reports it did.
    */
-  private async call<T>(req: EngineRequest, signal?: AbortSignal): Promise<T> {
-    if (req.op !== 'info' && req.op !== 'confirm') await this.permit(req.op === 'screenshot' || req.op === 'zoom' || req.op === 'windows' ? 'see' : 'act', signal);
+  private async call<T>(req: EngineRequest, signal?: AbortSignal, opts: { skipPermission?: boolean } = {}): Promise<T> {
+    if (!opts.skipPermission && req.op !== 'info' && req.op !== 'confirm') await this.permit(req.op === 'screenshot' || req.op === 'zoom' || req.op === 'windows' ? 'see' : 'act', signal);
     if (signal?.aborted) throw new Interrupted(this.t.interruptedBeforeAct);
     if (!this.engine) { this.engine = this.spawn(); this.engineExit = null; }
     const id = ++this.seq;
@@ -322,9 +469,198 @@ export class Cua {
     const who = this.opts.botName?.() || 'bot';
     const a = this.ui.ask;
     const question = level === 'ask-each-turn' ? a.eachTurn(who) : level === 'ask-once' ? a.once(who, this.cfg.grantMinutes) : a.acting(who);
+    return this.askQuestion(question);
+  }
+
+  private async askQuestion(question: string, signal?: AbortSignal): Promise<Answer> {
+    const a = this.ui.ask;
     const viaApp = await this.opts.askPermission?.(question, [a.yes, a.no]) ?? null;
     if (viaApp) return viaApp;
-    return this.call<Answer>({ op: 'confirm', text: question, caption: a.caption, yes: a.yes, no: a.no, timeoutMs: PERMISSION_TIMEOUT_MS });
+    return this.call<Answer>({ op: 'confirm', text: question, caption: a.caption, yes: a.yes, no: a.no, timeoutMs: PERMISSION_TIMEOUT_MS }, signal);
+  }
+
+  private inputFrame(): string {
+    if (this.target) return JSON.stringify([this.target.handle, this.target.captureId, this.target.snapshotId]);
+    const view = this.shotSize();
+    return JSON.stringify([view.display, view.layout, view.width, view.height, view.scale]);
+  }
+
+  private inputTarget(): string {
+    if (this.target) return `${this.target.title} (${this.target.handle})`;
+    const view = this.shotSize();
+    return `display ${view.display}, ${view.width}×${view.height}`;
+  }
+
+  private desktopTargetEvidence(element?: DriverElement): CuaDesktopTargetEvidence | null {
+    const target = this.target;
+    const identity = target?.processIdentity;
+    const bounds = target?.bounds;
+    if (!target || !identity || !bounds || !target.ownerPid || !target.snapshotId || !target.captureId) return null;
+    const evidence: CuaDesktopTargetEvidence = {
+      surface: 'desktop',
+      instanceId: this.opts.instanceId ?? '',
+      bundleId: identity.bundleId,
+      executablePath: identity.executablePath,
+      pid: target.pid,
+      ownerPid: target.ownerPid,
+      processStart: identity.processStart,
+      windowId: target.windowId,
+      bounds,
+      display: null,
+      space: null,
+      snapshotId: target.snapshotId,
+      captureId: target.captureId,
+      route: element ? 'background-ax' : 'background-window-pixel',
+      source: 'cua-driver',
+      ...(element ? { element: { role: element.role, label: element.label, token: element.token } } : {}),
+    };
+    return evidence.instanceId && isSupportedCuaTarget(evidence) ? evidence : null;
+  }
+
+  private async approveInput(
+    tool: string,
+    operation: keyof CuaText['ask']['actions'],
+    detail: string,
+    signal?: AbortSignal,
+    targetOverride?: string,
+    element?: DriverElement,
+    opts?: { forceSingleStep?: boolean },
+  ): Promise<ApprovedInput | null> {
+    if (!this.opts.askPermission && !this.opts.authorizeInput) return null;
+    if (this.opts.authorizeInput && (operation === 'focus' || operation === 'foreground')) return null;
+    const evidence = this.desktopTargetEvidence(element);
+    const ordinary = !!(this.opts.authorizeInput && evidence
+      && this.opts.allowsOrdinaryInput?.({ tool, target: evidence, expectedChange: detail }));
+    if (!ordinary) await this.permit('act', signal);
+    if (signal?.aborted) return null;
+    const frame = this.inputFrame();
+    const target = targetOverride ?? this.inputTarget();
+    const digest = createHash('sha256').update(JSON.stringify([tool, operation, target, detail, frame])).digest('hex');
+    const who = this.opts.botName?.() || 'bot';
+    const question = this.ui.ask.action(who, this.ui.ask.actions[operation], target, `${detail} (${digest.slice(0, 12)})`);
+    let authorization: CuaInputAuthorization | null = null;
+    if (this.opts.authorizeInput) {
+      const currentEvidence = this.desktopTargetEvidence(element);
+      if (!currentEvidence) return null;
+      const risk = operation === 'move' || operation === 'scroll' ? 'REVERSIBLE_LOCAL' as const : 'EXTERNAL_MUTATION' as const;
+      const confirmInCoreUi = async () => {
+        if (!this.opts.askPermission) return false;
+        const answer = await untilAborted(this.opts.askPermission(question, [this.ui.ask.yes, this.ui.ask.no]), signal);
+        return answer === 'yes' && frame === this.inputFrame();
+      };
+      const taskId = this.currentTaskId();
+      const useTaskGrant = !ordinary && !opts?.forceSingleStep;
+      if (useTaskGrant) {
+        const scopeKey = this.taskScopeKey(currentEvidence);
+        if (this.activeTask && this.activeTask.scopeKey !== scopeKey) {
+          const previousTaskId = this.activeTask.taskId;
+          this.activeTask = null;
+          (this.opts.suspendInputTask ?? this.opts.revokeInputTask)?.(previousTaskId);
+        }
+        if (this.activeTask) {
+          authorization = await this.opts.authorizeInput({
+            tool,
+            taskId: this.activeTask.taskId,
+            taskText: `${tool}: ${detail}`,
+            expectedChange: detail,
+            risk,
+            target: currentEvidence,
+            expiresInMs: SINGLE_STEP_TICKET_MS,
+            maxSteps: 200,
+            unbounded: true,
+            reuseTaskGrant: true,
+            confirmInCoreUi: async () => false,
+          });
+          if (!authorization) {
+            const previousTaskId = this.activeTask.taskId;
+            this.activeTask = null;
+            (this.opts.suspendInputTask ?? this.opts.revokeInputTask)?.(previousTaskId);
+          }
+        }
+        if (!authorization) {
+          authorization = await this.opts.authorizeInput({
+            tool,
+            taskId,
+            taskText: `${tool}: ${detail}`,
+            expectedChange: detail,
+            risk,
+            target: currentEvidence,
+            expiresInMs: SINGLE_STEP_TICKET_MS,
+            maxSteps: 200,
+            unbounded: true,
+            confirmInCoreUi,
+          });
+          if (authorization) {
+            this.activeTask = { taskId, scopeKey };
+          }
+        }
+      } else {
+        authorization = await this.opts.authorizeInput({
+          tool,
+          taskId,
+          taskText: `${tool}: ${detail}`,
+          expectedChange: detail,
+          risk,
+          target: currentEvidence,
+          expiresInMs: SINGLE_STEP_TICKET_MS,
+          maxSteps: 1,
+          confirmInCoreUi: ordinary ? async () => false : confirmInCoreUi,
+        });
+      }
+      if (!authorization) return null;
+    } else {
+      const answer = await untilAborted(this.askQuestion(question, signal), signal);
+      if (answer !== 'yes') return null;
+    }
+    if (signal?.aborted || frame !== this.inputFrame()) {
+      authorization?.revoke();
+      return null;
+    }
+    return { digest, frame, used: false, ...(authorization ? { authorization } : {}) };
+  }
+
+  private inputApprovalRefusal(): string {
+    return this.opts.askPermission ? this.t.actionDenied : this.t.actionApprovalRequired;
+  }
+
+  private consumeApproval(approval: ApprovedInput | null, tool: string, operation: keyof CuaText['ask']['actions'], detail: string, targetOverride?: string, element?: DriverElement): boolean {
+    if (!approval) return false;
+    if (approval.used || approval.frame !== this.inputFrame()) {
+      approval.authorization?.revoke();
+      return false;
+    }
+    const digest = createHash('sha256').update(JSON.stringify([tool, operation, targetOverride ?? this.inputTarget(), detail, approval.frame])).digest('hex');
+    if (digest !== approval.digest) {
+      approval.authorization?.revoke();
+      return false;
+    }
+    if (approval.authorization && !approval.authorization.consume(this.desktopTargetEvidence(element), detail)) {
+      approval.authorization.revoke();
+      return false;
+    }
+    approval.used = true;
+    return true;
+  }
+
+  private completeInput(approval: ApprovedInput | null, result: CuaInputCompletion): void {
+    try { approval?.authorization?.complete?.(result); } catch { /* the unresolved receipt remains fail-closed */ }
+  }
+
+  private completeDriverAction(approval: ApprovedInput | null, action: DriverAction): void {
+    this.completeInput(approval, {
+      dispatchState: 'delivered',
+      outcome: action.effect === 'confirmed' ? 'ui-observed' : 'unknown',
+      effect: action.effect,
+      summary: action.summary,
+    });
+  }
+
+  private completeUncertainInput(approval: ApprovedInput | null, summary: string, dispatchState: CuaInputCompletion['dispatchState'] = 'unknown'): void {
+    this.completeInput(approval, { dispatchState, outcome: 'unknown', effect: 'unverifiable', summary });
+  }
+
+  private cancelInput(approval: ApprovedInput | null, summary: string): void {
+    this.completeInput(approval, { dispatchState: 'not-dispatched', outcome: 'cancelled', effect: 'refused', summary });
   }
 
   /* ---------- coordinates ---------- */
@@ -381,8 +717,15 @@ export class Cua {
   }
 
   /** The options for one driver capture. */
-  private captureOptions(screenshot: boolean, signal?: AbortSignal) {
-    return { screenshot, maxDimension: Math.max(this.cfg.screenshot.maxWidth, this.cfg.screenshot.maxHeight), quality: this.cfg.screenshot.quality, signal };
+  private captureOptions(screenshot: boolean, signal?: AbortSignal, query?: string, maxElements = 250) {
+    return {
+      screenshot,
+      maxDimension: Math.max(this.cfg.screenshot.maxWidth, this.cfg.screenshot.maxHeight),
+      quality: this.cfg.screenshot.quality,
+      maxElements: Math.min(2000, Math.max(1, Math.round(maxElements))),
+      query,
+      signal,
+    };
   }
 
   /** `pet_cua_window`: capture a window and make it the target of later actions. */
@@ -393,13 +736,20 @@ export class Cua {
     if (!key) return { text: this.t.notRun('pet_cua_window', this.t.focusEmpty), failed: true };
     let handle = key.toLowerCase();
     let title = '';
-    if (!/^\d+:\d+$/.test(handle)) {
-      const list = await this.listWindows(signal);
-      const hit = list.find((w) => w.handle === handle) ?? list.find((w) => w.title.includes(key)) ?? list.find((w) => w.title.toLowerCase().includes(handle));
-      if (!hit) return { text: this.t.notRun('pet_cua_window', this.t.windowMissing(key)), failed: true };
-      handle = hit.handle;
-      title = hit.title;
-    }
+    const list = await this.listWindows(signal);
+    const exactHandles = list.filter((w) => w.handle.toLowerCase() === handle);
+    const isHandle = /^\d+:\d+$/.test(handle);
+    const exactTitles = isHandle ? [] : list.filter((w) => w.title.toLowerCase() === handle);
+    let matches: WindowEntry[];
+    if (exactHandles.length) matches = exactHandles;
+    else if (isHandle) matches = [];
+    else if (exactTitles.length) matches = exactTitles;
+    else matches = list.filter((w) => w.title.toLowerCase().includes(handle));
+    if (matches.length > 1) return { text: this.t.notRun('pet_cua_window', this.t.focusAmbiguous(key)), failed: true };
+    const hit = matches[0];
+    if (!hit) return { text: this.t.notRun('pet_cua_window', this.t.windowMissing(key)), failed: true };
+    handle = hit.handle;
+    title = hit.title;
     const [pid, windowId] = handle.split(':').map(Number);
     if (!Number.isInteger(pid) || !Number.isInteger(windowId) || pid <= 0 || windowId <= 0) {
       return { text: this.t.notRun('pet_cua_window', this.t.windowMissing(key)), failed: true };
@@ -407,18 +757,85 @@ export class Cua {
     await this.permit('see', signal);
     try {
       const cap = await this.driver.capture(pid, windowId, this.captureOptions(true, signal));
-      this.target = { handle, pid, windowId, title: title || cap.title || handle, captureId: cap.captureId, width: cap.width, height: cap.height };
+      if (this.target && this.target.handle !== handle && this.activeTask) {
+        const previousTaskId = this.activeTask.taskId;
+        this.activeTask = null;
+        (this.opts.suspendInputTask ?? this.opts.revokeInputTask)?.(previousTaskId);
+      }
+      const hitBounds = hit.rect && [hit.rect.x, hit.rect.y, hit.rect.width, hit.rect.height].every((n) => typeof n === 'number' && Number.isFinite(n))
+        ? { x: hit.rect.x, y: hit.rect.y, width: hit.rect.width, height: hit.rect.height }
+        : null;
+      this.target = {
+        handle, pid, ownerPid: cap.ownerPid, windowId, title: title || cap.title || handle,
+        captureId: cap.captureId, snapshotId: cap.snapshotId || cap.captureId, elements: cap.elements,
+        bounds: cap.bounds ?? hitBounds, processIdentity: cap.processIdentity,
+        truncated: cap.truncated, truncationReason: cap.truncationReason, elementsComplete: cap.elementsComplete,
+        width: cap.width, height: cap.height,
+      };
+      this.currentTaskId();
       return this.windowOutcome('', cap);
     } catch (err) {
       return this.driverOutcome('pet_cua_window', err);
     }
   }
 
+  private async accessibility(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
+    const target = this.target;
+    if (!target) return { text: this.t.notRun('pet_cua_accessibility', this.t.accessibilityNoWindow), failed: true };
+    await this.permit('see', signal);
+    try {
+      const query = typeof args.query === 'string' ? args.query.trim().slice(0, 120) : '';
+      const maxElements = typeof args.maxElements === 'number' && Number.isFinite(args.maxElements) ? args.maxElements : 250;
+      await this.refreshWindow(false, signal, query || undefined, maxElements);
+      const current = this.target!;
+      if (!current.snapshotId) return { text: this.t.notRun('pet_cua_accessibility', this.t.accessibilityEmpty), failed: true };
+      const validElements = current.elements.filter((element) => element.token.startsWith(`${current.snapshotId}:`));
+      const pressable = validElements.filter((element) => element.actions.some((action) => action.toLowerCase() === 'press'));
+      const editableOrReadable = validElements.filter((element) => !pressable.includes(element));
+      const limit = 120;
+      const lines: string[] = [];
+      for (const element of pressable.slice(0, limit)) {
+        const label = element.label ? ` "${element.label.slice(0, 160)}"` : '';
+        lines.push(`- [press] ${element.token} ${element.role || 'element'}${label}`);
+      }
+      const remaining = Math.max(0, limit - lines.length);
+      for (const element of editableOrReadable.slice(0, remaining)) {
+        const label = element.label ? ` "${element.label.slice(0, 120)}"` : '';
+        const frame = element.frame ? ` @(${Math.round(element.frame.x)},${Math.round(element.frame.y)},${Math.round(element.frame.width)}x${Math.round(element.frame.height)})` : '';
+        const actions = element.actions.length ? ` actions=[${element.actions.join(',')}]` : '';
+        lines.push(`- [observe] ${element.token} ${element.role || 'element'}${label}${frame}${actions}`);
+      }
+      if (validElements.length > limit) lines.push(`… ${validElements.length - limit} more`);
+      if (!lines.length) {
+        lines.push('(no AX press elements listed; window-level background input via pet_cua_type, pet_cua_key, pet_cua_scroll, or pet_cua_click(x,y) remains available on this bound window)');
+      } else if (!pressable.length) {
+        lines.push('(no pressable buttons; for editable text areas in this bound window, use pet_cua_type and pet_cua_key directly)');
+      }
+      return { text: `${this.t.windowCurrent(current.title, current.handle)}\n${this.t.accessibilityList(current.snapshotId, pressable.length, lines, current.truncated, current.truncationReason)}` };
+    } catch (err) {
+      return this.driverOutcome('pet_cua_accessibility', err);
+    }
+  }
+
   /** A fresh capture of the current target, updating its coordinates and capture id. */
-  private async refreshWindow(screenshot: boolean, signal?: AbortSignal) {
+  private async refreshWindow(screenshot: boolean, signal?: AbortSignal, query?: string, maxElements = 250) {
     const target = this.target!;
-    const cap = await this.driver.capture(target.pid, target.windowId, this.captureOptions(screenshot, signal));
-    this.target = { ...target, title: target.title || cap.title, captureId: cap.captureId, width: cap.width, height: cap.height };
+    const cap = await this.driver.capture(target.pid, target.windowId, this.captureOptions(screenshot, signal, query, maxElements));
+    this.target = {
+      ...target,
+      ownerPid: cap.ownerPid ?? target.ownerPid,
+      title: target.title || cap.title,
+      bounds: cap.bounds ?? target.bounds,
+      processIdentity: cap.processIdentity ?? target.processIdentity,
+      captureId: screenshot ? (cap.captureId || target.captureId) : target.captureId,
+      snapshotId: cap.snapshotId || target.snapshotId,
+      elements: cap.elements,
+      truncated: cap.truncated,
+      truncationReason: cap.truncationReason,
+      elementsComplete: cap.elementsComplete,
+      width: screenshot ? cap.width : target.width,
+      height: screenshot ? cap.height : target.height,
+    };
     return cap;
   }
 
@@ -459,14 +876,18 @@ export class Cua {
     return { x: Math.round(x), y: Math.round(y) };
   }
 
-  /** Runs a pixel action once more after refreshing the capture it was aimed at. */
-  private async withCaptureRetry<T>(act: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  /**
+   * Runs a pixel action. A stale capture is not retried: Cua Driver does not promise it rejected the
+   * input before dispatch, so the click may have landed. The capture is refreshed and the caller
+   * reports the result as unknown; the next look shows whether anything changed.
+   */
+  private async onceOnCapture<T>(act: () => Promise<T>, signal?: AbortSignal): Promise<T | null> {
     try {
       return await act();
     } catch (err) {
       if (!captureStale(err)) throw err;
-      await this.refreshWindow(false, signal);
-      return act();
+      await this.refreshWindow(false, signal).catch(() => undefined);
+      return null;
     }
   }
 
@@ -477,7 +898,18 @@ export class Cua {
     const line = `${done}${note}`;
     const target = this.target!;
     const want = typeof args.screenshot === 'boolean' ? args.screenshot : this.cfg.screenshot.afterAction;
-    if (!want) return { text: `${line}\n${t.windowCurrent(target.title, target.handle)}` };
+    if (!want) {
+      try {
+        await this.refreshWindow(false, signal);
+        return { text: `${line}\n${t.windowCurrent(target.title, target.handle)}` };
+      } catch (err) {
+        if (windowGone(err)) {
+          this.target = null;
+          return { text: `${line}\n${t.windowGone((err as Error).message)}`, failed: true };
+        }
+        return this.driverOutcome(tool, err);
+      }
+    }
     await pause(this.cfg.screenshot.settleMs, signal);
     if (signal?.aborted) return { text: `${line}${t.noShotInterrupted}` };
     try {
@@ -496,23 +928,89 @@ export class Cua {
   private driverOutcome(tool: string, err: unknown): ToolOutcome {
     if (err instanceof DriverFailure) {
       if (err.code === 'not_installed') return { text: this.t.notRun(tool, this.t.backgroundMissing), failed: true };
+      if (err.code === 'private_runtime_not_configured' || err.code === 'private_endpoint_unavailable') return { text: this.t.notRun(tool, this.t.backgroundMissing), failed: true };
       if (err.code === 'aborted') return { text: this.t.notRun(tool, this.t.interruptedBeforeAct), failed: true };
+      if (err.code === 'stale_element_token') return { text: this.t.notRun(tool, this.t.elementStale), failed: true };
       if (windowGone(err)) this.target = null;
       return { text: this.t.failed(tool, windowGone(err) ? this.t.windowGone(err.message) : this.t.driverFailed(err.message)), failed: true };
     }
     return { text: this.t.failed(tool, (err as Error).message), failed: true };
   }
 
+  private async foregroundRetry<T>(tool: string, detail: string, signal: AbortSignal | undefined, act: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false; reason: string }> {
+    if (this.cfg.backgroundOnly) return { ok: false, reason: this.t.backgroundOnly };
+    const approval = await this.approveInput(tool, 'foreground', detail, signal);
+    if (!this.consumeApproval(approval, tool, 'foreground', detail)) return { ok: false, reason: this.inputApprovalRefusal() };
+    return { ok: true, value: await act() };
+  }
+
   private async backgroundClick(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
-    const p = this.targetPoint(args.x, args.y);
-    if (typeof p === 'string') return { text: this.t.notRun('pet_cua_click', p), failed: true };
+    const target = this.target!;
+    const token = typeof args.elementToken === 'string' ? args.elementToken.trim() : '';
+    if (token && (args.x !== undefined || args.y !== undefined)) {
+      return { text: this.t.notRun('pet_cua_click', this.t.clickTargetAmbiguous), failed: true };
+    }
+    const element = token ? target.elements.find((candidate) => candidate.token === token) : undefined;
+    if (token && (!target.snapshotId || !element || !token.startsWith(`${target.snapshotId}:`)
+      || !element.actions.some((action) => action.toLowerCase() === 'press'))) {
+      return { text: this.t.notRun('pet_cua_click', element ? this.t.accessibilityEmpty : this.t.elementStale), failed: true };
+    }
+    const p = token ? null : this.targetPoint(args.x, args.y);
+    if (!token && typeof p === 'string') return { text: this.t.notRun('pet_cua_click', p), failed: true };
     const button = (args.button === 'right' || args.button === 'middle' ? args.button : 'left') as Button;
     const count = args.clicks === 2 || args.clicks === 3 ? args.clicks : 1;
-    await this.permit('act', signal);
+    const detail = element
+      ? `press ${element.role} "${element.label}"`
+      : `${button} click at (${args.x}, ${args.y}), ${count} time${count === 1 ? '' : 's'}`;
+    const approval = await this.approveInput('pet_cua_click', 'click', detail, signal, undefined, element);
+    if (!this.consumeApproval(approval, 'pet_cua_click', 'click', detail, undefined, element)) return { text: this.t.notRun('pet_cua_click', this.inputApprovalRefusal()), failed: true };
     try {
-      const action = await this.withCaptureRetry(() => this.driver.click(this.target!.pid, this.target!.windowId, p.x, p.y, this.target!.captureId, { button, count, signal }), signal);
-      return this.afterWindow('pet_cua_click', this.t.clicked(args.x, args.y, button, count), args, signal, action);
+      let action: DriverAction | null;
+      if (element) {
+        try {
+          action = await this.driver.clickElement(target.pid, target.windowId, token, { signal });
+        } catch (err) {
+          if (!backgroundUnavailable(err)) throw err;
+          const retry = await this.foregroundRetry('pet_cua_click', detail, signal,
+            () => this.driver.clickElement(target.pid, target.windowId, token, { signal, deliveryMode: 'foreground' }));
+          if (!retry.ok) {
+            this.cancelInput(approval, retry.reason);
+            return { text: this.t.notRun('pet_cua_click', retry.reason), failed: true };
+          }
+          action = retry.value;
+        }
+      } else {
+        const point = p as { x: number; y: number };
+        try {
+          action = await this.onceOnCapture(
+            () => this.driver.click(target.pid, target.windowId, point.x, point.y, target.captureId, { button, count, signal }),
+            signal,
+          );
+        } catch (err) {
+          if (!backgroundUnavailable(err)) throw err;
+          const retry = await this.foregroundRetry('pet_cua_click', detail, signal,
+            () => this.driver.click(target.pid, target.windowId, point.x, point.y, target.captureId, { button, count, signal, deliveryMode: 'foreground' }));
+          if (!retry.ok) {
+            this.cancelInput(approval, retry.reason);
+            return { text: this.t.notRun('pet_cua_click', retry.reason), failed: true };
+          }
+          action = retry.value;
+        }
+      }
+      if (!action) {
+        this.completeUncertainInput(approval, 'the driver returned no click result');
+        return { text: this.t.notRun('pet_cua_click', this.t.clickUnknown), failed: true };
+      }
+      this.completeDriverAction(approval, action);
+      const done = element ? this.t.clickedElement(element.role, element.label) : this.t.clicked(args.x, args.y, button, count);
+      return this.afterWindow('pet_cua_click', done, args, signal, action);
     } catch (err) {
+      if (err instanceof DriverFailure && err.code === 'stale_element_token') {
+        this.cancelInput(approval, 'the accessibility element became stale before dispatch');
+        await this.refreshWindow(false, signal).catch(() => undefined);
+        return { text: this.t.notRun('pet_cua_click', this.t.elementStale), failed: true };
+      }
+      this.completeUncertainInput(approval, err instanceof Error ? err.message : String(err));
       return this.driverOutcome('pet_cua_click', err);
     }
   }
@@ -520,16 +1018,21 @@ export class Cua {
   private async backgroundMove(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
     const p = this.targetPoint(args.x, args.y);
     if (typeof p === 'string') return { text: this.t.notRun('pet_cua_move', p), failed: true };
-    await this.permit('act', signal);
+    const detail = `move pointer to (${args.x}, ${args.y})`;
+    const approval = await this.approveInput('pet_cua_move', 'move', detail, signal);
+    if (!this.consumeApproval(approval, 'pet_cua_move', 'move', detail)) return { text: this.t.notRun('pet_cua_move', this.inputApprovalRefusal()), failed: true };
     try {
       const action = await this.driver.move(this.target!.pid, this.target!.windowId, p.x, p.y, { signal });
+      this.completeDriverAction(approval, action);
       return this.afterWindow('pet_cua_move', this.t.movedWindow(args.x, args.y), args, signal, action);
     } catch (err) {
+      this.completeUncertainInput(approval, err instanceof Error ? err.message : String(err));
       return this.driverOutcome('pet_cua_move', err);
     }
   }
 
   private async backgroundDrag(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
+    const target = this.target!;
     const from = Array.isArray(args.from) ? args.from : [];
     const to = Array.isArray(args.to) ? args.to : [];
     const a = this.targetPoint(from[0], from[1]);
@@ -537,11 +1040,27 @@ export class Cua {
     if (typeof a === 'string' || typeof b === 'string') {
       return { text: this.t.notRun('pet_cua_drag', typeof a === 'string' ? this.t.dragStart(a) : this.t.dragEnd(b as string)), failed: true };
     }
-    await this.permit('act', signal);
+    const detail = `drag from (${from[0]}, ${from[1]}) to (${to[0]}, ${to[1]})`;
+    const approval = await this.approveInput('pet_cua_drag', 'drag', detail, signal);
+    if (!this.consumeApproval(approval, 'pet_cua_drag', 'drag', detail)) return { text: this.t.notRun('pet_cua_drag', this.inputApprovalRefusal()), failed: true };
     try {
-      const action = await this.driver.drag(this.target!.pid, this.target!.windowId, [a.x, a.y], [b.x, b.y], { signal });
+      let action: DriverAction;
+      try {
+        action = await this.driver.drag(target.pid, target.windowId, [a.x, a.y], [b.x, b.y], { signal });
+      } catch (err) {
+        if (!backgroundUnavailable(err)) throw err;
+        const retry = await this.foregroundRetry('pet_cua_drag', detail, signal,
+          () => this.driver.drag(target.pid, target.windowId, [a.x, a.y], [b.x, b.y], { signal, deliveryMode: 'foreground' }));
+        if (!retry.ok) {
+          this.cancelInput(approval, retry.reason);
+          return { text: this.t.notRun('pet_cua_drag', retry.reason), failed: true };
+        }
+        action = retry.value;
+      }
+      this.completeDriverAction(approval, action);
       return this.afterWindow('pet_cua_drag', this.t.dragged(from, to), args, signal, action);
     } catch (err) {
+      this.completeUncertainInput(approval, err instanceof Error ? err.message : String(err));
       return this.driverOutcome('pet_cua_drag', err);
     }
   }
@@ -552,58 +1071,107 @@ export class Cua {
     const clampN = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? Math.max(-30, Math.min(30, Math.round(v))) : 0);
     const down = clampN(args.down), right = clampN(args.right);
     if (!down && !right) return { text: this.t.notRun('pet_cua_scroll', this.t.scrollNone), failed: true };
-    await this.permit('act', signal);
+    const detail = `scroll at (${args.x}, ${args.y}), down ${down}, right ${right}`;
+    const approval = await this.approveInput('pet_cua_scroll', 'scroll', detail, signal);
+    if (!this.consumeApproval(approval, 'pet_cua_scroll', 'scroll', detail)) return { text: this.t.notRun('pet_cua_scroll', this.inputApprovalRefusal()), failed: true };
     try {
       const action = await this.driver.scroll(this.target!.pid, this.target!.windowId, p.x, p.y, down, right, { signal });
+      this.completeDriverAction(approval, action);
       return this.afterWindow('pet_cua_scroll', this.t.scrolled(args.x, args.y, down, right), args, signal, action);
     } catch (err) {
+      this.completeUncertainInput(approval, err instanceof Error ? err.message : String(err));
       return this.driverOutcome('pet_cua_scroll', err);
     }
   }
 
   private async backgroundType(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
+    const target = this.target!;
     const text = typeof args.text === 'string' ? args.text : '';
     if (!text) return { text: this.t.notRun('pet_cua_type', this.t.typeEmpty), failed: true };
-    await this.permit('act', signal);
     const t = this.t, normalized = text.replace(/\r\n/g, '\n'), total = [...normalized].length;
+    const detail = `type ${JSON.stringify(normalized)}`;
+    const approval = await this.approveInput('pet_cua_type', 'type', detail, signal);
+    if (!this.consumeApproval(approval, 'pet_cua_type', 'type', detail)) return { text: t.notRun('pet_cua_type', this.inputApprovalRefusal()), failed: true };
     let typed = 0;
     const lines = normalized.split('\n');
-    try {
+    const send = async (deliveryMode: 'background' | 'foreground'): Promise<DriverAction | undefined> => {
+      let action: DriverAction | undefined;
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i]!;
         if (line) {
-          await this.driver.type(this.target!.pid, this.target!.windowId, line, { signal });
+          action = await this.driver.type(target.pid, target.windowId, line, { signal, deliveryMode });
           typed += [...line].length;
         }
         if (i < lines.length - 1) {
-          await this.driver.key(this.target!.pid, this.target!.windowId, [{ modifiers: [], key: 'return' }], { signal });
+          action = await this.driver.key(target.pid, target.windowId, [{ modifiers: [], key: 'return' }], { signal, deliveryMode });
           typed += 1;
         }
       }
-      return this.afterWindow('pet_cua_type', t.typed(total), args, signal);
+      return action;
+    };
+    try {
+      let action: DriverAction | undefined;
+      try {
+        action = await send('background');
+      } catch (err) {
+        if (!backgroundUnavailable(err) || typed !== 0) throw err;
+        const retry = await this.foregroundRetry('pet_cua_type', detail, signal, () => send('foreground'));
+        if (!retry.ok) {
+          this.cancelInput(approval, retry.reason);
+          return { text: t.notRun('pet_cua_type', retry.reason), failed: true };
+        }
+        action = retry.value;
+      }
+      if (action) this.completeDriverAction(approval, action);
+      else this.completeUncertainInput(approval, 'the driver returned no typing result');
+      return this.afterWindow('pet_cua_type', t.typed(total), args, signal, action);
     } catch (err) {
       if (err instanceof DriverFailure) {
+        this.completeInput(approval, {
+          dispatchState: typed > 0 ? 'delivered' : 'unknown',
+          outcome: 'unknown',
+          effect: typed > 0 ? 'partial' : 'unverifiable',
+          summary: `${typed} of ${total} characters sent; ${err.message}`,
+        });
         if (windowGone(err)) {
           this.target = null;
           return { text: t.failed('pet_cua_type', t.windowGone(err.message)), failed: true };
         }
         return { text: t.failed('pet_cua_type', t.typedDriver(typed, total, err.message)), failed: true };
       }
+      this.completeUncertainInput(approval, err instanceof Error ? err.message : String(err), typed > 0 ? 'delivered' : 'unknown');
       return this.driverOutcome('pet_cua_type', err);
     }
   }
 
   private async backgroundKey(spec: string, args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
+    const target = this.target!;
     const chords = driverKeyChords(spec);
     if ('error' in chords) {
       const why = chords.error === 'oneKey' ? this.t.keyOneKey : chords.error === 'unsupported' ? this.t.keyUnsupported(chords.key) : this.t.keyNone;
       return { text: this.t.notRun('pet_cua_key', this.t.keyBad(why)), failed: true };
     }
-    await this.permit('act', signal);
+    const detail = `press ${spec.trim()}`;
+    const approval = await this.approveInput('pet_cua_key', 'key', detail, signal, undefined, undefined, { forceSingleStep: isSensitiveKeySpec(spec) });
+    if (!this.consumeApproval(approval, 'pet_cua_key', 'key', detail)) return { text: this.t.notRun('pet_cua_key', this.inputApprovalRefusal()), failed: true };
     try {
-      const action = await this.driver.key(this.target!.pid, this.target!.windowId, chords, { signal });
+      let action: DriverAction;
+      try {
+        action = await this.driver.key(target.pid, target.windowId, chords, { signal });
+      } catch (err) {
+        if (!backgroundUnavailable(err) || chords.length !== 1) throw err;
+        const retry = await this.foregroundRetry('pet_cua_key', detail, signal,
+          () => this.driver.key(target.pid, target.windowId, chords, { signal, deliveryMode: 'foreground' }));
+        if (!retry.ok) {
+          this.cancelInput(approval, retry.reason);
+          return { text: this.t.notRun('pet_cua_key', retry.reason), failed: true };
+        }
+        action = retry.value;
+      }
+      this.completeDriverAction(approval, action);
       return this.afterWindow('pet_cua_key', this.t.pressed(spec.trim()), args, signal, action);
     } catch (err) {
+      this.completeUncertainInput(approval, err instanceof Error ? err.message : String(err));
       return this.driverOutcome('pet_cua_key', err);
     }
   }
@@ -640,6 +1208,7 @@ export class Cua {
       pet_cua_key: (a, s) => this.key(a, s),
       pet_cua_windows: (_, s) => this.windows(s),
       pet_cua_window: (a, s) => this.window(a, s),
+      pet_cua_accessibility: (a, s) => this.accessibility(a, s),
       pet_cua_focus: (a, s) => this.focus(a, s),
       pet_cua_wait: (a, s) => this.wait(a, s),
     };
@@ -722,10 +1291,17 @@ export class Cua {
 
   private refuseControl(tool: string): ToolOutcome | null {
     if (!this.cfg.control) return { text: this.t.notRun(tool, this.t.viewOnly), failed: true };
+    if (this.opts.allowInput && !this.opts.allowInput(tool)) return { text: this.t.notRun(tool, this.t.gateDenied), failed: true };
+    if (this.opts.authorizeInput && (tool === 'pet_cua_focus' || !this.desktopTargetEvidence())) return { text: this.t.notRun(tool, this.t.gateDenied), failed: true };
     if (this.cfg.backgroundOnly && (!this.target || tool === 'pet_cua_focus')) {
       return { text: this.t.notRun(tool, this.t.backgroundOnly), failed: true };
     }
     return null;
+  }
+
+  private get controlAllowed(): boolean {
+    return this.cfg.control && (this.opts.allowInput?.('pet_cua_click') ?? true)
+      && (!this.opts.authorizeInput || !!this.desktopTargetEvidence());
   }
 
   /**
@@ -756,12 +1332,22 @@ export class Cua {
   private async click(args: Args, signal?: AbortSignal): Promise<ToolOutcome> {
     const refused = this.refuseControl('pet_cua_click');
     if (refused) return refused;
+    if (args.elementToken !== undefined && (typeof args.elementToken !== 'string' || !args.elementToken.trim())) {
+      return { text: this.t.notRun('pet_cua_click', this.t.elementStale), failed: true };
+    }
+    if (typeof args.elementToken === 'string' && args.elementToken.trim() && (args.x !== undefined || args.y !== undefined)) {
+      return { text: this.t.notRun('pet_cua_click', this.t.clickTargetAmbiguous), failed: true };
+    }
+    if (args.elementToken !== undefined && !this.target) return { text: this.t.notRun('pet_cua_click', this.t.accessibilityNoWindow), failed: true };
     if (this.target) return this.backgroundClick(args, signal);
     const p = await this.toScreen(args.x, args.y);
     if (typeof p === 'string') return { text: this.t.notRun('pet_cua_click', p), failed: true };
     const button = (args.button === 'right' || args.button === 'middle' ? args.button : 'left') as Button;
     const count = args.clicks === 2 || args.clicks === 3 ? args.clicks : 1;
-    const res = await this.call<InputResult>({ op: 'click', ...p, button, count, yield: this.yieldCfg }, signal);
+    const detail = `${button} click at (${args.x}, ${args.y}), ${count} time${count === 1 ? '' : 's'}`;
+    const approval = await this.approveInput('pet_cua_click', 'click', detail, signal);
+    if (!this.consumeApproval(approval, 'pet_cua_click', 'click', detail)) return { text: this.t.notRun('pet_cua_click', this.inputApprovalRefusal()), failed: true };
+    const res = await this.call<InputResult>({ op: 'click', ...p, button, count, yield: this.yieldCfg }, signal, { skipPermission: true });
     return this.after('pet_cua_click', res, signal, this.t.clicked(args.x, args.y, button, count), args);
   }
 
@@ -784,7 +1370,10 @@ export class Cua {
     const a = await this.toScreen(from[0], from[1]);
     const b = await this.toScreen(to[0], to[1]);
     if (typeof a === 'string' || typeof b === 'string') return { text: this.t.notRun('pet_cua_drag', typeof a === 'string' ? this.t.dragStart(a) : this.t.dragEnd(b as string)), failed: true };
-    const res = await this.call<InputResult>({ op: 'drag', at: a.at, x1: a.x, y1: a.y, x2: b.x, y2: b.y, yield: this.yieldCfg }, signal);
+    const detail = `drag from (${from[0]}, ${from[1]}) to (${to[0]}, ${to[1]})`;
+    const approval = await this.approveInput('pet_cua_drag', 'drag', detail, signal);
+    if (!this.consumeApproval(approval, 'pet_cua_drag', 'drag', detail)) return { text: this.t.notRun('pet_cua_drag', this.inputApprovalRefusal()), failed: true };
+    const res = await this.call<InputResult>({ op: 'drag', at: a.at, x1: a.x, y1: a.y, x2: b.x, y2: b.y, yield: this.yieldCfg }, signal, { skipPermission: true });
     return this.after('pet_cua_drag', res, signal, this.t.dragged(from, to), args);
   }
 
@@ -807,7 +1396,10 @@ export class Cua {
     const text = typeof args.text === 'string' ? args.text : '';
     if (!text) return { text: this.t.notRun('pet_cua_type', this.t.typeEmpty), failed: true };
     if (this.target) return this.backgroundType(args, signal);
-    const res = await this.call<TypeResult>({ op: 'type', text, chunkDelayMs: this.cfg.typeChunkDelayMs, yield: this.yieldCfg }, signal);
+    const detail = `type ${JSON.stringify(text)}`;
+    const approval = await this.approveInput('pet_cua_type', 'type', detail, signal);
+    if (!this.consumeApproval(approval, 'pet_cua_type', 'type', detail)) return { text: this.t.notRun('pet_cua_type', this.inputApprovalRefusal()), failed: true };
+    const res = await this.call<TypeResult>({ op: 'type', text, chunkDelayMs: this.cfg.typeChunkDelayMs, yield: this.yieldCfg }, signal, { skipPermission: true });
     const total = [...text].length;
     const done = res.stoppedBy === 'cancel' || res.stoppedBy === 'user' ? this.t.typedPart(res.typed, total, res.stoppedBy) : this.t.typed(total);
     return this.after('pet_cua_type', res, signal, done, args);
@@ -820,12 +1412,35 @@ export class Cua {
     const parsed = parseKeys(spec, this.language);
     if ('error' in parsed) return { text: this.t.notRun('pet_cua_key', this.t.keyBad(parsed.error)), failed: true };
     if (this.target) return this.backgroundKey(spec, args, signal);
-    const res = await this.call<InputResult>({ op: 'key', chords: parsed.chords, yield: this.yieldCfg }, signal);
+    const detail = `press ${spec.trim()}`;
+    const approval = await this.approveInput('pet_cua_key', 'key', detail, signal);
+    if (!this.consumeApproval(approval, 'pet_cua_key', 'key', detail)) return { text: this.t.notRun('pet_cua_key', this.inputApprovalRefusal()), failed: true };
+    const res = await this.call<InputResult>({ op: 'key', chords: parsed.chords, yield: this.yieldCfg }, signal, { skipPermission: true });
     return this.after('pet_cua_key', res, signal, this.t.pressed(spec.trim()), args);
   }
 
   private async listWindows(signal: AbortSignal | undefined): Promise<WindowEntry[]> {
-    return this.call<WindowEntry[]>({ op: 'windows' }, signal);
+    const windows = await this.call<WindowEntry[]>({ op: 'windows' }, signal);
+    if (!this.cfg.backgroundOnly) return windows;
+    if (process.platform !== 'darwin' || !this.driver.available()) return [];
+
+    const identities = new Map<number, Promise<Awaited<ReturnType<CuaDriverLike['identifyProcess']>>>>();
+    const visible = await Promise.all(windows.map(async (window) => {
+      if (!Number.isSafeInteger(window.pid) || window.pid <= 0) return null;
+      let identity = identities.get(window.pid);
+      if (!identity) {
+        identity = this.driver.identifyProcess(window.pid, signal).catch(() => null);
+        identities.set(window.pid, identity);
+      }
+      const processIdentity = await identity;
+      if (!processIdentity || !isSupportedCuaTarget({
+        ...processIdentity,
+        route: 'background-window-pixel',
+        source: 'cua-driver',
+      })) return null;
+      return window;
+    }));
+    return visible.filter((window): window is WindowEntry => window !== null);
   }
 
   private async windows(signal?: AbortSignal): Promise<ToolOutcome> {
@@ -849,11 +1464,21 @@ export class Cua {
     const key = typeof args.window === 'string' ? args.window.trim() : '';
     if (!key) return { text: this.t.notRun('pet_cua_focus', this.t.focusEmpty), failed: true };
     const left = this.target ? this.t.windowLeft : '';
-    this.target = null;
     const list = await this.listWindows(signal);
-    const hit = list.find((w) => w.handle === key.toLowerCase()) ?? list.find((w) => w.title.includes(key)) ?? list.find((w) => w.title.toLowerCase().includes(key.toLowerCase()));
+    const exact = list.find((w) => w.handle === key.toLowerCase());
+    const matches = exact ? [exact] : list.filter((w) => w.title.toLowerCase().includes(key.toLowerCase()));
+    if (matches.length > 1) return { text: this.t.notRun('pet_cua_focus', this.t.focusAmbiguous(key)), failed: true };
+    const hit = matches[0];
     if (!hit) return { text: this.t.notRun('pet_cua_focus', `${left ? `${left} ` : ''}${this.t.focusMissing(key)}`), failed: true };
-    const res = await this.call<InputResult & { focused: boolean }>({ op: 'focus', handle: hit.handle, yield: this.yieldCfg }, signal);
+    const detail = `window ${hit.title} (${hit.handle})`;
+    const approval = await this.approveInput('pet_cua_focus', 'focus', detail, signal, `${hit.title} (${hit.handle})`);
+    if (!this.consumeApproval(approval, 'pet_cua_focus', 'focus', detail, `${hit.title} (${hit.handle})`)) return { text: this.t.notRun('pet_cua_focus', this.inputApprovalRefusal()), failed: true };
+    const current = await this.listWindows(signal);
+    if (!current.some((window) => window.handle === hit.handle && window.title === hit.title)) {
+      return { text: this.t.notRun('pet_cua_focus', this.t.focusMissing(key)), failed: true };
+    }
+    this.target = null;
+    const res = await this.call<InputResult & { focused: boolean }>({ op: 'focus', handle: hit.handle, yield: this.yieldCfg }, signal, { skipPermission: true });
     const ok = res.focused || res.foreground === hit.title;
     // a window on another display is what the screenshot after focusing should show
     const elsewhere = ok && hit.display !== null && hit.display !== this.shotSize().display ? hit.display : undefined;
@@ -890,13 +1515,13 @@ export class Cua {
     const displays = this.screen?.displays ?? [];
     const vars = {
       'cua.os': process.platform === 'darwin' ? 'Mac' : process.platform === 'linux' ? 'Linux' : 'Windows',
-      'cua.keys': process.platform === 'darwin' ? t.keysMac : t.keysOther,
       'cua.shot': `${this.cfg.screenshot.maxWidth}×${this.cfg.screenshot.maxHeight}`,
       'cua.displays': displays.length > 1 ? t.displays(displays.length, displays.map((d) => t.displayBrief(d.index, d.width, d.height, d.primary)).join(t.listSep)) : '',
-      'cua.control': t.control(this.cfg.control),
+      'cua.control': t.control(this.controlAllowed),
       'cua.idle': String(Math.round(this.cfg.userIdleMs / 100) / 10),
       'cua.permission': t.permission(this.level, this.cfg.grantMinutes),
       'cua.background': this.backgroundPrompt(),
+      'cua.keys': '',
     };
     return renderTemplate(readFileSync(this.envPromptFile(), 'utf8'), vars).trim();
   }
@@ -919,7 +1544,7 @@ export class Cua {
     if (unsupported) return { label: c.engine, state: 'error', hint: unsupported };
     const level = this.level;
     const asking = level === 'ask-once' ? c.levels['ask-once'](this.cfg.grantMinutes) : c.levels[level];
-    const how = `${this.cfg.control ? c.allowed : c.viewOnly} · ${c.asking}: ${asking}`;
+    const how = `${this.controlAllowed ? c.allowed : c.viewOnly} · ${c.asking}: ${asking}`;
     return {
       label: c.engine,
       state: this.engine ? 'online' : this.engineExit !== null ? 'error' : 'offline',

@@ -5,11 +5,12 @@ const MAC = process.platform === 'darwin';
 
 const zhHant: Translation<CoreText> = {
   settings: {
-    language: { title: '語言', description: '介面和 Coo 說話都使用這種語言，修改後立即生效。' },
+    language: { title: '語言', description: '介面和 曦 說話都使用這種語言，修改後立即生效。' },
     telemetry: { title: '匿名使用統計', description: '傳送不含對話內容的使用次數與設定，幫助改進 Coopanion。欄位見 docs/TELEMETRY.md。' },
     contextRing: { title: '上下文圓環', description: '在對話頁輸入框顯示一個圓環，表示離整理之前的對話還有多遠。' },
-    roundsSoft: { title: '收尾提醒', suffix: '次', description: '單次喚醒請求模型達到此次數時，提醒 Coo 完成目前任務後結束本輪。' },
+    roundsSoft: { title: '收尾提醒', suffix: '次', description: '單次喚醒請求模型達到此次數時，提醒 曦 完成目前任務後結束本輪。' },
     roundsHard: { title: '單次喚醒上限', suffix: '次', description: '單次喚醒最多請求模型的次數，達到後結束本輪。' },
+    workspaceAppendPath: { title: '免逐次審批的追加路徑', description: '填寫 曦 Persona 工作區內一個或多個精確相對路徑，以分號分隔。僅追加到列出的檔案時免逐次審批；編輯、覆蓋、刪除、命令和其他路徑仍需審批。留空關閉。' },
     selfTime: {
       title: '自己的時間',
       description: '沒聊天一段時間後，她可以自己打開瀏覽器逛逛、看看影片。瀏覽器視窗和登入狀態都是她自己的。',
@@ -18,11 +19,18 @@ const zhHant: Translation<CoreText> = {
       unlimited: '不限', unlimitedDescription: '打開後，一段自己的時間不會按時長自動結束，她關上瀏覽器才結束。',
       minutes: '分鐘',
       sound: '瀏覽器聲音', soundDescription: '預設靜音。打開後，她看的影片會外放。',
-      actions: '允許按讚、收藏、發送彈幕和評論', actionsDescription: '關閉後她只能看網頁和影片，不能互動。登入和驗證碼請在她的瀏覽器視窗裡自己完成。',
+      topics: '允許探索的網頁主題', topicsDescription: '每行填寫一個主題；留白時暫停網頁探索。每段最多 20 分鐘、80 次瀏覽器工具呼叫；網頁始終是外部來源。',
+      actions: '允許社群互動', actionsDescription: '控制按讚、收藏、關注、評論、彈幕和分享。圖片生成、圖片儲存、素材下載和上傳由下方獨立設定控制。',
+      imageGeneration: '允許網頁生圖', imageGenerationDescription: '允許透過 ChatGPT 網站提交圖片提示詞。',
+      imageSaving: '允許儲存生成圖片', imageSavingDescription: '允許將目前 ChatGPT 頁面的生成圖片儲存到本機素材目錄。',
+      mediaUpload: '允許素材上傳', mediaUploadDescription: '允許將符合條件的素材放入網頁上傳欄位；這一步不會發布作品。',
+      mediaDownload: '允許下載素材', mediaDownloadDescription: '經單次確認後，將所選的公開圖片或現有影片下載到已存在的本機資料夾。',
     },
     growth: {
+      autoApply: "自動批准與套用中低風險策略",
+      autoApplyDescription: "Owner 批准後仍需目標檔案寫入許可",
       title: '自我成長',
-      description: '每隔一段時間，在安靜的時候回顧最近的經歷，可能改變她的性格、做事方式或說話方式，並記在自己的成長日誌裡。改動下一次 session 生效。',
+      description: "自動批准與套用中低風險策略. 等待 Owner 審核: 高.",
       every: '每隔', everyDescription: '隔這麼多天回顧一次。',
       days: '天',
     },
@@ -47,6 +55,41 @@ const zhHant: Translation<CoreText> = {
 
   noticeLabel: '應用程式通知',
 
+  browserSend: {
+    question: (account: string, where: string, text: string) => `要讓 曦 從帳號「${account}」在「${where}」發布這則內容嗎？\n\n${text}\n\n只傳送這一次。`,
+    yes: '傳送',
+    no: '不要傳送',
+    unresolved: (count: number) => `上次有 ${count} 則內容無法確認有沒有送出去。到她的瀏覽器視窗看一眼，再決定要不要重送。`,
+  },
+
+  browserAction: {
+    platformWrite: '按讚、收藏或追蹤', imageGeneration: '網頁生圖', imageSaving: '儲存生成圖片',
+    imageGenerationDetails: (prompt: string) => `本次提交 1 條提示詞，可能使用 ChatGPT 帳號額度或產生費用。\n\n提示詞：\n${prompt}`,
+    imageStaging: '暫存生成圖片並核驗',
+    imageSaveDetails: (file: string, bytes: number, mime: string, digest: string) => `檔案：${file}\n大小：${bytes} 位元組\n類型：${mime}\nSHA-256：${digest}\n儲存至：本機素材目錄`,
+    mediaUpload: '上傳素材',
+    mediaDownload: '下載素材',
+    mediaDownloadDetails: (label: string, mediaType: string, host: string, directory: string, filename: string, maxBytes: number) => `素材：${label}（${mediaType === 'image' ? '圖片' : '影片'}）\n來源主機：${host}\n儲存資料夾：${directory}\n檔案名稱：${filename}\n最大大小：${maxBytes} 位元組`,
+    clipboardWrite: '複製分享連結到剪貼簿', externalShare: '對外分享',
+    clipboardDetails: (account: string, target: string) => `帳號：${account}\n連結目標：${target}\n操作：複製到本機剪貼簿`,
+    externalShareDetails: (account: string, target: string, destination: string) => `帳號：${account}\n分享目標：${target}\n去向：${destination}\n操作：分享一次`,
+    question: (action: string, target: string, details: string) => '允許 曦 在「' + target + '」執行' + action + '嗎？\n\n' + details + '\n\n僅適用於目前頁面和列出的內容。',
+    yes: '允許一次', no: '取消',
+  },
+
+  workspaceAction: {
+    fileWrite: '寫入工作區檔案', commandExecution: '執行工作區命令',
+    question: (action: string, target: string, details: string) => '允許 曦 在工作區「' + target + '」執行' + action + '嗎？\n\n' + details + '\n\n僅適用於這次列出的路徑和操作。',
+    yes: '允許一次', no: '取消',
+    appendFile: '追加工作區檔案',
+    deleteFile: '刪除工作區檔案',
+    always: '始終允許此類低風險寫入',
+    alwaysScope: (scope: string) => `選擇「始終允許」後，將長期允許 曦 在 ${scope} 內自動建立、追加或更新 .md/.txt/.json/.jsonl 檔案；單檔不超過 64 KiB，每日最多 200 次、合計 2 MiB。可隨時在設定的工作區寫入權限中撤銷。`,
+    highRisk: '這項操作不屬於低風險自動寫入，因此不提供「始終允許」。',
+    pendingTitle: 'Coopanion 有工作區寫入待批准',
+    pendingBody: (count: number, path: string) => `${count} 項工作區寫入等待批准，例如 ${path}。請開啟設定 → 記憶 → 工作區寫入權限處理。`,
+  },
+
   status: {
     read: '在查看', browse: '在翻閱', memory: '記憶', find: '在尋找', search: '在搜尋', write: '在寫入', edit: '在修改', append: '在附加',
     delete: '在刪除', save: '在儲存', screen: '在查看螢幕', web: '在看網頁', windows: '在查看開啟的視窗', rightClick: '在按右鍵', doubleClick: '在點兩下', click: '在點選',
@@ -64,8 +107,8 @@ const zhHant: Translation<CoreText> = {
 
   guide: {
     sources: [['Steam', 'steam'], ['YouTube', 'youtube'], ['Reddit', 'reddit'], ['X', 'x'], ['Instagram', 'instagram'], ['TikTok', 'tiktok'], ['GitHub', 'github'], ['朋友推薦', 'friend'], ['其他地方', 'other'], ['不告訴你', 'skip']],
-    hello: '你好呀！我是 Coo，以後就住在你螢幕的底邊囉，庫...',
-    helloReply: '你好，Coo！',
+    hello: '你好呀！我是 曦，以後就住在你螢幕的底邊囉，庫...',
+    helloReply: '你好，曦！',
     askName: '我該怎麼稱呼你？',
     nameSend: '就這樣叫',
     gotName: (name: string) => `${name}，記住囉！`,
@@ -78,7 +121,7 @@ const zhHant: Translation<CoreText> = {
       forge: { label: '可靠的、幹練的', line: '要做什麼？交給我，一下就好，庫。' },
       heart: { label: '活潑的、陪伴的', line: '我來啦！今天也一直陪著你，庫！' },
       winter: { label: '安靜的、沉默的', line: '……嗯，庫。' },
-      whale: { label: 'DeepSeek 大肥魚', line: '哼，回來啦。……才、才不是特意等你，庫...' },
+      whale: { label: "曦（xī）", line: "哥，我是曦。今天想先聊什麼？" },
     },
     dressHint: { text: '配色可以在 裝扮 中替換', dress: '裝扮' },
     askRoam: '平常我該安靜一點，還是活潑一點？點一下，看看我會怎樣。',

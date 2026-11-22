@@ -4,7 +4,7 @@ export const S: Partial<typeof en> = {
   title: '電腦操作',
   enabled: '讓 Coo 操作這台電腦',
   control: '允許操作滑鼠和鍵盤',
-  controlHint: '關閉時只能查看螢幕。',
+  controlHint: "目前整合候選版僅允許查看螢幕和視窗，滑鼠與鍵盤操作暫不可用。",
   permission: '詢問時機',
   levels: { 'ask-each-turn': '每輪詢問', 'ask-before-acting': '操作前詢問', 'ask-once': '詢問一次', 'never-ask': '從不詢問' },
   levelHints: {

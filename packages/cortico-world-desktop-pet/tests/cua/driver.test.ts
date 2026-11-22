@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -32,38 +32,91 @@ describe('driverKeyChords', () => {
 });
 
 
-describe.runIf(process.platform !== 'win32')('driver lifecycle', () => {
-  it('reopens an idle-expired CLI session before capturing without retrying the action', async () => {
+describe.runIf(process.platform === 'darwin')('private Cua Driver protocol', () => {
+  const fixture = () => {
     const dir = mkdtempSync(join(tmpdir(), 'coo-driver-test-'));
-    const bin = join(dir, 'cua-driver');
+    const bin = join(dir, 'cua-driver.cjs');
+    const socket = join(dir, 'driver.sock');
     const state = join(dir, 'state.json');
-    writeFileSync(state, JSON.stringify({ active: false, captures: 0 }));
+    writeFileSync(socket, 'fixture endpoint');
+    writeFileSync(state, JSON.stringify({ active: true, sessions: [], captures: 0, actions: 0, starts: 0, serves: 0 }));
     writeFileSync(bin, `#!${process.execPath}
 const fs=require('node:fs');
 const file=${JSON.stringify(state)};
-const state=JSON.parse(fs.readFileSync(file,'utf8'));
+const expectedSocket=${JSON.stringify(socket)};
 const args=process.argv.slice(2);
-if(args[0]==='status'){console.log('daemon is running');process.exit(0)}
-if(args[1]==='start_session'){state.active=true;fs.writeFileSync(file,JSON.stringify(state));console.log('{}');process.exit(0)}
+const state=JSON.parse(fs.readFileSync(file,'utf8'));
+const socketIndex=args.indexOf('--socket');
+if(socketIndex<0||args[socketIndex+1]!==expectedSocket){console.error('private socket required');process.exit(41)}
+if(args[0]==='status'){
+ if(!state.active){console.error('not running');process.exit(1)}
+ console.log('daemon is running');process.exit(0)
+}
+if(args[0]==='serve'){state.serves++;fs.writeFileSync(file,JSON.stringify(state));process.exit(42)}
+if(args[0]!=='call'||args[2]===undefined)process.exit(2)
+const payload=JSON.parse(args[2]);
+if(payload.session!=='run-test-1')process.exit(43)
+if(args[1]==='start_session'){
+ state.starts++;
+ state.sessions.push(payload.session);
+ fs.writeFileSync(file,JSON.stringify(state));
+ console.log('{}');process.exit(0)
+}
+if(!state.sessions.includes(payload.session))process.exit(44)
 if(args[1]==='get_window_state'){
- if(!state.active){console.error('session has ended');process.exit(1)}
- state.captures++;fs.writeFileSync(file,JSON.stringify(state));console.log(JSON.stringify({capture_id:'capture-'+state.captures,window_title:'Test window',screenshot_width:100,screenshot_height:80}));process.exit(0)
+ if(payload.tree_format!=='elements'||payload.max_elements!==512||payload.query!=='Save')process.exit(45)
+ state.captures++;fs.writeFileSync(file,JSON.stringify(state));
+ console.log(JSON.stringify({app_name:'Test window',owner_pid:12,window_bounds:{x:5,y:6,width:100,height:80},screenshot_width:100,screenshot_height:80,capture_id:'cap-1',snapshot_id:'s0000002a',truncated:true,truncation_reason:'max_elements',elements_complete:false,elements:[{element_index:7,element_token:'s0000002a:7',role:'button',label:'Save file',value:'draft.txt',actions:['press'],frame:{x:1,y:2,width:30,height:10},parent_index:2,depth:3}]}));process.exit(0)
+}
+if(args[1]==='click'){
+ if(payload.element_token!=='s0000002a:7'||payload.action!=='press')process.exit(46)
+ state.actions++;fs.writeFileSync(file,JSON.stringify(state));
+ console.log(JSON.stringify({effect:'confirmed',summary:'pressed',route:'accessibility'}));process.exit(0)
 }
 process.exit(2);
 `);
     chmodSync(bin, 0o755);
-    vi.stubEnv('CUA_DRIVER_BIN', bin);
+    const options = {
+      binaryPath: bin, endpoint: 'unix-socket' as const, socketPath: socket, session: 'run-test-1', lifecycle: 'external-managed' as const,
+      resolveProcessIdentity: async () => null,
+    };
+    return { dir, state, options };
+  };
+
+  it('uses the configured private socket, structured snapshot, owner and current element token', async () => {
+    const f = fixture();
     try {
-      const driver = new CuaDriver('test-window');
-      const options = { screenshot: false, maxDimension: 1280, quality: 75 };
-      expect((await driver.capture(12, 34, options)).captureId).toBe('capture-1');
-      const previous = JSON.parse(readFileSync(state, 'utf8'));
-      writeFileSync(state, JSON.stringify({ ...previous, active: false }));
-      expect((await driver.capture(12, 34, options)).captureId).toBe('capture-2');
-      expect(JSON.parse(readFileSync(state, 'utf8')).captures).toBe(2);
+      const driver = new CuaDriver(f.options);
+      expect(driver.available()).toBe(true);
+      const capture = await driver.capture(12, 34, { screenshot: false, maxDimension: 1280, quality: 75, maxElements: 512, query: 'Save' });
+      expect(capture).toMatchObject({
+        title: 'Test window', pid: 12, ownerPid: 12, windowId: 34,
+        captureId: 'cap-1', snapshotId: 's0000002a', truncated: true,
+        truncationReason: 'max_elements', elementsComplete: false,
+        processIdentity: null,
+        elements: [{ token: 's0000002a:7', index: 7, role: 'button', label: 'Save file', value: 'draft.txt', actions: ['press'], parentIndex: 2, depth: 3 }],
+      });
+      expect(capture.snapshotId).toMatch(/^s[0-9a-f]{8}$/);
+      expect(capture.elements[0]?.token).toMatch(new RegExp(`^${capture.snapshotId}:[0-9]+$`));
+      expect(await driver.clickElement(12, 34, 's0000002a:7')).toMatchObject({ effect: 'confirmed', route: 'accessibility' });
+      expect(JSON.parse(readFileSync(f.state, 'utf8'))).toMatchObject({ starts: 1, captures: 1, actions: 1, serves: 0 });
     } finally {
-      vi.unstubAllEnvs();
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not reopen a retired session or start a global daemon', async () => {
+    const f = fixture();
+    try {
+      const driver = new CuaDriver(f.options);
+      await driver.capture(12, 34, { screenshot: false, maxDimension: 1280, quality: 75, maxElements: 512, query: 'Save' });
+      const state = JSON.parse(readFileSync(f.state, 'utf8'));
+      writeFileSync(f.state, JSON.stringify({ ...state, active: false }));
+      await expect(driver.capture(12, 34, { screenshot: false, maxDimension: 1280, quality: 75, maxElements: 512, query: 'Save' }))
+        .rejects.toMatchObject({ code: 'private_endpoint_unavailable' });
+      expect(JSON.parse(readFileSync(f.state, 'utf8'))).toMatchObject({ starts: 1, captures: 1, serves: 0 });
+    } finally {
+      rmSync(f.dir, { recursive: true, force: true });
     }
   });
 });

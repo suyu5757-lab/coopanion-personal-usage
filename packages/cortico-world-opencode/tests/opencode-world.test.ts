@@ -9,7 +9,7 @@ import { dryMountWorld } from 'cortico/extensions/dry-mount.ts';
 import { OPENCODE_DEFAULTS, type OpencodeConfigSection } from '../src/config.ts';
 import { OPENCODE, opencodeDefinition } from '../src/definition.ts';
 import type { ModelLanguage } from '../src/model-text.ts';
-import { OpencodeWorld, type OpencodeGuestState } from '../src/world.ts';
+import { OpencodeWorld, type OpencodeActionCompletion, type OpencodeActionRequest, type OpencodeGuestState, type OpencodeWorldOptions } from '../src/world.ts';
 
 const FIXTURE = fileURLToPath(new URL('./fixtures/fake-acp.mjs', import.meta.url));
 const HAN = /\p{Script=Han}/u;
@@ -61,7 +61,11 @@ afterEach(async () => {
   cleanup = [];
 });
 
-async function mounted(patch: Partial<OpencodeConfigSection> = {}, language: ModelLanguage = 'zh') {
+async function mounted(
+  patch: Partial<OpencodeConfigSection> = {},
+  language: ModelLanguage = 'zh',
+  authorization: Pick<OpencodeWorldOptions, 'authorizeAction' | 'confirmAction'> = {},
+) {
   const dir = mkdtempSync(join(tmpdir(), 'opencode-'));
   const cfg: OpencodeConfigSection = { ...OPENCODE_DEFAULTS, ...patch, enabled: true };
   if (!('workRoots' in patch)) cfg.workRoots = dir;
@@ -72,6 +76,7 @@ async function mounted(patch: Partial<OpencodeConfigSection> = {}, language: Mod
     timezone: 'Asia/Shanghai',
     modelLanguage: () => language,
     command: { command: process.execPath, args: [FIXTURE] },
+    ...authorization,
     onState: (state) => states.push(state),
   });
   await world.start(host);
@@ -148,6 +153,65 @@ describe('opencode World', () => {
     const result = await waitEvent(host, 'opencode.result');
     expect(result.text).toContain('Denied');
     expect(existsSync(join(dir, 'denied.txt'))).toBe(false);
+  });
+
+  it('routes ACP file writes and commands through one Core confirmation and one dispatch receipt', async () => {
+    const requests: OpencodeActionRequest[] = [];
+    const completions: OpencodeActionCompletion[] = [];
+    let consumed = 0;
+    let confirmed = 0;
+    const authorization: Pick<OpencodeWorldOptions, 'authorizeAction' | 'confirmAction'> = {
+      confirmAction: async () => { confirmed++; return true; },
+      authorizeAction: async (request, confirmInCoreUi) => {
+        requests.push(request);
+        if (!await confirmInCoreUi()) return null;
+        return {
+          consume(target, expectedChange, files) {
+            expect(target).toMatchObject({ workspaceRoot: request.target.workspaceRoot, path: request.target.path, operation: request.action });
+            expect(expectedChange).toBe(request.expectedChange);
+            expect(files).toEqual(request.files);
+            consumed++;
+            return true;
+          },
+          revoke() {},
+          complete: (result) => completions.push(result),
+        };
+      },
+    };
+    const { host, dir, world, call } = await mounted({}, 'zh', authorization);
+
+    const started = await call('opencode_task', { task: 'WRITE guarded.txt' });
+    expect(failed(started)).toBe(false);
+    const fileResult = await waitEvent(host, 'opencode.result');
+    expect(fileResult.text).toContain('Done');
+    expect(readFileSync(join(dir, 'guarded.txt'), 'utf8')).toBe('hello from opencode');
+    expect(world.tools().some((tool) => tool.name === 'opencode_answer')).toBe(false);
+    expect(requests[0]).toMatchObject({ action: 'file-write', target: { path: 'guarded.txt', source: 'opencode-acp' }, files: [{ path: 'guarded.txt', bytes: 19, mime: 'text/plain' }] });
+    expect(completions[0]).toMatchObject({ phase: 'verified', dispatchState: 'delivered', outcome: 'ui-observed' });
+
+    const resultsBeforeCommand = host.events.filter((event) => event.type === 'opencode.result').length;
+    await call('opencode_task', { task: 'RUN_COMMAND printf hello' });
+    await expect.poll(() => host.events.filter((event) => event.type === 'opencode.result').length, { timeout: 10_000 }).toBe(resultsBeforeCommand + 1);
+    const commandResult = host.events.filter((event) => event.type === 'opencode.result').at(-1)!;
+    expect(commandResult.text).toContain('printf hello');
+    expect(requests[1]).toMatchObject({ action: 'command-execution', target: { path: '.', source: 'opencode-acp' }, risk: 'IRREVERSIBLE_OR_PUBLIC' });
+    expect(consumed).toBe(2);
+    expect(confirmed).toBe(2);
+    expect(completions).toContainEqual(expect.objectContaining({ phase: 'verified', outcome: 'remote-acknowledged' }));
+  });
+
+  it('does not accept an ACP file permission when Core refuses its one-time grant', async () => {
+    const { host, dir, call } = await mounted({}, 'zh', {
+      authorizeAction: async (request, confirmInCoreUi) => {
+        expect(request.action).toBe('file-write');
+        expect(await confirmInCoreUi()).toBe(false);
+        return null;
+      },
+      confirmAction: async () => false,
+    });
+    await call('opencode_task', { task: 'WRITE refused.txt' });
+    await waitEvent(host, 'opencode.result');
+    expect(existsSync(join(dir, 'refused.txt'))).toBe(false);
   });
 
   it('cancels a running task', async () => {

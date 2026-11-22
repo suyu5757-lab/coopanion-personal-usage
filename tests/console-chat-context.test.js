@@ -108,6 +108,13 @@ async function mountChat() {
   return { root, socket: sockets[0], ring: root.querySelector('.chat-ctx') };
 }
 
+it('renders completed assistant text from the chat stream', async () => {
+  status = statusAt(0);
+  const { root, socket } = await mountChat();
+  socket.frame({ t: 'init', bot: 'Coo', items: [{ kind: 'assistant', cursor: 17, ts: '2026-11-11T10:00:00+08:00', text: 'A final answer' }], phase: { state: 'idle', running: [] } });
+  expect(root.querySelector('.pet-bubble.assistant')?.textContent).toBe('A final answer');
+});
+
 it('fills with the reported count and spins while the earlier conversation is tidied up', async () => {
   const full = contextGauge(statusAt(0)).handoffAt;
   status = statusAt(Math.round(full / 4));

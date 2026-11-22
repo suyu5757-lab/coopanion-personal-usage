@@ -1,0 +1,290 @@
+/** Short lived user grants and one-use tickets for actions bound to a verified target. */
+import { createHash, randomUUID } from 'node:crypto';
+import { isAbsolute } from 'node:path';
+
+export interface Rect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export type ActionTargetEvidence = DesktopTargetEvidence | BrowserTargetEvidence | FileSystemTargetEvidence;
+export type ActionRisk = 'READ_ONLY' | 'REVERSIBLE_LOCAL' | 'EXTERNAL_MUTATION' | 'IRREVERSIBLE_OR_PUBLIC';
+export type ApprovalChannel = 'core-pet-bubble' | 'durable-rule' | 'permission-center';
+export interface CoreUiApproval {
+  approved: boolean;
+  channel?: ApprovalChannel;
+  ruleId?: string;
+}
+export type CoreUiConfirmation = () => Promise<boolean | CoreUiApproval>;
+const ACTION_RISKS = new Set<ActionRisk>(['READ_ONLY', 'REVERSIBLE_LOCAL', 'EXTERNAL_MUTATION', 'IRREVERSIBLE_OR_PUBLIC']);
+
+export interface DesktopTargetEvidence {
+  surface: 'desktop';
+  instanceId: string;
+  bundleId: string;
+  executablePath: string;
+  pid: number;
+  ownerPid: number;
+  processStart: string;
+  windowId: number;
+  bounds: Rect;
+  display: string | null;
+  space: string | null;
+  snapshotId: string;
+  captureId: string;
+  element?: { role: string; label: string; token: string };
+  route: 'background-ax' | 'background-window-pixel';
+  source: 'cua-driver';
+}
+
+export interface BrowserTargetEvidence {
+  surface: 'browser';
+  instanceId: string;
+  origin: string;
+  url: string;
+  accountRef: string;
+  snapshotId: string;
+  formId: string;
+  control: string;
+}
+
+export interface FileSystemTargetEvidence {
+  surface: 'filesystem';
+  instanceId: string;
+  workspaceRoot: string;
+  path: string;
+  operation: 'file-write' | 'command-execution';
+  snapshotId: string;
+  source: 'opencode-acp' | 'persona-workspace' | 'video-world';
+}
+
+export interface TaskGrantRequest {
+  taskId: string;
+  taskText: string;
+  risk: ActionRisk;
+  target: ActionTargetEvidence;
+  actions: string[];
+  files?: Array<{ path: string; digest: string; bytes: number; mime: string }>;
+  expiresInMs: number;
+  maxSteps: number;
+  /** When true, the task grant is goal-scoped without fixed wall-clock or step-count truncation. */
+  unbounded?: boolean;
+  /** The durable rule that made this grant automatic, when one did. */
+  policyRuleId?: string;
+}
+
+export interface TaskGrant {
+  id: string;
+  taskId: string;
+  taskText: string;
+  risk: ActionRisk;
+  surface: ActionTargetEvidence['surface'];
+  targetDigest: string;
+  actions: readonly string[];
+  files: readonly { path: string; digest: string; bytes: number; mime: string }[];
+  permissionGeneration: string;
+  approvedAt: number;
+  expiresAt: number;
+  maxSteps: number;
+  unbounded?: boolean;
+  stepsUsed: number;
+  digest: string;
+  revoked: boolean;
+  approvalChannel: ApprovalChannel;
+  policyRuleId?: string;
+}
+
+export interface StepRequest {
+  action: string;
+  target: ActionTargetEvidence;
+  expectedChange: string;
+  files?: Array<{ path: string; digest: string; bytes: number; mime: string }>;
+}
+
+export interface StepTicket {
+  id: string;
+  grantId: string;
+  taskId: string;
+  action: string;
+  targetDigest: string;
+  snapshotDigest: string;
+  expectedChangeDigest: string;
+  permissionGeneration: string;
+  issuedAt: number;
+  expiresAt: number;
+}
+
+interface TicketRecord {
+  ticket: StepTicket;
+  request: StepRequest;
+}
+
+const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const sorted = (values: readonly string[]) => [...values].sort();
+const safeRelativePath = (path: string) => !!path.trim() && !path.startsWith('/') && !path.startsWith('\\')
+  && !path.includes('\0') && !path.split(/[\\/]/).some((part) => part === '..' || part === '');
+const normalizeFiles = (files: readonly { path: string; digest: string; bytes: number; mime: string }[] | undefined) =>
+  [...(files ?? [])].map(({ path, digest, bytes, mime }) => ({ path, digest, bytes, mime }));
+const targetIdentity = (target: ActionTargetEvidence): unknown => {
+  if (target.surface === 'desktop') {
+    return [target.surface, target.instanceId, target.bundleId, target.executablePath, target.pid, target.ownerPid, target.processStart, target.windowId];
+  }
+  if (target.surface === 'browser') {
+    return [target.surface, target.instanceId, target.origin, target.url, target.accountRef, target.formId, target.control];
+  }
+  return [target.surface, target.instanceId, target.workspaceRoot, target.path, target.operation, target.source];
+};
+const targetSnapshot = (target: ActionTargetEvidence): unknown => {
+  if (target.surface === 'desktop') {
+    return [target.snapshotId, target.captureId, target.display, target.space, target.element?.role ?? '', target.element?.label ?? '', target.element?.token ?? '', target.route];
+  }
+  if (target.surface === 'browser') return [target.snapshotId, target.url, target.accountRef, target.formId, target.control];
+  return [target.snapshotId, target.workspaceRoot, target.path, target.operation, target.source];
+};
+
+function validTarget(target: ActionTargetEvidence): boolean {
+  if (target.surface === 'desktop') {
+    return !!target.instanceId && !!target.bundleId && !!target.executablePath && target.pid > 0
+      && target.ownerPid === target.pid && !!target.processStart && target.windowId > 0
+      && [target.bounds.x, target.bounds.y, target.bounds.width, target.bounds.height].every(Number.isFinite)
+      && target.bounds.width > 0 && target.bounds.height > 0 && !!target.snapshotId && !!target.captureId
+      && (target.element === undefined || (!!target.element.role && !!target.element.label && !!target.element.token
+        && target.element.token.startsWith(`${target.snapshotId}:`)));
+  }
+  if (target.surface === 'browser') {
+    return !!target.instanceId && !!target.origin && !!target.url && !!target.accountRef
+      && !!target.snapshotId && !!target.formId && !!target.control;
+  }
+  return !!target.instanceId && isAbsolute(target.workspaceRoot) && !!target.snapshotId
+    && safeRelativePath(target.path) && (target.operation === 'file-write' || target.operation === 'command-execution')
+    && (target.source === 'opencode-acp' || target.source === 'persona-workspace' || target.source === 'video-world');
+}
+
+/** Core owns this registry; callers supply the confirmation callback bound to the app's own UI. */
+export class TaskGrantRegistry {
+  private readonly grants = new Map<string, TaskGrant>();
+  private readonly tickets = new Map<string, TicketRecord>();
+
+  constructor(private generation: string) {}
+
+  /** Any relevant preference change invalidates pending grants and tickets. */
+  synchronizePermissionGeneration(next: string): void {
+    if (next === this.generation) return;
+    this.generation = next;
+    this.grants.clear();
+    this.tickets.clear();
+  }
+
+  async requestGrant(
+    request: TaskGrantRequest,
+    confirmInCoreUi: CoreUiConfirmation,
+    now = Date.now(),
+    stillAllowed: () => boolean = () => true,
+  ): Promise<TaskGrant | null> {
+    const actions = sorted(request.actions);
+    const files = normalizeFiles(request.files);
+    const unbounded = request.unbounded === true && request.risk !== 'IRREVERSIBLE_OR_PUBLIC';
+    if (!request.taskId || !request.taskText.trim() || request.taskText.length > 4000 || !ACTION_RISKS.has(request.risk) || !validTarget(request.target)
+      || actions.length === 0 || actions.length > 16 || files.some((file) => !safeRelativePath(file.path)
+      || !/^[a-f0-9]{64}$/.test(file.digest) || !Number.isSafeInteger(file.bytes) || file.bytes < 0 || !file.mime.trim())
+      || (!unbounded && (!Number.isSafeInteger(request.expiresInMs) || request.expiresInMs < 1_000 || request.expiresInMs > 4 * 60 * 60_000
+        || !Number.isSafeInteger(request.maxSteps) || request.maxSteps < 1 || request.maxSteps > 1_000))) {
+      throw new Error('task grant request is incomplete or outside its limits');
+    }
+    const confirmation = await confirmInCoreUi();
+    const approval: CoreUiApproval = typeof confirmation === 'boolean' ? { approved: confirmation } : confirmation;
+    if (!approval.approved) return null;
+    if (!stillAllowed()) return null;
+    const targetDigest = hash(targetIdentity(request.target));
+    const expiresAt = unbounded ? Number.MAX_SAFE_INTEGER : now + request.expiresInMs;
+    const maxSteps = unbounded ? Number.MAX_SAFE_INTEGER : request.maxSteps;
+    const grant: TaskGrant = {
+      id: randomUUID(),
+      taskId: request.taskId,
+      taskText: request.taskText,
+      risk: request.risk,
+      surface: request.target.surface,
+      targetDigest,
+      actions,
+      files,
+      permissionGeneration: this.generation,
+      approvedAt: now,
+      expiresAt,
+      maxSteps,
+      ...(unbounded ? { unbounded: true } : {}),
+      stepsUsed: 0,
+      digest: hash([request.taskId, request.taskText, request.risk, targetDigest, actions, files, this.generation, now, unbounded ? 'unbounded' : request.expiresInMs, unbounded ? 'unbounded' : request.maxSteps,
+        approval.channel ?? 'core-pet-bubble', request.policyRuleId ?? approval.ruleId ?? '']),
+      revoked: false,
+      approvalChannel: approval.channel ?? 'core-pet-bubble',
+      ...(request.policyRuleId ?? approval.ruleId ? { policyRuleId: request.policyRuleId ?? approval.ruleId } : {}),
+    };
+    this.grants.set(grant.id, grant);
+    return structuredClone(grant);
+  }
+
+  issueStepTicket(grantId: string, request: StepRequest, now = Date.now()): StepTicket | null {
+    const grant = this.grants.get(grantId);
+    if (!grant || !this.usable(grant, request, now)) return null;
+    const ticket: StepTicket = {
+      id: randomUUID(),
+      grantId,
+      taskId: grant.taskId,
+      action: request.action,
+      targetDigest: grant.targetDigest,
+      snapshotDigest: hash(targetSnapshot(request.target)),
+      expectedChangeDigest: hash(request.expectedChange),
+      permissionGeneration: this.generation,
+      issuedAt: now,
+      expiresAt: Math.min(grant.expiresAt, now + 60_000),
+    };
+    this.tickets.set(ticket.id, { ticket, request: structuredClone(request) });
+    return structuredClone(ticket);
+  }
+
+  /** Consumes the ticket before returning, including when the fresh evidence no longer matches. */
+  consumeStepTicket(ticketId: string, current: StepRequest, now = Date.now()): boolean {
+    const record = this.tickets.get(ticketId);
+    this.tickets.delete(ticketId);
+    if (!record) return false;
+    const grant = this.grants.get(record.ticket.grantId);
+    if (!grant || !this.usable(grant, current, now) || record.ticket.permissionGeneration !== this.generation
+      || record.ticket.taskId !== grant.taskId || record.ticket.action !== current.action
+      || record.ticket.targetDigest !== hash(targetIdentity(current.target))
+      || record.ticket.snapshotDigest !== hash(targetSnapshot(current.target))
+      || record.ticket.expectedChangeDigest !== hash(current.expectedChange)
+      || hash(normalizeFiles(record.request.files)) !== hash(normalizeFiles(current.files))) return false;
+    grant.stepsUsed++;
+    if (!grant.unbounded && grant.stepsUsed >= grant.maxSteps) this.grants.delete(grant.id);
+    return true;
+  }
+
+  getGrant(grantId: string, now = Date.now()): TaskGrant | null {
+    const grant = this.grants.get(grantId);
+    if (!grant || grant.revoked || grant.permissionGeneration !== this.generation
+      || (!grant.unbounded && (now > grant.expiresAt || grant.stepsUsed >= grant.maxSteps))) return null;
+    return structuredClone(grant);
+  }
+
+  revokeTask(taskId: string): void {
+    for (const [id, grant] of this.grants) if (grant.taskId === taskId) this.grants.delete(id);
+    for (const [id, record] of this.tickets) if (record.ticket.taskId === taskId) this.tickets.delete(id);
+  }
+
+  revokeAll(): void {
+    this.grants.clear();
+    this.tickets.clear();
+  }
+
+  private usable(grant: TaskGrant, request: StepRequest, now: number): boolean {
+    const files = normalizeFiles(request.files);
+    return !grant.revoked && grant.permissionGeneration === this.generation
+      && (grant.unbounded === true || (now <= grant.expiresAt && grant.stepsUsed < grant.maxSteps))
+      && grant.surface === request.target.surface
+      && grant.actions.includes(request.action) && validTarget(request.target)
+      && grant.targetDigest === hash(targetIdentity(request.target))
+      && hash(files) === hash(grant.files);
+  }
+}

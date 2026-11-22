@@ -87,8 +87,13 @@ const KEYS = {
   selfTimeAfter: 'companion.selfTime.afterMinutes',
   selfTimeSession: 'companion.selfTime.sessionMinutes',
   selfTimeUnlimited: 'companion.selfTime.sessionUnlimited',
+  selfTimeTopics: 'companion.selfTime.topics',
   selfTimeSound: 'companion.selfTime.sound',
   selfTimeActions: 'companion.selfTime.actions',
+  selfTimeImageGeneration: 'companion.selfTime.imageGeneration',
+  selfTimeImageSaving: 'companion.selfTime.imageSaving',
+  selfTimeMediaUpload: 'companion.selfTime.mediaUpload',
+  selfTimeMediaDownload: 'companion.selfTime.mediaDownload',
   growth: 'companion.growth.enabled',
   growthDays: 'companion.growth.everyDays',
 } as const;
@@ -188,9 +193,24 @@ async function mount(ctx: PageContext): Promise<void> {
     onChange: (on) => { renderSelfTime(); void save(KEYS.selfTimeUnlimited, on, STATS_GROUP, behaviorMsg); },
   });
   selfTimeSession.box.append(selfTimeUnlimited.el);
+  const selfTimeTopics = ui.textarea({ placeholder: S.selfTimeTopicsPlaceholder, cls: 'grow' });
+  selfTimeTopics.maxLength = 800;
+  selfTimeTopics.addEventListener('change', () => {
+    const topics = selfTimeTopics.value.split(/\r?\n/).map((topic) => topic.trim()).filter(Boolean).slice(0, 8).map((topic) => topic.slice(0, 80)).join('\n');
+    selfTimeTopics.value = topics;
+    void save(KEYS.selfTimeTopics, topics, STATS_GROUP, behaviorMsg);
+  }, { signal });
   const selfTimeSound = ui.checkbox(S.selfTimeSound, { onChange: (on) => void save(KEYS.selfTimeSound, on, STATS_GROUP, behaviorMsg) });
   const selfTimeActions = ui.checkbox(S.selfTimeActions, { onChange: (on) => void save(KEYS.selfTimeActions, on, STATS_GROUP, behaviorMsg) });
-  selfTimeActions.setChecked(true);
+  selfTimeActions.setChecked(false);
+  const selfTimeImageGeneration = ui.checkbox(S.selfTimeImageGeneration, { onChange: (on) => void save(KEYS.selfTimeImageGeneration, on, STATS_GROUP, behaviorMsg) });
+  selfTimeImageGeneration.setChecked(false);
+  const selfTimeImageSaving = ui.checkbox(S.selfTimeImageSaving, { onChange: (on) => void save(KEYS.selfTimeImageSaving, on, STATS_GROUP, behaviorMsg) });
+  selfTimeImageSaving.setChecked(false);
+  const selfTimeMediaUpload = ui.checkbox(S.selfTimeMediaUpload, { onChange: (on) => void save(KEYS.selfTimeMediaUpload, on, STATS_GROUP, behaviorMsg) });
+  selfTimeMediaUpload.setChecked(false);
+  const selfTimeMediaDownload = ui.checkbox(S.selfTimeMediaDownload, { onChange: (on) => void save(KEYS.selfTimeMediaDownload, on, STATS_GROUP, behaviorMsg) });
+  selfTimeMediaDownload.setChecked(false);
   const growth = ui.checkbox(S.growth, { onChange: (on) => { renderGrowth(); void save(KEYS.growth, on, STATS_GROUP, behaviorMsg); } });
   growth.setChecked(true);
   const growthDays = minutesBox(1, 60, KEYS.growthDays, 7, S.growthDays);
@@ -432,14 +452,27 @@ async function mount(ctx: PageContext): Promise<void> {
   const behavior = ui.sheet({ title: S.groupBehavior });
   const selfTimeAfterRow = row(S.selfTimeAfter, selfTimeAfter.box);
   const selfTimeSessionRow = row(S.selfTimeSession, selfTimeSession.box);
+  const selfTimeTopicsRow = row(S.selfTimeTopics, selfTimeTopics, S.selfTimeTopicsHint);
   const selfTimeSoundRow = row(S.selfTimeSound, selfTimeSound.el, S.selfTimeSoundHint);
   const selfTimeActionsRow = row(S.selfTimeActions, selfTimeActions.el, S.selfTimeActionsHint);
+  const selfTimeImageGenerationRow = row(S.selfTimeImageGeneration, selfTimeImageGeneration.el, S.selfTimeImageGenerationHint);
+  const selfTimeImageSavingRow = row(S.selfTimeImageSaving, selfTimeImageSaving.el, S.selfTimeImageSavingHint);
+  const selfTimeMediaUploadRow = row(S.selfTimeMediaUpload, selfTimeMediaUpload.el, S.selfTimeMediaUploadHint);
+  const selfTimeMediaDownloadRow = row(S.selfTimeMediaDownload, selfTimeMediaDownload.el, S.selfTimeMediaDownloadHint);
   const renderSelfTime = () => {
     const on = selfTime.checked;
-    for (const r of [selfTimeAfterRow, selfTimeSessionRow, selfTimeSoundRow, selfTimeActionsRow]) r.hidden = !on;
+    for (const r of [selfTimeAfterRow, selfTimeSessionRow, selfTimeTopicsRow, selfTimeSoundRow, selfTimeActionsRow,
+      selfTimeImageGenerationRow, selfTimeImageSavingRow, selfTimeMediaUploadRow, selfTimeMediaDownloadRow]) r.hidden = !on;
     selfTimeAfter.input.disabled = !on;
     selfTimeUnlimited.input.disabled = !on;
     selfTimeSession.input.disabled = !on || selfTimeUnlimited.checked;
+    selfTimeTopics.disabled = !on;
+    selfTimeSound.input.disabled = !on;
+    selfTimeActions.input.disabled = !on;
+    selfTimeImageGeneration.input.disabled = !on;
+    selfTimeImageSaving.input.disabled = !on;
+    selfTimeMediaUpload.input.disabled = !on;
+    selfTimeMediaDownload.input.disabled = !on;
   };
   const growthDaysRow = row(S.growthEvery, growthDays.box);
   const renderGrowth = () => {
@@ -451,8 +484,13 @@ async function mount(ctx: PageContext): Promise<void> {
     row(S.selfTime, selfTime.el, `${S.selfTimeHint} ${S.selfTimeLogin}`),
     selfTimeAfterRow,
     selfTimeSessionRow,
+    selfTimeTopicsRow,
     selfTimeSoundRow,
     selfTimeActionsRow,
+    selfTimeImageGenerationRow,
+    selfTimeImageSavingRow,
+    selfTimeMediaUploadRow,
+    selfTimeMediaDownloadRow,
     row(S.growth, growth.el, S.growthHint),
     growthDaysRow,
     row(S.wake, wake.el, wakeHint),
@@ -687,6 +725,11 @@ async function mount(ctx: PageContext): Promise<void> {
     }
     if (typeof statsValues[KEYS.selfTimeSound] === 'boolean') selfTimeSound.setChecked(statsValues[KEYS.selfTimeSound] as boolean);
     if (typeof statsValues[KEYS.selfTimeActions] === 'boolean') selfTimeActions.setChecked(statsValues[KEYS.selfTimeActions] as boolean);
+    selfTimeImageGeneration.setChecked(statsValues[KEYS.selfTimeImageGeneration] === true);
+    selfTimeImageSaving.setChecked(statsValues[KEYS.selfTimeImageSaving] === true);
+    selfTimeMediaUpload.setChecked(statsValues[KEYS.selfTimeMediaUpload] === true);
+    selfTimeMediaDownload.setChecked(statsValues[KEYS.selfTimeMediaDownload] === true);
+    if (typeof statsValues[KEYS.selfTimeTopics] === 'string' && document.activeElement !== selfTimeTopics) selfTimeTopics.value = statsValues[KEYS.selfTimeTopics] as string;
     if (typeof statsValues[KEYS.growth] === 'boolean') growth.setChecked(statsValues[KEYS.growth] as boolean);
     renderGrowth();
     const growthDaysValue = statsValues[KEYS.growthDays];
