@@ -15,7 +15,7 @@
  */
 
 export interface WorldToolSchemaRoot {
-  world: 'opencode' | 'codex' | 'browser' | 'desktop-pet';
+  world: 'opencode' | 'codex' | 'browser' | 'desktop-pet' | 'anime-studio';
   tool: string;
   digest: string;
   /** Exact source file and declaration the digest was computed from. */
@@ -78,6 +78,11 @@ export const WORLD_TOOL_SCHEMA_ROOTS: readonly WorldToolSchemaRoot[] = [
   { world: 'desktop-pet', tool: 'pet_cua_focus', digest: 'fe01f2315e2a2f6355f92ed169ef2763e1937ab2cecbe916b2c24dcdd1221b39', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
   { world: 'desktop-pet', tool: 'pet_cua_wait', digest: '0127c2d03e99fce22050623e9dcad2c593b072301abe7b7a9bf120ebfde7a9af', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
   { world: 'desktop-pet', tool: 'pet_cua_open_settings', digest: '802bf51ecaee7156b29601eb836ad4d822f74e490d4fe0cf21d184a8c188a581', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  // Bundled Anime Studio (local ComfyUI MCP bridge) tools.
+  { world: 'anime-studio', tool: 'anime_studio_assets', digest: '2081284a4efa9457a1dde667018673f36253a262bac1285955bf54b046feb87c', source: 'core/anime-studio/tools.ts', schemaRevision: '2026-11-23', environment: 'coopanion-core' },
+  { world: 'anime-studio', tool: 'anime_studio_submit', digest: '91c7072c5f9f944ce810b75fd6357b20b67e5b925730ba897cc2367f201024f3', source: 'core/anime-studio/tools.ts', schemaRevision: '2026-11-23', environment: 'coopanion-core' },
+  { world: 'anime-studio', tool: 'anime_studio_job', digest: '76cb6412231eab2ea5137e0fa8ebe0c6d6228801bacfdbceb84428aae72f4d1b', source: 'core/anime-studio/tools.ts', schemaRevision: '2026-11-23', environment: 'coopanion-core' },
+  { world: 'anime-studio', tool: 'anime_studio_jobs', digest: 'e64b07c255686462c5408eac2fe9b0fe3bba4a8a2776184745ba38ea52928a4a', source: 'core/anime-studio/tools.ts', schemaRevision: '2026-11-23', environment: 'coopanion-core' },
 ];
 
 const BUILTIN_TOOL_SCHEMA_DIGESTS: readonly string[] = [

@@ -39,6 +39,12 @@ export const STREAMVOICE_TRUSTED_TEMPLATE_DIGESTS: readonly string[] = [
   'ea8497b91eefcf21d7db1e52a21df4e8ab7dc88cf0227e95700585fe2abe86e3',
 ];
 
+/** `core/anime-studio/ENV_PROMPT.md` (zh) and `ENV_PROMPT.en.md` as shipped. */
+export const ANIME_STUDIO_TRUSTED_TEMPLATE_DIGESTS: readonly string[] = [
+  '47e9eb7c987fd213737a4ab2184d829a771c8d4e9b119ee0156c1da23ce89749',
+  '73fd224f4139bcd8621c7280cf056edfe3e5b11c3f49eb382788e5eaea674ce4',
+];
+
 /** The app's trust policy for the Worlds it builds itself. Desktop-pet keeps its package policy. */
 export function coopanionWorldPromptTrust(world: World) {
   if (world.id === 'console') {
@@ -55,6 +61,9 @@ export function coopanionWorldPromptTrust(world: World) {
   }
   if (world.id === 'streamvoice') {
     return { templateDigests: STREAMVOICE_TRUSTED_TEMPLATE_DIGESTS, independentVariables: true };
+  }
+  if (world.id === 'anime-studio') {
+    return { templateDigests: ANIME_STUDIO_TRUSTED_TEMPLATE_DIGESTS, independentVariables: true };
   }
   return undefined;
 }

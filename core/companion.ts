@@ -92,6 +92,10 @@ import { isTrustedGrowthToolText } from './growth/review.ts';
 import { isTrustedEndTurnReceipt, sourceMapEndTurnReceipts } from './end-turn-evidence.ts';
 import { isTrustedMemorySearchNotice, isTrustedMemoryWriteReceipt } from './memory/model-text.ts';
 import { videoConfigGroup, videoDefinition, VIDEO_ID } from './video/definition.ts';
+import { animeStudioConfigGroup, animeStudioDefinition, ANIME_STUDIO_ID } from './anime-studio/definition.ts';
+import { ANIME_STUDIO_TOOL_DECLS } from './anime-studio/tools.ts';
+
+const ANIME_STUDIO_TOOL_NAMES = new Set(ANIME_STUDIO_TOOL_DECLS.map((t) => t.name));
 import { coreText } from './i18n/index.ts';
 import { petToolDescriber } from './pet-status.ts';
 import { appLanguage, modelLanguage, replyLanguage } from './language.ts';
@@ -799,6 +803,7 @@ export async function main(): Promise<void> {
   const settingsGroup = companionGroup('zh');
   const hindsightGroup = hindsightConfigGroup('zh');
   const videoGroup = videoConfigGroup('zh');
+  const animeStudioGroup = animeStudioConfigGroup('zh');
   const longTerm = new HindsightMemory();
   const journal = new RelationshipJournal();
   const affinitySync = new AffinitySync();
@@ -893,7 +898,7 @@ export async function main(): Promise<void> {
   let coo: CoopanionPersona | null = null;
   const definitionBase: BotDefinition<CorminiConfig> = {
     ...base.definition,
-    declares: [CONSOLE.id, DESKTOP_PET.id, NOTICE.id, BROWSER_ID, VIDEO_ID],
+    declares: [CONSOLE.id, DESKTOP_PET.id, NOTICE.id, BROWSER_ID, VIDEO_ID, ANIME_STUDIO_ID],
     // Cormini's tools under the same names; the memory differs by PARTNER.md and the version history
     describe: {
       tools: [...(base.definition.describe?.tools ?? []), ...memoryToolDescribes({ memory: () => null })],
@@ -992,6 +997,8 @@ export async function main(): Promise<void> {
           // only; third-party page content never enters user-input spans and never authorizes writes
           // (all external writes remain gated by ActionGate + Core UI confirmation).
           world.id === BROWSER_ID && BROWSER_TOOL_NAMES.has(tool) && typeof outcome.text === 'string'
+        ) || (
+          world.id === ANIME_STUDIO_ID && ANIME_STUDIO_TOOL_NAMES.has(tool) && typeof outcome.text === 'string'
         ) || ((world.id === 'tts' || world.id === 'audio-play') && isVoiceToolReceipt(tool, outcome)),
         worldDeferredTrust: (world, type, rendered) => notice !== null && world === notice
           && ((type === 'coopanion.updated' && notice.admitUpdate(rendered))
@@ -1028,7 +1035,7 @@ export async function main(): Promise<void> {
         onStart: () => persona.startRhythm(),
         onStop: () => { persona.stopRhythm(); persona.stopGrowth(); },
         webUi: {
-          configGroups: [base.contextGroup, settingsGroup, hindsightGroup, videoGroup],
+          configGroups: [base.contextGroup, settingsGroup, hindsightGroup, videoGroup, animeStudioGroup],
           status: () => ({ context: { maxTokens: cfg.context.maxTokens, softRatio: cfg.context.softRatio } }),
           configOptions: (kind) => (kind === LANGUAGE_OPTIONS ? LANGUAGES.map((value) => ({ value, label: LANGUAGE_NAMES[value] })) : []),
         },
@@ -1068,6 +1075,21 @@ export async function main(): Promise<void> {
     authorizeAction: (request, confirmInCoreUi) => authorizeFileSystemAction(actionReceipts, gate, request, confirmInCoreUi),
     confirmAction: confirmWorldWorkspaceAction,
   });
+  const ANIME_STUDIO = animeStudioDefinition({
+    modelLanguage: () => modelLanguage(config?.language),
+    language: () => language(),
+    command: () => String(getByPath(config as unknown as Record<string, unknown>, 'worlds.anime-studio.command') ?? ''),
+    scriptPath: () => String(getByPath(config as unknown as Record<string, unknown>, 'worlds.anime-studio.scriptPath') ?? ''),
+    comfyuiUrl: () => String(getByPath(config as unknown as Record<string, unknown>, 'worlds.anime-studio.comfyuiUrl') ?? ''),
+    timeoutMs: () => {
+      const raw = Number(getByPath(config as unknown as Record<string, unknown>, 'worlds.anime-studio.timeoutMs'));
+      return Number.isFinite(raw) && raw > 0 ? raw : 60_000;
+    },
+  });
+  const ANIME_STUDIO_TRUSTED = {
+    ...ANIME_STUDIO,
+    create: (ctx: Parameters<typeof ANIME_STUDIO.create>[0]) => withTrustedWorldVariables(ANIME_STUDIO.create(ctx)),
+  } as WorldDefinition<WorldSection>;
   const CONSOLE_TRUSTED = {
     ...CONSOLE,
     create: (ctx: Parameters<typeof CONSOLE.create>[0]) => withTrustedConsoleVariables(CONSOLE.create(ctx)),
@@ -1080,7 +1102,7 @@ export async function main(): Promise<void> {
     ...CODEX,
     create: (ctx: Parameters<typeof CODEX.create>[0]) => withTrustedWorldVariables(CODEX.create(ctx)),
   } as WorldDefinition<WorldSection>;
-  const bundled = [CONSOLE_TRUSTED, DESKTOP_PET, NOTICE, BROWSER, OPENCODE_TRUSTED, CODEX_TRUSTED, VIDEO] as WorldDefinition<WorldSection>[];
+  const bundled = [CONSOLE_TRUSTED, DESKTOP_PET, NOTICE, BROWSER, OPENCODE_TRUSTED, CODEX_TRUSTED, VIDEO, ANIME_STUDIO_TRUSTED] as WorldDefinition<WorldSection>[];
 
   // Owner decision (Rev29): QQ is no longer a product capability. The package stays installed
   // for the later retirement inventory, but it is never imported, registered, initialized or
@@ -1130,10 +1152,12 @@ export async function main(): Promise<void> {
   Object.assign(settingsGroup, companionGroup(language()));
   Object.assign(hindsightGroup, hindsightConfigGroup(language()));
   Object.assign(videoGroup, videoConfigGroup(language()));
+  Object.assign(animeStudioGroup, animeStudioConfigGroup(language()));
   watchLanguage(loaded.config, (next) => {
     Object.assign(settingsGroup, companionGroup(next));
     Object.assign(hindsightGroup, hindsightConfigGroup(next));
     Object.assign(videoGroup, videoConfigGroup(next));
+    Object.assign(animeStudioGroup, animeStudioConfigGroup(next));
     followPersonaLanguage(loaded.memoryDir, next);
     process.send?.({ type: 'companion:language', language: next });
     (pet as DesktopPetWorld | null)?.refresh();
