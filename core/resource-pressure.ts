@@ -2,7 +2,7 @@
 import { execFileSync } from 'node:child_process';
 import { freemem, totalmem } from 'node:os';
 
-export const RESOURCE_PRESSURE_PAUSE_FREE_PERCENT = 20;
+export const RESOURCE_PRESSURE_PAUSE_FREE_PERCENT = 5;
 const CACHE_MS = 30_000;
 
 export interface ResourcePressureSnapshot {

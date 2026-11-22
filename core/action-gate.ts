@@ -109,7 +109,6 @@ export interface FileSystemStepAuthorization {
 const desktopEvidenceKey = (target: DesktopTargetEvidence): string => JSON.stringify([
   target.instanceId, target.bundleId, target.executablePath, target.pid, target.ownerPid,
   target.processStart, target.windowId,
-  [target.bounds.x, target.bounds.y, target.bounds.width, target.bounds.height],
   target.display, target.space, target.snapshotId, target.captureId,
   target.element ? [target.element.role, target.element.label, target.element.token] : null,
   target.route, target.source,
@@ -146,9 +145,9 @@ const HIGH_RISK_ORDINARY_BUNDLES = new Set([
   'com.apple.AppStore', 'com.apple.Passbook', 'com.apple.Wallet',
   'com.tencent.xinWeChat', 'com.tencent.qq', 'com.tinyspeck.slackmacgap', 'com.hnc.Discord', 'ru.keepcoder.Telegram',
 ]);
-const SENSITIVE_ORDINARY_KEY_RE = /(?:^|,)(?:(?:cmd|command|meta|super)\+(?:q|w|delete|backspace|return|enter|shift\+delete|shift\+q|option\+esc|alt\+esc)|ctrl\+alt\+delete|alt\+f4)(?:$|,)/i;
-const SAFE_ORDINARY_KEY_TOKENS_RE = /^(?:(?:(?:cmd|command)\+(?:s|a|c|v|z|shift\+z|f|i|1|2|3|4)|return|enter|tab|escape|esc|space|up|down|left|right|pageup|pagedown|home|end|backspace)(?:\s+|$))+$/i;
-const HIGH_RISK_CLICK_LABEL_RE = /(?:\b(?:send|publish|post|pay|purchase|buy|checkout|delete|erase|remove|transfer|submit\s+order|confirm\s+payment)\b|发送|发布|支付|付款|购买|下单|转账|永久删除)/iu;
+const SENSITIVE_ORDINARY_KEY_RE = /(?:^|,)(?:(?:cmd|command|meta|super)\+(?:q|delete|backspace|return|enter|shift\+delete|shift\+q|option\+esc|alt\+esc)|ctrl\+alt\+delete|alt\+f4)(?:$|,)/i;
+const SAFE_ORDINARY_KEY_TOKENS_RE = /^(?:(?:(?:cmd|command)\+(?:s|a|c|v|x|z|shift\+z|f|i|n|t|shift\+t|w|l|r|p|tab|1|2|3|4|5|6|7|8|9)|return|enter|tab|escape|esc|space|up|down|left|right|pageup|pagedown|home|end|backspace)(?:\s+|$))+$/i;
+const HIGH_RISK_CLICK_LABEL_RE = /(?:\b(?:send|publish|post|pay|purchase|buy|checkout|transfer|submit\s+order|confirm\s+payment|empty\s+trash|permanently\s+delete|erase\s+all)\b|发送|发布|支付|付款|购买|下单|转账|永久删除|清空废纸篓)/iu;
 
 export class ActionGate {
   private readonly grants: TaskGrantRegistry;

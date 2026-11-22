@@ -8122,7 +8122,7 @@ describe('P3 G-75 real Growth fork recent conversation', () => {
     });
     expect(JSON.parse(growthBody)).toBeTruthy();
     expect(growthBody).toContain(`Person: ${directPersonLine}`);
-    expect(growthBody).toContain('Coo: G75 first answer.');
+    expect(growthBody).toContain('Xi (曦): G75 first answer.');
 
     const mapped = growthEnvelope.items.flatMap((item) => item.spans)
       .filter((span) => span.serializedRanges.length > 0)

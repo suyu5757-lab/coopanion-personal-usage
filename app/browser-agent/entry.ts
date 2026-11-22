@@ -10,6 +10,7 @@ import { PageController } from '@page-agent/page-controller';
 import { accountEvidence, sharePanelOpen, shareTarget, videoEvidence } from './card.ts';
 import {
   chatGPTComposer,
+  chatGPTGenerationActive,
   chatGPTImageMediaMatchesTurn,
   chatGPTImageTaskEvidence,
   chatGPTSubmittedUserTurn,
@@ -18,6 +19,16 @@ import {
   isChatGPTPage,
   type ChatGPTUserTurnBaseline,
 } from './chatgpt.ts';
+import {
+  geminiComposer,
+  geminiImageMediaMatchesTurn,
+  geminiImageTaskEvidence,
+  geminiSubmittedUserTurn,
+  geminiUserTurnBaseline,
+  isGeminiImageSaveTarget,
+  isGeminiPage,
+  type GeminiUserTurnBaseline,
+} from './gemini.ts';
 import { replyTargetForBox } from './comments.ts';
 import { installFileChooserGuard } from './safety.ts';
 import { accessibleRole, composedElements, composedParentElement } from './accessible-name.ts';
@@ -73,6 +84,15 @@ interface ChatGPTImageTaskRuntime {
   turnIndex: number;
 }
 
+interface GeminiImageTaskRuntime {
+  initialUrl: string;
+  baseline: GeminiUserTurnBaseline;
+  pageUrl: string | null;
+  turn: HTMLElement | null;
+  turnMarker: string;
+  turnIndex: number;
+}
+
 interface VideoState {
   current: number;
   duration: number;
@@ -116,6 +136,7 @@ if (!host[KEY]) {
   let nextElementId = 1;
   const shareMarked = new WeakSet<HTMLElement>();
   const chatGPTImageTasks = new Map<string, ChatGPTImageTaskRuntime>();
+  const geminiImageTasks = new Map<string, GeminiImageTaskRuntime>();
   const elementId = (element: HTMLElement): number => {
     let id = elementIds.get(element);
     if (id === undefined) { id = nextElementId++; elementIds.set(element, id); }
@@ -176,8 +197,6 @@ if (!host[KEY]) {
   const snapshotId = (): string => {
     const current = videoEvidence(document);
     const account = accountEvidence(document)?.ref ?? '';
-    const stableText = (value: string, maxLen: number): string =>
-      value.replace(/\s+/g, ' ').trim().replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, '<time>').slice(0, maxLen);
     const scopeCache = new WeakMap<HTMLElement, unknown[]>();
     const scopeEvidenceFor = (element: HTMLElement): unknown[] => {
       const isScope = (candidate: HTMLElement): boolean => candidate.matches('article, [role], li, [data-e2e]');
@@ -196,9 +215,9 @@ if (!host[KEY]) {
       while (scope && evidence.length < 3) {
         evidence.push([
           elementId(scope), scope.tagName.toLowerCase(),
-          stableText(currentElementLabel(scope), 200).toLowerCase(),
+          currentElementLabel(scope).replace(/\s+/g, ' ').trim().toLowerCase(),
           scope.getAttribute('role') ?? '', scope.getAttribute('data-e2e') ?? '',
-          stableText(scope.innerText || scope.textContent || '', 240),
+          (scope.innerText || scope.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 240),
         ]);
         scope = semanticParent(scope);
       }
@@ -211,8 +230,8 @@ if (!host[KEY]) {
         if (!element) return [index, ''];
         const label = currentElementLabel(element) || (shareMarked.has(element) ? '分享' : '');
         return [index, elementId(element), framePath(element), element.isConnected, element.tagName.toLowerCase(),
-          stableText(label, 200).toLowerCase(),
-          stableText(element.innerText || element.textContent || '', 200),
+          label.replace(/\s+/g, ' ').trim().toLowerCase(),
+          (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200),
           element instanceof HTMLAnchorElement ? element.href : '',
           element.getAttribute('aria-label') ?? '', element.getAttribute('title') ?? '',
           element.getAttribute('aria-pressed') ?? '', element.getAttribute('aria-selected') ?? '',
@@ -389,7 +408,7 @@ if (!host[KEY]) {
       container.style.cssText = 'position:fixed;inset:0;pointer-events:none;z-index:2147483647;';
       document.documentElement.appendChild(container);
     }
-    container.innerHTML = '';
+    container.replaceChildren();
 
     const vw = window.innerWidth || document.documentElement.clientWidth;
     const vh = window.innerHeight || document.documentElement.clientHeight;
@@ -401,11 +420,6 @@ if (!host[KEY]) {
     const indexedEls = new Set<HTMLElement>();
     for (const node of map.values()) { if (node?.ref?.isConnected) indexedEls.add(node.ref); }
 
-    const isSemanticControl = (candidate: HTMLElement): boolean =>
-      candidate.matches('a[href], button, input, textarea, select, [role="button"], [role="link"], [role="tab"], [role="menuitem"]');
-
-    const renderedNonSemanticCards: HTMLElement[] = [];
-
     for (const [index, node] of map.entries()) {
       const el = node?.ref;
       if (!el || !el.isConnected || !isVisible(el)) continue;
@@ -413,22 +427,18 @@ if (!host[KEY]) {
       if (!rect) continue;
       // Skip giant full-viewport scroll/page wrappers that should never carry corner badges.
       if (rect.width > vw * 0.85 && rect.height > vh * 0.75) continue;
+      // Skip redundant nested non-semantic children inside an already-indexed semantic control (e.g. icon/label divs inside <a>/<button>).
       const tag = el.tagName.toLowerCase();
-      const isOwnSemantic = isSemanticControl(el);
+      const isOwnSemantic = el.matches('a[href], button, input, textarea, select, [role="button"], [role="link"], [role="tab"]');
       if (!isOwnSemantic) {
-        // Skip layout/scroll container wrappers (e.g. header, tablist, menu containers, flex/scroll wrappers) that wrap other indexed controls.
-        let wrapsIndexedChild = false;
-        for (const other of indexedEls) {
-          if (other !== el && el.contains(other)) { wrapsIndexedChild = true; break; }
-        }
-        if (wrapsIndexedChild) continue;
-        // Skip redundant nested non-semantic children inside an already-indexed semantic control or already-rendered card.
-        let coveredByParent = false;
+        let coveredByIndexedParent = false;
         for (let p = composedParentElement(el); p && p !== document.body; p = composedParentElement(p)) {
-          if (indexedEls.has(p) && isSemanticControl(p)) { coveredByParent = true; break; }
+          if (indexedEls.has(p) && p.matches('a[href], button, [role="button"], [role="link"], [role="tab"]')) {
+            coveredByIndexedParent = true;
+            break;
+          }
         }
-        if (!coveredByParent && renderedNonSemanticCards.some((card) => card.contains(el))) coveredByParent = true;
-        if (coveredByParent) continue;
+        if (coveredByIndexedParent) continue;
       }
       // Skip ghost elements covered by a foreground modal/header.
       const cx = rect.left + rect.width / 2;
@@ -441,8 +451,7 @@ if (!host[KEY]) {
       const badgeH = 15;
       const isInputLike = tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
       const isCard = rect.width >= 140 && rect.height >= 90;
-      const isCompact = rect.height <= 56 && rect.width <= 110;
-      if (!isOwnSemantic && isCard) renderedNonSemanticCards.push(el);
+      const isCompact = rect.height <= 44 && rect.width <= 110;
 
       const clampL = (v: number) => Math.max(2, Math.min(v, vw - badgeW - 2));
       const clampT = (v: number) => Math.max(2, Math.min(v, vh - badgeH - 2));
@@ -460,9 +469,9 @@ if (!host[KEY]) {
           ]
           : isCompact
             ? [
-              { left: clampL(rect.left), top: clampT(rect.top - badgeH + 4) },
+              { left: clampL(rect.left), top: clampT(rect.top - badgeH + 3) },
               { left: clampL(rect.left), top: clampT(rect.top + 1) },
-              { left: clampL(rect.right - badgeW), top: clampT(rect.top - badgeH + 4) },
+              { left: clampL(rect.right - badgeW), top: clampT(rect.top - badgeH + 3) },
               { left: clampL(rect.left), top: clampT(rect.bottom - 2) },
             ]
             : [
@@ -531,14 +540,14 @@ if (!host[KEY]) {
     const vw = window.innerWidth || document.documentElement.clientWidth;
     const vh = window.innerHeight || document.documentElement.clientHeight;
     const extraLines: string[] = [];
-    const addedRects: Array<{ left: number; top: number; width: number; height: number; el: HTMLElement; semantic: boolean }> = [];
+    const addedRects: Array<{ left: number; top: number; width: number; height: number; el: HTMLElement }> = [];
 
     const isSameBox = (r1: DOMRect, r2: { left: number; top: number; width: number; height: number }) =>
       Math.abs(r1.left - r2.left) < 8 && Math.abs(r1.top - r2.top) < 8
       && Math.abs(r1.width - r2.width) < 12 && Math.abs(r1.height - r2.height) < 12;
 
     const candidateNodes = document.getElementsByTagName('*').length > 4000
-      ? Array.from(document.querySelectorAll<HTMLElement>('a[href], button, summary, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [data-e2e], article, li, header div, header span, nav div, [role="tablist"] ~ div, [role="tablist"] ~ span'))
+      ? Array.from(document.querySelectorAll<HTMLElement>('a[href], button, summary, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [data-e2e], article, li'))
       : composedElements(document);
     for (const el of candidateNodes) {
       if (map.size >= ELEMENT_LIST_MAX) break;
@@ -546,42 +555,36 @@ if (!host[KEY]) {
       if (el.id === HIGHLIGHTS || el.closest?.(`#${HIGHLIGHTS}`)) continue;
       if (!isVisible(el)) continue;
       const rect = el.getBoundingClientRect();
-      if (rect.width < 14 || rect.height < 14) continue;
+      if (rect.width < 12 || rect.height < 12) continue;
       if (rect.bottom <= 0 || rect.top >= vh || rect.right <= 0 || rect.left >= vw) continue;
       if (rect.width > vw * 0.92 && rect.height > vh * 0.85) continue;
 
       const tag = el.tagName.toLowerCase();
       const semantic = el.matches('a[href], button, summary, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"]');
-      let isInteractiveTarget = false;
+      let isInteractiveCard = false;
       if (!semantic) {
         const style = el.ownerDocument.defaultView?.getComputedStyle(el);
-        if (style?.cursor === 'pointer' && rect.width >= 18 && rect.height >= 18) {
-          // Skip container divs that wrap multiple semantic controls or a full section.
-          const semanticChildren = el.querySelectorAll('a[href], button, [role="button"], [role="tab"]');
-          const isContainerWrapper = semanticChildren.length > 1 || (semanticChildren.length === 1 && rect.width * rect.height > vw * vh * 0.25);
-          if (!isContainerWrapper) isInteractiveTarget = true;
+        if (style?.cursor === 'pointer' && rect.width >= 48 && rect.height >= 40) {
+          // Prefer leaf-ish clickable cards/controls rather than huge page wrappers.
+          const hasSemanticChildSameBox = !!el.querySelector('a[href], button') && rect.width * rect.height > vw * vh * 0.35;
+          if (!hasSemanticChildSameBox) isInteractiveCard = true;
         }
       }
-      if (!semantic && !isInteractiveTarget) continue;
+      if (!semantic && !isInteractiveCard) continue;
 
-      let label = currentElementLabel(el);
-      if (!label && rect.width <= 84 && rect.height <= 84 && el.querySelector('svg, img')) {
-        label = (el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('data-e2e') || '').trim() || 'icon-button';
-      }
+      const label = currentElementLabel(el);
       if (!label) continue;
 
-      // Skip if an existing indexed element or previously added element covers the exact same box,
-      // or if a non-semantic target is nested inside an already-added non-semantic card/control.
+      // Skip if an existing indexed element or previously added element covers the exact same box.
       let dup = false;
       for (const prev of addedRects) {
-        if (isSameBox(rect, prev) || (!semantic && prev.el.contains(el))) { dup = true; break; }
+        if (isSameBox(rect, prev) || (prev.el.contains(el) && isSameBox(rect, prev))) { dup = true; break; }
       }
       if (dup) continue;
       for (const ref of existingRefs) {
         if (!ref.isConnected) continue;
         const r = ref.getBoundingClientRect();
         if (isSameBox(rect, r)) { dup = true; break; }
-        if (!semantic && ref.contains(el) && ref.matches('a[href], button, [role="button"], [role="link"], [role="tab"]')) { dup = true; break; }
       }
       if (dup) continue;
 
@@ -592,10 +595,10 @@ if (!host[KEY]) {
       map.set(nextIndex, { ref: el });
       internals.elementTextMap?.set(nextIndex, label);
       existingRefs.add(el);
-      addedRects.push({ left: rect.left, top: rect.top, width: rect.width, height: rect.height, el, semantic });
+      addedRects.push({ left: rect.left, top: rect.top, width: rect.width, height: rect.height, el });
       const href = el instanceof HTMLAnchorElement && el.href ? ` href="${el.href.slice(0, 200)}"` : '';
       extraLines.push(`[${nextIndex}]<${tag}${href}>${label.slice(0, 140)}</${tag}>`);
-      if (extraLines.length >= 80) break;
+      if (extraLines.length >= 60) break;
     }
 
     if (extraLines.length && typeof page.content === 'string') {
@@ -611,7 +614,7 @@ if (!host[KEY]) {
       const raw = await controller.getBrowserState();
       const augmented = augmentViewportTargets(raw as unknown as { content?: string; [k: string]: unknown });
       alignHighlightOverlay();
-      return augmented as typeof raw;
+      return augmented as unknown as typeof raw;
     }
     finally { restore(); }
   };
@@ -704,14 +707,20 @@ if (!host[KEY]) {
     .map((element) => (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim())
     .filter(Boolean))].slice(0, 20);
 
-  const fileInputTarget = async (id: number, expectedSnapshotId?: string): Promise<{ ok: true; token: string; accept: string; multiple: boolean; snapshotId: string } | { ok: false; reason: string }> => {
-    await readPage();
+  const fileInputTarget = async (id: number, expectedSnapshotId?: string): Promise<{ ok: true; token: string; accept: string; multiple: boolean; snapshotId: string; id: number } | { ok: false; reason: string }> => {
     if (expectedSnapshotId && snapshotId() !== expectedSnapshotId) return { ok: false, reason: 'the page changed' };
-    const input = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]')).find((candidate) => elementId(candidate) === id);
+    const allInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]')).filter((candidate) => candidate.isConnected && !candidate.disabled);
+    let input = allInputs.find((candidate) => elementId(candidate) === id) ?? null;
+    if (!input && allInputs.length) {
+      input = allInputs.find((candidate) => /image/i.test(candidate.accept) && candidate.multiple)
+        ?? allInputs.find((candidate) => /image/i.test(candidate.accept))
+        ?? allInputs[0]
+        ?? null;
+    }
     if (!input || !input.isConnected || input.disabled) return { ok: false, reason: 'no enabled file input with that id' };
     const token = `coo-upload-${crypto.randomUUID()}`;
     input.setAttribute('data-coo-upload-token', token);
-    return { ok: true, token, accept: input.accept, multiple: input.multiple, snapshotId: snapshotId() };
+    return { ok: true, token, accept: input.accept, multiple: input.multiple, snapshotId: snapshotId(), id: elementId(input) };
   };
 
   const releaseFileInput = (token: string): void => {
@@ -721,8 +730,11 @@ if (!host[KEY]) {
   };
 
   const fileInputSelection = async (id: number): Promise<{ names: string[]; accept: string; multiple: boolean } | null> => {
-    await readPage();
-    const input = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]')).find((candidate) => elementId(candidate) === id);
+    const allInputs = Array.from(document.querySelectorAll<HTMLInputElement>('input[type="file"]')).filter((candidate) => candidate.isConnected);
+    const input = allInputs.find((candidate) => elementId(candidate) === id)
+      ?? allInputs.find((candidate) => /image/i.test(candidate.accept))
+      ?? allInputs[0]
+      ?? null;
     if (!input || !input.isConnected) return null;
     return { names: Array.from(input.files ?? []).map((file) => file.name), accept: input.accept, multiple: input.multiple };
   };
@@ -775,19 +787,37 @@ if (!host[KEY]) {
     const draft = composer instanceof HTMLInputElement || composer instanceof HTMLTextAreaElement
       ? composer.value
       : composer?.innerText ?? '';
-    const submittedTurn = task && new URL(task.initialUrl).origin === new URL(location.href).origin
+    const sameOrigin = !!task && new URL(task.initialUrl).origin === new URL(location.href).origin;
+    const submittedTurn = sameOrigin
       ? chatGPTSubmittedUserTurn(document, location.href, prompt, task.baseline)
       : { submitted: false as const };
-    const submitted = !!task && isChatGPTPage(location.href) && !draft.trim() && submittedTurn.submitted;
-    if (submitted && submittedTurn.submitted) {
+    const generating = sameOrigin && chatGPTGenerationActive(document, location.href, task.baseline);
+    const navigatedToThread = sameOrigin && location.href !== task.initialUrl && /\/c\//.test(location.pathname);
+    const allTurns = Array.from(document.querySelectorAll<HTMLElement>('[data-message-author-role="user"]'));
+    const fallbackTurn = !submittedTurn.submitted && (generating || navigatedToThread) ? (allTurns.at(-1) ?? null) : null;
+    const submitted = !!task && isChatGPTPage(location.href) && !draft.trim()
+      && (submittedTurn.submitted || generating || (navigatedToThread && !!fallbackTurn));
+    let resolvedMarker = '';
+    let resolvedIndex = -1;
+    if (submitted) {
       task.pageUrl = location.href;
-      task.turn = submittedTurn.turn;
-      task.turnMarker = submittedTurn.marker;
-      task.turnIndex = submittedTurn.index;
+      if (submittedTurn.submitted) {
+        task.turn = submittedTurn.turn;
+        task.turnMarker = submittedTurn.marker;
+        task.turnIndex = submittedTurn.index;
+      } else if (fallbackTurn) {
+        task.turn = fallbackTurn;
+        task.turnMarker = fallbackTurn.getAttribute('data-message-id') || fallbackTurn.id || `chatgpt-user-${Math.max(0, allTurns.length - 1)}`;
+        task.turnIndex = Math.max(0, allTurns.length - 1);
+      } else {
+        task.turnIndex = Math.max(0, allTurns.length - 1);
+      }
+      resolvedMarker = task.turnMarker;
+      resolvedIndex = task.turnIndex;
     }
     return {
       submitted,
-      ...(submitted && submittedTurn.submitted ? { userTurnMarker: submittedTurn.marker, userTurnIndex: submittedTurn.index } : {}),
+      ...(submitted ? { userTurnMarker: resolvedMarker, userTurnIndex: resolvedIndex } : {}),
       state: { ...page, elements: elements(), current: videoEvidence(document), account: accountEvidence(document), timestamps: timestamps(), fileInputs: fileInputs(), replyTargets: await replyTargets(), statusMessages: statusMessages(), snapshotId: snapshotId(), video: video(), mediaTargets: mediaTargets() },
     };
   };
@@ -819,6 +849,82 @@ if (!host[KEY]) {
   };
 
   const chatGPTImageTaskRelease = (taskId: string): void => { chatGPTImageTasks.delete(taskId); };
+
+  const geminiComposerTarget = async (): Promise<{ ok: true; id: number; snapshotId: string } | { ok: false; reason: string }> => {
+    await readPage();
+    if (!isGeminiPage(location.href)) return { ok: false, reason: 'the current page is not Gemini' };
+    const element = geminiComposer(document, location.href);
+    if (!element) return { ok: false, reason: 'no visible Gemini prompt box' };
+    const id = [...(internals.selectorMap?.entries() ?? [])].find(([, node]) => node.ref === element)?.[0];
+    return id === undefined ? { ok: false, reason: 'the Gemini prompt box is not in the current page map' } : { ok: true, id, snapshotId: snapshotId() };
+  };
+
+  const geminiImageTaskStart = (taskId: string): { ok: boolean; reason?: string } => {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(taskId) || geminiImageTasks.has(taskId)) {
+      return { ok: false, reason: 'invalid or duplicate image task id' };
+    }
+    const baseline = geminiUserTurnBaseline(document, location.href);
+    if (!baseline) return { ok: false, reason: 'the current page is not Gemini' };
+    geminiImageTasks.set(taskId, {
+      initialUrl: location.href,
+      baseline,
+      pageUrl: null,
+      turn: null,
+      turnMarker: '',
+      turnIndex: -1,
+    });
+    while (geminiImageTasks.size > 16) geminiImageTasks.delete(geminiImageTasks.keys().next().value!);
+    return { ok: true };
+  };
+
+  const geminiSubmission = async (taskId: string, prompt: string): Promise<{ submitted: boolean; userTurnMarker?: string; userTurnIndex?: number; state: AgentState }> => {
+    const page = await readPage();
+    const task = geminiImageTasks.get(taskId);
+    const composer = geminiComposer(document, location.href);
+    const draft = composer instanceof HTMLInputElement || composer instanceof HTMLTextAreaElement
+      ? composer.value
+      : composer?.innerText ?? '';
+    const submittedTurn = task && new URL(task.initialUrl).origin === new URL(location.href).origin
+      ? geminiSubmittedUserTurn(document, location.href, prompt, task.baseline)
+      : { submitted: false as const };
+    const submitted = !!task && isGeminiPage(location.href) && !draft.trim() && submittedTurn.submitted;
+    if (submitted && submittedTurn.submitted) {
+      task.pageUrl = location.href;
+      task.turn = submittedTurn.turn;
+      task.turnMarker = submittedTurn.marker;
+      task.turnIndex = submittedTurn.index;
+    }
+    return {
+      submitted,
+      ...(submitted && submittedTurn.submitted ? { userTurnMarker: submittedTurn.marker, userTurnIndex: submittedTurn.index } : {}),
+      state: { ...page, elements: elements(), current: videoEvidence(document), account: accountEvidence(document), timestamps: timestamps(), fileInputs: fileInputs(), replyTargets: await replyTargets(), statusMessages: statusMessages(), snapshotId: snapshotId(), video: video(), mediaTargets: mediaTargets() },
+    };
+  };
+
+  const geminiImageTaskTurn = (task: GeminiImageTaskRuntime): HTMLElement | null => {
+    if (task.turn?.isConnected) return task.turn;
+    const turns = Array.from(document.querySelectorAll<HTMLElement>('user-query, [data-test-id="user-query"], .user-query-container'));
+    if (task.turnIndex >= 0 && task.turnIndex < turns.length) return turns[task.turnIndex] ?? null;
+    return null;
+  };
+
+  const geminiImageTaskStatus = (taskId: string): ReturnType<typeof geminiImageTaskEvidence> => {
+    const task = geminiImageTasks.get(taskId);
+    if (!task?.pageUrl || location.href !== task.pageUrl) return { status: 'unknown', imageCount: 0, imageSizes: [] };
+    const turn = geminiImageTaskTurn(task);
+    return geminiImageTaskEvidence(document, location.href, turn);
+  };
+
+  const geminiImageTaskMediaTarget = (taskId: string, targetId: number, expectedSnapshotId: string): boolean => {
+    const task = geminiImageTasks.get(taskId);
+    if (!task?.pageUrl || location.href !== task.pageUrl || snapshotId() !== expectedSnapshotId) return false;
+    const turn = geminiImageTaskTurn(task);
+    if (geminiImageTaskEvidence(document, location.href, turn).status !== 'image_available') return false;
+    const selected = mediaTargets().filter((target) => target.id === targetId && target.mediaType === 'image');
+    return selected.length === 1 && geminiImageMediaMatchesTurn(document, location.href, turn, selected[0]!.url);
+  };
+
+  const geminiImageTaskRelease = (taskId: string): void => { geminiImageTasks.delete(taskId); };
 
   const active = (): AgentElement | null => {
     const element = document.activeElement;
@@ -1191,6 +1297,12 @@ if (!host[KEY]) {
     chatGPTImageTaskStatus,
     chatGPTImageTaskMediaTarget,
     chatGPTImageTaskRelease,
+    geminiComposer: geminiComposerTarget,
+    geminiImageTaskStart,
+    geminiSubmission,
+    geminiImageTaskStatus,
+    geminiImageTaskMediaTarget,
+    geminiImageTaskRelease,
     fileInputTarget,
     releaseFileInput,
     fileInputSelection,
@@ -1200,6 +1312,12 @@ if (!host[KEY]) {
       if (!isChatGPTPage(location.href) || (expectedSnapshotId && snapshotId() !== expectedSnapshotId)) return false;
       const element = elementAt(index);
       return !!element && isChatGPTImageSaveTarget(document, location.href, element);
+    },
+    geminiImageSaveTarget: async (index: number, expectedSnapshotId?: string): Promise<boolean> => {
+      await readPage();
+      if (!isGeminiPage(location.href) || (expectedSnapshotId && snapshotId() !== expectedSnapshotId)) return false;
+      const element = elementAt(index);
+      return !!element && isGeminiImageSaveTarget(document, location.href, element);
     },
     /** The live text of one box, for the confirmation the host shows before a public write. */
     draft: async (index: number, expectedSnapshotId?: string): Promise<string | null> => {

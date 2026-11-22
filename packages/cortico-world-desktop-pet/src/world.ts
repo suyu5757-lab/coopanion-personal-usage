@@ -928,10 +928,9 @@ export class DesktopPetWorld implements World {
     this.phase = phase;
     this.status.onPhase(phase);
     if (phase.state === 'delivering' && phase.round === undefined) {
-      // Duplicate delivering notifications for the same batch must not wipe out active bubbles.
+      // Do not wipe active bubbles on internal/background batches; explicit preemption clears via onAbort.
       if (!this.inDeliveringBatch) {
         this.inDeliveringBatch = true;
-        this.clearQueuedSayBubbles();
       }
     } else if (phase.state !== 'delivering') {
       this.inDeliveringBatch = false;

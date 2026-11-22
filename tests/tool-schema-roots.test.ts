@@ -3,6 +3,8 @@ import { OPENCODE_TOOL_DECLS } from 'cortico-world-opencode';
 import CODEX from 'cortico-world-codex';
 import type { ToolDef } from 'cortico/core/types.ts';
 import { toolSchemaDigest } from '../vendor/cortico/src/core/evidence.ts';
+import { BROWSER_TOOL_DECLS } from '../core/browser/tools.ts';
+import { CUA_OFF_TOOL_DECLS, CUA_TOOL_DECLS } from '../packages/cortico-world-desktop-pet/src/cua/tools.ts';
 import { COOPANION_TOOL_SCHEMA_DIGESTS, WORLD_TOOL_SCHEMA_ROOTS } from '../core/tool-schema-roots.ts';
 import { memoryTools } from '../core/memory/tools.ts';
 
@@ -12,16 +14,18 @@ function worldTools(): ToolDef[] {
   return [
     ...OPENCODE_TOOL_DECLS.filter((tool) => tool.name !== 'opencode_answer').map((tool) => ({ ...tool, handler: async () => '' })),
     ...codex.tools(),
+    ...BROWSER_TOOL_DECLS.map((tool) => ({ ...tool, handler: async () => '' })),
+    ...[...CUA_TOOL_DECLS, ...CUA_OFF_TOOL_DECLS].map((tool) => ({ ...tool, handler: async () => '' })),
   ] as ToolDef[];
 }
 
-describe('opencode/codex tool schema roots', () => {
+describe('opencode/codex/browser/cua tool schema roots', () => {
   it('recomputes every registered root from the actual World definitions', () => {
     const actual = new Map(worldTools().map((tool) => [tool.name, toolSchemaDigest(tool)]));
     expect(actual.size).toBe(WORLD_TOOL_SCHEMA_ROOTS.length);
     for (const root of WORLD_TOOL_SCHEMA_ROOTS) {
       expect(actual.get(root.tool), `${root.world}/${root.tool}`).toBe(root.digest);
-      expect(root.source).toMatch(/^packages\/cortico-world-(opencode|codex)\//u);
+      expect(root.source).toMatch(/^(packages\/cortico-world-(opencode|codex|desktop-pet)\/|core\/browser\/)/u);
       expect(root.environment).toBe('coopanion-core');
     }
   });

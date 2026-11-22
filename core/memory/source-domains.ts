@@ -93,10 +93,7 @@ export interface SourceDomainStats {
   blocked: boolean;
 }
 
-/**
- * Content returned by a trusted readback boundary. D1 does not wire a production
- * provider; without one, classification writes fail closed.
- */
+/** Content from the exact Hindsight readback held only while one classification is committed. */
 export interface SourceDomainEvidence {
   bankId: string;
   endpoint: string;

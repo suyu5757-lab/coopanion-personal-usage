@@ -1446,6 +1446,21 @@ export class MemoryStateStore {
         throw new Error('source is superseded and cannot be classified');
       }
 
+      const existing = this.readSourceDomainRecord(input.bankId, input.endpoint, input.documentId);
+      if (existing && existing.state === input.state
+        && existing.taxonomyVersion === input.taxonomyVersion
+        && existing.classifierVersion === input.classifierVersion
+        && existing.confidence === input.confidence
+        && existing.sourceEpoch === epoch && existing.sourceRevision === revision
+        && existing.links.length === input.links.length
+        && existing.links.every((link) => {
+          const next = input.links.find((candidate) => candidate.domainId === link.domainId);
+          return !!next && link.linkState === next.linkState && link.confidence === next.confidence
+            && link.ruleId === next.ruleId && link.evidenceStart === next.evidenceStart
+            && link.evidenceEnd === next.evidenceEnd && link.evidenceDigest === next.evidenceDigest
+            && link.claimVerification === next.claimVerification;
+        })) return existing;
+
       this.db.prepare(`
         DELETE FROM source_domain_link WHERE bank_id = ? AND endpoint = ? AND document_id = ?
       `).run(input.bankId, input.endpoint, input.documentId);

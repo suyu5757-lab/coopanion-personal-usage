@@ -8,6 +8,7 @@ const visible = (element: HTMLElement): boolean =>
 export interface ChatGPTUserTurnBaseline {
   count: number;
   last: HTMLElement | null;
+  assistantCount: number;
 }
 
 export type ChatGPTImageTaskStatus = 'prompt_submitted' | 'generating' | 'image_available' | 'unknown' | 'failed';
@@ -43,14 +44,38 @@ export function chatGPTComposer(doc: Document, url: string): HTMLElement | null 
 const userTurns = (doc: Document): HTMLElement[] =>
   Array.from(doc.querySelectorAll<HTMLElement>('[data-message-author-role="user"]'));
 
+const assistantTurns = (doc: Document): HTMLElement[] =>
+  Array.from(doc.querySelectorAll<HTMLElement>('[data-message-author-role="assistant"]'));
+
 /** Captures the last visible turn before a single approved prompt is dispatched. */
 export function chatGPTUserTurnBaseline(doc: Document, url: string): ChatGPTUserTurnBaseline | null {
   if (!isChatGPTPage(url)) return null;
   const turns = userTurns(doc);
-  return { count: turns.length, last: turns.at(-1) ?? null };
+  return { count: turns.length, last: turns.at(-1) ?? null, assistantCount: assistantTurns(doc).length };
 }
 
-/** Accepts only a newly-added last user turn that exactly matches the submitted prompt. */
+/** Returns true when ChatGPT's live DOM shows an active response/image generation after dispatch. */
+export function chatGPTGenerationActive(doc: Document, url: string, baseline: ChatGPTUserTurnBaseline): boolean {
+  if (!isChatGPTPage(url)) return false;
+  const assistants = assistantTurns(doc);
+  if (assistants.length > baseline.assistantCount) return true;
+  const stopBtn = Array.from(doc.querySelectorAll<HTMLElement>('button[data-testid="stop-button"], button, [role="button"]'))
+    .some((el) => {
+      if (!visible(el)) return false;
+      if (el.getAttribute('data-testid') === 'stop-button') return true;
+      const label = [el.getAttribute('aria-label'), el.getAttribute('title'), el.innerText, el.textContent]
+        .filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+      return /stop generating|stop streaming|stop response|停止生成|停止响应|停止回答/u.test(label);
+    });
+  if (stopBtn) return true;
+  const lastAssistant = assistants.at(-1);
+  if (lastAssistant && (lastAssistant.getAttribute('aria-busy') === 'true' || !!lastAssistant.querySelector('[aria-busy="true"]'))) {
+    return true;
+  }
+  return false;
+}
+
+/** Accepts only a newly-added last user turn that matches the submitted prompt. */
 export function chatGPTSubmittedUserTurn(
   doc: Document,
   url: string,
@@ -60,10 +85,12 @@ export function chatGPTSubmittedUserTurn(
   if (!isChatGPTPage(url)) return { submitted: false };
   const turns = userTurns(doc);
   const turn = turns.at(-1);
-  if (!turn || turns.length <= baseline.count || turn === baseline.last) return { submitted: false };
+  if (!turn || (turns.length <= baseline.count && turn === baseline.last)) return { submitted: false };
   const text = (turn.innerText || turn.textContent || '').replace(/\s+/g, ' ').trim();
   const expected = prompt.replace(/\s+/g, ' ').trim();
-  if (!expected || text !== expected) return { submitted: false };
+  if (!expected) return { submitted: false };
+  const matched = text === expected || text.includes(expected) || (expected.length >= 16 && text.includes(expected.slice(0, 32)));
+  if (!matched) return { submitted: false };
   return {
     submitted: true,
     turn,

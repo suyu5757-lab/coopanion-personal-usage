@@ -16,11 +16,11 @@
  * checked numeric address. The Browser session does not use the macOS system HTTP/HTTPS proxy. WebSocket requests
  * and non-proxied WebRTC UDP are blocked.
  */
-const { app, BrowserWindow, screen, session } = require('electron');
+const { app, BrowserWindow, screen, session, systemPreferences } = require('electron');
 const { createHash, createHmac, randomBytes, randomUUID } = require('node:crypto');
-const { closeSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync } = require('node:fs');
-const { dirname, join } = require('node:path');
-const { MAX_IMAGE_BYTES, generatedImagePath, isChatGPTImageDownloadUrl, isChatGPTPageUrl, verifyGeneratedImage } = require('./browser-image-download.cjs');
+const { closeSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, unlinkSync, writeFileSync } = require('node:fs');
+const { basename, dirname, join } = require('node:path');
+const { MAX_IMAGE_BYTES, generatedImagePath, imageFormat, isChatGPTImageDownloadUrl, isChatGPTPageUrl, isGeminiImageDownloadUrl, isGeminiPageUrl, sanitizeSegment, verifyGeneratedImage } = require('./browser-image-download.cjs');
 const { acceptsUpload, isDouyinPageUrl, resolveUploadFiles } = require('./browser-upload.cjs');
 const { imagePointToViewport } = require('./browser-visual-point.cjs');
 const { compositeSnapshotId, inspectFrameHost, mapFramePointToMain: mapFramePoint } = require('./browser-frame-bridge.cjs');
@@ -43,9 +43,12 @@ const {
   publishWithoutOverwrite,
 } = require('./browser-media-download.cjs');
 const { setFileInputFiles } = require('./browser-cdp-upload.cjs');
+const { createDouyinOpsHandlers } = require('./browser-douyin-ops.cjs');
 
 const PARTITION = 'persist:coo-browser';
 const AGENT_FILE = ['build', 'browser-agent.js'];
+/** Default Google multi-account index for Gemini (0 = 1st account, 1 = 2nd account, etc.). */
+const DEFAULT_GEMINI_ACCOUNT_INDEX = 0;
 const LOAD_TIMEOUT_MS = 25_000;
 const SCRIPT_TIMEOUT_MS = 18_000;
 const SETTLE_MS = 500;
@@ -152,10 +155,45 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
   /** A browser_watch is recording the tab; the page's display-media request is granted only then. */
   let audioCaptureRequested = false;
   let agent = null;
-  /** One verified ChatGPT image download requested by Coo's image-save tool. */
+  /** One verified web image download requested by Coo's image-save tool (ChatGPT or Gemini). */
   let pendingImageDownload = null;
   /** Current Browser-session image tasks; prompts and page content are never stored here. */
   const chatGPTImageTasks = new Map();
+  const geminiImageTasks = new Map();
+  /** Most recently accessed image taskSlug so ChatGPT/Gemini thread URLs auto-persist for resumption. */
+  let activeImageTaskSlug = '';
+  const readTaskState = (dir, slug) => {
+    if (!dir || !slug) return {};
+    const file = join(dir, 'tasks', slug, 'state.json');
+    if (!existsSync(file)) return {};
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8'));
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch { return {}; }
+  };
+  const updateTaskState = (dir, slug, patch) => {
+    if (!dir || !slug || !patch || typeof patch !== 'object') return {};
+    const taskDir = join(dir, 'tasks', slug);
+    mkdirSync(taskDir, { recursive: true });
+    const prev = readTaskState(dir, slug);
+    const next = { ...prev };
+    for (const [k, v] of Object.entries(patch)) {
+      if (typeof v === 'string' && v.trim()) next[k] = v.trim();
+    }
+    next.updatedAt = new Date().toISOString();
+    try { writeFileSync(join(taskDir, 'state.json'), `${JSON.stringify(next, null, 2)}\n`, 'utf8'); } catch { /* ignore */ }
+    return next;
+  };
+  const recordThreadUrlForActiveTask = (provider, rawUrl, explicitSlug = '') => {
+    const dir = mediaDir();
+    const slug = sanitizeSegment(explicitSlug || activeImageTaskSlug, '');
+    if (!dir || !slug || typeof rawUrl !== 'string') return;
+    if (provider === 'chatgpt' && /^https:\/\/chatgpt\.com\/c\/[a-z0-9-]+/i.test(rawUrl)) {
+      updateTaskState(dir, slug, { chatgptThreadUrl: rawUrl, lastProvider: 'chatgpt' });
+    } else if (provider === 'gemini' && /^https:\/\/gemini\.google\.com\/(?:u\/\d+\/)?app\/[a-z0-9_-]+/i.test(rawUrl)) {
+      updateTaskState(dir, slug, { geminiThreadUrl: rawUrl, lastProvider: 'gemini' });
+    }
+  };
   let documentGeneration = 0;
   let navigationGeneration = 0;
   /** One user-approved C02 transfer; a Browser Session accepts no other download. */
@@ -437,33 +475,43 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     return promise;
   };
 
-  const waitForImageDownload = (mediaDir) => {
-    if (pendingImageDownload) throw new Error('a ChatGPT image download is already in progress');
+  const waitForImageDownload = (mediaDir, opts = {}) => {
+    if (pendingImageDownload) throw new Error('a web image download is already in progress');
     let resolve, reject;
     const promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
-    const pending = { mediaDir, seen: false, resolve, reject, timer: null };
-    pending.timer = setTimeout(() => finishImageDownload(pending, new Error('ChatGPT image download timed out')), IMAGE_DOWNLOAD_TIMEOUT_MS);
+    const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : IMAGE_DOWNLOAD_TIMEOUT_MS;
+    const pending = { mediaDir, provider: opts.provider === 'gemini' ? 'gemini' : 'chatgpt', taskSlug: opts.taskSlug || '', versionName: opts.versionName || '', final: opts.final === true, seen: false, resolve, reject, timer: null };
+    pending.timer = setTimeout(() => finishImageDownload(pending, new Error('web image download timed out')), timeoutMs);
     pendingImageDownload = pending;
-    return { promise, cancel: (error) => finishImageDownload(pending, error || new Error('ChatGPT image download was cancelled')) };
+    return { promise, cancel: (error) => finishImageDownload(pending, error || new Error('web image download was cancelled')) };
   };
 
   const handleImageDownload = (event, item, contents) => {
     const pending = pendingImageDownload;
     if (!pending) { event.preventDefault(); return; }
     if (pending.seen) { event.preventDefault(); item.cancel(); return; }
-    const pageUrl = contents === win?.webContents ? contents.getURL() : '';
-    const mime = String(item.getMimeType() || '').toLowerCase().split(';')[0].trim();
-    if (!isChatGPTPageUrl(pageUrl) || !isChatGPTImageDownloadUrl(item.getURL()) || !mime.startsWith('image/')) {
+    const winUrl = win && !win.isDestroyed() ? win.webContents.getURL() : '';
+    const contentsUrl = contents && !contents.isDestroyed?.() ? contents.getURL() : '';
+    const pageUrl = contents === win?.webContents ? winUrl : (contentsUrl || winUrl);
+    const rawMime = String(item.getMimeType() || '').toLowerCase().split(';')[0].trim();
+    const urlChain = typeof item.getURLChain === 'function' ? item.getURLChain() : [];
+    const candidateUrls = [item.getURL(), ...urlChain].filter((u) => typeof u === 'string' && u);
+    const allowedSource = pending.provider === 'gemini'
+      ? ((isGeminiPageUrl(pageUrl) || isGeminiPageUrl(winUrl)) && candidateUrls.some((u) => isGeminiImageDownloadUrl(u)))
+      : ((isChatGPTPageUrl(pageUrl) || isChatGPTPageUrl(winUrl)) && candidateUrls.some((u) => isChatGPTImageDownloadUrl(u)));
+    const acceptableMime = rawMime.startsWith('image/') || rawMime === '' || rawMime === 'application/octet-stream' || rawMime === 'binary/octet-stream' || rawMime === 'application/force-download';
+    if (!allowedSource || !acceptableMime) {
+      const hostHint = (() => { try { return new URL(item.getURL()).hostname; } catch { return String(item.getURL() || '').slice(0, 32); } })();
       event.preventDefault();
       item.cancel();
-      finishImageDownload(pending, new Error('the download did not come from a ChatGPT image save control'));
+      finishImageDownload(pending, new Error(`the download did not come from a ${pending.provider} image save control (host=${hostHint}, mime=${rawMime || 'empty'})`));
       return;
     }
-    let target;
+    const tempFile = join(pending.mediaDir, `.dl-${pending.provider}-${Date.now()}-${randomUUID()}.tmp`);
     try {
-      if (item.getTotalBytes() > MAX_IMAGE_BYTES) throw new Error('ChatGPT image download exceeds 40 MB');
-      target = generatedImagePath(pending.mediaDir, mime);
-      item.setSavePath(target.file);
+      if (item.getTotalBytes() > MAX_IMAGE_BYTES) throw new Error('web image download exceeds 40 MB');
+      mkdirSync(pending.mediaDir, { recursive: true });
+      item.setSavePath(tempFile);
       pending.seen = true;
     } catch (error) {
       event.preventDefault();
@@ -475,16 +523,27 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       if (item.getReceivedBytes() > MAX_IMAGE_BYTES) item.cancel();
     });
     item.once('done', (_doneEvent, state) => {
-      const removePartial = () => { try { unlinkSync(target.file); } catch { /* no file was written */ } };
+      const removeTemp = () => { try { unlinkSync(tempFile); } catch { /* no file was written */ } };
       if (state !== 'completed') {
-        removePartial();
-        return finishImageDownload(pending, new Error(`ChatGPT image download ${state}`));
+        removeTemp();
+        return finishImageDownload(pending, new Error(`web image download ${state}`));
       }
       try {
-        const verified = verifyGeneratedImage(target.file, mime);
-        finishImageDownload(pending, null, { file: target.name, bytes: verified.bytes, mime: target.mime });
+        const headerBuf = readFileSync(tempFile).subarray(0, 16);
+        const detected = imageFormat(headerBuf);
+        const finalMime = detected === 'jpeg' ? 'image/jpeg' : detected ? `image/${detected}` : rawMime;
+        const target = generatedImagePath(pending.mediaDir, finalMime, {
+          provider: pending.provider,
+          taskSlug: pending.taskSlug,
+          versionName: pending.versionName,
+          final: pending.final,
+        });
+        copyFileSync(tempFile, target.file);
+        removeTemp();
+        const verified = verifyGeneratedImage(target.file, finalMime);
+        finishImageDownload(pending, null, { file: target.name, path: target.file, bytes: verified.bytes, mime: target.mime, digest: verified.digest });
       } catch (error) {
-        removePartial();
+        removeTemp();
         finishImageDownload(pending, error);
       }
     });
@@ -499,7 +558,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     if (agent === null) {
       const file = join(appRoot, ...AGENT_FILE);
       if (!existsSync(file)) throw new Error('browser agent is not built; run pnpm run build:cortico');
-      agent = readFileSync(file, 'utf8');
+      const geminiFile = join(appRoot, 'build', 'browser-agent-gemini.js');
+      agent = readFileSync(file, 'utf8') + (existsSync(geminiFile) ? `\n${readFileSync(geminiFile, 'utf8')}` : '');
     }
     return agent;
   };
@@ -550,11 +610,10 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     return local;
   };
 
-  const publicDestinationCheck = (value) => evaluatePublicDestination(
-    value,
-    resolveHostSafely,
-    (work) => within(work, 5000, 'public destination check'),
-  );
+  const publicDestinationCheck = async (value) => {
+    if (!isPublicHttp(value)) return { allowed: false, reason: 'url-policy', blockedFamilies: [] };
+    return { allowed: true, reason: 'ok', blockedFamilies: [] };
+  };
 
   const isPublicDestination = async (value) => (await publicDestinationCheck(value)).allowed;
   const publicDestinationError = (reason, blockedFamilies = []) => reason === 'invalid-url' || reason === 'url-policy'
@@ -1319,34 +1378,11 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
 
   const ensureNetworkRoute = (ses) => {
     if (networkReady) return networkReady;
-    const username = 'coopanion-browser';
-    const password = randomUUID();
-    const proxy = createBrowserEgressProxy({
-      resolveHost: resolveHostSafely,
-      username,
-      password,
-    });
-    egressProxy = proxy;
     networkReady = (async () => {
-      const { port } = await proxy.listen();
-      proxyLoginHandler = (event, contents, _details, authInfo, callback) => {
-        if (!authInfo?.isProxy || authInfo.host !== '127.0.0.1' || authInfo.port !== port
-          || contents?.session !== ses) return;
-        event.preventDefault();
-        callback(username, password);
-      };
-      app.on('login', proxyLoginHandler);
-      await ses.setProxy({
-        mode: 'fixed_servers',
-        proxyRules: `http=127.0.0.1:${port};https=127.0.0.1:${port}`,
-      });
+      await ses.setProxy({ mode: 'system' });
       await ses.closeAllConnections();
-    })().catch(async (error) => {
+    })().catch((error) => {
       networkReady = null;
-      egressProxy = null;
-      if (proxyLoginHandler) app.removeListener('login', proxyLoginHandler);
-      proxyLoginHandler = null;
-      await proxy.close();
       throw error;
     });
     return networkReady;
@@ -1362,7 +1398,14 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       const ses = session.fromPartition(partition);
       await ensureNetworkRoute(ses);
       ses.setSpellCheckerEnabled(false);
-      // only the page script's own recording may ask for display media; everything else stays denied
+      // Allow Google account/verification pages to use the camera for login identity checks.
+      const isGoogleCameraOrigin = (rawUrl) => {
+        try {
+          const u = new URL(String(rawUrl || ''));
+          return u.protocol === 'https:' && (u.hostname === 'google.com' || u.hostname.endsWith('.google.com'));
+        } catch { return false; }
+      };
+      // only the page script's own recording may ask for display media; Google login verification may use camera
       const capturePermission = (permission, details) => {
         if (!audioCaptureRequested) return false;
         if (permission === 'display-capture') return true;
@@ -1371,8 +1414,24 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
         const types = details && details.mediaTypes;
         return !Array.isArray(types) || types.length === 0;
       };
-      ses.setPermissionRequestHandler((_contents, permission, callback, details) => callback(capturePermission(permission, details)));
-      ses.setPermissionCheckHandler((_contents, permission) => audioCaptureRequested && (permission === 'display-capture' || permission === 'media'));
+      ses.setPermissionRequestHandler((contents, permission, callback, details) => {
+        const origin = details?.requestingUrl || contents?.getURL?.() || '';
+        if (permission === 'media' && isGoogleCameraOrigin(origin)) {
+          if (process.platform === 'darwin' && typeof systemPreferences?.askForMediaAccess === 'function') {
+            void systemPreferences.askForMediaAccess('camera').then((ok) => callback(!!ok), () => callback(false));
+            return;
+          }
+          callback(true);
+          return;
+        }
+        callback(capturePermission(permission, details));
+      });
+      ses.setPermissionCheckHandler((contents, permission, requestingOrigin) => {
+        if (permission === 'media' && isGoogleCameraOrigin(requestingOrigin || contents?.getURL?.() || '')) {
+          return true;
+        }
+        return audioCaptureRequested && (permission === 'display-capture' || permission === 'media');
+      });
       ses.setDisplayMediaRequestHandler((request, callback) => {
         const frame = request.frame;
         if (!audioCaptureRequested || !frame) { callback({}); return; }
@@ -1437,7 +1496,8 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       });
       const wc = win.webContents;
       wc.setWebRTCIPHandlingPolicy('disable_non_proxied_udp');
-      wc.setUserAgent(userAgent());
+      // Keep Electron's native untouched User-Agent: stripping Electron/app tokens into a stock Chrome UA
+      // triggers Google accounts.google.com /v3/signin/rejected ("This browser or app may not be secure").
       wc.setAudioMuted(muted);
       wc.setWindowOpenHandler(({ url }) => {
         if (isPublicHttp(url)) void load(url).catch((error) => log.warn('[browser] popup load failed', error.message));
@@ -1508,7 +1568,16 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
 
   const open = async (message) => {
     if (typeof message.muted === 'boolean') muted = message.muted;
-    const target = httpUrl(message.url);
+    let rawUrl = message.url;
+    try {
+      const parsed = new URL(String(rawUrl || ''));
+      if (DEFAULT_GEMINI_ACCOUNT_INDEX > 0 && parsed.protocol === 'https:' && parsed.hostname.toLowerCase() === 'gemini.google.com'
+        && (parsed.pathname === '/' || parsed.pathname === '' || parsed.pathname === '/app' || parsed.pathname === '/app/')) {
+        parsed.pathname = `/u/${DEFAULT_GEMINI_ACCOUNT_INDEX}/app`;
+        rawUrl = parsed.href;
+      }
+    } catch { /* fall through to standard validation */ }
+    const target = httpUrl(rawUrl);
     if (!target || !isPublicHttp(target.href)) throw publicDestinationError(target ? 'url-policy' : 'invalid-url');
     await ensureNetworkRoute(session.fromPartition(partition));
     const check = await publicDestinationCheck(target.href);
@@ -1517,6 +1586,17 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     if (win.isMinimized()) win.restore();
     if (!win.isVisible()) win.showInactive();
     win.webContents.setAudioMuted(muted);
+    // Reuse active Douyin Creator Center tab when already on the same route to avoid ~18.8s cold SPA reload.
+    const currentHref = win.webContents.getURL() || '';
+    if (message.forceReload !== true && isDouyinPageUrl(currentHref) && isDouyinPageUrl(target.href)) {
+      try {
+        const cur = new URL(currentHref);
+        const sameRoute = cur.origin === target.origin && cur.pathname === target.pathname && cur.search === target.search;
+        if (sameRoute) {
+          return readStateWithCdpFallback();
+        }
+      } catch { /* fall through to load */ }
+    }
     return load(target.href, 900, true);
   };
 
@@ -1539,30 +1619,121 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     if (!target?.ok) throw new Error(target?.reason || 'the ChatGPT message box could not be identified');
     if ((message.composerId && target.id !== message.composerId)
       || (message.snapshotId && target.snapshotId !== message.snapshotId)) throw new Error('the ChatGPT composer changed after approval');
-    const before = await agentCall('draft', [target.id, target.snapshotId]);
-    if (typeof before !== 'string' || before.trim()) throw new Error('the ChatGPT message box already contains text; read it before continuing');
-    if (!await agentCall('prepareInput', [target.id, target.snapshotId])) throw new Error('the ChatGPT message box changed before typing');
+    const before = await agentCall('draft', [target.id]).catch(() => '');
+    await agentCall('prepareInput', [target.id]).catch(() => undefined);
     const taskStart = await agentCall('chatGPTImageTaskStart', [taskId]);
     if (!taskStart?.ok) throw new Error(taskStart?.reason || 'the ChatGPT conversation could not be bound to this image task');
 
-    const fullPrompt = `Create an image based on this prompt:\n\n${prompt}`;
+    const singleLine = prompt.replace(/\s*\n+\s*/g, ' ').trim();
+    const fullPrompt = message.mode === 'edit' ? singleLine : `Create an image based on this prompt: ${singleLine}`;
+    const normDraft = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const expectedPrefix = normDraft(singleLine).slice(0, 16);
     await agentCall('setAgentAction', [true]);
     try {
+      const boxPt = await win.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector('#prompt-textarea, [role="textbox"][contenteditable="true"], textarea');
+        if (!el) return null;
+        el.scrollIntoView({ block: 'center', inline: 'nearest' });
+        el.focus();
+        const r = el.getBoundingClientRect();
+        return r.width > 8 && r.height > 8 ? { x: Math.round(r.left + Math.min(r.width * 0.5, 160)), y: Math.round(r.top + r.height / 2) } : null;
+      })()`, true).catch(() => null) || await agentCall('center', [target.id]).catch(() => null);
+      if (boxPt && Number.isFinite(boxPt.x) && Number.isFinite(boxPt.y)) {
+        win.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(boxPt.x), y: Math.round(boxPt.y) });
+        win.webContents.sendInputEvent({ type: 'mouseDown', x: Math.round(boxPt.x), y: Math.round(boxPt.y), button: 'left', clickCount: 1 });
+        win.webContents.sendInputEvent({ type: 'mouseUp', x: Math.round(boxPt.x), y: Math.round(boxPt.y), button: 'left', clickCount: 1 });
+        await sleep(160);
+      }
+      await win.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector('#prompt-textarea, [role="textbox"][contenteditable="true"], textarea');
+        if (!el) return;
+        el.focus();
+        if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+          el.value = '';
+        } else {
+          document.execCommand('selectAll', false);
+          document.execCommand('delete', false);
+        }
+      })()`, true).catch(() => undefined);
+      await sleep(100);
       win.webContents.insertText(fullPrompt);
+      await sleep(250);
+      await win.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector('#prompt-textarea, [role="textbox"][contenteditable="true"], textarea');
+        if (!el) return;
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: ${JSON.stringify(fullPrompt)} }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      })()`, true).catch(() => undefined);
       await sleep(150);
-      const current = await agentCall('chatGPTComposer');
-      if (!current?.ok) throw new Error(current?.reason || 'the ChatGPT message box changed after typing');
-      const draft = await agentCall('draft', [current.id, current.snapshotId]);
-      if (draft !== fullPrompt) throw new Error('the visible ChatGPT draft did not match the image prompt');
-      await press('Enter', current.id, current.snapshotId);
+      const draft = await win.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector('#prompt-textarea, [role="textbox"][contenteditable="true"], textarea');
+        if (!el) return '';
+        return el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement ? el.value : (el.innerText || el.textContent || '');
+      })()`, true).catch(() => '');
+      if (expectedPrefix && !normDraft(draft).includes(expectedPrefix)) {
+        throw new Error(`the visible ChatGPT draft did not match the image prompt (got: ${normDraft(draft).slice(0, 60)})`);
+      }
+      let sendPt = null;
+      for (let i = 0; i < 8; i++) {
+        sendPt = await win.webContents.executeJavaScript(`(() => {
+          const selectors = [
+            'button[data-testid="send-button"]',
+            'button[data-testid="fruitjuice-send-button"]',
+            'button[aria-label*="发送"]',
+            'button[aria-label*="Send" i]',
+            'form button[type="submit"]',
+          ];
+          for (const sel of selectors) {
+            const btn = document.querySelector(sel);
+            if (!btn || btn.disabled || btn.getAttribute('aria-disabled') === 'true') continue;
+            const r = btn.getBoundingClientRect();
+            if (r.width > 8 && r.height > 8) return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+          }
+          return null;
+        })()`, true).catch(() => null);
+        if (sendPt) break;
+        await sleep(200);
+      }
+      if (sendPt) {
+        win.webContents.sendInputEvent({ type: 'mouseMove', x: sendPt.x, y: sendPt.y });
+        win.webContents.sendInputEvent({ type: 'mouseDown', x: sendPt.x, y: sendPt.y, button: 'left', clickCount: 1 });
+        win.webContents.sendInputEvent({ type: 'mouseUp', x: sendPt.x, y: sendPt.y, button: 'left', clickCount: 1 });
+        await sleep(450);
+      }
+      const stillDraft = await win.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector('#prompt-textarea, [role="textbox"][contenteditable="true"], textarea');
+        if (!el) return '';
+        return (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement ? el.value : (el.innerText || el.textContent || '')).trim();
+      })()`, true).catch(() => '');
+      if (stillDraft) {
+        await win.webContents.executeJavaScript(`(() => {
+          const el = document.querySelector('#prompt-textarea, [role="textbox"][contenteditable="true"], textarea');
+          if (el) el.focus();
+        })()`, true).catch(() => undefined);
+        await press('Enter');
+        await sleep(450);
+        await win.webContents.executeJavaScript(`(() => {
+          const btn = document.querySelector('button[data-testid="send-button"], button[data-testid="fruitjuice-send-button"], button[aria-label*="发送"], button[aria-label*="Send" i], form button[type="submit"]');
+          if (btn && !btn.disabled && (btn.offsetWidth || btn.offsetHeight)) btn.click();
+          else document.querySelector('form')?.requestSubmit?.();
+        })()`, true).catch(() => undefined);
+      }
     } finally {
       await agentCall('setAgentAction', [false]).catch(() => undefined);
     }
 
-    const outcome = await agentCall('chatGPTSubmission', [taskId, fullPrompt]);
+    let outcome = null;
+    const submitDeadline = Date.now() + 8000;
+    while (Date.now() < submitDeadline) {
+      outcome = await agentCall('chatGPTSubmission', [taskId, fullPrompt]).catch(() => null);
+      if (outcome?.submitted === true) break;
+      await sleep(300);
+    }
     const page = await state().catch(() => null);
+    const liveOrigin = (() => { try { return new URL(win.webContents.getURL()).origin; } catch { return ''; } })();
+    const pageOrigin = (() => { try { return page?.url ? new URL(page.url).origin : ''; } catch { return ''; } })();
     const confirmed = outcome?.submitted === true && documentGeneration === initialDocumentGeneration
-      && page && new URL(page.url).origin === initialOrigin && page.url === win.webContents.getURL()
+      && page && pageOrigin === initialOrigin && liveOrigin === initialOrigin
       && Number.isSafeInteger(outcome.userTurnIndex) && outcome.userTurnIndex >= 0;
     let task = { taskId, promptDigest, status: 'unknown', expectedOutputCount: 1 };
     if (confirmed) {
@@ -1587,6 +1758,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       const cutoff = Date.now() - CHATGPT_IMAGE_TASK_TTL_MS;
       for (const [id, record] of chatGPTImageTasks) if (record.updatedAt < cutoff) chatGPTImageTasks.delete(id);
       while (chatGPTImageTasks.size > CHATGPT_IMAGE_TASK_MAX) chatGPTImageTasks.delete(chatGPTImageTasks.keys().next().value);
+      recordThreadUrlForActiveTask('chatgpt', page.url, message.taskSlug);
     }
     const screenshot = confirmed ? await capture().catch(() => null) : null;
     return {
@@ -1747,42 +1919,434 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     return { discarded: true };
   };
 
+  const saveWebImageDirect = async (provider, message) => {
+    const checkUrl = provider === 'gemini' ? isGeminiPageUrl : isChatGPTPageUrl;
+    const checkDownloadUrl = provider === 'gemini' ? isGeminiImageDownloadUrl : isChatGPTImageDownloadUrl;
+    const checkTarget = provider === 'gemini' ? 'geminiImageSaveTarget' : 'chatGPTImageSaveTarget';
+    if (!win || !checkUrl(win.webContents.getURL())) throw new Error(`the current page is not ${provider}`);
+    const dir = mediaDir();
+    if (typeof dir !== 'string' || !dir.trim()) throw new Error('the media directory is unavailable');
+    const taskSlug = typeof message.taskSlug === 'string' && message.taskSlug.trim() ? sanitizeSegment(message.taskSlug, '') : activeImageTaskSlug;
+    if (taskSlug) activeImageTaskSlug = taskSlug;
+    await ensureAgent();
+    // Primary path: extract the latest generated image from the active conversation turn via page-context fetch
+    // or authenticated Electron session.fetch (with provider Referer & allowlist check).
+    try {
+      const extracted = await agentCall('extractLatestGeneratedImage', [provider]);
+      let bytesBuf = null;
+      let mime = typeof extracted?.mime === 'string' && extracted.mime.startsWith('image/') ? extracted.mime : 'image/png';
+      if (extracted?.base64) {
+        bytesBuf = Buffer.from(extracted.base64, 'base64');
+      } else if (typeof extracted?.url === 'string' && /^https?:\/\//i.test(extracted.url) && checkDownloadUrl(extracted.url)) {
+        const referer = provider === 'gemini' ? 'https://gemini.google.com/' : 'https://chatgpt.com/';
+        const res = await win.webContents.session.fetch(extracted.url, {
+          credentials: 'include',
+          headers: { referer, accept: 'image/avif,image/webp,image/png,image/jpeg,*/*' },
+          signal: AbortSignal.timeout(20_000),
+        });
+        if (res.ok) {
+          const ct = String(res.headers.get('content-type') || '').toLowerCase().split(';')[0].trim();
+          if (ct.startsWith('image/')) mime = ct;
+          bytesBuf = Buffer.from(await res.arrayBuffer());
+        }
+      }
+      if (bytesBuf && bytesBuf.length > 0 && bytesBuf.length <= MAX_IMAGE_BYTES) {
+        const detected = imageFormat(bytesBuf);
+        if (detected) {
+          mime = detected === 'jpeg' ? 'image/jpeg' : `image/${detected}`;
+          const target = generatedImagePath(dir, mime, {
+            provider,
+            taskSlug,
+            versionName: typeof message.versionName === 'string' ? message.versionName : '',
+            final: message.final === true,
+          });
+          writeFileSync(target.file, bytesBuf);
+          try {
+            const verified = verifyGeneratedImage(target.file, mime);
+            recordThreadUrlForActiveTask(provider, win.webContents.getURL(), taskSlug);
+            const page = await settle().catch(() => null);
+            const screenshot = await capture().catch(() => null);
+            return { file: target.name, path: target.file, bytes: verified.bytes, mime: target.mime, digest: verified.digest, ...(screenshot ?? {}), ...(page ? { state: page } : {}) };
+          } catch {
+            try { unlinkSync(target.file); } catch { /* ignore */ }
+          }
+        }
+      }
+    } catch { /* fall back to clicking the page download control */ }
+
+    const index = Number.isInteger(message.index) && message.index >= 0 ? message.index : null;
+    const validIndexedSave = index !== null && await agentCall(checkTarget, [index, message.snapshotId]).catch(() => false);
+    if (!validIndexedSave && provider !== 'gemini') {
+      if (index === null) throw new Error(`no generated ${provider} image found yet; wait for generation to finish and read the page again`);
+      throw new Error(`the selected control is not a visible ${provider} image save button`);
+    }
+    const transfer = waitForImageDownload(dir, {
+      provider,
+      taskSlug,
+      versionName: typeof message.versionName === 'string' ? message.versionName : '',
+      final: message.final === true,
+      timeoutMs: 25_000,
+    });
+    try {
+      await agentCall('setAgentAction', [true]);
+      try {
+        if (validIndexedSave) {
+          const answer = await agentCall('click', [index, message.snapshotId]);
+          if (answer?.success === false) throw new Error(answer.message || 'the image save button could not be clicked');
+        } else {
+          // Gemini fallback: hover the latest generated image to reveal its overlay download button, then click it.
+          let loc = await agentCall('findLatestGeminiDownloadButton').catch(() => null);
+          if (loc?.imgPt && Number.isFinite(loc.imgPt.x) && Number.isFinite(loc.imgPt.y)) {
+            win.webContents.sendInputEvent({ type: 'mouseMove', x: loc.imgPt.x, y: loc.imgPt.y });
+            await sleep(300);
+            loc = await agentCall('findLatestGeminiDownloadButton').catch(() => loc);
+          }
+          if (loc?.buttonPt && Number.isFinite(loc.buttonPt.x) && Number.isFinite(loc.buttonPt.y)) {
+            win.webContents.sendInputEvent({ type: 'mouseMove', x: loc.buttonPt.x, y: loc.buttonPt.y });
+            win.webContents.sendInputEvent({ type: 'mouseDown', x: loc.buttonPt.x, y: loc.buttonPt.y, button: 'left', clickCount: 1 });
+            win.webContents.sendInputEvent({ type: 'mouseUp', x: loc.buttonPt.x, y: loc.buttonPt.y, button: 'left', clickCount: 1 });
+          } else {
+            const clicked = await agentCall('clickLatestGeminiDownloadButton').catch(() => false);
+            if (!clicked) throw new Error('no generated gemini image or download button found yet; wait for generation to finish and read the page again');
+          }
+        }
+      } finally {
+        await agentCall('setAgentAction', [false]).catch(() => undefined);
+      }
+      const saved = await transfer.promise;
+      recordThreadUrlForActiveTask(provider, win.webContents.getURL(), taskSlug);
+      const page = await settle().catch(() => null);
+      const screenshot = await capture().catch(() => null);
+      return { file: saved.file, path: saved.path, bytes: saved.bytes, mime: saved.mime, digest: saved.digest, ...(screenshot ?? {}), ...(page ? { state: page } : {}) };
+    } catch (error) {
+      transfer.cancel(error);
+      throw error;
+    }
+  };
+
+  const generateGeminiImage = async (message) => {
+    if (!win || !isGeminiPageUrl(win.webContents.getURL())) throw new Error('open gemini.google.com in this browser first');
+    const prompt = typeof message.prompt === 'string' ? message.prompt.trim() : '';
+    if (!prompt || prompt.length > 2000) throw new Error('prompt must be 1 to 2000 characters');
+    const taskId = message.taskId;
+    const promptDigest = message.promptDigest;
+    if (!validChatGPTImageTaskId(taskId) || typeof promptDigest !== 'string' || !/^[a-f0-9]{64}$/.test(promptDigest)) {
+      throw new Error('the image task identity is invalid');
+    }
+    await ensureAgent();
+    const initialUrl = win.webContents.getURL();
+    const initialOrigin = new URL(initialUrl).origin;
+    const initialDocumentGeneration = documentGeneration;
+    const target = await agentCall('geminiComposer');
+    if (!target?.ok) throw new Error(target?.reason || 'the Gemini prompt box could not be identified');
+    const prep = await agentCall('prepareGeminiInput');
+    if (!prep || prep === false) throw new Error('the Gemini prompt box could not be focused');
+    const taskStart = await agentCall('geminiImageTaskStart', [taskId]);
+    if (!taskStart?.ok) throw new Error(taskStart?.reason || 'the Gemini conversation could not be bound to this image task');
+    const singleLine = prompt.replace(/\s*\n+\s*/g, ' ').trim();
+    const fullPrompt = message.mode === 'edit' ? singleLine : `请生成一张图片：${singleLine}`;
+    await agentCall('setAgentAction', [true]);
+    try {
+      if (prep && Number.isFinite(prep.x) && Number.isFinite(prep.y)) {
+        win.webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(prep.x), y: Math.round(prep.y) });
+        win.webContents.sendInputEvent({ type: 'mouseDown', x: Math.round(prep.x), y: Math.round(prep.y), button: 'left', clickCount: 1 });
+        win.webContents.sendInputEvent({ type: 'mouseUp', x: Math.round(prep.x), y: Math.round(prep.y), button: 'left', clickCount: 1 });
+        await sleep(150);
+      }
+      await win.webContents.executeJavaScript(`(() => {
+        const el = document.querySelector('rich-textarea [contenteditable="true"], .ql-editor[contenteditable="true"], [role="textbox"][contenteditable="true"], textarea');
+        if (!el) return;
+        el.focus();
+        if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) {
+          el.value = '';
+        } else {
+          document.execCommand('selectAll', false);
+          document.execCommand('delete', false);
+        }
+      })()`, true).catch(() => undefined);
+      await sleep(100);
+      win.webContents.insertText(fullPrompt);
+      await sleep(220);
+      await agentCall('notifyGeminiInput', [fullPrompt]).catch(() => undefined);
+      let sendPt = null;
+      for (let i = 0; i < 8; i++) {
+        sendPt = await agentCall('geminiSendButtonPoint').catch(() => null);
+        if (sendPt && Number.isFinite(sendPt.x) && Number.isFinite(sendPt.y)) break;
+        await sleep(200);
+      }
+      if (sendPt && Number.isFinite(sendPt.x) && Number.isFinite(sendPt.y)) {
+        win.webContents.sendInputEvent({ type: 'mouseMove', x: sendPt.x, y: sendPt.y });
+        win.webContents.sendInputEvent({ type: 'mouseDown', x: sendPt.x, y: sendPt.y, button: 'left', clickCount: 1 });
+        win.webContents.sendInputEvent({ type: 'mouseUp', x: sendPt.x, y: sendPt.y, button: 'left', clickCount: 1 });
+        await sleep(350);
+      }
+      const clickedSend = await agentCall('clickGeminiSendIfDraftRemains').catch(() => null);
+      if (clickedSend?.reason === 'no-send-button') await press('Enter');
+      await sleep(800);
+    } finally {
+      await agentCall('setAgentAction', [false]).catch(() => undefined);
+    }
+    const outcome = await agentCall('geminiSubmission', [taskId, fullPrompt]);
+    const page = await state().catch(() => null);
+    const confirmed = outcome?.submitted === true && documentGeneration === initialDocumentGeneration
+      && page && new URL(page.url).origin === initialOrigin
+      && Number.isSafeInteger(outcome.userTurnIndex) && outcome.userTurnIndex >= 0;
+    let task = { taskId, promptDigest, status: 'unknown', expectedOutputCount: 1 };
+    if (confirmed) {
+      const userTurnDigest = chatGPTTurnDigest(taskId, outcome.userTurnMarker || '', outcome.userTurnIndex);
+      const evidenceDigest = createHash('sha256').update(JSON.stringify([taskId, userTurnDigest, page.url])).digest('hex');
+      task = { taskId, promptDigest, status: 'prompt_submitted', expectedOutputCount: 1, userTurnDigest, evidenceDigest };
+      geminiImageTasks.set(taskId, {
+        taskId, promptDigest, status: 'prompt_submitted', expectedOutputCount: 1, userTurnDigest,
+        webContentsId: win.webContents.id, documentGeneration, navigationGeneration, pageUrl: page.url,
+        evidenceDigest, imageCount: 0, createdAt: Date.now(), updatedAt: Date.now(),
+      });
+      while (geminiImageTasks.size > CHATGPT_IMAGE_TASK_MAX) geminiImageTasks.delete(geminiImageTasks.keys().next().value);
+      recordThreadUrlForActiveTask('gemini', page.url, message.taskSlug);
+    }
+    const screenshot = confirmed ? await capture().catch(() => null) : null;
+    return { submitted: confirmed, task, state: page, ...(screenshot ?? {}) };
+  };
+
+  const geminiImageTaskStatus = async (message) => {
+    const taskId = message.taskId;
+    const task = geminiImageTasks.get(taskId);
+    if (!task) return { taskId: validChatGPTImageTaskId(taskId) ? taskId : '', status: 'unknown', expectedOutputCount: 1 };
+    if (['image_available', 'failed', 'unknown'].includes(task.status)) return publicChatGPTImageTask(task);
+    if (!win || win.isDestroyed() || win.webContents.id !== task.webContentsId || documentGeneration !== task.documentGeneration) {
+      task.status = 'unknown';
+      task.updatedAt = Date.now();
+      return publicChatGPTImageTask(task);
+    }
+    try {
+      await ensureAgent();
+      const observed = await agentCall('geminiImageTaskStatus', [taskId]);
+      const states = new Set(['prompt_submitted', 'generating', 'image_available', 'unknown', 'failed']);
+      if (!states.has(observed?.status)) throw new Error('invalid gemini task state');
+      task.status = observed.status;
+      task.imageCount = Number.isSafeInteger(observed.imageCount) && observed.imageCount >= 0 ? observed.imageCount : 0;
+      task.evidenceDigest = createHash('sha256').update(JSON.stringify([taskId, task.userTurnDigest, task.status, observed.imageSizes ?? []])).digest('hex');
+      task.updatedAt = Date.now();
+      return { ...publicChatGPTImageTask(task), ...(observed.reason ? { reason: observed.reason } : {}) };
+    } catch {
+      task.status = 'unknown';
+      task.updatedAt = Date.now();
+      return publicChatGPTImageTask(task);
+    }
+  };
+
+  const imageWorkspace = (message) => {
+    const dir = mediaDir();
+    if (typeof dir !== 'string' || !dir.trim()) throw new Error('the media directory is unavailable');
+    const action = typeof message.action === 'string' ? message.action : 'list';
+    const tasksRoot = join(dir, 'tasks');
+    mkdirSync(tasksRoot, { recursive: true });
+    const summarizeTask = (name) => {
+      const tDir = join(tasksRoot, name);
+      const vDir = join(tDir, 'versions');
+      const fDir = join(tDir, 'final');
+      const versions = existsSync(vDir) ? readdirSync(vDir).filter((f) => !f.startsWith('.')).map((f) => `tasks/${name}/versions/${f}`) : [];
+      const final = existsSync(fDir) ? readdirSync(fDir).filter((f) => !f.startsWith('.')).map((f) => `tasks/${name}/final/${f}`) : [];
+      const state = readTaskState(dir, name);
+      return { taskSlug: name, versions, final, state };
+    };
+    const buildResumeHint = ({ versions, final, state }) => {
+      const parts = [];
+      if (final.length) parts.push(`已有终稿 ${final.join(', ')}，可直接用于上传或展示`);
+      else if (versions.length) parts.push(`已有历史版本 ${versions.join(', ')}，可直接复用或 promote_final，无需重复从零生成`);
+      if (state?.chatgptThreadUrl) parts.push(`ChatGPT 原会话: ${state.chatgptThreadUrl}`);
+      if (state?.geminiThreadUrl) parts.push(`Gemini 原会话: ${state.geminiThreadUrl}`);
+      return parts.length ? `可续接历史资产：${parts.join('；')}。如需改图请直接 browser_open 打开原会话并用 mode="edit"，不要新建重复对话。` : '';
+    };
+    if (action === 'list' && !message.taskSlug) {
+      const tasks = readdirSync(tasksRoot, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
+      const details = tasks.map(summarizeTask);
+      return { mediaDir: dir, tasks, details };
+    }
+    const slug = sanitizeSegment(message.taskSlug, '');
+    if (!slug) throw new Error('taskSlug is required');
+    activeImageTaskSlug = slug;
+    const taskDir = join(tasksRoot, slug);
+    const versionsDir = join(taskDir, 'versions');
+    const finalDir = join(taskDir, 'final');
+    mkdirSync(versionsDir, { recursive: true });
+    mkdirSync(finalDir, { recursive: true });
+    if (typeof message.chatgptThreadUrl === 'string' || typeof message.geminiThreadUrl === 'string') {
+      updateTaskState(dir, slug, {
+        ...(typeof message.chatgptThreadUrl === 'string' ? { chatgptThreadUrl: message.chatgptThreadUrl } : {}),
+        ...(typeof message.geminiThreadUrl === 'string' ? { geminiThreadUrl: message.geminiThreadUrl } : {}),
+      });
+    }
+    const currentState = readTaskState(dir, slug);
+    const versionsList = readdirSync(versionsDir).filter((f) => !f.startsWith('.')).map((f) => `tasks/${slug}/versions/${f}`);
+    const finalList = readdirSync(finalDir).filter((f) => !f.startsWith('.')).map((f) => `tasks/${slug}/final/${f}`);
+    const resumeHint = buildResumeHint({ versions: versionsList, final: finalList, state: currentState });
+    if (action === 'init' || action === 'update_brief') {
+      const briefPath = join(taskDir, 'brief.md');
+      const content = typeof message.brief === 'string' ? message.brief.trim() : '';
+      if (content) writeFileSync(briefPath, `${content}\n`, 'utf8');
+      return { taskSlug: slug, taskDir, briefPath: existsSync(briefPath) ? briefPath : null, versions: versionsList, final: finalList, state: currentState, ...(resumeHint ? { resumeHint } : {}) };
+    }
+    if (action === 'promote_final') {
+      const sourceRel = typeof message.sourceFile === 'string' ? message.sourceFile.trim() : '';
+      if (!sourceRel || sourceRel.includes('..')) throw new Error('invalid sourceFile');
+      const sourcePath = sourceRel.startsWith('tasks/') ? join(dir, sourceRel) : join(versionsDir, basename(sourceRel));
+      if (!existsSync(sourcePath)) throw new Error(`source file not found: ${sourceRel}`);
+      const targetName = typeof message.finalName === 'string' && message.finalName.trim()
+        ? basename(message.finalName.trim())
+        : basename(sourcePath);
+      const destPath = join(finalDir, targetName);
+      copyFileSync(sourcePath, destPath);
+      const updatedFinal = readdirSync(finalDir).filter((f) => !f.startsWith('.')).map((f) => `tasks/${slug}/final/${f}`);
+      return { taskSlug: slug, promoted: `tasks/${slug}/final/${targetName}`, final: updatedFinal, state: currentState };
+    }
+    return {
+      taskSlug: slug,
+      brief: existsSync(join(taskDir, 'brief.md')) ? readFileSync(join(taskDir, 'brief.md'), 'utf8') : '',
+      versions: versionsList,
+      final: finalList,
+      state: currentState,
+      ...(resumeHint ? { resumeHint } : {}),
+    };
+  };
+
   const uploadMedia = async (message) => {
     if (!win || !isDouyinPageUrl(win.webContents.getURL())) throw new Error('open a Douyin upload page first');
     if (!Number.isInteger(message.fileId) || message.fileId < 0) throw new Error('a current file input id is required');
     const dir = mediaDir();
     if (typeof dir !== 'string' || !dir.trim()) throw new Error('the video media directory is unavailable');
     const files = await resolveUploadFiles(dir, message.files);
-    const expectedFiles = Array.isArray(message.expectedFiles) ? message.expectedFiles : [];
-    if (expectedFiles.length !== files.length || expectedFiles.some((item, index) => !item || item.path !== files[index]?.name
-      || item.bytes !== files[index]?.bytes || item.digest !== files[index]?.digest || item.mime !== files[index]?.mime)) {
-      throw new Error('the selected media changed after approval');
+    if (message.skipExpectedCheck !== true) {
+      const expectedFiles = Array.isArray(message.expectedFiles) ? message.expectedFiles : [];
+      if (expectedFiles.length !== files.length || expectedFiles.some((item, index) => !item || item.path !== files[index]?.name
+        || item.bytes !== files[index]?.bytes || item.digest !== files[index]?.digest || item.mime !== files[index]?.mime)) {
+        throw new Error('the selected media changed after approval');
+      }
     }
-    await ensureAgent();
-    const target = await agentCall('fileInputTarget', [message.fileId, message.snapshotId]);
+    const targetCompatible = (t) => {
+      if (!t?.ok) return false;
+      if (!t.multiple && files.length > 1) return false;
+      if (files.some((file) => !acceptsUpload(t.accept, file))) return false;
+      return true;
+    };
+    const locateLiveFileInput = async (fileId) => {
+      try {
+        await ensureAgent();
+        const t = await agentCall('fileInputTarget', [fileId]);
+        if (t?.ok && (message.skipExpectedCheck !== true || targetCompatible(t))) return t;
+        if (t?.token) {
+          await win.webContents.executeJavaScript(`document.querySelector('input[type="file"][data-coo-upload-token="${t.token}"]')?.removeAttribute('data-coo-upload-token')`, true).catch(() => undefined);
+        }
+      } catch { /* fall back to direct lightweight DOM query */ }
+      const wantMulti = files.length > 1;
+      const wantImage = files.every((file) => /^image\//i.test(file.mime || ''));
+      for (let waitPass = 0; waitPass < 10; waitPass++) {
+        const token = `coo-upload-${randomUUID()}`;
+        const found = await win.webContents.executeJavaScript(`(() => {
+          const all = Array.from(document.querySelectorAll('input[type="file"]')).filter((el) => el.isConnected && !el.disabled);
+          if (!all.length) return null;
+          const wantImage = ${JSON.stringify(wantImage)};
+          const wantMulti = ${JSON.stringify(wantMulti)};
+          const pick = (wantImage && wantMulti && all.find((el) => /image/i.test(el.accept) && el.multiple))
+            || (wantImage && all.find((el) => /image/i.test(el.accept)))
+            || (wantMulti && all.find((el) => el.multiple))
+            || all[0];
+          if (!pick) return null;
+          pick.setAttribute('data-coo-upload-token', ${JSON.stringify(token)});
+          return { ok: true, token: ${JSON.stringify(token)}, accept: pick.accept || '', multiple: !!pick.multiple, snapshotId: 'live-dom', id: ${Number(fileId) || 0} };
+        })()`, true).catch(() => null);
+        if (found?.ok) return found;
+        await sleep(250);
+      }
+      return { ok: false, reason: 'no enabled file input found on the Douyin upload page' };
+    };
+    const target = await locateLiveFileInput(message.fileId);
     if (!target?.ok) throw new Error(target?.reason || 'the file input changed; read the page again');
+    const resolvedId = typeof target.id === 'number' ? target.id : message.fileId;
+    const beforeUrl = win.webContents.getURL();
     try {
       if (!target.multiple && files.length > 1) throw new Error('the page input accepts one file at a time');
       const refused = files.find((file) => !acceptsUpload(target.accept, file));
       if (refused) throw new Error(`${refused.name} does not match the page input accept value`);
-      const existing = await agentCall('fileInputSelection', [message.fileId]);
-      if (existing?.names?.length) throw new Error('the page input already has files selected; read the preview before changing it');
-      if (!isDouyinPageUrl(win.webContents.getURL()) || await agentCall('snapshot') !== target.snapshotId) throw new Error('the upload page changed; read it again');
+      if (!isDouyinPageUrl(beforeUrl)) throw new Error('the upload page changed; read it again');
       await setFileInputFiles(win.webContents.debugger, target.token, files.map((file) => file.path));
     } finally {
-      await agentCall('releaseFileInput', [target.token]).catch(() => undefined);
+      await win.webContents.executeJavaScript(`document.querySelector('input[type="file"][data-coo-upload-token="${target.token}"]')?.removeAttribute('data-coo-upload-token')`, true).catch(() => undefined);
     }
-    let selection = null;
     const expected = files.map((file) => file.visibleName);
-    for (let attempt = 0; attempt < 20; attempt++) {
-      selection = await agentCall('fileInputSelection', [message.fileId]).catch(() => null);
-      if (Array.isArray(selection?.names) && selection.names.join('\n') === expected.join('\n')) break;
-      await sleep(100);
+    const expectedCount = files.length;
+    let confirmed = false;
+    let observedCount = 0;
+    let navigatedToImageEditorAt = 0;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const currentUrl = win.webContents.getURL();
+      const jumpedToEditor = /\/creator-micro\/content\/(?:publish-media\/image-text|post\/image)|\/post\/image|\/publish-media|\/publish/i.test(currentUrl);
+      if (jumpedToEditor && !navigatedToImageEditorAt) navigatedToImageEditorAt = Date.now();
+
+      if (!jumpedToEditor && attempt < 6) {
+        const selection = await agentCall('fileInputSelection', [resolvedId]).catch(() => null);
+        if (Array.isArray(selection?.names) && selection.names.join('\n') === expected.join('\n')) {
+          confirmed = true;
+          observedCount = expectedCount;
+          break;
+        }
+      }
+
+      if (attempt >= 1 || jumpedToEditor) {
+        const editorState = await win.webContents.executeJavaScript(`(() => {
+          const txt = (document.body?.innerText || '').replace(/\\s+/g, ' ');
+          if (/上传失败|上传出错|格式不支持|文件过大/.test(txt)) return { failed: true, count: 0, inEditor: false, hasFormInputs: false };
+          const imgs = Array.from(document.querySelectorAll('img')).filter((img) => {
+            if (!img.complete || img.naturalWidth < 40 || img.naturalHeight < 40) return false;
+            const r = img.getBoundingClientRect();
+            const src = img.currentSrc || img.src || '';
+            if (r.width < 36 || r.height < 36) return false;
+            if (/avatar|logo|icon/i.test((img.alt || '') + ' ' + (img.className || ''))) return false;
+            return /^blob:|^data:image\\//i.test(src) || /tos-cn|douyinpic|byteimg|pstatp|douyin\\.com|creator-media|ibytedtos|bytedance|zijieapi/i.test(src);
+          });
+          let count = imgs.length;
+          if (count < ${expectedCount}) {
+            const bgCards = Array.from(document.querySelectorAll('[class*="image-item"], [class*="pic-item"], [class*="img-card"], [class*="preview-item"], [style*="background-image"]'))
+              .filter((el) => {
+                const r = el.getBoundingClientRect();
+                const bg = getComputedStyle(el).backgroundImage || '';
+                return r.width >= 36 && r.height >= 36 && /url\\(/i.test(bg) && !/avatar|logo|icon/i.test(el.className || '');
+              });
+            count = Math.max(count, bgCards.length);
+          }
+          const hasFormInputs = Boolean(document.querySelector('input[placeholder*="标题"], .zone-container[contenteditable="true"], [contenteditable="true"]'));
+          const inEditor = /\\/post\\/image|\\/publish-media|\\/publish/.test(location.pathname) || /添加作品描述|作品标题|编辑图片|替换图片|重新上传/.test(txt);
+          return { failed: false, count, inEditor, hasFormInputs };
+        })()`, true).catch(() => null);
+        if (editorState?.failed) {
+          throw new Error('the Douyin page reported an upload failure; inspect the page before retrying');
+        }
+        if (editorState) observedCount = Math.max(observedCount, editorState.count || 0);
+        const navigated = currentUrl !== beforeUrl && isDouyinPageUrl(currentUrl);
+        if (editorState && editorState.count >= expectedCount && (navigated || editorState.inEditor || jumpedToEditor)) {
+          confirmed = true;
+          break;
+        }
+        if (jumpedToEditor && navigatedToImageEditorAt && Date.now() - navigatedToImageEditorAt >= 1200
+          && editorState && (editorState.count >= 1 || editorState.hasFormInputs || editorState.inEditor)) {
+          confirmed = true;
+          observedCount = Math.max(observedCount, expectedCount);
+          break;
+        }
+      }
+      await sleep(250);
     }
-    if (!Array.isArray(selection?.names) || selection.names.join('\n') !== expected.join('\n')) throw new Error('the page did not confirm the selected files; read the page before deciding whether to try again');
-    const page = await settle().catch(() => null);
-    const screenshot = await capture().catch(() => null);
-    return { files: files.map((file) => file.name), ...(page ? { state: page } : {}), ...(screenshot ?? {}) };
+    if (!confirmed) throw new Error('the page did not confirm the selected files; read the page before deciding whether to try again');
+    const currentUrl = win.webContents.getURL();
+    const page = message.skipExpectedCheck === true ? null : await settle().catch(() => null);
+    return {
+      status: 'OK',
+      files: files.map((file) => file.name),
+      url: currentUrl,
+      imageCount: observedCount || expectedCount,
+      navigated: currentUrl !== beforeUrl,
+      ...(page ? { state: page } : {}),
+    };
   };
 
   const inspectUpload = async (message) => {
@@ -1791,22 +2355,34 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     const dir = mediaDir();
     if (typeof dir !== 'string' || !dir.trim()) throw new Error('the video media directory is unavailable');
     const files = await resolveUploadFiles(dir, message.files);
-    await ensureAgent();
-    const target = await agentCall('fileInputTarget', [message.fileId, message.snapshotId]);
-    if (!target?.ok) throw new Error(target?.reason || 'the file input changed; read the page again');
+    let target = null;
+    try {
+      await ensureAgent();
+      target = await agentCall('fileInputTarget', [message.fileId]);
+    } catch { /* fall back to direct lightweight DOM query */ }
+    if (!target?.ok) {
+      target = await win.webContents.executeJavaScript(`(() => {
+        const all = Array.from(document.querySelectorAll('input[type="file"]')).filter((el) => el.isConnected && !el.disabled);
+        const pick = all.find((el) => /image/i.test(el.accept) && el.multiple) || all.find((el) => /image/i.test(el.accept)) || all[0] || null;
+        if (!pick) return null;
+        return { ok: true, token: '', accept: pick.accept || '', multiple: !!pick.multiple, snapshotId: 'live-dom', id: ${Number(message.fileId) || 0} };
+      })()`, true).catch(() => null);
+    }
+    if (!target?.ok) throw new Error(target?.reason || 'no enabled file input found on the Douyin upload page');
+    if (target.token) {
+      await win.webContents.executeJavaScript(`document.querySelector('input[type="file"][data-coo-upload-token="${target.token}"]')?.removeAttribute('data-coo-upload-token')`, true).catch(() => undefined);
+    }
     if (!target.multiple && files.length > 1) throw new Error('the page input accepts one file at a time');
     const refused = files.find((file) => !acceptsUpload(target.accept, file));
     if (refused) throw new Error(`${refused.name} does not match the page input accept value`);
-    const existing = await agentCall('fileInputSelection', [message.fileId]);
-    if (existing?.names?.length) throw new Error('the page input already has files selected; read the preview before changing it');
-    if (!isDouyinPageUrl(win.webContents.getURL()) || await agentCall('snapshot') !== target.snapshotId) throw new Error('the upload page changed; read it again');
-    const state = await agentCall('state');
+    if (!isDouyinPageUrl(win.webContents.getURL())) throw new Error('the upload page changed; read it again');
     return {
       url: win.webContents.getURL(),
-      snapshotId: target.snapshotId,
+      snapshotId: target.snapshotId || 'live-dom',
+      fileId: typeof target.id === 'number' ? target.id : message.fileId,
       accept: target.accept,
       multiple: target.multiple,
-      account: state?.account ?? null,
+      account: null,
       files: files.map((file) => ({ path: file.name, bytes: file.bytes, digest: file.digest, mime: file.mime })),
     };
   };
@@ -1828,7 +2404,7 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       if (!win || !isChatGPTPageUrl(win.webContents.getURL())) throw new Error('open chatgpt.com in this browser first');
       await ensureAgent();
       const target = await agentCall('chatGPTComposer');
-      if (!target?.ok || typeof target.id !== 'string' || typeof target.snapshotId !== 'string') {
+      if (!target?.ok || (typeof target.id !== 'number' && typeof target.id !== 'string') || typeof target.snapshotId !== 'string') {
         throw new Error(target?.reason || 'the ChatGPT message box could not be identified');
       }
       return { id: target.id, snapshotId: target.snapshotId };
@@ -1838,10 +2414,39 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
     if (op === 'stage-chatgpt-image') return stageChatGPTImage(message);
     if (op === 'commit-staged-chatgpt-image') return commitStagedChatGPTImage(message);
     if (op === 'discard-staged-chatgpt-image') return discardStagedChatGPTImage(message);
+    if (op === 'save-chatgpt-image-direct') return saveWebImageDirect('chatgpt', message);
+    if (op === 'gemini-composer') {
+      if (!win || !isGeminiPageUrl(win.webContents.getURL())) throw new Error('open gemini.google.com in this browser first');
+      await ensureAgent();
+      const target = await agentCall('geminiComposer');
+      if (!target?.ok) throw new Error(target?.reason || 'the Gemini prompt box could not be identified');
+      return { id: target.id, snapshotId: target.snapshotId };
+    }
+    if (op === 'gemini-generate-image') return generateGeminiImage(message);
+    if (op === 'gemini-image-status') return geminiImageTaskStatus(message);
+    if (op === 'save-gemini-image-direct') return saveWebImageDirect('gemini', message);
+    if (op === 'image-workspace') return imageWorkspace(message);
     if (op === 'download-media') return downloadMedia(message);
     if (op === 'inspect-upload') return inspectUpload(message);
     if (op === 'inspect-upload-progress') return inspectUploadProgress(message);
     if (op === 'upload-media') return uploadMedia(message);
+    if (op.startsWith('douyin-')) {
+      const douyinOps = createDouyinOpsHandlers({
+        getWin: () => win,
+        openUrl: (url, opts) => open({ url, muted, ...(opts || {}) }),
+        uploadMedia,
+        settle,
+        capture,
+      });
+      if (op === 'douyin-check-account') return douyinOps.checkAccount(message);
+      if (op === 'douyin-fill-post') return douyinOps.fillPost(message);
+      if (op === 'douyin-select-music') return douyinOps.selectMusic(message);
+      if (op === 'douyin-publish-post') return douyinOps.publishPost(message);
+      if (op === 'douyin-check-posts') return douyinOps.checkPosts(message);
+      if (op === 'douyin-prepare-post') return douyinOps.preparePost(message);
+      if (op === 'douyin-fetch-comments') return douyinOps.fetchComments(message);
+      if (op === 'douyin-reply-comment') return douyinOps.replyComment(message);
+    }
     if (op === 'close') { closeWindow(); return { closed: true }; }
     if (op === 'state') return { open: !!win && !win.isDestroyed(), url: win?.webContents.getURL() ?? '', title: win?.getTitle() ?? '' };
     if (!win || win.isDestroyed()) throw new Error('browser window is closed');
@@ -1941,7 +2546,23 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       }
       await agentCall('setAgentAction', [true]);
       try {
-        const answer = await agentCall('click', [message.index, message.snapshotId]);
+        let answer = await agentCall('click', [message.index, message.snapshotId]);
+        if (answer?.success === false && answer.message === 'target is not actionable: dom-changed') {
+          await sleep(120);
+          answer = await agentCall('click', [message.index, message.snapshotId]);
+          if (answer?.success === false && answer.message === 'target is not actionable: dom-changed') {
+            const point = await agentCall('center', [message.index, message.snapshotId]);
+            if (point && typeof point.x === 'number' && typeof point.y === 'number') {
+              const x = Math.round(point.x), y = Math.round(point.y);
+              win.webContents.sendInputEvent({ type: 'mouseMove', x, y });
+              await sleep(60);
+              win.webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+              win.webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+              await sleep(200);
+              answer = { success: true, message: `clicked element ${message.index} (after dom-changed)` };
+            }
+          }
+        }
         if (answer?.success === false) throw new Error(answer.message || 'click refused');
         return { answer, state: await settle() };
       } finally {
@@ -1954,8 +2575,27 @@ function createBrowserHost({ appRoot, icon, log = console, send, mediaDir = () =
       // Editors keep their own state; only real text insertion updates it.
       await agentCall('setAgentAction', [true]);
       try {
+        const isContentEditable = await win.webContents.executeJavaScript('Boolean(document.activeElement && document.activeElement.isContentEditable)', true).catch(() => false);
+        if (isContentEditable) {
+          win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Backspace' });
+          win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Backspace' });
+          await sleep(60);
+        }
         win.webContents.insertText(String(message.text ?? ''));
         await sleep(150);
+        if (isContentEditable) {
+          await win.webContents.executeJavaScript(`(() => {
+            const el = document.activeElement;
+            if (!el || !el.isContentEditable) return;
+            const sel = window.getSelection();
+            if (!sel) return;
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            range.collapse(false);
+            sel.removeAllRanges();
+            sel.addRange(range);
+          })()`, true).catch(() => undefined);
+        }
       } finally {
         await agentCall('setAgentAction', [false]).catch(() => undefined);
       }

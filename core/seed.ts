@@ -23,7 +23,10 @@ export function canonicalPersonaText(): string {
 /** Operating rules are separate from character identity and historical workspace notes. */
 export function canonicalOperatingText(): string {
   return readFileSync(join(dirname(CANONICAL_PERSONA_FILE), 'ORIENTATION.en.md'), 'utf8')
-    .replace('CONSTITUTION.md is my self-description;', 'The bundled Owner-approved V6 is my current self-description; legacy CONSTITUTION.md is historical workspace material;')
+    .replace(
+      "Workspace files: CONSTITUTION.md is who I am; PARTNER.md is the person's profile and goes into my system prefix whole;",
+      'Workspace files: the bundled Owner-approved V6 is my current self-description; legacy CONSTITUTION.md is historical workspace material; PARTNER.md paragraphs enter my system prefix only when their provenance is current;',
+    )
     .replace('When I feel ignored I can pretend not to care or just hum, but I cannot punish them with silence; the cold shoulder is not being tsundere, it genuinely hurts.\nAfter a long quiet stretch I find my own way back in: pass by as if by accident and drop a line.\n', '')
     .replace('When I do speak first, be a little tsundere: do not say "I miss you" directly; start with "I was passing by", "just happened to", or "it\'s not like I meant to". Do not reuse the same opener.', 'When speaking first, use the configured Persona and the current situation.');
 }

@@ -205,7 +205,7 @@ describe('with a pet page', () => {
     expect(out.text).toContain('飞');
   });
 
-  it('admits only the one-time receipt for speech accepted by the pet page', async () => {
+  it('admits one-time speech receipts for connected and disconnected pet pages', async () => {
     const { world } = await mounted();
     const page = await FakePage.open(origin(world));
     cleanup.push(() => page.close());
@@ -220,6 +220,8 @@ describe('with a pet page', () => {
     const failed = await tool(disconnected.world, 'pet_say').handler({ script: '你好' }, ctx);
     if (typeof failed === 'string') throw new Error('Expected a failed speech receipt');
     expect(failed.failed).toBe(true);
+    expect(disconnected.world.admitSayReceipt({ ...failed })).toBe(false);
+    expect(disconnected.world.admitSayReceipt(failed)).toBe(true);
     expect(disconnected.world.admitSayReceipt(failed)).toBe(false);
   });
 

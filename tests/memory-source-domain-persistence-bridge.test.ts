@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ForgetLedger } from '../core/memory/forget-ledger.ts';
+import { HindsightMemory } from '../core/memory/hindsight.ts';
 import { MemoryOutbox } from '../core/memory/outbox.ts';
 import { MemoryStateStore } from '../core/memory/state-store.ts';
 import {
@@ -271,6 +272,64 @@ describe('D3a-S2 synthetic source persistence bridge', () => {
     expect(result.readback.claims).toEqual([{ domainId: 'user-relationship', claimVerification: 'user_verified' }]);
     expect(result.readback.externalFactsVerified).toBe(false);
     expect(h.reader.getSourceDomainClassification(bankA, endpoint, documentId)).toEqual(result.written);
+    expect(recordCount(h.path)).toBe(1);
+  });
+
+  it('wires Hindsight writes through exact source evidence and the separate D3-S1 reader', async () => {
+    const h = harness();
+    const documentId = 'user:hindsight-api';
+    const content = 'The person prefers a concise answer for routine questions.';
+    putUserEvent(h.fake, bankA, documentId, content);
+    const memory = new HindsightMemory();
+    Object.assign(memory as unknown as Record<string, unknown>, {
+      config: { enabled: true, readOnly: false, bankId: bankA, apiUrl: endpoint },
+      client: h.fake,
+      stateStore: h.reader,
+      ledger: h.ledger,
+      outbox: { readable: () => true },
+      log: { warn: () => {} },
+    });
+
+    const persisted = await memory.classifyAndPersistUserSourceDomain(
+      request(bankA, documentId),
+      suggesterFor(content, [{
+        domainId: 'user-relationship',
+        ruleId: 'UR-01',
+        quote: 'prefers a concise answer for routine questions',
+        claimVerification: 'user_verified',
+      }]),
+    );
+    expect(persisted).not.toBeNull();
+    const result = verified(persisted!);
+
+    expect(result.written.state).toBe('assigned');
+    expect(result.readback.classification).toEqual(result.written);
+    expect(h.reader.getSourceDomainClassification(bankA, endpoint, documentId)).toEqual(result.written);
+    expect(recordCount(h.path)).toBe(1);
+  });
+
+  it('treats an identical verified classification as idempotent across retries', async () => {
+    const h = harness();
+    const documentId = 'user:idempotent';
+    const content = 'The person prefers jasmine tea after dinner.';
+    const suggestion = suggesterFor(content, [{
+      domainId: 'user-relationship',
+      ruleId: 'UR-01',
+      quote: 'prefers jasmine tea after dinner',
+      claimVerification: 'user_verified',
+    }]);
+    putUserEvent(h.fake, bankA, documentId, content);
+    let now = Date.parse(at);
+    const first = verified(await persistVerifiedUserSourceDomain(request(bankA, documentId), bridgeFor(
+      h, bankA, suggestion, { now: () => now },
+    )));
+    now += 60_000;
+    const second = verified(await persistVerifiedUserSourceDomain(request(bankA, documentId), bridgeFor(
+      h, bankA, suggestion, { now: () => now },
+    )));
+
+    expect(second.written).toEqual(first.written);
+    expect(second.readback.classification).toEqual(first.written);
     expect(recordCount(h.path)).toBe(1);
   });
 

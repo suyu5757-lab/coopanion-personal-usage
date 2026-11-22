@@ -1,9 +1,9 @@
-export const DEFAULT_RECALL_TIMEOUT_MS = 8_000;
-export const MAX_CONFIGURED_RECALL_TIMEOUT_MS = 10_000;
-export const MAX_DEEP_RECALL_TIMEOUT_MS = 15_000;
-export const DEFAULT_SOURCE_FACTS_TOKEN_BUDGET = 4_096;
-export const DOMAIN_SUPPLEMENT_SOURCE_FACTS_TOKEN_BUDGET = 16_384;
-export const MAX_SOURCE_FACTS_TOKEN_BUDGET = 16_384;
+export const DEFAULT_RECALL_TIMEOUT_MS = 15_000;
+export const MAX_CONFIGURED_RECALL_TIMEOUT_MS = 30_000;
+export const MAX_DEEP_RECALL_TIMEOUT_MS = 45_000;
+export const DEFAULT_SOURCE_FACTS_TOKEN_BUDGET = 8_192;
+export const DOMAIN_SUPPLEMENT_SOURCE_FACTS_TOKEN_BUDGET = 32_768;
+export const MAX_SOURCE_FACTS_TOKEN_BUDGET = 32_768;
 
 export function sourceFactsTokenBudget(value?: number): number {
   return typeof value === 'number' && Number.isFinite(value)

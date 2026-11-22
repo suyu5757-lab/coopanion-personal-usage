@@ -271,7 +271,7 @@ function recentConversation(records: readonly ContextRecord[], generationEvidenc
   let remaining = RECENT_MAX_CHARS;
   for (const record of [...records].reverse()) {
     if (record.context.head) continue;
-    const who = hasRole(record, 'user') ? 'Person' : hasRole(record, 'assistant') ? 'Coo' : null;
+    const who = hasRole(record, 'user') ? 'Person' : hasRole(record, 'assistant') ? 'Xi (曦)' : null;
     const original = who ? textOf(record) : '';
     const text = original.trim();
     if (!text) continue;

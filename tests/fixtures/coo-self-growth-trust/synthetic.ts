@@ -26,4 +26,4 @@ export const SYNTHETIC_PROPOSAL = {
   }],
 } as const;
 
-export const SYNTHETIC_COMPLETE_COO_OUTPUT = `Synthetic complete Coo output ${'x'.repeat(5000)}`;
+export const SYNTHETIC_COMPLETE_COO_OUTPUT = `Synthetic complete Xi output ${'x'.repeat(5000)}`;

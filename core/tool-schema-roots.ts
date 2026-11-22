@@ -15,7 +15,7 @@
  */
 
 export interface WorldToolSchemaRoot {
-  world: 'opencode' | 'codex';
+  world: 'opencode' | 'codex' | 'browser' | 'desktop-pet';
   tool: string;
   digest: string;
   /** Exact source file and declaration the digest was computed from. */
@@ -34,6 +34,50 @@ export const WORLD_TOOL_SCHEMA_ROOTS: readonly WorldToolSchemaRoot[] = [
   { world: 'codex', tool: 'codex_status', digest: '5cc87b5d8f23b0a18c248fbcf00d768896e5bdd4b26de95984876e36915dccff', source: 'packages/cortico-world-codex/index.mjs', schemaRevision: '2026-11-16', environment: 'coopanion-core' },
   { world: 'codex', tool: 'codex_review', digest: '9e8b2c8471e2c6fd1708d7733be2f217cf4d444f58c141f19f1f93065d87f55c', source: 'packages/cortico-world-codex/index.mjs', schemaRevision: '2026-11-16', environment: 'coopanion-core' },
   { world: 'codex', tool: 'codex_stop', digest: 'bc2927eeddd91de76e54dfa260e09d2ca8f3fb642a127635d11da23aabc4ba82', source: 'packages/cortico-world-codex/index.mjs', schemaRevision: '2026-11-16', environment: 'coopanion-core' },
+  // Bundled Browser World tools (Rev31 A4/N6). Execution still goes through ActionGate + Receipt.
+  { world: 'browser', tool: 'browser_open', digest: '77f95b9e4fefac336f28bbeab518d2261ab44bb0a8aeb0cf334d75e4000b4231', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_search', digest: 'affe1822b7aad67c1e510518fc163dc9e0bdcabfabb3b72d4055a495200eae6d', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_read', digest: '669f7816caca38342a7ea44c56d2994b826ff11df9c45dfefb1d99b164028301', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_text', digest: 'acc9644bcc424b30b4e9e80a7354b7b440a04900e9add55ea31a527e27d2dc30', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_find', digest: '650875e06fa5f383545918a605bf5a901cae4df4de35beec288f68166c044d66', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_click', digest: '592df9613d8096908b8b7ae39312e8ee6f0d5e77196e67c5ec92d6192fb45af4', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_hover', digest: '878678e5a284e29c5eab922ecf630e8631565eea9d6ab6c03cb23a1b857b3185', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_share', digest: '480f37c613c7bcf4db7f14abf4b973bbcf89a59c93c27a10c4fec3f7c97155f6', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_type', digest: 'b94b7d1377d6362203307f971babc1a29a34fe2885159e188239e2a30bb04249', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_press', digest: 'c6cd8de37e533a0a3fb7f27487d92dfe6925207aff5df7e57627b1ef979b52c1', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_scroll', digest: '15c9f1effc3ac3d626bd8e0cc9efa9b995eceb7119b4ffa51de89288d86da10e', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_play', digest: '553cbea2eb9d06cbc3acd29c80d5ea10671e53464ab48577a0ac4a485af08269', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_watch', digest: 'e5422fcbba621b2a3642283cab86c6e6ba9a34cb562defe0474abd81451d7b75', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_screenshot', digest: 'f5baf8d6a87fe75c75d6e068c89864e36ee6320b04494d36b0b1d25e947c0289', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_chatgpt_generate_image', digest: '79a1b1745e2e76e910f69403820783bc0564fb6038820c9674ee07cf2793d567', source: 'core/browser/tools.ts', schemaRevision: '2026-11-21', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_chatgpt_image_status', digest: '480ff1e60cc713927c2f273340dcf402f592d981244d7bf71627bd69bbabfcea', source: 'core/browser/tools.ts', schemaRevision: '2026-11-21', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_save_chatgpt_image', digest: '0957d2aa9b6a7de8854bc4488f385007f4928dfea9353f529d14db9dee56b64a', source: 'core/browser/tools.ts', schemaRevision: '2026-11-21', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_gemini_generate_image', digest: 'cadf32ee5c6dc26ea7e56fe22088905349b28d7ab3e2ba5a061d15b6641dab22', source: 'core/browser/tools.ts', schemaRevision: '2026-11-21', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_gemini_image_status', digest: '6d8f948d7c7cf0d6582dd33e5e757c34d7a34ad1ac4a232912590f1f3d636fed', source: 'core/browser/tools.ts', schemaRevision: '2026-11-21', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_save_gemini_image', digest: '3fc41aafb5e36f6a7bf2c5178c4f3c3d1a561c298536d046952c7daa24d393c5', source: 'core/browser/tools.ts', schemaRevision: '2026-11-21', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_image_workspace', digest: 'b3234ac1910f4fa34ca28e454605e620428d886c1185d74236f13bdd79d81973', source: 'core/browser/tools.ts', schemaRevision: '2026-11-21', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_download_media', digest: '89338a8f30ec636c6c3d148ea7f304f6e2f9992881a807831a31baee1a5708fd', source: 'core/browser/tools.ts', schemaRevision: '2026-11-21', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_upload_media', digest: '4247e3f8876424cc603fcab2fc488478f30ac7408bb010b47cb980c280882e90', source: 'core/browser/tools.ts', schemaRevision: '2026-11-21', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_douyin_task', digest: '63c32de6b81e3095bd0ad04b65ee2e7a2607d0db68a5def11641065166fe0530', source: 'core/browser/tools.ts', schemaRevision: '2026-11-22', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_douyin_ops', digest: '6fc7507b9ed4daa35e1b344313fbb8b2df7e043e1487545f92956f32d2609b00', source: 'core/browser/tools.ts', schemaRevision: '2026-11-22', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'douyin_prepare_post', digest: 'b3ce56c10bfe61af80eeea9bd8d085b681df4de6df18dddc425352a3942a6e47', source: 'core/browser/tools.ts', schemaRevision: '2026-11-22', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_back', digest: '7a7ef3ac92455685dccc76a8bfdeafd2aa8120c42f091a8dee459112e68e81b7', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'browser', tool: 'browser_close', digest: '8c82b3673b9cdcc98d0265b180df629d9312f2773d169002a0ea3bfeb484f609', source: 'core/browser/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  // Bundled Desktop-Pet built-in CUA tools (Rev31 A4/N6). Execution still goes through ActionGate + Receipt.
+  { world: 'desktop-pet', tool: 'pet_cua_screenshot', digest: '02db80a454f8f61fd4fb510b03fab06c654ff3ae913843551fac629e6fc3be25', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'desktop-pet', tool: 'pet_cua_zoom', digest: '576b19af51eb43de4b765fa623f568a21f1603ac2fa6874a266326afbfe0d03c', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'desktop-pet', tool: 'pet_cua_click', digest: 'a095179091da4e630768b99189d64f6f8b8b9ec85f3354509511850b4d29c86d', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'desktop-pet', tool: 'pet_cua_move', digest: '9d3f523ff2d86f0cad5c30f81bdc36938e8cdc0d3ba7dcf49c6d98ac370bebb9', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'desktop-pet', tool: 'pet_cua_drag', digest: 'ac435dad56ff950a700dd24c2059f21ec0c8dc140054585a067424ff6cf1fe1d', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'desktop-pet', tool: 'pet_cua_scroll', digest: 'f12d7cf252828ce678ded4512c0edc37f9513ccaba88aa044b7c703898a60c4d', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'desktop-pet', tool: 'pet_cua_type', digest: '633a9762412e3aa25aec71b6941907fe525ae3a6bf4e3257f0b661b7b4984850', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'desktop-pet', tool: 'pet_cua_key', digest: '187e5e3f738a87dc7eed23cd5624d319d6ed6d2b522a948462939e3286583ea4', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'desktop-pet', tool: 'pet_cua_windows', digest: '8c120aa932c7e9a7d4f1fc42954cdc3179be02eca4878981d370f726a6f56dac', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'desktop-pet', tool: 'pet_cua_window', digest: '53f2255ac19f73532d2c7bfa3891a564f38a77f5b48d3900992c37a0fea287e6', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'desktop-pet', tool: 'pet_cua_accessibility', digest: '7d9c45eefca117e01dc6127d2f30fa6c71cc7b718bab08f93a6eeb930988cd33', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'desktop-pet', tool: 'pet_cua_focus', digest: 'fe01f2315e2a2f6355f92ed169ef2763e1937ab2cecbe916b2c24dcdd1221b39', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'desktop-pet', tool: 'pet_cua_wait', digest: '0127c2d03e99fce22050623e9dcad2c593b072301abe7b7a9bf120ebfde7a9af', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
+  { world: 'desktop-pet', tool: 'pet_cua_open_settings', digest: '802bf51ecaee7156b29601eb836ad4d822f74e490d4fe0cf21d184a8c188a581', source: 'packages/cortico-world-desktop-pet/src/cua/tools.ts', schemaRevision: '2026-11-20', environment: 'coopanion-core' },
 ];
 
 const BUILTIN_TOOL_SCHEMA_DIGESTS: readonly string[] = [

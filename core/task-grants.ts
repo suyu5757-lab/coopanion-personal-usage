@@ -138,7 +138,7 @@ const targetIdentity = (target: ActionTargetEvidence): unknown => {
 };
 const targetSnapshot = (target: ActionTargetEvidence): unknown => {
   if (target.surface === 'desktop') {
-    return [target.snapshotId, target.captureId, target.bounds, target.display, target.space, target.element?.role ?? '', target.element?.label ?? '', target.element?.token ?? '', target.route];
+    return [target.snapshotId, target.captureId, target.display, target.space, target.element?.role ?? '', target.element?.label ?? '', target.element?.token ?? '', target.route];
   }
   if (target.surface === 'browser') return [target.snapshotId, target.url, target.accountRef, target.formId, target.control];
   return [target.snapshotId, target.workspaceRoot, target.path, target.operation, target.source];
@@ -189,8 +189,8 @@ export class TaskGrantRegistry {
     if (!request.taskId || !request.taskText.trim() || request.taskText.length > 4000 || !ACTION_RISKS.has(request.risk) || !validTarget(request.target)
       || actions.length === 0 || actions.length > 16 || files.some((file) => !safeRelativePath(file.path)
       || !/^[a-f0-9]{64}$/.test(file.digest) || !Number.isSafeInteger(file.bytes) || file.bytes < 0 || !file.mime.trim())
-      || (!unbounded && (!Number.isSafeInteger(request.expiresInMs) || request.expiresInMs < 1_000 || request.expiresInMs > 60 * 60_000
-        || !Number.isSafeInteger(request.maxSteps) || request.maxSteps < 1 || request.maxSteps > 200))) {
+      || (!unbounded && (!Number.isSafeInteger(request.expiresInMs) || request.expiresInMs < 1_000 || request.expiresInMs > 4 * 60 * 60_000
+        || !Number.isSafeInteger(request.maxSteps) || request.maxSteps < 1 || request.maxSteps > 1_000))) {
       throw new Error('task grant request is incomplete or outside its limits');
     }
     const confirmation = await confirmInCoreUi();
@@ -238,7 +238,7 @@ export class TaskGrantRegistry {
       expectedChangeDigest: hash(request.expectedChange),
       permissionGeneration: this.generation,
       issuedAt: now,
-      expiresAt: Math.min(grant.expiresAt, now + 5_000),
+      expiresAt: Math.min(grant.expiresAt, now + 60_000),
     };
     this.tickets.set(ticket.id, { ticket, request: structuredClone(request) });
     return structuredClone(ticket);

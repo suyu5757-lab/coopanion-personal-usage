@@ -25,6 +25,36 @@ function isChatGPTImageDownloadUrl(value) {
   } catch { return false; }
 }
 
+function isGeminiPageUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.hostname.toLowerCase() === 'gemini.google.com';
+  } catch { return false; }
+}
+
+function isGeminiImageDownloadUrl(value) {
+  try {
+    if (typeof value === 'string' && /^data:image\/(?:png|jpeg|webp);base64,/i.test(value)) return true;
+    const url = new URL(value);
+    if (url.protocol === 'blob:') return !url.origin || url.origin === 'null' || isGeminiPageUrl(url.origin);
+    const host = url.hostname.toLowerCase();
+    return url.protocol === 'https:' && (
+      host === 'gemini.google.com'
+      || host === 'googleusercontent.com' || host.endsWith('.googleusercontent.com')
+      || host === 'ggpht.com' || host.endsWith('.ggpht.com')
+      || host === 'googleapis.com' || host.endsWith('.googleapis.com')
+      || host === 'gstatic.com' || host.endsWith('.gstatic.com')
+      || host === 'google.com' || host.endsWith('.google.com')
+      || host === 'gvt1.com' || host.endsWith('.gvt1.com')
+    );
+  } catch { return false; }
+}
+
+function sanitizeSegment(value, fallback) {
+  const clean = String(value || '').trim().replace(/[^a-zA-Z0-9\u4e00-\u9fff_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
+  return clean || fallback;
+}
+
 function imageFormat(bytes) {
   if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'png';
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'jpeg';
@@ -32,23 +62,43 @@ function imageFormat(bytes) {
   return null;
 }
 
-function generatedImagePath(mediaDir, mime) {
+function generatedImagePath(mediaDir, mime, opts = {}) {
   const kind = MIME_FORMATS.get(String(mime).toLowerCase().split(';')[0].trim());
-  if (!kind) throw new Error('ChatGPT image download must be PNG, JPEG or WebP');
-  mkdirSync(mediaDir, { recursive: true });
-  const root = realpathSync(mediaDir);
+  if (!kind) throw new Error('Web image download must be PNG, JPEG or WebP');
+  const provider = opts.provider === 'gemini' ? 'gemini' : 'chatgpt';
+  const taskSlug = opts.taskSlug ? sanitizeSegment(opts.taskSlug, '') : '';
+  const folder = taskSlug ? join(mediaDir, 'tasks', taskSlug, opts.final ? 'final' : 'versions') : mediaDir;
+  mkdirSync(folder, { recursive: true });
+  const root = realpathSync(folder);
+  const relPrefix = taskSlug ? `tasks/${taskSlug}/${opts.final ? 'final' : 'versions'}/` : '';
+  if (opts.versionName) {
+    const stem = sanitizeSegment(opts.versionName.replace(/\.(png|jpe?g|webp)$/i, ''), `${provider}-${Date.now()}`);
+    let candidate = join(root, `${stem}.${kind.extension}`);
+    if (existsSync(candidate)) candidate = join(root, `${stem}-${Date.now()}.${kind.extension}`);
+    return {
+      file: candidate,
+      name: `${relPrefix}${basename(candidate)}`,
+      mime: `image/${kind.format === 'jpeg' ? 'jpeg' : kind.format}`,
+    };
+  }
   for (let attempt = 0; attempt < 3; attempt++) {
-    const file = join(root, `chatgpt-image-${Date.now()}-${randomUUID()}.${kind.extension}`);
-    if (!existsSync(file)) return { file, name: basename(file), mime: `image/${kind.format === 'jpeg' ? 'jpeg' : kind.format}` };
+    const file = join(root, `${provider}-image-${Date.now()}-${randomUUID()}.${kind.extension}`);
+    if (!existsSync(file)) {
+      return {
+        file,
+        name: `${relPrefix}${basename(file)}`,
+        mime: `image/${kind.format === 'jpeg' ? 'jpeg' : kind.format}`,
+      };
+    }
   }
   throw new Error('could not allocate a new media filename');
 }
 
 function verifyGeneratedImage(file, mime) {
   const expected = MIME_FORMATS.get(String(mime).toLowerCase().split(';')[0].trim());
-  if (!expected) throw new Error('ChatGPT image download has an unsupported MIME type');
+  if (!expected) throw new Error('Web image download has an unsupported MIME type');
   const info = statSync(file);
-  if (!info.isFile() || info.size <= 0 || info.size > MAX_IMAGE_BYTES) throw new Error('ChatGPT image download is empty or larger than 40 MB');
+  if (!info.isFile() || info.size <= 0 || info.size > MAX_IMAGE_BYTES) throw new Error('Web image download is empty or larger than 40 MB');
   const fd = openSync(file, 'r');
   const header = Buffer.alloc(12);
   const digest = createHash('sha256');
@@ -66,4 +116,14 @@ function verifyGeneratedImage(file, mime) {
   return { bytes: info.size, format: expected.format, digest: digest.digest('hex') };
 }
 
-module.exports = { MAX_IMAGE_BYTES, generatedImagePath, imageFormat, isChatGPTImageDownloadUrl, isChatGPTPageUrl, verifyGeneratedImage };
+module.exports = {
+  MAX_IMAGE_BYTES,
+  generatedImagePath,
+  imageFormat,
+  isChatGPTImageDownloadUrl,
+  isChatGPTPageUrl,
+  isGeminiImageDownloadUrl,
+  isGeminiPageUrl,
+  sanitizeSegment,
+  verifyGeneratedImage,
+};

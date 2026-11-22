@@ -9,7 +9,8 @@ import { Cormini } from '../vendor/cortico/bots/cormini/persona/persona.ts';
 import { ConsoleWorld } from '../vendor/cortico/src/worlds/console/world.ts';
 import { BrowserWorld } from '../core/browser/world.ts';
 import { SELF_TIME_DEFAULTS } from '../core/browser/config.ts';
-import { canonicalPersonaText, CANONICAL_PERSONA_SHA256 } from '../core/seed.ts';
+import { canonicalOperatingText, canonicalPersonaText, CANONICAL_PERSONA_SHA256 } from '../core/seed.ts';
+import { HindsightMemory } from '../core/memory/hindsight.ts';
 import { SOURCE_CONTEXT_POLICY } from '../core/memory/model-text.ts';
 import { coopanionPersona } from '../core/persona.ts';
 import {
@@ -59,6 +60,29 @@ function coversEveryVisibleCharacter(text: string, spans: readonly { start: numb
 }
 
 describe('Coopanion seed prefix provenance', () => {
+  it('keeps the current Persona authoritative and gates partner paragraphs on provenance', () => {
+    const orientation = canonicalOperatingText();
+    expect(orientation).toContain('the bundled Owner-approved V6 is my current self-description');
+    expect(orientation).toContain('PARTNER.md paragraphs enter my system prefix only when their provenance is current');
+    expect(orientation).not.toContain('CONSTITUTION.md is who I am');
+    expect(orientation).not.toContain('goes into my system prefix whole');
+  });
+
+  it('states both sides of the configured sibling relationship in the reflect mission', async () => {
+    const bankOptions: Record<string, unknown>[] = [];
+    const memory = new HindsightMemory();
+    Object.assign(memory as unknown as Record<string, unknown>, {
+      config: { bankId: 'synthetic-bank' },
+      client: { createBank: async (_bankId: string, options: Record<string, unknown>) => { bankOptions.push(options); } },
+    });
+    await (memory as unknown as { ensureBank: () => Promise<void> }).ensureBank();
+
+    const reflectMission = bankOptions[0]?.reflectMission as string;
+    expect(reflectMission).toContain("Xi (曦), the person's younger sister.");
+    expect(reflectMission).toContain('The person is your older brother (哥哥)');
+    expect(reflectMission).not.toContain('younger sister (哥哥)');
+  });
+
   it('does not promote a custom prefix wrapper around the canonical character to Host evidence', async () => {
     const seed = seedWorkspace();
     const Xi = coopanionPersona(Cormini, { canonicalPersona: true });

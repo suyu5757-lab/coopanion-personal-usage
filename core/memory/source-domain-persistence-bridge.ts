@@ -327,7 +327,15 @@ function classificationInput(
 
 function canonical(record: SourceDomainClassification): string {
   return JSON.stringify({
-    ...record,
+    bankId: record.bankId,
+    endpoint: record.endpoint,
+    documentId: record.documentId,
+    state: record.state,
+    taxonomyVersion: record.taxonomyVersion,
+    classifierVersion: record.classifierVersion,
+    confidence: record.confidence,
+    sourceEpoch: record.sourceEpoch,
+    sourceRevision: record.sourceRevision,
     links: [...record.links]
       .sort((left, right) => left.domainId.localeCompare(right.domainId))
       .map((link) => ({

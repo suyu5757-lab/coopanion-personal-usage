@@ -40,6 +40,7 @@
  * console in the app language (`settings-preload.cjs`).
  */
 const { app, BrowserWindow, Menu, Notification, Tray, dialog, ipcMain, nativeImage, screen, session, shell } = require('electron');
+const { spawn } = require('node:child_process');
 const http = require('node:http');
 const { Readable } = require('node:stream');
 const { randomUUID } = require('node:crypto');
@@ -77,9 +78,17 @@ const APP_ID = TEST_APP?.appId ?? ACCEPTANCE_APP?.appId ?? 'ai.pal.coopanion';
 // Chromium builds request headers as Latin-1; a Chinese product name in the fallback user agent
 // makes every settings-window load fail before the page is requested.
 if (ACCEPTANCE) app.userAgentFallback = app.userAgentFallback.replace(/[^\x20-\x7e]/g, '');
+const findCuaDriverBin = () => {
+  if (!MAC) return '';
+  const candidates = [
+    '/Applications/CuaDriver.app/Contents/MacOS/cua-driver',
+    join(app.getPath('home'), 'Applications', 'CuaDriver.app', 'Contents', 'MacOS', 'cua-driver'),
+  ];
+  return candidates.find((candidate) => existsSync(candidate)) ?? '';
+};
 const CUA_DRIVER_BIN = ISOLATED
-  ? (MAC && existsSync('/Applications/CuaDriver.app/Contents/MacOS/cua-driver') ? '/Applications/CuaDriver.app/Contents/MacOS/cua-driver' : '')
-  : process.env.CORTICO_CUA_DRIVER_BIN || (MAC && existsSync('/Applications/CuaDriver.app/Contents/MacOS/cua-driver') ? '/Applications/CuaDriver.app/Contents/MacOS/cua-driver' : '');
+  ? findCuaDriverBin()
+  : process.env.CORTICO_CUA_DRIVER_BIN || findCuaDriverBin();
 const CUA_DRIVER_SOCKET = ISOLATED ? join('/tmp', `cua-${RUN_ID}.sock`) : process.env.CORTICO_CUA_DRIVER_SOCKET || join('/tmp', `cua-${RUN_ID}.sock`);
 const CUA_DRIVER_SESSION = ISOLATED ? `r-${RUN_ID.slice(0, 24)}-${randomUUID().slice(0, 6)}` : process.env.CORTICO_CUA_DRIVER_SESSION || `r-${RUN_ID.slice(0, 24)}-${randomUUID().slice(0, 6)}`;
 const STEAM = BUILD.channel === 'steam';
@@ -706,6 +715,49 @@ app.on('second-instance', bringBack);
 // macOS: opening the app again while it runs
 app.on('activate', bringBack);
 app.on('window-all-closed', () => { /* stays in the tray */ });
+let cuaDriverProc = null;
+let cuaDriverRespawnTimer = null;
+const cuaDriverRestarts = [];
+function scheduleCuaDriverRespawn() {
+  if (quitting || cuaDriverRespawnTimer || !MAC || !CUA_DRIVER_BIN || !existsSync(CUA_DRIVER_BIN)) return;
+  const now = Date.now();
+  while (cuaDriverRestarts.length && now - cuaDriverRestarts[0] > 60_000) cuaDriverRestarts.shift();
+  if (cuaDriverRestarts.length >= 5) return;
+  cuaDriverRestarts.push(now);
+  cuaDriverRespawnTimer = setTimeout(() => {
+    cuaDriverRespawnTimer = null;
+    if (quitting) return;
+    try { if (existsSync(CUA_DRIVER_SOCKET)) rmSync(CUA_DRIVER_SOCKET, { force: true }); } catch { /* ignore */ }
+    startPrivateCuaDriver();
+  }, 1000);
+}
+function startPrivateCuaDriver() {
+  if (!MAC || !CUA_DRIVER_BIN || !existsSync(CUA_DRIVER_BIN) || existsSync(CUA_DRIVER_SOCKET) || cuaDriverProc) return;
+  try {
+    const proc = spawn(CUA_DRIVER_BIN, ['serve', '--socket', CUA_DRIVER_SOCKET], { stdio: 'ignore' });
+    cuaDriverProc = proc;
+    proc.on('exit', () => {
+      if (cuaDriverProc === proc) cuaDriverProc = null;
+      if (!quitting) scheduleCuaDriverRespawn();
+    });
+    proc.on('error', () => {
+      if (cuaDriverProc === proc) cuaDriverProc = null;
+      if (!quitting) scheduleCuaDriverRespawn();
+    });
+  } catch { cuaDriverProc = null; }
+}
+function stopPrivateCuaDriver() {
+  if (cuaDriverRespawnTimer) {
+    clearTimeout(cuaDriverRespawnTimer);
+    cuaDriverRespawnTimer = null;
+  }
+  if (cuaDriverProc) {
+    try { cuaDriverProc.kill('SIGTERM'); } catch { /* already exited */ }
+    cuaDriverProc = null;
+  }
+  try { if (existsSync(CUA_DRIVER_SOCKET)) rmSync(CUA_DRIVER_SOCKET, { force: true }); } catch { /* ignore */ }
+}
+
 app.on('before-quit', (e) => {
   if (quitting) return;
   quitting = true;
@@ -713,6 +765,7 @@ app.on('before-quit', (e) => {
   tray?.destroy();
   tray = null;
   browser.close();
+  stopPrivateCuaDriver();
   void core.stop().finally(() => {
     // a downloaded update installs now; its quit comes back here with quitting set and goes through
     if (updater?.installOnQuit(restartAfterUpdate)) setTimeout(() => app.exit(0), 10_000);
@@ -755,6 +808,7 @@ app.whenReady().then(() => {
   if (STEAM) core.opts.env.COOPANION_PACK_ROOTS = require('./steam.cjs').workshopPackRoots(BUILD.steamAppId, join(userData, 'logs')).join(delimiter);
   buildTray();
   noteAutostart();
+  startPrivateCuaDriver();
   void core.start();
   // A Test App's window is opened by this run, not by the tray: no candidate run depends on
   // macOS accessibility automation to reach a window it must observe.

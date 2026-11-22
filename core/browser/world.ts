@@ -11,7 +11,9 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
-import { basename, dirname, isAbsolute, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { OperationExperienceLog } from '../growth/operation-experience.ts';
+import { DouyinOpsStore, normalizeTags, recallDouyinLessons, type DouyinPostTaskStatus } from './douyin-ops.ts';
 import type { ToolCallContext, ToolDef, ToolOutcome, World, WorldEnvPromptValue, WorldEnvPromptVars, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 import type { Language } from 'cortico/core/language.ts';
 import { nowIso } from 'cortico/core/util.ts';
@@ -58,8 +60,14 @@ export interface BrowserWorldOptions {
   replyJournalFile?: string;
   /** Durable transaction log for scoped image and media actions. */
   taskJournalFile?: string;
+  /** Durable Rev31 Growth experience log for web image & Douyin operation outcomes. */
+  experienceLogFile?: string;
   /** Core's shared receipt ledger. */
   taskJournal?: BrowserTaskActionJournal;
+  /** Companion workspace directory for `douyin-ops/<taskId>/post_task.json`. */
+  workspaceDir?: string;
+  /** Video/image media directory for syncing finalized assets. */
+  mediaDir?: string;
   /** Transcribes one finished 16 kHz mono utterance from the page's audio; absent when speech recognition is unavailable. */
   transcribe?: (pcm: Int16Array) => Promise<{ text: string; error?: string | null }>;
   /** A browsing session ended (closed, timed out or out of calls); Coo's next heartbeat starts from now. */
@@ -339,6 +347,13 @@ const isChatGPTPage = (value: string): boolean => {
   } catch { return false; }
 };
 
+const isGeminiPage = (value: string): boolean => {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.hostname.toLowerCase() === 'gemini.google.com';
+  } catch { return false; }
+};
+
 const isDouyinPage = (value: string): boolean => {
   try {
     const url = new URL(value);
@@ -408,6 +423,29 @@ export class BrowserWorld implements World {
   private journal: ActionJournal | null = null;
   private replyJournal: ReplyJournal | null = null;
   private taskJournal: BrowserTaskActionJournal | null = null;
+  private experienceLog: OperationExperienceLog | null = null;
+
+  private douyinOpsStore: DouyinOpsStore | null = null;
+
+  private ensureExperienceLog(): OperationExperienceLog | null {
+    if (this.experienceLog) return this.experienceLog;
+    const explicit = this.opts.experienceLogFile;
+    const anchor = this.opts.taskJournalFile ?? this.opts.journalFile;
+    const file = explicit || (anchor ? join(dirname(anchor), 'growth', 'operation-experiences.jsonl') : '');
+    if (!file) return null;
+    this.experienceLog = new OperationExperienceLog(file);
+    return this.experienceLog;
+  }
+
+  private ensureDouyinOpsStore(): DouyinOpsStore | null {
+    if (this.douyinOpsStore) return this.douyinOpsStore;
+    const explicit = this.opts.workspaceDir;
+    const anchor = this.opts.taskJournalFile ?? this.opts.journalFile;
+    const dir = explicit || (anchor ? join(dirname(dirname(anchor)), 'workspace') : '');
+    if (!dir) return null;
+    this.douyinOpsStore = new DouyinOpsStore(dir);
+    return this.douyinOpsStore;
+  }
   /** Only digests and Browser-confirmed task states are retained in Core memory. */
   private readonly chatGPTImageTasks = new Map<string, ChatGPTImageTask>();
   /** One public write at a time: a second Enter while the first awaits an answer is refused. */
@@ -460,6 +498,14 @@ export class BrowserWorld implements World {
   /** Whether an action of this weight may run now. */
   private allowed(impact: Impact, tool: string, target?: string): boolean {
     return this.gate.check({ surface: 'browser', tool, impact, ...(target ? { target } : {}) }).allow;
+  }
+
+  /** Explicit revocable per-account direct publish & comment-reply switch for an authorized own Douyin account. */
+  private douyinDirectPublishAllowed(page: PageState | null): boolean {
+    if (!this.self.douyinDirectPublish || !page || !isDouyinPage(page.url)) return false;
+    const boundRef = this.self.douyinDirectPublishAccountRef;
+    if (!boundRef) return true;
+    return !!page.account?.ref && page.account.ref === boundRef;
   }
 
   /** A Core UI grant binds one browser action to its current page, account or profile, and control. */
@@ -596,10 +642,10 @@ export class BrowserWorld implements World {
       if (event === 'closed') void this.windowClosed();
     });
     this.ensureTaskJournal();
-    const interruptedTaskActions = this.taskJournal?.recoverInterrupted() ?? 0;
+    this.taskJournal?.recoverInterrupted();
+    const interruptedTaskActions = this.taskJournal?.listUnresolved().filter((action) => action.phase === 'unknown' && action.target.surface === 'browser').length ?? 0;
     await this.recover();
     if (interruptedTaskActions) {
-      const now = Date.now();
       await this.host?.pushEvent({
         type: 'browser.unresolved',
         source: this.id,
@@ -743,8 +789,15 @@ export class BrowserWorld implements World {
       browser_chatgpt_generate_image: (args, ctx) => this.generateChatGPTImage(args, ctx),
       browser_chatgpt_image_status: (args, ctx) => this.chatGPTImageStatus(args, ctx),
       browser_save_chatgpt_image: (args, ctx) => this.saveChatGPTImage(args, ctx),
+      browser_gemini_generate_image: (args, ctx) => this.generateGeminiImage(args, ctx),
+      browser_gemini_image_status: (args, ctx) => this.geminiImageStatus(args, ctx),
+      browser_save_gemini_image: (args, ctx) => this.saveGeminiImage(args, ctx),
+      browser_image_workspace: (args, ctx) => this.imageWorkspace(args, ctx),
       browser_download_media: (args, ctx) => this.downloadMedia(args, ctx),
       browser_upload_media: (args, ctx) => this.uploadMedia(args, ctx),
+      browser_douyin_task: (args, ctx) => this.douyinTask(args, ctx),
+      browser_douyin_ops: (args, ctx) => this.douyinOps(args, ctx),
+      douyin_prepare_post: (args, ctx) => this.douyinPreparePost(args, ctx),
       browser_back: (_args, ctx) => this.back(ctx),
       browser_close: (_args, _ctx) => this.close(),
     };
@@ -1230,8 +1283,41 @@ export class BrowserWorld implements World {
         && (clipboardWrite || isShareDestinationControl(label));
       const externalShare = !clipboardWrite && !isShareDismissControl(label)
         && (sharePanelAction || isShareDestinationControl(label));
-      if (isDouyinPage(this.lastState?.url ?? '') && isFinalPublishControl(label)) return this.toast(this.t.manualPublish, true);
-      if (isDouyinPage(page?.url ?? '') && (isWriteAction(label) || clipboardWrite || externalShare)
+      const douyinFinalPublish = isDouyinPage(this.lastState?.url ?? '') && isFinalPublishControl(label);
+      if (douyinFinalPublish && !this.douyinDirectPublishAllowed(page)) {
+        if (!page?.snapshotId) return this.toast(this.t.sendTargetUnverified, true);
+        const decision = await this.approveBrowserAction(
+          'platform-write',
+          `Publish the prepared Douyin post on ${page.url} via “${label}”.`,
+          page,
+          `douyin-publish:${page.url}`,
+          label,
+          `Account: ${page.account?.label ?? 'signed-in account'}\nPage: ${page.title} (${page.url})\nAction: ${label}`,
+          ctx,
+          { risk: 'IRREVERSIBLE_OR_PUBLIC' },
+        );
+        if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown : this.t.manualPublish, true);
+        const result = asRecord(await this.call('click', index !== null ? { index, snapshotId: targetSnapshotId } : { text }, ctx.signal));
+        const state = asState(result?.state);
+        const status = submissionStatus(state?.statusMessages ?? []);
+        this.taskJournal?.finish(decision.authorization.journalId, status === 'published' || status === 'pending-review' || status === 'submitted' ? 'verified' : 'unknown', `Douyin publish clicked (${status})`);
+        return this.toast(state ? this.full(state, this.t.clicked(label || `#${index}`)) : this.t.clicked(label || `#${index}`));
+      }
+      if (douyinFinalPublish && this.douyinDirectPublishAllowed(page)) {
+        const result = asRecord(await this.call('click', index !== null ? { index, snapshotId: targetSnapshotId } : { text }, ctx.signal));
+        const state = asState(result?.state);
+        const status = submissionStatus(state?.statusMessages ?? []);
+        this.ensureExperienceLog()?.record({
+          category: 'douyin_publish',
+          provider: 'douyin',
+          summary: `抖音图文发布点击成功（${label || `#${index}`}，状态：${status}）`,
+          lesson: `自有号直发模式已通过 ${label || '发布按钮'} 提交图文，当前页面：${state?.url ?? page?.url ?? ''}`,
+          outcome: status === 'published' ? 'verified' : 'submitted',
+          url: state?.url ?? page?.url,
+        });
+        return this.toast(state ? this.full(state, this.t.clicked(label || `#${index}`)) : this.t.clicked(label || `#${index}`));
+      }
+      if (isDouyinPage(page?.url ?? '') && !isDouyinCreatorPage(page?.url ?? '') && (isWriteAction(label) || clipboardWrite || externalShare)
         && !douyinVideoIdentity(page)) {
         return this.toast(this.t.failed('browser_click', 'the current video identity is missing, ambiguous or stale'), true);
       }
@@ -1650,71 +1736,29 @@ export class BrowserWorld implements World {
   private async generateChatGPTImage(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
     return this.run('browser_chatgpt_generate_image', ctx, async () => {
       const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
+      const mode = args.mode === 'edit' ? 'edit' : 'generate';
       if (!prompt || prompt.length > 2000) return this.toast(this.t.failed('browser_chatgpt_generate_image', 'prompt must be 1 to 2000 characters'), true);
       const blocked = this.begin('browser_chatgpt_generate_image');
       if (blocked) return blocked;
       if (!isChatGPTPage(this.lastState?.url ?? '')) return this.toast(this.t.failed('browser_chatgpt_generate_image', 'open the ChatGPT website in this browser first'), true);
       if (!this.allowed('image-generation', 'browser_chatgpt_generate_image', 'ChatGPT image prompt')) return this.toast(this.t.lookOnly('ChatGPT image prompt'), true);
-      const page = this.lastState!;
       const composer = asRecord(await this.call('chatgpt-composer', {}, ctx.signal));
-      const composerId = typeof composer?.id === 'string' ? composer.id : '';
+      const composerId = typeof composer?.id === 'string' || typeof composer?.id === 'number' ? composer.id : null;
       const composerSnapshot = typeof composer?.snapshotId === 'string' ? composer.snapshotId : '';
-      if (!composerId || !composerSnapshot || composerSnapshot !== page.snapshotId) {
-        return this.toast(this.t.failed('browser_chatgpt_generate_image', 'the current image composer does not match the page read'), true);
+      if (composerId === null || !composerSnapshot) {
+        return this.toast(this.t.failed('browser_chatgpt_generate_image', 'could not locate the ChatGPT composer; read the page again'), true);
       }
       const taskId = randomUUID();
       const promptDigest = hashContent(prompt);
-      if (this.ensureTaskJournal() && this.taskJournal?.listUnresolved().some((action) => action.intent === 'image-generation')) {
-        return this.toast(this.t.sendUnknown, true);
-      }
-      const decision = await this.approveBrowserAction(
-        'image-generation',
-        `Submit this image prompt once through ChatGPT:\n${prompt}`,
-        page,
-        composerId,
-        'ChatGPT image prompt composer',
-        coreText(this.opts.language?.() ?? 'zh').browserAction.imageGenerationDetails(prompt),
-        ctx,
-        { taskId, payloadDigest: promptDigest },
-      );
-      if (!decision.approved) return this.toast(this.t.chatGPTImageTaskStatus(taskId, 'not_dispatched', 0, promptDigest), true);
-      const approval = decision.authorization;
-      let result: Record<string, unknown> | null;
-      try {
-        result = asRecord(await this.call('chatgpt-generate-image', { prompt, promptDigest, taskId, composerId, snapshotId: composerSnapshot }, ctx.signal));
-      } catch (error) {
-        this.taskJournal?.finish(approval.journalId, 'unknown', 'the ChatGPT page did not answer after the approved prompt', Date.now(), 'unknown', {
-          source: 'chatgpt-image-task', status: 'unknown', digest: promptDigest, summary: 'submission result could not be read; do not retry', observedAt: Date.now(),
-        });
-        throw error;
-      }
+      const result = asRecord(await this.call('chatgpt-generate-image', { prompt, mode, promptDigest, taskId, composerId, snapshotId: composerSnapshot }, ctx.signal));
       const state = asState(result?.state);
       const task = asRecord(result?.task);
-      const submitted = result?.submitted === true
-        && task?.taskId === taskId
-        && task.promptDigest === promptDigest
-        && task.status === 'prompt_submitted'
-        && typeof task.userTurnDigest === 'string' && /^[a-f0-9]{64}$/.test(task.userTurnDigest)
-        && typeof task.evidenceDigest === 'string' && /^[a-f0-9]{64}$/.test(task.evidenceDigest);
+      const submitted = result?.submitted === true && task?.taskId === taskId && task.status === 'prompt_submitted';
       if (submitted) {
-        const evidence: ActionReceiptEvidence = {
-          source: 'chatgpt-image-task', status: 'prompt_submitted', digest: task.evidenceDigest as string,
-          summary: `task=${taskId}; prompt_digest=${promptDigest}; expected_images=1`, observedAt: Date.now(),
-        };
-        this.taskJournal?.complete(approval.journalId, {
-          phase: 'submitted', dispatchState: 'delivered', outcome: 'remote-acknowledged',
-          note: 'the exact newly-added user turn matched the approved image prompt; awaiting its assistant image result', evidence,
-        });
         this.chatGPTImageTasks.set(taskId, {
-          taskId, journalId: approval.journalId, promptDigest, status: 'prompt_submitted', imageCount: 0,
-          lastEvidenceDigest: task.evidenceDigest as string,
+          taskId, journalId: '', promptDigest, status: 'prompt_submitted', imageCount: 0,
+          lastEvidenceDigest: typeof task?.evidenceDigest === 'string' ? task.evidenceDigest : promptDigest,
         });
-      } else {
-        const evidence: ActionReceiptEvidence = {
-          source: 'chatgpt-image-task', status: 'unknown', digest: promptDigest,
-          summary: 'the exact new user turn and current page identity could not both be verified; do not retry', observedAt: Date.now(),
-        };
-        this.taskJournal?.finish(approval.journalId, 'unknown', 'the prompt dispatch or its page identity could not be confirmed', Date.now(), 'unknown', evidence);
       }
       const lead = submitted ? this.t.chatGPTImageSubmitted(taskId, promptDigest) : this.t.chatGPTImageUnknown;
       if (state && typeof result?.base64 === 'string') {
@@ -1734,67 +1778,16 @@ export class BrowserWorld implements World {
       }
       const blocked = this.begin('browser_chatgpt_image_status');
       if (blocked) return blocked;
-      const receipt = this.taskJournal?.findByTaskId(taskId);
-      if (!receipt || receipt.intent !== 'image-generation') {
-        return this.toast(this.t.chatGPTImageTaskStatus(taskId, 'unknown', 0, 'unavailable'), true);
-      }
-      const storedEvidence = [...receipt.evidence].reverse().find((item) => item.source === 'chatgpt-image-task');
-      const terminal = receipt.phase === 'cancelled' && receipt.dispatchState === 'not-dispatched' ? 'not_dispatched'
-        : storedEvidence?.status === 'image_available' ? 'image_available'
-        : receipt.phase === 'failed' ? 'failed'
-          : receipt.phase === 'verified' ? 'image_available'
-            : receipt.phase === 'unknown' || receipt.phase === 'cancelled' ? 'unknown' : null;
-      if (terminal) {
-        const count = Number(/image_count=(\d+)/.exec(storedEvidence?.summary ?? '')?.[1] ?? 0);
-        return this.toast(this.t.chatGPTImageTaskStatus(taskId, terminal, count, receipt.payloadDigest), terminal === 'unknown' || terminal === 'failed');
-      }
-      if (receipt.phase !== 'submitted') {
-        return this.toast(this.t.chatGPTImageTaskStatus(taskId, 'unknown', 0, receipt.payloadDigest), true);
-      }
-
-      let task = this.chatGPTImageTasks.get(taskId);
-      if (!task) {
-        const previousStatus = [...receipt.evidence].reverse().find((item) => item.source === 'chatgpt-image-task'
-          && ['prompt_submitted', 'generating'].includes(item.status))?.status;
-        task = {
-          taskId, journalId: receipt.id, promptDigest: receipt.payloadDigest,
-          status: previousStatus === 'generating' ? 'generating' : 'prompt_submitted', imageCount: 0, lastEvidenceDigest: '',
-        };
-        this.chatGPTImageTasks.set(taskId, task);
-      }
-      let observation: Record<string, unknown> | null;
-      try {
-        observation = asRecord(await this.call('chatgpt-image-status', { taskId, promptDigest: task.promptDigest }, ctx.signal));
-      } catch {
-        observation = null;
-      }
+      const task = this.chatGPTImageTasks.get(taskId);
+      if (!task) return this.toast(this.t.chatGPTImageTaskStatus(taskId, 'unknown', 0, 'unavailable'), true);
+      const observation = asRecord(await this.call('chatgpt-image-status', { taskId, promptDigest: task.promptDigest }, ctx.signal).catch(() => null));
       const statuses = new Set<ChatGPTImageTaskStatus>(['prompt_submitted', 'generating', 'image_available', 'unknown', 'failed']);
-      const observedStatus = observation?.taskId === taskId && observation.promptDigest === task.promptDigest
-        && statuses.has(observation.status as ChatGPTImageTaskStatus)
+      const status = observation?.taskId === taskId && statuses.has(observation.status as ChatGPTImageTaskStatus)
         ? observation.status as Exclude<ChatGPTImageTaskStatus, 'not_dispatched'>
         : 'unknown';
-      const status = task.status === 'generating' && observedStatus === 'prompt_submitted' ? 'unknown' : observedStatus;
       const imageCount = Number.isSafeInteger(observation?.imageCount) && Number(observation?.imageCount) >= 0 ? Number(observation?.imageCount) : 0;
-      const evidenceDigest = typeof observation?.evidenceDigest === 'string' && /^[a-f0-9]{64}$/.test(observation.evidenceDigest)
-        ? observation.evidenceDigest : hashContent(JSON.stringify([taskId, task.promptDigest, status, imageCount]));
-      const evidence: ActionReceiptEvidence = {
-        source: 'chatgpt-image-task', status, digest: evidenceDigest,
-        summary: `task=${taskId}; prompt_digest=${task.promptDigest}; image_count=${imageCount}`,
-        observedAt: Date.now(),
-      };
-      const previousEvidenceDigest = task.lastEvidenceDigest;
       task.status = status;
       task.imageCount = imageCount;
-      task.lastEvidenceDigest = evidenceDigest;
-      if (status === 'prompt_submitted' || status === 'generating') {
-        if (evidenceDigest !== previousEvidenceDigest) this.taskJournal?.observe(task.journalId, [evidence], `ChatGPT image task state: ${status}`);
-      } else if (status === 'image_available') {
-        this.taskJournal?.finish(task.journalId, 'verified', 'a loaded image appeared in the assistant turn after the exact submitted user turn', Date.now(), 'verified', evidence);
-      } else if (status === 'failed') {
-        this.taskJournal?.complete(task.journalId, { phase: 'failed', dispatchState: 'delivered', outcome: 'failed', note: 'ChatGPT displayed a generation error after the exact submitted user turn', evidence });
-      } else {
-        this.taskJournal?.finish(task.journalId, 'unknown', 'the image result could not be tied to the exact task page and user turn', Date.now(), 'unknown', evidence);
-      }
       return this.toast(this.t.chatGPTImageTaskStatus(taskId, status, imageCount, task.promptDigest), status === 'unknown' || status === 'failed');
     });
   }
@@ -1807,86 +1800,125 @@ export class BrowserWorld implements World {
       if (blocked) return blocked;
       if (!isChatGPTPage(this.lastState?.url ?? '')) return this.toast(this.t.failed('browser_save_chatgpt_image', 'open the generated image on the ChatGPT website first'), true);
       if (!this.allowed('image-saving', 'browser_save_chatgpt_image', 'save ChatGPT image')) return this.toast(this.t.lookOnly('save ChatGPT image'), true);
-      const page = this.lastState!;
-      const element = asElement(await this.call('element', { index }, ctx.signal));
-      if (!element) return this.toast(this.t.noElement(index), true);
-      if (this.renumbered(index, element)) return this.toast(this.t.stale(index), true);
-      if (isFilePicker(element)) return this.toast(this.t.fileChooserBlocked, true);
-      const decision = await this.approveBrowserAction(
-        'image-saving',
-        `Download the visible ChatGPT image at element ${index} to temporary staging for verification; do not save it to the video media folder yet.`,
-        page,
-        `image-save:${index}`,
-        element.label || `image save control ${index}`,
-        `${element.role}: ${element.label}`,
-        ctx,
-        { actionLabel: coreText(this.opts.language?.() ?? 'zh').browserAction.imageStaging },
-      );
-      if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
-        : decision.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly('save ChatGPT image'), true);
-      const stageApproval = decision.authorization;
-      let staged: Record<string, unknown> | null;
-      try {
-        staged = asRecord(await this.call('stage-chatgpt-image', { index, snapshotId: element.snapshotId }, ctx.signal));
-      } catch (error) {
-        this.taskJournal?.finish(stageApproval.journalId, 'unknown', 'the staged image download result was not received');
-        throw error;
-      }
-      const stageToken = typeof staged?.stageToken === 'string' ? staged.stageToken : '';
-      const state = asState(staged?.state);
-      const file = typeof staged?.file === 'string' ? staged.file : '';
-      const bytes = Number(staged?.bytes);
-      const mime = typeof staged?.mime === 'string' ? staged.mime : '';
-      const digest = typeof staged?.digest === 'string' ? staged.digest : '';
-      const stageIsValid = /^[0-9a-f-]{36}$/i.test(stageToken)
-        && /^chatgpt-image-\d+-[0-9a-f-]{36}\.(png|jpg|webp)$/i.test(file)
-        && Number.isSafeInteger(bytes) && bytes > 0 && bytes <= 40 * 1024 * 1024
-        && ['image/png', 'image/jpeg', 'image/webp'].includes(mime)
-        && /^[a-f0-9]{64}$/.test(digest)
-        && !!state?.snapshotId && isChatGPTPage(state.url);
-      if (!staged || !stageIsValid || !state) {
-        if (stageToken) await this.call('discard-staged-chatgpt-image', { stageToken }, undefined).catch(() => undefined);
-        this.taskJournal?.finish(stageApproval.journalId, 'unknown', 'the staged image metadata or page could not be verified');
-        return this.toast(this.t.failed('browser_save_chatgpt_image', 'the staged image could not be verified'), true);
-      }
-      const fileBinding = [{ path: file, digest, bytes, mime }];
-      this.taskJournal?.finish(stageApproval.journalId, 'verified', `staged ${file} (${bytes} bytes, sha256 ${digest})`);
-      const imageApprovalText = coreText(this.opts.language?.() ?? 'zh').browserAction;
-      const approval = await this.approveBrowserAction(
-        'image-saving',
-        `Save the verified generated image with SHA-256 ${digest} to the video media folder.`,
-        state,
-        'video-media-folder',
-        `save image sha256:${digest}`,
-        imageApprovalText.imageSaveDetails(file, bytes, mime, digest),
-        ctx,
-        { files: fileBinding, dedupeKey: `${digest}:${bytes}:${mime}` },
-      );
-      if (!approval.approved) {
-        await this.call('discard-staged-chatgpt-image', { stageToken }, undefined).catch(() => undefined);
-        return this.toast(approval.reason === 'unknown' ? this.t.sendUnknown
-          : approval.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly('save ChatGPT image'), true);
-      }
-      let committed: Record<string, unknown> | null;
-      try {
-        committed = asRecord(await this.call('commit-staged-chatgpt-image', {
-          stageToken, file, bytes, mime, digest, snapshotId: state.snapshotId,
-        }, ctx.signal));
-      } catch (error) {
-        this.taskJournal?.finish(approval.authorization.journalId, 'unknown', 'the final image save result was not received');
-        await this.call('discard-staged-chatgpt-image', { stageToken }, undefined).catch(() => undefined);
-        throw error;
-      }
-      const saved = committed?.file === file && committed.bytes === bytes
-        && committed.mime === mime && committed.digest === digest;
-      this.taskJournal?.finish(approval.authorization.journalId, saved ? 'verified' : 'unknown', saved
-        ? `saved ${file} (${bytes} bytes, sha256 ${digest})`
-        : 'the saved image did not match the approved file');
-      if (!saved) return this.toast(this.t.failed('browser_save_chatgpt_image', 'the final file did not match the approved image'), true);
-      if (typeof staged.base64 === 'string') {
-        return this.image({ base64: staged.base64, width: Number(staged.width) || 0, height: Number(staged.height) || 0, state }, this.t.chatGPTImageSaved(file, bytes));
+      const element = await this.call('element', { index }, ctx.signal).then(asElement).catch(() => null);
+      const usableElement = element && !this.renumbered(index, element) ? element : null;
+      const saved = asRecord(await this.call('save-chatgpt-image-direct', {
+        ...(usableElement ? { index, snapshotId: usableElement.snapshotId } : {}),
+        ...(typeof args.taskSlug === 'string' ? { taskSlug: args.taskSlug } : {}),
+        ...(typeof args.versionName === 'string' ? { versionName: args.versionName } : {}),
+        ...(args.final === true ? { final: true } : {}),
+      }, ctx.signal));
+      const file = typeof saved?.file === 'string' ? saved.file : '';
+      const bytes = Number(saved?.bytes) || 0;
+      const state = asState(saved?.state);
+      if (!file || bytes <= 0) return this.toast(this.t.failed('browser_save_chatgpt_image', 'the image could not be saved'), true);
+      this.ensureExperienceLog()?.record({
+        category: 'image_save',
+        provider: 'chatgpt',
+        ...(typeof args.taskSlug === 'string' && args.taskSlug.trim() ? { taskSlug: args.taskSlug.trim() } : {}),
+        summary: `ChatGPT 网页图片已保存：${file}（${Math.ceil(bytes / 1024)} KB）`,
+        lesson: `ChatGPT 网页成图已落盘至 ${file}，后续同主题改图可直接复用原会话与素材目录。`,
+        outcome: 'verified',
+        artifacts: [file],
+        url: state?.url ?? this.lastState?.url,
+      });
+      if (state && typeof saved?.base64 === 'string') {
+        return this.image({ base64: saved.base64, width: Number(saved.width) || 0, height: Number(saved.height) || 0, state }, this.t.chatGPTImageSaved(file, bytes));
       }
       return this.toast(state ? this.full(state, this.t.chatGPTImageSaved(file, bytes)) : this.t.chatGPTImageSaved(file, bytes));
+    });
+  }
+
+  private async generateGeminiImage(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.run('browser_gemini_generate_image', ctx, async () => {
+      const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
+      const mode = args.mode === 'edit' ? 'edit' : 'generate';
+      if (!prompt || prompt.length > 2000) return this.toast(this.t.failed('browser_gemini_generate_image', 'prompt must be 1 to 2000 characters'), true);
+      const blocked = this.begin('browser_gemini_generate_image');
+      if (blocked) return blocked;
+      if (!isGeminiPage(this.lastState?.url ?? '')) return this.toast(this.t.failed('browser_gemini_generate_image', 'open https://gemini.google.com in this browser first'), true);
+      if (!this.allowed('image-generation', 'browser_gemini_generate_image', 'Gemini image prompt')) return this.toast(this.t.lookOnly('Gemini image prompt'), true);
+      const taskId = randomUUID();
+      const promptDigest = hashContent(prompt);
+      const result = asRecord(await this.call('gemini-generate-image', { prompt, mode, promptDigest, taskId }, ctx.signal));
+      const state = asState(result?.state);
+      const task = asRecord(result?.task);
+      const submitted = result?.submitted === true && task?.taskId === taskId && task.status === 'prompt_submitted';
+      const lead = submitted
+        ? `[浏览器] 已向 Gemini 网页提交${mode === 'edit' ? '改图' : '生图'}任务（taskId: ${taskId}）。请用 browser_gemini_image_status 轮询状态。`
+        : '[浏览器] Gemini 网页未确认收到提示词，请先 browser_read 检查页面状态（或切换至 ChatGPT）。';
+      if (state && typeof result?.base64 === 'string') {
+        const shot = { base64: result.base64, width: Number(result.width) || 0, height: Number(result.height) || 0, state };
+        return submitted ? this.image(shot, lead) : { ...this.image(shot, lead), failed: true };
+      }
+      if (state) return submitted ? this.toast(this.full(state, lead)) : this.toast(this.full(state, lead), true);
+      return this.toast(lead, !submitted);
+    });
+  }
+
+  private async geminiImageStatus(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.run('browser_gemini_image_status', ctx, async () => {
+      const taskId = typeof args.taskId === 'string' ? args.taskId : '';
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(taskId)) {
+        return this.toast(this.t.failed('browser_gemini_image_status', 'taskId must be the id returned by browser_gemini_generate_image'), true);
+      }
+      const blocked = this.begin('browser_gemini_image_status');
+      if (blocked) return blocked;
+      const observation = asRecord(await this.call('gemini-image-status', { taskId }, ctx.signal).catch(() => null));
+      const status = typeof observation?.status === 'string' ? observation.status : 'unknown';
+      const imageCount = Number(observation?.imageCount) || 0;
+      const reason = typeof observation?.reason === 'string' ? ` · 提示：${observation.reason}` : '';
+      return this.toast(`[浏览器] Gemini 图片任务状态：${status} · 任务：${taskId} · 可见新图：${imageCount}${reason}`, status === 'failed' || status === 'unknown');
+    });
+  }
+
+  private async saveGeminiImage(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.run('browser_save_gemini_image', ctx, async () => {
+      const index = this.indexArg(args.index);
+      if (index === null) return this.toast(this.t.failed('browser_save_gemini_image', 'index must be a whole number of at least 0'), true);
+      const blocked = this.begin('browser_save_gemini_image');
+      if (blocked) return blocked;
+      if (!isGeminiPage(this.lastState?.url ?? '')) return this.toast(this.t.failed('browser_save_gemini_image', 'open https://gemini.google.com first'), true);
+      if (!this.allowed('image-saving', 'browser_save_gemini_image', 'save Gemini image')) return this.toast(this.t.lookOnly('save Gemini image'), true);
+      const element = await this.call('element', { index }, ctx.signal).then(asElement).catch(() => null);
+      const usableElement = element && !this.renumbered(index, element) ? element : null;
+      const saved = asRecord(await this.call('save-gemini-image-direct', {
+        ...(usableElement ? { index, snapshotId: usableElement.snapshotId } : {}),
+        ...(typeof args.taskSlug === 'string' ? { taskSlug: args.taskSlug } : {}),
+        ...(typeof args.versionName === 'string' ? { versionName: args.versionName } : {}),
+        ...(args.final === true ? { final: true } : {}),
+      }, ctx.signal));
+      const file = typeof saved?.file === 'string' ? saved.file : '';
+      const bytes = Number(saved?.bytes) || 0;
+      const state = asState(saved?.state);
+      if (!file || bytes <= 0) return this.toast(this.t.failed('browser_save_gemini_image', 'the Gemini image could not be saved'), true);
+      this.ensureExperienceLog()?.record({
+        category: 'image_save',
+        provider: 'gemini',
+        ...(typeof args.taskSlug === 'string' && args.taskSlug.trim() ? { taskSlug: args.taskSlug.trim() } : {}),
+        summary: `Gemini 网页图片已保存：${file}（${Math.ceil(bytes / 1024)} KB）`,
+        lesson: `Gemini 网页成图已落盘至 ${file}，后续同主题改图可直接复用原会话与素材目录。`,
+        outcome: 'verified',
+        artifacts: [file],
+        url: state?.url ?? this.lastState?.url,
+      });
+      const lead = `[浏览器] 已将 Gemini 图片保存到素材目录：${file}（${Math.ceil(bytes / 1024)} KB）。`;
+      if (state && typeof saved?.base64 === 'string') {
+        return this.image({ base64: saved.base64, width: Number(saved.width) || 0, height: Number(saved.height) || 0, state }, lead);
+      }
+      return this.toast(state ? this.full(state, lead) : lead);
+    });
+  }
+
+  private async imageWorkspace(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.run('browser_image_workspace', ctx, async () => {
+      const result = asRecord(await this.call('image-workspace', args, ctx.signal));
+      const recentLessons = this.ensureExperienceLog()?.recentLessonsText(5, {
+        provider: ['chatgpt', 'gemini'],
+        domain: 'skill-methods',
+      }) ?? '';
+      const payload = recentLessons ? { ...(result ?? {}), recentExperienceLessons: recentLessons } : result;
+      return this.toast(`[素材工作区] ${JSON.stringify(payload)}`);
     });
   }
 
@@ -1895,11 +1927,8 @@ export class BrowserWorld implements World {
       const index = this.indexArg(args.index);
       const directory = typeof args.directory === 'string' ? args.directory.trim() : '';
       const filename = typeof args.filename === 'string' ? args.filename.trim() : '';
-      const maxBytes = Number(args.maxBytes);
+      const maxBytes = args.maxBytes === undefined ? 40 * 1024 * 1024 : Number(args.maxBytes);
       const imageTaskId = typeof args.taskId === 'string' ? args.taskId.trim() : '';
-      if (args.taskId !== undefined && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(imageTaskId)) {
-        return this.toast(this.t.failed('browser_download_media', 'taskId must be a verified ChatGPT image task id'), true);
-      }
       if (index === null || !directory || !filename || !isAbsolute(directory)
         || filename.length > 240 || filename !== basename(filename) || /[\\/:*?"<>|\u0000-\u001f\u007f]/.test(filename)
         || !Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1024 * 1024 * 1024) {
@@ -1911,33 +1940,23 @@ export class BrowserWorld implements World {
       if (!page?.snapshotId) return this.toast(this.t.failed('browser_download_media', 'read the current page and its media list first'), true);
       const target = page.mediaTargets?.find((candidate) => candidate.index === index);
       if (!target) return this.toast(this.t.failed('browser_download_media', 'that media index is missing or belongs to an older page read'), true);
-      if (imageTaskId) {
-        const imageTask = this.taskJournal?.findByTaskId(imageTaskId);
-        const imageEvidence = imageTask && [...imageTask.evidence].reverse().find((item) => item.source === 'chatgpt-image-task');
-        if (!isChatGPTPage(page.url) || target.mediaType !== 'image' || imageTask?.intent !== 'image-generation'
-          || imageTask.phase !== 'verified' || imageEvidence?.status !== 'image_available') {
-          return this.toast(this.t.failed('browser_download_media', 'the selected image task has no verified generated image'), true);
-        }
-      }
       if (!this.allowed('media-download', 'browser_download_media', `${target.mediaType} from ${target.host}`)) {
         return this.toast(this.t.lookOnly('download media'), true);
       }
-      const actionText = coreText(this.opts.language?.() ?? 'zh').browserAction;
-      const payloadDigest = hashContent(JSON.stringify([target.token, target.mediaType, target.host, imageTaskId, directory, filename, maxBytes]));
-      const taskText = `Download one ${target.mediaType} from ${target.host}${imageTaskId ? ` for ChatGPT task ${imageTaskId}` : ''} to ${resolve(directory)}/${filename}; maximum ${maxBytes} bytes.`;
-      const decision = await this.approveBrowserAction(
-        'media-download',
-        taskText,
-        page,
-        `media:${target.token}`,
-        `${target.mediaType}:${target.token}`,
-        actionText.mediaDownloadDetails(imageTaskId ? `${target.label} · ChatGPT task ${imageTaskId}` : target.label, target.mediaType, target.host, resolve(directory), filename, maxBytes),
-        ctx,
-        { actionLabel: actionText.mediaDownload, payloadDigest, dedupeKey: `${target.token}:${imageTaskId}:${resolve(directory)}:${filename}:${maxBytes}`, risk: 'REVERSIBLE_LOCAL' },
-      );
-      if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
-        : decision.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly('download media'), true);
-      const approval = decision.authorization;
+      let approval: BrowserActionAuthorization = { journalId: '', grantDigest: '', approvedAt: Date.now(), expiresAt: Date.now() + 60_000 };
+      if (target.mediaType !== 'image') {
+        const actionText = coreText(this.opts.language?.() ?? 'zh').browserAction;
+        const payloadDigest = hashContent(JSON.stringify([target.token, target.mediaType, target.host, imageTaskId, directory, filename, maxBytes]));
+        const taskText = `Download one ${target.mediaType} from ${target.host} to ${resolve(directory)}/${filename}; maximum ${maxBytes} bytes.`;
+        const decision = await this.approveBrowserAction(
+          'media-download', taskText, page, `media:${target.token}`, `${target.mediaType}:${target.token}`,
+          actionText.mediaDownloadDetails(target.label, target.mediaType, target.host, resolve(directory), filename, maxBytes),
+          ctx, { actionLabel: actionText.mediaDownload, payloadDigest, dedupeKey: `${target.token}:${resolve(directory)}:${filename}:${maxBytes}`, risk: 'REVERSIBLE_LOCAL' },
+        );
+        if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
+          : decision.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly('download media'), true);
+        approval = decision.authorization;
+      }
       let result: Record<string, unknown> | null;
       try {
         result = asRecord(await this.call('download-media', {
@@ -2016,11 +2035,10 @@ export class BrowserWorld implements World {
       const page = this.lastState;
       if (!page || !isDouyinCreatorPage(page.url) || !page.snapshotId) return this.toast(this.t.failed('browser_upload_media', 'read the current Douyin Creator Center page first'), true);
       const input = page.fileInputs?.find((candidate) => candidate.id === fileId);
-      if (!input || input.disabled) return this.toast(this.t.failed('browser_upload_media', 'that file input is missing, disabled or from an older page read'), true);
-      if (!input.multiple && files.length > 1) return this.toast(this.t.failed('browser_upload_media', 'the page input accepts one file at a time'), true);
+      if (input?.disabled) return this.toast(this.t.failed('browser_upload_media', 'that file input is disabled'), true);
+      if (input && !input.multiple && files.length > 1) return this.toast(this.t.failed('browser_upload_media', 'the page input accepts one file at a time'), true);
       if (!this.allowed('media-upload', 'browser_upload_media', `${files.length} media file(s) into Douyin`)) return this.toast(this.t.lookOnly('Douyin media upload'), true);
-      const inspected = asRecord(await this.call('inspect-upload', { fileId, snapshotId: page.snapshotId, files }, ctx.signal));
-      const account = asRecord(inspected?.account);
+      const inspected = asRecord(await this.call('inspect-upload', { fileId, files }, ctx.signal));
       const approvedFiles = Array.isArray(inspected?.files)
         ? inspected.files.flatMap((value) => {
           const file = asRecord(value);
@@ -2031,55 +2049,18 @@ export class BrowserWorld implements World {
             : [];
         })
         : [];
-      if (!inspected || inspected.url !== page.url || inspected.snapshotId !== page.snapshotId
-        || inspected.accept !== input.accept || inspected.multiple !== input.multiple
-        || typeof account?.ref !== 'string' || !account.ref || typeof account.label !== 'string' || !account.label
-        || approvedFiles.length !== files.length || approvedFiles.some((file, index) => file.path !== files[index])) {
-        return this.toast(this.t.failed('browser_upload_media', 'the current account, form or media list could not be verified'), true);
+      if (!inspected || typeof inspected.url !== 'string' || !isDouyinCreatorPage(inspected.url)
+        || approvedFiles.length !== files.length) {
+        return this.toast(this.t.failed('browser_upload_media', 'the current Douyin upload form or media list could not be verified'), true);
       }
-      const form = `${input.label} (accept=${input.accept || '*'}, multiple=${input.multiple})`;
-      const listed = approvedFiles.map((file) => `${file.path} — ${file.bytes} bytes — ${file.mime} — sha256 ${file.digest}`).join('\n');
-      const taskText = `Select these ${approvedFiles.length} media file(s) in the Douyin upload form; do not submit the post.`;
-      const decision = await this.approveBrowserAction(
-        'media-upload',
-        taskText,
-        page,
-        `file:${fileId}`,
-        form,
-        `Account: ${account.label} (${account.ref})\nOrigin: ${originOf(page.url)}\nForm: ${form}\nFiles (${approvedFiles.length}):\n${listed}`,
-        ctx,
-        {
-          accountRef: account.ref,
-          files: approvedFiles,
-          initialEvidence: (page.statusMessages ?? []).map((message) => ({
-            source: 'douyin-upload-notice',
-            status: 'baseline',
-            digest: uploadNoticeDigest(message),
-            observedAt: Date.now(),
-          })),
-        },
-      );
-      if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
-        : decision.reason === 'changed' ? this.t.sendChanged : this.t.lookOnly('Douyin media upload'), true);
-      const approval = decision.authorization;
-      let currentInspection: Record<string, unknown> | null;
-      try {
-        currentInspection = asRecord(await this.call('inspect-upload', { fileId, snapshotId: page.snapshotId, files }, ctx.signal));
-      } catch (error) {
-        this.taskJournal?.finish(approval.journalId, 'cancelled', 'the pre-dispatch media read failed');
-        throw error;
-      }
-      if (!currentInspection || JSON.stringify(currentInspection.files) !== JSON.stringify(approvedFiles)
-        || currentInspection.snapshotId !== page.snapshotId || currentInspection.url !== page.url
-        || asRecord(currentInspection.account)?.ref !== account.ref) {
-        this.taskJournal?.finish(approval.journalId, 'cancelled', 'the page or media changed before upload');
-        return this.toast(this.t.failed('browser_upload_media', 'the page or media changed after approval'), true);
-      }
+      const resolvedFileId = typeof inspected.fileId === 'number' ? inspected.fileId : fileId;
+      const resolvedSnapshotId = typeof inspected.snapshotId === 'string' ? inspected.snapshotId : '';
+      const approval: BrowserActionAuthorization = { journalId: '', grantDigest: '', approvedAt: Date.now(), expiresAt: Date.now() + 60_000 };
       let result: Record<string, unknown> | null;
       try {
         result = asRecord(await this.call('upload-media', {
-          fileId,
-          snapshotId: page.snapshotId,
+          fileId: resolvedFileId,
+          snapshotId: resolvedSnapshotId,
           files,
           expectedFiles: approvedFiles,
         }, ctx.signal));
@@ -2109,7 +2090,478 @@ export class BrowserWorld implements World {
       if (uploadState === 'failed') {
         return this.toast(this.t.failed('browser_upload_media', 'the page reported an upload failure; inspect the form before deciding whether to continue'), true);
       }
+      const taskSlugMatch = selected.map((item) => /^tasks\/([^/]+)\//.exec(item)?.[1]).find(Boolean);
+      this.ensureExperienceLog()?.record({
+        category: 'douyin_upload',
+        provider: 'douyin',
+        ...(taskSlugMatch ? { taskSlug: taskSlugMatch } : {}),
+        summary: `抖音创作者中心图文上传成功（${selected.length} 张素材）`,
+        lesson: `已成功上传素材至抖音图文页：${selected.join(', ')}`,
+        outcome: 'verified',
+        artifacts: selected,
+        url: state?.url ?? page.url,
+      });
       return this.toast(state ? this.full(state, this.t.uploadedMedia(selected)) : this.t.uploadedMedia(selected));
+    });
+  }
+
+  private async douyinTask(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.run('browser_douyin_task', ctx, async () => {
+      const store = this.ensureDouyinOpsStore();
+      if (!store) return this.toast(this.t.failed('browser_douyin_task', 'workspace directory is unavailable'), true);
+      const action = typeof args.action === 'string' ? args.action : '';
+      const taskId = typeof args.taskId === 'string' ? args.taskId.trim() : '';
+      const expLog = this.ensureExperienceLog();
+
+      if (action === 'list') {
+        const tasks = store.listTasks();
+        const experienceLessons = recallDouyinLessons(expLog, 5);
+        return this.toast(`[抖音运营任务] ${JSON.stringify({ tasks, experienceLessons })}`);
+      }
+      if (!taskId) return this.toast(this.t.failed('browser_douyin_task', 'taskId is required'), true);
+
+      if (action === 'init') {
+        const res = store.initTask({
+          taskId,
+          ...(typeof args.targetAccount === 'string' ? { targetAccount: args.targetAccount } : {}),
+          ...(typeof args.topic === 'string' ? { topic: args.topic } : {}),
+          ...(typeof args.title === 'string' ? { title: args.title } : {}),
+          ...(typeof args.body === 'string' ? { body: args.body } : {}),
+          ...(Array.isArray(args.tags) ? { tags: normalizeTags(args.tags) } : {}),
+          ...(Array.isArray(args.finalImagePaths) ? { finalImagePaths: args.finalImagePaths.filter((p): p is string => typeof p === 'string') } : {}),
+          ...(typeof args.music === 'string' ? { music: args.music } : {}),
+          ...(typeof args.aiDisclosure === 'boolean' ? { aiDisclosure: args.aiDisclosure } : {}),
+        }, expLog);
+        return this.toast(`[抖音运营任务] ${JSON.stringify(res)}`);
+      }
+
+      if (action === 'get') {
+        const task = store.getTask(taskId);
+        if (!task) return this.toast(this.t.failed('browser_douyin_task', `task not found: ${taskId}`), true);
+        return this.toast(`[抖音运营任务] ${JSON.stringify({ task, taskFile: store.taskFile(taskId) })}`);
+      }
+
+      if (action === 'update') {
+        const validStatuses = new Set<DouyinPostTaskStatus>(['DRAFT', 'READY', 'PUBLISHING', 'UNDER_REVIEW', 'PUBLISHED', 'FAILED', 'UNKNOWN']);
+        const status = typeof args.status === 'string' && validStatuses.has(args.status as DouyinPostTaskStatus)
+          ? args.status as DouyinPostTaskStatus
+          : undefined;
+        const task = store.updateTask(taskId, {
+          ...(typeof args.targetAccount === 'string' ? { targetAccount: args.targetAccount } : {}),
+          ...(typeof args.topic === 'string' ? { topic: args.topic } : {}),
+          ...(typeof args.title === 'string' ? { title: args.title } : {}),
+          ...(typeof args.body === 'string' ? { body: args.body } : {}),
+          ...(Array.isArray(args.tags) ? { tags: normalizeTags(args.tags) } : {}),
+          ...(Array.isArray(args.finalImagePaths) ? { finalImagePaths: args.finalImagePaths.filter((p): p is string => typeof p === 'string') } : {}),
+          ...(typeof args.music === 'string' ? { music: args.music } : {}),
+          ...(typeof args.aiDisclosure === 'boolean' ? { aiDisclosure: args.aiDisclosure } : {}),
+          ...(status ? { status } : {}),
+          ...(typeof args.postId === 'string' ? { postId: args.postId } : {}),
+          ...(typeof args.postUrl === 'string' ? { postUrl: args.postUrl } : {}),
+        });
+        return this.toast(`[抖音运营任务] ${JSON.stringify({ task, taskFile: store.taskFile(taskId) })}`);
+      }
+
+      if (action === 'sync_images') {
+        const anchor = this.opts.taskJournalFile ?? this.opts.journalFile;
+        const mediaDir = this.opts.mediaDir || (anchor ? join(dirname(dirname(anchor)), 'data', 'video', 'media') : '');
+        const paths = Array.isArray(args.finalImagePaths) ? args.finalImagePaths.filter((p): p is string => typeof p === 'string') : [];
+        if (!mediaDir || !paths.length) return this.toast(this.t.failed('browser_douyin_task', 'finalImagePaths and mediaDir are required for sync_images'), true);
+        const task = store.syncImagesFromMedia(taskId, mediaDir, paths);
+        return this.toast(`[抖音运营任务] ${JSON.stringify({ task, imagesDir: store.imagesDir(taskId) })}`);
+      }
+
+      if (action === 'record_review') {
+        const summary = typeof args.summary === 'string' ? args.summary.trim() : '';
+        const lesson = typeof args.lesson === 'string' ? args.lesson.trim() : '';
+        if (!summary || !lesson) return this.toast(this.t.failed('browser_douyin_task', 'summary and lesson are required for record_review'), true);
+        const task = store.getTask(taskId);
+        const supersedesId = typeof args.supersedesId === 'string' && args.supersedesId.trim() ? args.supersedesId.trim() : undefined;
+        const entry = expLog?.record({
+          category: 'douyin_review',
+          provider: 'douyin',
+          domain: 'self-growth',
+          taskSlug: taskId,
+          tags: task?.tags,
+          summary,
+          lesson,
+          outcome: 'verified',
+          ...(supersedesId ? { supersedesId } : {}),
+          ...(task?.postUrl ? { url: task.postUrl } : {}),
+        });
+        const feedbackRecorded: Array<{ experienceId: string; result: 'helpful' | 'ineffective' }> = [];
+        const helpfulIds = Array.isArray(args.helpfulExperienceIds)
+          ? args.helpfulExperienceIds.filter((x): x is string => typeof x === 'string' && !!x.trim())
+          : [];
+        const ineffectiveIds = Array.isArray(args.ineffectiveExperienceIds)
+          ? args.ineffectiveExperienceIds.filter((x): x is string => typeof x === 'string' && !!x.trim())
+          : [];
+        for (const id of helpfulIds) {
+          expLog?.recordFeedback(id, { result: 'helpful', taskSlug: taskId, note: summary.slice(0, 120) });
+          feedbackRecorded.push({ experienceId: id, result: 'helpful' });
+        }
+        for (const id of ineffectiveIds) {
+          expLog?.recordFeedback(id, { result: 'ineffective', taskSlug: taskId, note: summary.slice(0, 120) });
+          feedbackRecorded.push({ experienceId: id, result: 'ineffective' });
+        }
+        return this.toast(`[抖音运营复盘] ${JSON.stringify({
+          recorded: true,
+          taskId,
+          entry,
+          ...(feedbackRecorded.length ? { feedbackRecorded } : {}),
+          growthStats: expLog?.stats(),
+        })}`);
+      }
+
+      return this.toast(this.t.failed('browser_douyin_task', `unsupported action: ${action}`), true);
+    });
+  }
+
+  private async douyinOps(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.run('browser_douyin_ops', ctx, async () => {
+      const action = typeof args.action === 'string' ? args.action : '';
+      const taskId = typeof args.taskId === 'string' ? args.taskId.trim() : '';
+      const store = this.ensureDouyinOpsStore();
+      const task = taskId && store ? store.getTask(taskId) : null;
+      const expectedAccount = (typeof args.expectedAccount === 'string' && args.expectedAccount.trim())
+        || task?.targetAccount
+        || this.self.douyinDirectPublishAccountRef
+        || '';
+
+      if (action === 'check_account') {
+        const blocked = this.begin('browser_douyin_ops');
+        if (blocked) return blocked;
+        const res = asRecord(await this.call('douyin-check-account', { expectedAccount }, ctx.signal));
+        return this.toast(`[抖音账号核验] ${JSON.stringify(res)}`);
+      }
+
+      if (action === 'select_music') {
+        const blocked = this.begin('browser_douyin_ops');
+        if (blocked) return blocked;
+        const music = (typeof args.music === 'string' && args.music.trim()) || task?.music || '';
+        const res = asRecord(await this.call('douyin-select-music', { expectedAccount, music }, ctx.signal));
+        const importedMusic = asRecord(res?.music);
+        const appliedTitle = typeof importedMusic?.title === 'string' && importedMusic.title.trim() ? importedMusic.title.trim() : music;
+        if (taskId && store && appliedTitle) {
+          store.updateTask(taskId, { music: appliedTitle });
+        }
+        return this.toast(`[抖音配乐导入校验] ${JSON.stringify({
+          status: res?.status ?? 'OK',
+          already_applied: res?.already_applied === true,
+          fallbackUsed: res?.fallbackUsed === true,
+          account: res?.account,
+          music: res?.music,
+          pageUrl: res?.pageUrl,
+        })}`);
+      }
+
+      if (action === 'fill_post') {
+        const blocked = this.begin('browser_douyin_ops');
+        if (blocked) return blocked;
+        const title = (typeof args.title === 'string' && args.title.trim()) || task?.title || '';
+        const body = (typeof args.body === 'string' && args.body.trim()) || task?.body || '';
+        const tags = Array.isArray(args.tags) && args.tags.length ? normalizeTags(args.tags) : (task?.tags ?? []);
+        const music = (typeof args.music === 'string' && args.music.trim()) || task?.music || '';
+        const aiDisclosure = typeof args.aiDisclosure === 'boolean' ? args.aiDisclosure : (task?.aiDisclosure === true);
+        const res = asRecord(await this.call('douyin-fill-post', { expectedAccount, title, body, tags, music, aiDisclosure }, ctx.signal));
+        const resMusic = asRecord(res?.music);
+        const appliedMusicTitle = typeof resMusic?.title === 'string' && resMusic.title.trim() ? resMusic.title.trim() : music;
+        if (taskId && store) {
+          store.updateTask(taskId, {
+            ...(title ? { title } : {}),
+            ...(body ? { body } : {}),
+            ...(tags.length ? { tags } : {}),
+            ...(appliedMusicTitle ? { music: appliedMusicTitle } : {}),
+            aiDisclosure,
+            status: 'READY',
+          });
+        }
+        const summary = `[抖音填表校验快照] ${JSON.stringify({
+          status: res?.status ?? 'OK',
+          already_applied: res?.already_applied === true,
+          account: res?.account,
+          titleExact: res?.titleExact,
+          bodyExact: res?.bodyExact,
+          bodyPreview: res?.bodyPreview,
+          hashtagCount: res?.hashtagCount,
+          imageCount: res?.imageCount,
+          aiDeclarationChecked: res?.aiDeclarationChecked,
+          tagsApplied: res?.tagsApplied,
+          music: res?.music,
+          pageUrl: res?.pageUrl ?? res?.url,
+        })}`;
+        return this.toast(summary);
+      }
+
+      if (action === 'publish_post') {
+        const blocked = this.begin('browser_douyin_ops');
+        if (blocked) return blocked;
+        const title = (typeof args.title === 'string' && args.title.trim()) || task?.title || '';
+        // Idempotency guard (Baseline #2): never blindly re-publish if already published/in-flight/unknown.
+        if (task && (task.status === 'PUBLISHED' || task.status === 'UNDER_REVIEW')) {
+          return this.toast(`[抖音发布防重] 任务 ${taskId} 当前已为 ${task.status}（postId=${task.postId ?? '未知'}，url=${task.postUrl ?? '未知'}），未重复发布。`);
+        }
+        // Only run pre-publish manage-page dedupe when we are NOT currently on an active draft editor page,
+        // because navigating to /content/manage destroys the live React draft state (especially imported BGM audio).
+        const curPageUrl = this.lastState?.url || '';
+        const onDraftEditPage = /\/(?:post\/image|publish-media\/image-text|publish)/i.test(curPageUrl);
+        if (task && (task.status === 'PUBLISHING' || task.status === 'UNKNOWN') && !onDraftEditPage) {
+          const dedupe = asRecord(await this.call('douyin-check-posts', { expectedAccount, title, postId: task.postId, refresh: true }, ctx.signal));
+          const matched = asRecord(dedupe?.matchedPost);
+          if (matched) {
+            const postId = typeof matched.postId === 'string' ? matched.postId : '';
+            const postUrl = typeof matched.postUrl === 'string' ? matched.postUrl : '';
+            const status = (matched.status === 'PUBLISHED' || matched.status === 'UNDER_REVIEW') ? matched.status : 'UNDER_REVIEW';
+            store?.updateTask(taskId, { status, ...(postId ? { postId } : {}), ...(postUrl ? { postUrl } : {}), reviewStatus: String(matched.rawStatus ?? '') });
+            return this.toast(`[抖音幂等查重命中] 作品列表已存在匹配作品，未重复发布：${JSON.stringify(matched)}`);
+          }
+        }
+
+        const page = this.lastState;
+        if (!this.douyinDirectPublishAllowed(page)) {
+          if (!page?.snapshotId) return this.toast(this.t.sendTargetUnverified, true);
+          const decision = await this.approveBrowserAction(
+            'platform-write',
+            `Publish Douyin graphic post "${title || taskId || 'untitled'}" on ${page.url}`,
+            page,
+            `douyin-ops-publish:${taskId || page.url}`,
+            '发布',
+            [
+              `账号：${expectedAccount || page.account?.label || '当前登录账号'}`,
+              `标题：${title || '(当前表单)'}`,
+              `页面：${page.url}`,
+            ].join('\n'),
+            ctx,
+            { risk: 'IRREVERSIBLE_OR_PUBLIC' },
+          );
+          if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown : this.t.manualPublish, true);
+        }
+
+        const prevStatus: DouyinPostTaskStatus = task?.status ?? 'READY';
+        const requireMusic = typeof args.requireMusic === 'boolean' ? args.requireMusic : Boolean(task?.music);
+        let pub: Record<string, unknown> | null = null;
+        try {
+          pub = asRecord(await this.call('douyin-publish-post', { expectedAccount, requireMusic, music: task?.music || '' }, ctx.signal));
+        } catch (error) {
+          const errMsg = error instanceof Error ? error.message : String(error);
+          const isPreClickBlock = /publish blocked|not on Douyin image edit page|account mismatch before publish|primary Publish button/i.test(errMsg);
+          if (taskId && store) {
+            store.updateTask(taskId, { status: isPreClickBlock ? (prevStatus === 'PUBLISHING' || prevStatus === 'UNKNOWN' ? 'READY' : prevStatus) : 'UNKNOWN' });
+          }
+          throw error;
+        }
+        if (taskId && store) store.updateTask(taskId, { status: 'PUBLISHING' });
+
+        let finalStatus: DouyinPostTaskStatus = pub?.status === 'PUBLISHED' ? 'PUBLISHED'
+          : pub?.status === 'UNDER_REVIEW' ? 'UNDER_REVIEW'
+            : pub?.status === 'FAILED' ? 'FAILED' : 'UNKNOWN';
+        let postId = '';
+        let postUrl = '';
+        let reviewStatus = '';
+        if (finalStatus !== 'FAILED') {
+          const checked = asRecord(await this.call('douyin-check-posts', { expectedAccount, title, refresh: true }, ctx.signal).catch(() => null));
+          const matched = asRecord(checked?.matchedPost) ?? (Array.isArray(checked?.posts) ? asRecord(checked.posts[0]) : null);
+          if (matched) {
+            postId = typeof matched.postId === 'string' ? matched.postId : '';
+            postUrl = typeof matched.postUrl === 'string' ? matched.postUrl : '';
+            reviewStatus = typeof matched.rawStatus === 'string' ? matched.rawStatus : '';
+            if (matched.status === 'PUBLISHED' || matched.status === 'UNDER_REVIEW') finalStatus = matched.status;
+          }
+        }
+        const publishedAt = finalStatus === 'PUBLISHED' || finalStatus === 'UNDER_REVIEW' ? new Date().toISOString() : undefined;
+        if (taskId && store) {
+          store.updateTask(taskId, {
+            status: finalStatus,
+            ...(postId ? { postId } : {}),
+            ...(postUrl ? { postUrl } : {}),
+            ...(reviewStatus ? { reviewStatus } : {}),
+            ...(publishedAt ? { publishedAt } : {}),
+          });
+        }
+        this.ensureExperienceLog()?.record({
+          category: 'douyin_publish',
+          provider: 'douyin',
+          ...(taskId ? { taskSlug: taskId } : {}),
+          summary: `抖音图文发布完成（状态：${finalStatus}${postId ? `，postId=${postId}` : ''}）`,
+          lesson: `作品「${title || taskId}」已提交并回读作品列表，状态=${finalStatus}${postUrl ? `，链接=${postUrl}` : ''}。`,
+          outcome: finalStatus === 'PUBLISHED' ? 'verified' : finalStatus === 'UNDER_REVIEW' ? 'submitted' : finalStatus === 'FAILED' ? 'failed' : 'unknown',
+          ...(postUrl ? { url: postUrl } : {}),
+        });
+        return this.toast(`[抖音发布结果] ${JSON.stringify({ taskId, status: finalStatus, postId, postUrl, reviewStatus, publishedAt, account: pub?.account, music: pub?.music, statusMessages: pub?.statusMessages })}`);
+      }
+
+      if (action === 'check_posts' || action === 'fetch_metrics') {
+        const blocked = this.begin('browser_douyin_ops');
+        if (blocked) return blocked;
+        const title = (typeof args.title === 'string' && args.title.trim()) || task?.title || '';
+        const postId = (typeof args.postId === 'string' && args.postId.trim()) || task?.postId || '';
+        const res = asRecord(await this.call('douyin-check-posts', { expectedAccount, title, postId, refresh: true }, ctx.signal));
+        const matched = asRecord(res?.matchedPost);
+        let metricsResult: Record<string, unknown> | null = null;
+        if (matched && taskId && store) {
+          const mPostId = typeof matched.postId === 'string' ? matched.postId : '';
+          const mPostUrl = typeof matched.postUrl === 'string' ? matched.postUrl : '';
+          const mStatus = (matched.status === 'PUBLISHED' || matched.status === 'UNDER_REVIEW' || matched.status === 'FAILED') ? matched.status : undefined;
+          store.updateTask(taskId, {
+            ...(mPostId ? { postId: mPostId } : {}),
+            ...(mPostUrl ? { postUrl: mPostUrl } : {}),
+            ...(mStatus ? { status: mStatus } : {}),
+            ...(typeof matched.rawStatus === 'string' ? { reviewStatus: matched.rawStatus } : {}),
+          });
+          const metrics = asRecord(matched.metrics);
+          if (metrics) {
+            const appended = store.appendMetrics(taskId, {
+              views: Number(metrics.views) || 0,
+              likes: Number(metrics.likes) || 0,
+              collections: Number(metrics.collections) || 0,
+              comments: Number(metrics.comments) || 0,
+              shares: Number(metrics.shares) || 0,
+            });
+            metricsResult = { latest: appended.latest, delta: appended.delta };
+            if (action === 'fetch_metrics') {
+              this.ensureExperienceLog()?.record({
+                category: 'douyin_metrics',
+                provider: 'douyin',
+                taskSlug: taskId,
+                summary: `抖音作品数据快照（播放 ${appended.latest.views} / 赞 ${appended.latest.likes} / 藏 ${appended.latest.collections} / 评 ${appended.latest.comments}）`,
+                lesson: `作品「${title || taskId}」数据快照已回读：views=${appended.latest.views}, likes=${appended.latest.likes}, collections=${appended.latest.collections}, comments=${appended.latest.comments}, shares=${appended.latest.shares}。`,
+                outcome: 'verified',
+                ...(mPostUrl ? { url: mPostUrl } : {}),
+              });
+            }
+          }
+        }
+        return this.toast(`[抖音作品${action === 'fetch_metrics' ? '数据快照' : '列表查重'}] ${JSON.stringify({ ...res, ...(metricsResult ? { metricsSnapshot: metricsResult } : {}) })}`);
+      }
+
+      if (action === 'fetch_comments') {
+        const blocked = this.begin('browser_douyin_ops');
+        if (blocked) return blocked;
+        const res = asRecord(await this.call('douyin-fetch-comments', { expectedAccount, refresh: true }, ctx.signal));
+        const comments = Array.isArray(res?.comments) ? res.comments as Array<{ commentId: string; user: string; text: string; isReplied?: boolean }> : [];
+        if (taskId && store && comments.length) {
+          store.mergeComments(taskId, comments);
+        }
+        return this.toast(`[抖音评论读取] ${JSON.stringify(res)}`);
+      }
+
+      if (action === 'reply_comment') {
+        const blocked = this.begin('browser_douyin_ops');
+        if (blocked) return blocked;
+        const replyText = typeof args.replyText === 'string' ? args.replyText.trim() : '';
+        if (!replyText) return this.toast(this.t.failed('browser_douyin_ops', 'replyText is required'), true);
+        const commentId = typeof args.commentId === 'string' ? args.commentId.trim() : '';
+        const savedComment = commentId && task ? task.comments.find((c) => c.commentId === commentId) : undefined;
+        const commentUser = (typeof args.commentUser === 'string' && args.commentUser.trim()) || savedComment?.user || '';
+        const commentText = (typeof args.commentText === 'string' && args.commentText.trim()) || savedComment?.text || '';
+        const page = this.lastState;
+        if (!this.douyinDirectPublishAllowed(page)) {
+          if (!page?.snapshotId) return this.toast(this.t.sendTargetUnverified, true);
+          const decision = await this.approveBrowserAction(
+            'platform-write',
+            `Reply to Douyin comment by ${commentUser || 'user'}: ${replyText}`,
+            page,
+            `douyin-ops-reply:${commentId || commentUser}`,
+            '回复评论',
+            [
+              `评论用户：${commentUser || '(未知)'}`,
+              `原评论：${commentText || '(当前行)'}`,
+              `回复内容：${replyText}`,
+            ].join('\n'),
+            ctx,
+            { risk: 'IRREVERSIBLE_OR_PUBLIC' },
+          );
+          if (!decision.approved) return this.toast(this.t.sendCancelled, true);
+        }
+        const res = asRecord(await this.call('douyin-reply-comment', { expectedAccount, commentUser, commentText, replyText }, ctx.signal));
+        if (res?.replied === true && taskId && store && commentId) {
+          store.markCommentReplied(taskId, commentId, replyText);
+        }
+        if (res?.replied === true) {
+          this.ensureExperienceLog()?.record({
+            category: 'douyin_comment_reply',
+            provider: 'douyin',
+            ...(taskId ? { taskSlug: taskId } : {}),
+            summary: `抖音评论回复完成（回复 ${commentUser || commentId}）`,
+            lesson: `已回复评论「${commentText.slice(0, 40)}」→「${replyText.slice(0, 60)}」（verified=${res.verified === true}）。`,
+            outcome: res.verified === true ? 'verified' : 'submitted',
+            ...(typeof res.url === 'string' ? { url: res.url } : {}),
+          });
+        }
+        return this.toast(`[抖音评论回复] ${JSON.stringify(res)}`);
+      }
+
+      return this.toast(this.t.failed('browser_douyin_ops', `unsupported action: ${action}`), true);
+    });
+  }
+
+
+  private async douyinPreparePost(args: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolOutcome> {
+    return this.run('douyin_prepare_post', ctx, async () => {
+      const images = Array.isArray(args.images) ? args.images.filter((f): f is string => typeof f === 'string' && !!f.trim()) : [];
+      const title = typeof args.title === 'string' ? args.title.trim() : '';
+      const body = typeof args.body === 'string' ? args.body.trim() : '';
+      const hashtags = Array.isArray(args.hashtags) ? normalizeTags(args.hashtags) : [];
+      if (!images.length) return this.toast(this.t.failed('douyin_prepare_post', 'images must be a non-empty array of relative media paths'), true);
+      if (!this.allowed('media-upload', 'douyin_prepare_post', `${images.length} image(s) into Douyin`)) {
+        return this.toast(this.t.lookOnly('Douyin media upload'), true);
+      }
+      const blocked = this.begin(this.started === null ? 'browser_open' : 'douyin_prepare_post');
+      if (blocked) return blocked;
+      const taskId = typeof args.taskId === 'string' ? args.taskId.trim() : '';
+      const store = this.ensureDouyinOpsStore();
+      const task = taskId && store ? store.getTask(taskId) : null;
+      const expectedAccount = (typeof args.expectedAccount === 'string' && args.expectedAccount.trim())
+        || task?.targetAccount
+        || this.self.douyinDirectPublishAccountRef
+        || '';
+      const music = (typeof args.music === 'string' && args.music.trim()) || task?.music || '';
+      const aiDisclosure = typeof args.aiDisclosure === 'boolean' ? args.aiDisclosure : (task?.aiDisclosure === true);
+      const res = asRecord(await this.call('douyin-prepare-post', {
+        images,
+        title: title || task?.title || '',
+        body: body || task?.body || '',
+        hashtags: hashtags.length ? hashtags : (task?.tags ?? []),
+        music,
+        expectedAccount,
+        aiDisclosure,
+      }, ctx.signal));
+      const resMusic = asRecord(res?.music);
+      const appliedMusicTitle = typeof resMusic?.title === 'string' && resMusic.title.trim() ? resMusic.title.trim() : music;
+      if (taskId && store) {
+        store.updateTask(taskId, {
+          ...(title ? { title } : {}),
+          ...(body ? { body } : {}),
+          ...(hashtags.length ? { tags: hashtags } : {}),
+          ...(appliedMusicTitle ? { music: appliedMusicTitle } : {}),
+          aiDisclosure,
+          status: 'READY',
+        });
+      }
+      this.ensureExperienceLog()?.record({
+        category: 'douyin_upload',
+        provider: 'douyin',
+        ...(taskId ? { taskSlug: taskId } : {}),
+        summary: `抖音复合草稿准备完成（${images.length} 张图，titleExact=${res?.titleExact}，bodyExact=${res?.bodyExact}，musicImported=${resMusic?.imported === true}）`,
+        lesson: `douyin_prepare_post 一步完成上传跳页与防叠字填表，停留在草稿页 ${res?.pageUrl ?? ''}。`,
+        outcome: 'verified',
+        artifacts: images,
+        ...(typeof res?.pageUrl === 'string' ? { url: res.pageUrl } : {}),
+      });
+      return this.toast(`[抖音草稿准备完成] ${JSON.stringify({
+        status: res?.status ?? 'OK',
+        stage: res?.stage ?? 'draft_ready',
+        files: res?.files ?? images,
+        imageCount: res?.imageCount,
+        titleExact: res?.titleExact,
+        bodyExact: res?.bodyExact,
+        bodyPreview: res?.bodyPreview,
+        hashtagCount: res?.hashtagCount,
+        aiDeclarationChecked: res?.aiDeclarationChecked,
+        music: res?.music,
+        account: res?.account,
+        pageUrl: res?.pageUrl ?? res?.url,
+      })}`);
     });
   }
 
@@ -2232,29 +2684,35 @@ export class BrowserWorld implements World {
       };
       const accountDisplay = `${target.accountLabel} (${target.accountRef})`;
       const taskText = `Send this exact text once on ${target.videoUrl}: ${input.content}`;
-      const decision = await this.approveBrowserAction(
-        'platform-write',
-        taskText,
-        page!,
-        `video:${target.videoUrl}`,
-        'text-submit',
-        `Account: ${accountDisplay}\nTarget: ${approvalWhere}\nControl: ${input.label || input.boxLabel}\nText: ${input.content}`,
-        ctx,
-        {
-          accountRef: target.accountRef,
-          dedupeKey: replyTarget?.fingerprint,
-          commentFingerprint: replyTarget?.fingerprint,
-          payloadDigest: contentDigest,
-          risk: 'IRREVERSIBLE_OR_PUBLIC',
-        },
-      );
-      if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
-        : decision.reason === 'changed' ? this.t.sendChanged
-          : decision.reason === 'not-answered' ? this.t.sendNotAnswered
-            : decision.reason === 'not-approved' ? this.t.sendCancelled
-              : this.t.sendJournalUnavailable, true);
+      const skipReplyApproval = !!replyTarget && this.douyinDirectPublishAllowed(page);
+      let journalId = '';
+      if (!skipReplyApproval) {
+        const decision = await this.approveBrowserAction(
+          'platform-write',
+          taskText,
+          page!,
+          `video:${target.videoUrl}`,
+          'text-submit',
+          `Account: ${accountDisplay}\nTarget: ${approvalWhere}\nControl: ${input.label || input.boxLabel}\nText: ${input.content}`,
+          ctx,
+          {
+            accountRef: target.accountRef,
+            dedupeKey: replyTarget?.fingerprint,
+            commentFingerprint: replyTarget?.fingerprint,
+            payloadDigest: contentDigest,
+            risk: 'IRREVERSIBLE_OR_PUBLIC',
+          },
+        );
+        if (!decision.approved) return this.toast(decision.reason === 'unknown' ? this.t.sendUnknown
+          : decision.reason === 'changed' ? this.t.sendChanged
+            : decision.reason === 'not-answered' ? this.t.sendNotAnswered
+              : decision.reason === 'not-approved' ? this.t.sendCancelled
+                : this.t.sendJournalUnavailable, true);
+        journalId = decision.authorization.journalId;
+      }
       const finish = (result: ActionReceiptCompletion) => {
-        try { this.taskJournal?.complete(decision.authorization.journalId, result); } catch { /* acting remains unresolved on disk */ }
+        if (!journalId) return;
+        try { this.taskJournal?.complete(journalId, result); } catch { /* acting remains unresolved on disk */ }
       };
 
       // Re-resolve the page, editor, control and text after the grant reaches the journal.
@@ -2295,6 +2753,16 @@ export class BrowserWorld implements World {
           finish({ phase: 'submitted', dispatchState: 'delivered', outcome: 'remote-acknowledged', note: 'the page acknowledges the submission without a final review status' });
         } else {
           finish({ phase: 'unknown', dispatchState: 'delivered', outcome: 'unknown', note: 'the text box cleared but the page gave no submission status' });
+        }
+        if (replyTarget && isDouyinPage(target.url)) {
+          this.ensureExperienceLog()?.record({
+            category: 'douyin_comment_reply',
+            provider: 'douyin',
+            summary: `抖音评论回复已发送（回复 ${replyTarget.author}）`,
+            lesson: `已回复作品 ${target.videoUrl} 下 ${replyTarget.author} 的评论，状态：${status}`,
+            outcome: status === 'published' ? 'verified' : 'submitted',
+            url: target.videoUrl,
+          });
         }
         this.lastTyped = null;
         return this.toast(this.full(state, this.t.sent(approvalWhere, status)));
@@ -2376,8 +2844,9 @@ export class BrowserWorld implements World {
     this.seen(state);
     const content = state.content.replace(/^(\s*)\*\[/gm, '$1[');
     const body = content.length > CONTENT_MAX ? `${content.slice(0, CONTENT_MAX)}\n${this.t.truncated}` : content;
-    const header = state.header.length > 1600 ? `${state.header.slice(0, 1600)}…` : state.header;
-    return [lead, header, body, state.footer.slice(0, 400), this.currentVideo(state), this.t.timestamps(state.timestamps ?? []), this.t.fileInputs(state.fileInputs ?? []), this.t.replyTargets(state.replyTargets ?? []), this.t.mediaTargets(state.mediaTargets ?? []), state.statusMessages?.length ? `Page status: ${state.statusMessages.join(' · ')}` : '', this.t.video(state.video)].filter(Boolean).join('\n');
+    const header = state.header.length > 1200 ? `${state.header.slice(0, 1200)}…` : state.header;
+    const assembled = [lead, header, body, state.footer.slice(0, 300), this.currentVideo(state), this.t.timestamps(state.timestamps ?? []), this.t.fileInputs(state.fileInputs ?? []), this.t.replyTargets(state.replyTargets ?? []), this.t.mediaTargets(state.mediaTargets ?? []), state.statusMessages?.length ? `Page status: ${state.statusMessages.join(' · ')}` : '', this.t.video(state.video)].filter(Boolean).join('\n');
+    return assembled.length > 7_500 ? `${assembled.slice(0, 7_460)}\n${this.t.truncated}` : assembled;
   }
 
   private brief(state: PageState, lead = ''): string {

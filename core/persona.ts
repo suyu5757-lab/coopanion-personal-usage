@@ -415,7 +415,8 @@ function handoffOwner(artifact: DerivedArtifact): HandoffFileOwner | null {
 function handoffFileMatches(path: string, owner: HandoffFileOwner, digest: string): boolean {
   try {
     const stat = lstatSync(path);
-    return stat.isFile() && stat.dev === owner.device && stat.ino === owner.inode
+    const parentDev = lstatSync(dirname(path)).dev;
+    return stat.isFile() && (stat.dev === owner.device || stat.dev === parentDev) && stat.ino === owner.inode
       && sha256(readFileSync(path)) === digest;
   } catch {
     return false;
@@ -715,9 +716,36 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         && item.spans.some((span) => span.origin === 'hindsight-source' && span.mappingState === 'complete')
         && item.spans.some((span) => span.origin === 'generation-derived' && span.mappingState === 'unverified'
           && span.generationEvidenceId === undefined)) === true;
-      if (incompleteMemory) this.sourceRecoveryHandoffPending = true;
+      const staleEpochMemory = !current && sources.length > 0
+        && this.longTerm?.enabled() === true
+        && !this.longTerm.sourceExposureCurrent(sources);
+      if (staleEpochMemory && !this.pendingForgottenHandoffReset) {
+        const staleIds = [...new Set(sources.filter((source) => !this.longTerm?.sourceExposureCurrent([source])).map((source) => source.documentId).filter(Boolean))];
+        if (!this.longTerm?.settled() || staleIds.length === 0 || !this.requestHandoffAfterDeliveredNoteForget(staleIds, { allowStaleEpochOnly: true })) {
+          this.scheduleSourceRecoveryHandoff();
+        }
+      } else if (!current || incompleteMemory || (inspection && inspection.mappingState !== 'complete')) {
+        this.scheduleSourceRecoveryHandoff();
+      }
       this.logSourceSpanDiagnostic(sources, inspection, { allowed: current, recoveryHandoffPending: this.sourceRecoveryHandoffPending });
       return current;
+    }
+
+    private scheduleSourceRecoveryHandoff(): void {
+      if (this.sourceRecoveryHandoffPending) return;
+      this.sourceRecoveryHandoffPending = true;
+      // core-evidence-blocked exits processBatch early before onBatchEnd(); trigger handoff once idle.
+      void (async () => {
+        const deadline = Date.now() + 3000;
+        while (this.sourceRecoveryHandoffPending && this.attachedCore && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 40));
+          if (!this.sourceRecoveryHandoffPending || !this.attachedCore) return;
+          if (this.attachedCore.requestContextHandoff()) {
+            this.sourceRecoveryHandoffPending = false;
+            return;
+          }
+        }
+      })();
     }
 
     override onBatchEnd(): void {
@@ -1700,7 +1728,8 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         // re-read from the bodyDigest-bound file, but only for per-part recovery; the stale
         // artifact is never admitted as a whole note.
         const recoverable = artifact.lifecycleState === 'active'
-          || (artifact.lifecycleState === 'stale' && artifact.lineageState === 'complete' && artifact.sources.length > 0);
+          || (artifact.lifecycleState === 'stale' && artifact.lineageState === 'complete' && artifact.sources.length > 0)
+          || (artifact.lifecycleState === 'withdrawn' && artifact.statusReason === 'handoff-active-file-changed-or-missing' && artifact.lineageState === 'complete');
         if (!recoverable || !artifact.target.startsWith(HANDOFF_DIR)) return [];
         const owner = handoffOwner(artifact);
         if (!owner) return [];
@@ -1738,7 +1767,8 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             const fileInText = /saved in (handoffs\/[^\s]+\.md):/.exec(segment)?.[1];
             const noticeRecord = record.item.type === 'message' && record.item.role === 'user'
               && !record.context.frame?.events?.length && !record.context.evidence?.length
-              && !record.context.sourceIndependentSpans?.length && !record.context.sourceMapSpans?.length;
+              && !record.context.sourceIndependentSpans?.length
+              && (record.context.sourceMapSpans ?? []).every((s) => s.origin === 'core-generated' && !s.exposedSources?.length);
             const deliveryNotice = record.item.type === 'message' && record.item.role === 'user'
               && (noticeRecord || !!record.context.frame?.events?.length || refreshedEvidence.has(record))
               && /^\[system\] \d+ new events?\.$/.test(segment);
@@ -1777,6 +1807,19 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             && span.exposedSources.every((source) => file.sources.some((dependency) => dependency.bankId === source.bankId
               && dependency.endpoint === source.endpoint && dependency.documentId === source.documentId
               && dependency.contentDigest === source.contentDigest)))) continue;
+          if (!belongsToHandoff && record.item.type === 'message' && record.item.role === 'user'
+            && /^\[system\] \d+ new events?\.$/.test(segment)
+            && handoffFiles.some((file) => span.exposedSources.every((source) => file.sources.some((dependency) =>
+              dependency.bankId === source.bankId && dependency.endpoint === source.endpoint
+              && dependency.documentId === source.documentId && dependency.contentDigest === source.contentDigest)))) {
+            sourceFree.push({
+              proofId: span.proofId,
+              digest: span.digest,
+              persistedSources: span.exposedSources,
+              currentSources: span.exposedSources,
+            });
+            continue;
+          }
           inputs.push({ text: segment, digest: span.digest, exposedSources: span.exposedSources });
           spans.push({ proofId: span.proofId, digest: span.digest, exposedSources: span.exposedSources });
         }
@@ -2915,7 +2958,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       this.core?.injectInternal(`[system] The World "${event.label}" ${what}.`, 'notice');
     }
 
-    private requestHandoffAfterDeliveredNoteForget(forgottenIds: readonly string[]): boolean {
+    private requestHandoffAfterDeliveredNoteForget(forgottenIds: readonly string[], opts?: { allowStaleEpochOnly?: boolean }): boolean {
       const memory = this.longTerm;
       const core = this.attachedCore;
       const forgotten = [...new Set(forgottenIds.filter(Boolean))];
@@ -2925,14 +2968,16 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       const snapshot = core.sessionInfo('main').snapshot;
       if (!bankId || !endpoint || !snapshot?.length) return false;
       const forgottenSet = new Set(forgotten);
+      const isInvalidated = (source: SourceExposureRef): boolean =>
+        source.bankId === bankId && source.endpoint === endpoint
+        && (forgottenSet.has(source.documentId) || !memory.sourceExposureCurrent([source]));
       const affectedSources = new Map<string, SourceExposureRef>();
       for (const record of snapshot) {
         const noteEvents = (record.context.frame?.events ?? []).filter((event) => event.type === HANDOFF_NOTE_TYPE);
         if (noteEvents.length === 0) continue;
         for (const span of record.context.sourceDependencySpans ?? []) {
           const coversNote = noteEvents.some((event) => span.start < event.start + event.chars && span.end > event.start);
-          if (!coversNote || !span.exposedSources.some((source) =>
-            source.bankId === bankId && source.endpoint === endpoint && forgottenSet.has(source.documentId))) continue;
+          if (!coversNote || !span.exposedSources.some(isInvalidated)) continue;
           for (const source of span.exposedSources) {
             if (source.bankId === bankId && source.endpoint === endpoint) {
               affectedSources.set(handoffSourceProofIdentity(source), source);
@@ -2949,8 +2994,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             ...(record.context.sourceDependencySpans ?? []).flatMap((span) => span.exposedSources),
             ...(record.context.sourceMapSpans ?? []).flatMap((span) => span.exposedSources ?? []),
           ];
-          if (!refs.some((source) => source.bankId === bankId && source.endpoint === endpoint
-            && forgottenSet.has(source.documentId))) continue;
+          if (!refs.some(isInvalidated)) continue;
           for (const source of refs) {
             if (source.bankId === bankId && source.endpoint === endpoint) {
               affectedSources.set(handoffSourceProofIdentity(source), source);
@@ -2960,6 +3004,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         rawContext = affectedSources.size > 0;
       }
       if (affectedSources.size === 0) return false;
+      const fencedIds = opts?.allowStaleEpochOnly ? forgotten.filter((id) => memory.sourceFenced(id)) : forgotten;
 
       const sourceRefs = [...affectedSources.values()];
       const identities = new Set(sourceRefs.map(handoffSourceIdentity));
@@ -3003,7 +3048,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       const reset: ForgottenHandoffReset = {
         phase: 'awaiting-block',
         ...(rawContext ? { rawContext: true as const, eventCutoff } : {}),
-        forgottenIds: forgotten,
+        forgottenIds: fencedIds,
         sourceRefs,
         artifactIds,
         expectedEpoch,
@@ -3884,16 +3929,21 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
           const segment = text.slice(start, end);
           return evidenceCoversText(segment, [{ ...attachment, segment: { start: 0, end: segment.length, digest: attachment.segment.digest } }]);
         });
-        const independent = (record.context.sourceIndependentSpans ?? []).filter((span) => validSpan(text, span)
-          && !((record.context.frame?.events ?? []).some((event) => fenced(event)
-            && event.start < span.end && event.start + event.chars > span.start)));
         const dependencies = (record.context.sourceDependencySpans ?? []).filter((span) => validSpan(text, span)
           && itemCoverage.spans.some((covered) => covered.start === span.start && covered.end === span.end
             && covered.digest === span.digest && covered.origin === 'generation-derived' && covered.mappingState === 'complete'
             && covered.generationEvidenceId === span.proofId)
           && span.exposedSources.every((source) => memory?.sourceVisible(source.documentId)
             && memory.sourceCurrentForContext(source.documentId)));
+        const droppedDependencies = (record.context.sourceDependencySpans ?? []).filter((span) => !dependencies.includes(span));
+        const overlapsDroppedDependency = (start: number, end: number): boolean =>
+          droppedDependencies.some((dropped) => dropped.start < end && dropped.end > start);
+        const independent = (record.context.sourceIndependentSpans ?? []).filter((span) => validSpan(text, span)
+          && !overlapsDroppedDependency(span.start, span.end)
+          && !((record.context.frame?.events ?? []).some((event) => fenced(event)
+            && event.start < span.end && event.start + event.chars > span.start)));
         const sourceMaps = (record.context.sourceMapSpans ?? []).filter((span) => validSpan(text, span)
+          && !overlapsDroppedDependency(span.start, span.end)
           && span.origin !== 'unknown-derived'
           && (span.origin === 'core-generated' || span.origin === 'user-input' || span.origin === 'user-config'
             ? !span.exposedSources?.length
@@ -3912,6 +3962,9 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         if (!redacted.trim()) return null;
         const frameEvents = record.context.frame?.events.filter((event) =>
           safeRanges.some((range) => range.start <= event.start && range.end >= event.start + event.chars) && !fenced(event));
+        if (record.context.frame && record.context.frame.events.length > 0 && (frameEvents?.length ?? 0) === 0) {
+          return null;
+        }
         const changed = redacted !== text || evidence.length !== (record.context.evidence?.length ?? 0)
           || independent.length !== (record.context.sourceIndependentSpans?.length ?? 0)
           || dependencies.length !== (record.context.sourceDependencySpans?.length ?? 0)
@@ -4518,6 +4571,7 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         'Only the latest stretch keeps what your speaking tools were called with and their receipts. ',
         'What a call was given is what you meant to say; whether the person saw it is in the receipt and the events after it. ',
         'Carry on with the current topic or action naturally, with no need to remark on the pause, the clear or the handoff. Old lines and folded fragments are not models for wording or length. ',
+        'Do NOT re-execute tasks, tool flows, or replies from the handoff note that were already completed or reported; if there is no new user request after the handoff, simply call end_turn without speaking or acting. ',
         'Never call a speaking tool with empty content; nothing would show. ',
         'To say something, put it straight into the call. If you have nothing to say this turn, call end_turn.',
       ];

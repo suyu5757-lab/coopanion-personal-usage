@@ -49,8 +49,9 @@ describe('alarms panel', () => {
       newInstall: () => true, read: () => undefined, petConnected: () => false, guiding: () => false,
       refreshTools: async () => {}, label: () => 'notice',
     }).create({ timezone: 'Asia/Shanghai' } as never);
-    const pushed: Array<{ type: string; render: () => string | null }> = [];
-    await world.start({ pushDeferred: (e: { type: string; render: () => string | null }) => pushed.push(e) } as unknown as WorldHost);
+    const notice = world as NoticeWorld;
+    const pushed: Array<{ type: string; render: () => unknown }> = [];
+    await world.start({ pushDeferred: (e: { type: string; render: () => unknown }) => pushed.push(e) } as unknown as WorldHost);
     try {
       const run = (name: string, args: Record<string, unknown>) => world.tools().find((t) => t.name === name)!.handler(args, {} as never) as Promise<{ text: string }>;
       await run('alarm_set', { note: '提醒喝水', in_minutes: 30 });
@@ -61,7 +62,10 @@ describe('alarms panel', () => {
       expect(after.alarms.map((a) => a.note)).toEqual(['提醒睡觉']);
       expect((await run('alarm_list', {})).text).not.toContain('提醒喝水');
       expect(pushed.map((e) => e.type)).toEqual(['coopanion.alarm-cancelled']);
-      expect(pushed[0]!.render()).toContain('提醒喝水');
+      const rendered = pushed[0]!.render() as { text: string };
+      expect(rendered.text).toContain('提醒喝水');
+      expect(notice.admitAlarmNotice(rendered)).toBe(true);
+      expect(notice.admitAlarmNotice(rendered)).toBe(false);
       await expect(panel.invoke!('alarms', 'cancel', [first!.id])).rejects.toThrow();
     } finally {
       await world.stop();

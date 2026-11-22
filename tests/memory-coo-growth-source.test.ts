@@ -245,7 +245,7 @@ describe('Coo Growth source synthetic persistence loop', () => {
     const cooOutput = rig.store.listDerivedArtifacts('coo-output').find((artifact) => artifact.target.startsWith('coo:'))!;
     const cooOutputDocument = rig.bank.get(SYNTHETIC_BANK_ID, cooOutput.target)!;
     expect(cooOutput.bodyDigest).toBe(sha256(SYNTHETIC_COMPLETE_COO_OUTPUT));
-    expect(cooOutputDocument.text).toBe(`Coo said to the person: ${SYNTHETIC_COMPLETE_COO_OUTPUT.slice(0, 4000)}`);
+    expect(cooOutputDocument.text).toBe(`Xi said to the person: ${SYNTHETIC_COMPLETE_COO_OUTPUT.slice(0, 4000)}`);
     expect(cooOutputDocument.metadata.kind).toBe('event');
     expect(proposalStored.metadata).toMatchObject({ source_actor: 'coo', kind: 'plan', status: 'candidate', candidate_state: 'candidate' });
     expect(proposalStored.metadata.candidate_body_sha256).toBe(proposalArtifact.bodyDigest);

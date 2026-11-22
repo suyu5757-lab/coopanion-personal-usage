@@ -94,6 +94,21 @@ await esbuild.build({
   logLevel: 'warning',
 });
 
+const BROWSER_AGENT_GEMINI_SRC = join(ROOT, 'app', 'browser-agent', 'gemini-bridge.ts');
+if (existsSync(BROWSER_AGENT_GEMINI_SRC)) {
+  await esbuild.build({
+    entryPoints: [BROWSER_AGENT_GEMINI_SRC],
+    outfile: join(ROOT, 'build', 'browser-agent-gemini.js'),
+    bundle: true,
+    format: 'iife',
+    target: 'es2022',
+    platform: 'browser',
+    minify: false,
+    legalComments: 'inline',
+    logLevel: 'warning',
+  });
+}
+
 const PANELS_OUT = join(ROOT, 'build', 'panels', 'coopanion');
 rmSync(PANELS_OUT, { recursive: true, force: true });
 await esbuild.build({

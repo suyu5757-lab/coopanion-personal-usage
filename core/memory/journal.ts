@@ -113,7 +113,7 @@ export class RelationshipJournal {
           cursor = day;
           continue;
         }
-        const question = `Write Coo's private diary entry for ${day} about the relationship with the person. `
+        const question = `Write Xi's private diary entry for ${day} about her relationship with her older brother (哥哥). `
           + 'Use that day\'s affection events, affinity changes and long-term memories. '
           + 'Describe only what the dated sources support; distinguish feelings, plans and claims from verified actions. '
           + 'Two to four sentences, first person, warm and concrete. No diagnosis, no heading, no bullet list.';

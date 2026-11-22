@@ -149,10 +149,10 @@ describe('workspace write permissions', () => {
     const store = open();
     store.grantRule({ path: 'self-review/', operations: ['create', 'append', 'update'], extensions: ['.md'], maxBytes: 100 });
     expect(store.evaluate(input(root, 'self-review/large.md', { payloadBytes: 101, deltaBytes: 101 }))).toMatchObject({ decision: 'REQUIRE_APPROVAL', reason: 'rule-size' });
-    store.grantRule({ path: 'self-review/', operations: ['create', 'append', 'update'], extensions: ['.md'], maxBytes: 64 * 1024 });
+    store.grantRule({ path: 'self-review/', operations: ['create', 'append', 'update'], extensions: ['.md'], maxBytes: 1024 * 1024 });
     expect(store.evaluate(input(root, 'self-review/append.md', { operation: 'append', payloadBytes: 200, deltaBytes: 100, targetState: 'present', baseDigest: sha('old') })))
       .toMatchObject({ decision: 'AUTO_ALLOW' });
-    expect(store.evaluate(input(root, 'self-review/append.md', { operation: 'append', payloadBytes: 60_000, deltaBytes: 26_000, targetState: 'present', baseDigest: sha('old') })))
+    expect(store.evaluate(input(root, 'self-review/append.md', { operation: 'append', payloadBytes: 300_000, deltaBytes: 270_000, targetState: 'present', baseDigest: sha('old') })))
       .toMatchObject({ decision: 'REQUIRE_APPROVAL', reason: 'append-too-large' });
   });
 
@@ -170,7 +170,8 @@ describe('workspace write permissions', () => {
     let now = 2_000_000;
     const store = open(() => now);
     store.enableDefaults();
-    for (let i = 0; i < 200; i += 1) {
+    const dailyWrites = store.snapshot().limits.dailyWrites;
+    for (let i = 0; i < dailyWrites; i += 1) {
       now += 2_000;
       const result = await store.authorize(input(root, `self-review/day-${i}.md`, { payloadDigest: sha(`day ${i}`) }), allowPrompt);
       expect(result.decision, `write ${i}`).toBe('AUTO_ALLOW');

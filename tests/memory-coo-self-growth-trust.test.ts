@@ -407,7 +407,7 @@ describe('Coo self-growth trust boundary', () => {
       proposalArtifact.bodyDigest,
       sha256(JSON.stringify(proposal)),
     ];
-    expect(retainedItem.content).toBe(`Coo said to the person: ${SYNTHETIC_COMPLETE_COO_OUTPUT.slice(0, 4000)}`);
+    expect(retainedItem.content).toBe(`Xi said to the person: ${SYNTHETIC_COMPLETE_COO_OUTPUT.slice(0, 4000)}`);
     expect(retainedRead?.storedText).toBe(retainedItem.content);
     expect(cooArtifact.bodyDigest).toBe(sha256(SYNTHETIC_COMPLETE_COO_OUTPUT));
     expect(proposalArtifact.bodyDigest).toBe(sha256(candidateArtifactText));

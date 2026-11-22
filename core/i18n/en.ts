@@ -93,7 +93,7 @@ const en: CoreText = {
     appendFile: 'append to a workspace file',
     deleteFile: 'delete a workspace file',
     always: 'Always allow this kind of low-risk write',
-    alwaysScope: (scope: string) => `Always allowing covers automatic creates, appends and updates under ${scope} for .md/.txt/.json/.jsonl files, up to 64 KiB per file and at most 200 writes / 2 MiB per day. You can revoke it in Settings → Memory → Workspace write permissions.`,
+    alwaysScope: (scope: string) => `Always allowing covers automatic creates, appends and updates under ${scope} for .md/.txt/.json/.jsonl files, up to 1 MiB per file and at most 2000 writes / 50 MiB per day. You can revoke it in Settings → Memory → Workspace write permissions.`,
     highRisk: 'This operation is not a low-risk automatic write, so there is no Always allow choice.',
     pendingTitle: 'Coopanion has a workspace write waiting for approval',
     pendingBody: (count: number, path: string) => `${count} workspace write${count === 1 ? '' : 's'} waiting for approval, for example ${path}. Open Settings → Memory → Workspace write permissions.`,

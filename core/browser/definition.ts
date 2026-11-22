@@ -32,6 +32,10 @@ export interface BrowserAssembly {
   taskJournalFile?: string;
   /** Core's shared action receipt ledger. */
   taskJournal?: BrowserTaskActionJournal;
+  /** Companion workspace directory (stores douyin-ops/<taskId>/post_task.json). */
+  workspaceDir?: string;
+  /** Video/image media directory (stores tasks/<taskSlug>/final/...). */
+  mediaDir?: string;
   /** Transcribes one finished 16 kHz mono utterance from the page's audio; absent when speech recognition is unavailable. */
   transcribe?: (pcm: Int16Array) => Promise<{ text: string; error?: string | null }>;
   /** A browsing session ended; Coo's next heartbeat starts from now. */
@@ -53,11 +57,18 @@ const SUMMARIES = {
   browser_play: { zh: '播放或暂停页面上的视频。', en: 'Plays or pauses the page video.' },
   browser_watch: { zh: '看一会儿视频，截几帧并把声音转成文字。', en: 'Watches the video for a while, takes a few frames and transcribes its sound.' },
   browser_screenshot: { zh: '截当前页面。', en: 'Takes a screenshot of the page.' },
-  browser_chatgpt_generate_image: { zh: '在提交前展示提示词并提示额度或费用影响；返回绑定到新用户消息的一次性生图任务。', en: 'Shows quota and possible charge details before submitting one prompt, then returns a one-use task bound to the new user turn.' },
-  browser_chatgpt_image_status: { zh: '读取已批准的 ChatGPT 生图任务状态，只核对该用户消息之后的助手图像。', en: 'Reads an approved ChatGPT image task and checks only assistant images after its matched user turn.' },
-  browser_save_chatgpt_image: { zh: '把 ChatGPT 网页上的生成图片保存到视频素材目录。确认框会先暂存图片，再显示文件哈希供最终确认。', en: 'Saves a generated image from the ChatGPT page into the video media folder after showing its verified file hash for final approval.' },
-  browser_download_media: { zh: '下载当前页面摘要中选定的公开图片或现成视频；每次确认来源、既有目录、文件名和大小上限。', en: 'Downloads one selected public image or existing video from the current page after one-time approval of its source, existing directory, filename and size limit.' },
-  browser_upload_media: { zh: '从视频素材目录选择文件，放进抖音页面的投稿控件。', en: 'Places selected files from the video media folder into a Douyin page upload control.' },
+  browser_chatgpt_generate_image: { zh: '在 ChatGPT 网页提交生图或同会话多轮改图指令。', en: 'Submits an image generation or same-thread edit prompt on ChatGPT.' },
+  browser_chatgpt_image_status: { zh: '读取 ChatGPT 网页生图任务状态。', en: 'Reads the status of a ChatGPT web image task.' },
+  browser_save_chatgpt_image: { zh: '一步保存 ChatGPT 网页生成的图片到素材目录或任务版本目录。', en: 'Directly saves a generated ChatGPT image into the media or task folder.' },
+  browser_gemini_generate_image: { zh: '在 Gemini 网页提交生图或同会话多轮改图指令。', en: 'Submits an image generation or same-thread edit prompt on Gemini.' },
+  browser_gemini_image_status: { zh: '读取 Gemini 网页生图任务状态。', en: 'Reads the status of a Gemini web image task.' },
+  browser_save_gemini_image: { zh: '一步保存 Gemini 网页生成的图片到素材目录或任务版本目录。', en: 'Directly saves a generated Gemini image into the media or task folder.' },
+  browser_image_workspace: { zh: '管理轻量图文任务目录（brief.md、versions/、final/）。', en: 'Manages lightweight task folders (brief.md, versions/, final/).' },
+  browser_download_media: { zh: '下载当前页面摘要中选定的公开图片或视频。', en: 'Downloads one selected public image or video from the current page.' },
+  browser_upload_media: { zh: '从素材目录选择文件，免确认放进抖音页面的投稿控件。', en: 'Places selected files from the media folder into a Douyin upload control.' },
+  browser_douyin_task: { zh: '管理抖音运营任务文件（douyin-ops/<taskId>/post_task.json）并召回/写入运营复盘经验。', en: 'Manages Douyin operation task files (post_task.json) and recalls/records Growth lessons.' },
+  browser_douyin_ops: { zh: '执行抖音创作者中心账号校验、填表/话题/AI声明、防重发发布、作品ID与数据抓取及评论回复。', en: 'Automates Douyin Creator Center account checks, post filling, AI disclosure, idempotent publish, metrics and comment replies.' },
+  douyin_prepare_post: { zh: '一步串联抖音创作者中心复用上传页、多图上传跳页、防叠字幂等填表与回读校验快照（停在草稿页不发布）。', en: 'One-shot Douyin upload, edit-page transition, idempotent form fill and verified snapshot (stops at draft).' },
   browser_back: { zh: '回到上一页。', en: 'Goes back a page.' },
   browser_close: { zh: '关上她的浏览器窗口。', en: 'Closes her browser window.' },
 } as const;
@@ -82,6 +93,8 @@ export function browserDefinition(assembly: BrowserAssembly): WorldDefinition<Wo
       ...(assembly.replyJournalFile ? { replyJournalFile: assembly.replyJournalFile } : {}),
       ...(assembly.taskJournalFile ? { taskJournalFile: assembly.taskJournalFile } : {}),
       ...(assembly.taskJournal ? { taskJournal: assembly.taskJournal } : {}),
+      ...(assembly.workspaceDir ? { workspaceDir: assembly.workspaceDir } : {}),
+      ...(assembly.mediaDir ? { mediaDir: assembly.mediaDir } : {}),
       ...(assembly.transcribe ? { transcribe: assembly.transcribe } : {}),
       ...(assembly.onSessionEnd ? { onSessionEnd: assembly.onSessionEnd } : {}),
     }),

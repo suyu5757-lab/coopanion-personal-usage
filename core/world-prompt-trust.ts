@@ -18,7 +18,7 @@ export const CONSOLE_TRUSTED_TEMPLATE_DIGESTS: readonly string[] = [
 
 /** `core/browser/ENV_PROMPT.md` (zh) and `ENV_PROMPT.en.md` as shipped. */
 export const BROWSER_TRUSTED_TEMPLATE_DIGESTS: readonly string[] = [
-  '6144867fa5b246ca5bfd152899ad4b41f41ac8f15de869d25d18abc626df6c6a',
+  '59d64e7c9848094371fbf1a9a9f9dcf95741bff0804b84edef23716a6a1730d6',
   'ee1a84a73c92ef7707477e8bd0bde6e209052f1662bdf54ba72ffb18a4f9ebe1',
 ];
 

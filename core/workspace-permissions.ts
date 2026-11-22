@@ -147,17 +147,17 @@ export interface WorkspacePermissionStoreOptions {
   onPending?: (pending: { count: number; path: string; operation: WorkspaceWriteOperation }) => void;
 }
 
-const MAX_AUTO_BYTES = 64 * 1024;
-const MAX_AUTO_APPEND_BYTES = 24 * 1024;
-const DAILY_WRITES = 200;
-const DAILY_BYTES = 2 * 1024 * 1024;
+const MAX_AUTO_BYTES = 1024 * 1024;
+const MAX_AUTO_APPEND_BYTES = 256 * 1024;
+const DAILY_WRITES = 2_000;
+const DAILY_BYTES = 50 * 1024 * 1024;
 const MAX_RULES = 32;
 const MAX_PENDING = 50;
 const MAX_HISTORY = 200;
-const PROMPT_COOLDOWN_MS = 10 * 60_000;
-const DEFER_HOLD_MS = 6 * 60 * 60_000;
+const PROMPT_COOLDOWN_MS = 2 * 60_000;
+const DEFER_HOLD_MS = 15 * 60_000;
 const ONE_SHOT_TTL_MS = 10 * 60_000;
-const PER_PATH_INTERVAL_MS = 1_500;
+const PER_PATH_INTERVAL_MS = 200;
 const MAX_PATH_BYTES = 1_024;
 const MAX_PATH_DEPTH = 6;
 const MAX_FILE_NAME_BYTES = 200;

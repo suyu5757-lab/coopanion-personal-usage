@@ -1045,6 +1045,8 @@ export async function main(): Promise<void> {
     journalFile: join(deployDir, 'browser', 'actions.json'),
     replyJournalFile: join(deployDir, 'browser', 'replies.json'),
     taskJournalFile: join(deployDir, 'browser', 'task-actions.json'),
+    workspaceDir: join(deployDir, 'workspace'),
+    mediaDir: join(deployDir, 'data', 'video', 'media'),
     ...(actionReceipts ? { taskJournal: actionReceipts } : {}),
     transcribe: (pcm) => pet
       ? pet.transcribePcm(pcm)

@@ -16,7 +16,7 @@ import { ExperienceCards } from '../core/growth/experience-cards.ts';
 import { GROWTH_SESSION, GrowthReview, PROPOSE_EXPERIENCE_TOOL, PROPOSE_GROWTH_TOOL } from '../core/growth/review.ts';
 import { GrowthSchedule } from '../core/growth/schedule.ts';
 import { GrowthProposals, readProposalInput } from '../core/growth/proposals.ts';
-import { createResourcePressureReader } from '../core/resource-pressure.ts';
+import { createResourcePressureReader, RESOURCE_PRESSURE_PAUSE_FREE_PERCENT } from '../core/resource-pressure.ts';
 
 class FakeTimers implements TimersApi {
   entries: TimerEntry[] = [];
@@ -280,7 +280,7 @@ describe('the growth schedule', () => {
     const start = new Date('2026-10-01T00:00:00.000Z');
     let now = start;
     let pressureNow = 0;
-    let output = 'System-wide memory free percentage: 19%';
+    let output = `System-wide memory free percentage: ${RESOURCE_PRESSURE_PAUSE_FREE_PERCENT - 1}%`;
     const pressure = createResourcePressureReader({
       platform: 'darwin',
       readMacOutput: () => output,
@@ -299,7 +299,7 @@ describe('the growth schedule', () => {
     s.start();
     now = new Date('2026-10-08T00:00:00.000Z');
     expect(await s.check()).toBe(false);
-    output = 'System-wide memory free percentage: 20%';
+    output = `System-wide memory free percentage: ${RESOURCE_PRESSURE_PAUSE_FREE_PERCENT}%`;
     pressureNow = 30_000;
     expect(await s.check()).toBe(true);
     expect(run).toHaveBeenCalledOnce();

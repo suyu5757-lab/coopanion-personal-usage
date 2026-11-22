@@ -24,7 +24,7 @@ describe('background memory pressure policy', () => {
 
   it('falls back from an invalid macOS reading and refreshes only after the cache expires', () => {
     let output = 'unrecognized output';
-    let freeBytes = 19;
+    let freeBytes = RESOURCE_PRESSURE_PAUSE_FREE_PERCENT - 1;
     let macReads = 0;
     let memoryReads = 0;
     const read = createResourcePressureReader({
@@ -33,11 +33,11 @@ describe('background memory pressure policy', () => {
       readMemory: () => { memoryReads++; return { freeBytes, totalBytes: 100 }; },
     });
 
-    expect(read(0)).toEqual({ freePercent: 19, paused: true });
-    output = 'System-wide memory free percentage: 20%';
+    expect(read(0)).toEqual({ freePercent: RESOURCE_PRESSURE_PAUSE_FREE_PERCENT - 1, paused: true });
+    output = `System-wide memory free percentage: ${RESOURCE_PRESSURE_PAUSE_FREE_PERCENT}%`;
     freeBytes = 90;
-    expect(read(29_999)).toEqual({ freePercent: 19, paused: true });
-    expect(read(30_000)).toEqual({ freePercent: 20, paused: false });
+    expect(read(29_999)).toEqual({ freePercent: RESOURCE_PRESSURE_PAUSE_FREE_PERCENT - 1, paused: true });
+    expect(read(30_000)).toEqual({ freePercent: RESOURCE_PRESSURE_PAUSE_FREE_PERCENT, paused: false });
     expect({ macReads, memoryReads }).toEqual({ macReads: 2, memoryReads: 1 });
   });
 

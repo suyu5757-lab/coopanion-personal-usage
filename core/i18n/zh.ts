@@ -92,7 +92,7 @@ export default {
     appendFile: '追加工作区文件',
     deleteFile: '删除工作区文件',
     always: '始终允许此类低风险写入',
-    alwaysScope: (scope: string) => `选择「始终允许」后，将长期允许 曦 在 ${scope} 内自动创建、追加或更新 .md/.txt/.json/.jsonl 文件；单文件不超过 64 KiB，每日最多 200 次、合计 2 MiB。可随时在设置的工作区写入权限中撤销。`,
+    alwaysScope: (scope: string) => `选择「始终允许」后，将长期允许 曦 在 ${scope} 内自动创建、追加或更新 .md/.txt/.json/.jsonl 文件；单文件不超过 1 MiB，每日最多 2000 次、合计 50 MiB。可随时在设置的工作区写入权限中撤销。`,
     highRisk: '这项操作不属于低风险自动写入，因此不提供「始终允许」。',
     pendingTitle: 'Coopanion 有工作区写入待批准',
     pendingBody: (count: number, path: string) => `${count} 项工作区写入等待批准，例如 ${path}。请打开设置 → 记忆 → 工作区写入权限处理。`,
