@@ -90,7 +90,7 @@ export function recallDouyinLessonEntries(
 ): ScoredExperienceRecord[] {
   if (!log) return [];
   return log.recallRelevant({
-    provider: ['douyin', 'chatgpt', 'gemini'],
+    provider: ['douyin'],
     domain: ['self-growth', 'skill-methods', 'project-functional', 'social-context'],
     keywords,
     limit,

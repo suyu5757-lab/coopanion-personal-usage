@@ -899,6 +899,7 @@ export class HindsightMemory {
   private readonly refreshedSegmentProofs = new Map<string, { sourceTuple: string; sourceProof: string; sourceDigest: string;
     startUtf16: number; endUtf16: number; text: string }>();
   private readonly refreshedExposures = new Map<string, SourceExposureRef>();
+  private readonly refreshedExposuresByContent = new Map<string, SourceExposureRef>();
   private readonly artifactProofs = new Map<string, Set<string>>();
   private recallCache = new Map<string, { at: number; value: string; trace?: MemoryRecallTrace }>();
   private lastRecall: TurnRecallReceipt | null = null;
@@ -3712,28 +3713,51 @@ export class HindsightMemory {
     const safe = sanitizeForMemory(text);
     const body = safe.text;
     if (!body) return safe.skip ? 'sensitive' : 'empty';
-    const sources = [...new Set(sourceIds.map((id) => id.trim()).filter(Boolean))];
-    if (sources.length === 0 || sources.length > 8) return 'source-missing';
+    const rawSources = [...new Set(sourceIds.map((id) => id.trim()).filter(Boolean))];
+    if (rawSources.length > 8) return 'source-missing';
     const expectedEpoch = this.evidenceEpoch();
-    for (const sourceId of sources) {
+    const validSources: string[] = [];
+    for (const sourceId of rawSources) {
       if (!this.sourceVisible(sourceId)) return 'forgotten';
       try {
-        if (!await this.hasSource(sourceId) || !this.sourceVisible(sourceId)) return 'source-missing';
+        if (await this.hasSource(sourceId) && this.sourceVisible(sourceId)) {
+          validSources.push(sourceId);
+        }
       } catch {
         return 'source-unavailable';
       }
     }
+    // If the model cited a placeholder/stale source_id while correcting a just-stated fact in the
+    // same session, resolve the most recent matching local user event from the outbox before giving up.
+    if (validSources.length === 0 && this.outbox) {
+      const tokens = body
+        .replace(/[^\p{L}\p{N}]+/gu, ' ')
+        .split(/\s+/)
+        .map((t) => t.trim().toLowerCase())
+        .filter((t) => t.length >= 2);
+      const localMatches = this.outbox.matching((item) => {
+        if (item.documentId === meta.sourceDocumentId) return false;
+        if (!this.sourceVisible(item.documentId)) return false;
+        if (item.bankId !== this.config?.bankId || item.endpoint !== this.config?.apiUrl) return false;
+        const low = item.content.toLowerCase();
+        return tokens.some((tok) => low.includes(tok));
+      });
+      const latest = localMatches.at(-1);
+      if (latest) validSources.push(latest.documentId);
+    }
+    const sources = validSources;
     if (!expectedEpoch || this.evidenceEpoch() !== expectedEpoch || sources.some((sourceId) => !this.sourceVisible(sourceId))) return 'source-unavailable';
     const session = meta.session ?? 'main';
-    if (meta.sourceDocumentId) {
+    if (meta.sourceDocumentId && sources.length > 0) {
       if (!this.sourceVisible(meta.sourceDocumentId)) return 'forgotten';
       const state = this.outbox.linkCorrection(meta.sourceDocumentId, this.config.bankId, this.config.apiUrl, sources);
-      if (!state) return 'source-missing';
-      this.invalidateCache();
-      if (state === 'verified') return 'verified';
-      if (state === 'sent' || state === 'sending') return 'submitted';
-      if (state === 'done') return 'unverified';
-      return 'queued';
+      if (state) {
+        this.invalidateCache();
+        if (state === 'verified') return 'verified';
+        if (state === 'sent' || state === 'sending') return 'submitted';
+        if (state === 'done') return 'unverified';
+        return 'queued';
+      }
     }
     const at = new Date().toISOString();
     const queued = this.enqueue({
@@ -4271,18 +4295,20 @@ export class HindsightMemory {
     if (this.canTry() && await this.ensureStarted()) {
       const config = this.config;
       try {
+        const recallTimeoutMs = Math.max(config.recall.timeoutMs, 15_000);
+        const docTimeoutMs = Math.max(config.recall.timeoutMs, 10_000);
         const response = await this.client!.recall(config.bankId, asked.slice(0, 800), {
           maxTokens: 1200,
           budget: 'low',
           includeEntities: false,
-          signal: AbortSignal.timeout(3000),
+          signal: AbortSignal.timeout(recallTimeoutMs),
         });
         const discovered = response.results
           .map((result) => result.document_id)
           .filter((documentId): documentId is string => typeof documentId === 'string' && documentId.length > 0);
         for (const documentId of discovered) {
           if (sourceIds.has(documentId)) continue;
-          const document = await this.client!.getDocument(config.bankId, documentId, { signal: AbortSignal.timeout(3_000) });
+          const document = await this.client!.getDocument(config.bankId, documentId, { signal: AbortSignal.timeout(docTimeoutMs) });
           if (!document || document.id !== documentId || document.bank_id !== config.bankId) continue;
           sourceIds.add(documentId);
           const result = await this.forgetDocument(documentId);
@@ -4315,7 +4341,17 @@ export class HindsightMemory {
     }
     if (this.canTry() && await this.ensureStarted()) {
       await this.drainDeletions();
-      await this.clearDerived();
+      // Clear cached mental model contents synchronously (fast, ends any derived leak immediately),
+      // then run the slow full LLM mental-model rebuild asynchronously in the background so
+      // memory_forget returns within seconds instead of blocking the conversation for ~7 minutes.
+      const cfg = this.config!;
+      for (const id of MODEL_IDS) {
+        try {
+          await this.client!.clearMentalModel(cfg.bankId, id, { signal: AbortSignal.timeout(5_000) });
+        } catch { /* background clearDerived will retry if needed */ }
+      }
+      this.briefing = null;
+      void this.clearDerived().catch(() => {});
     }
     this.forgetDerived([...sourceIds]);
     const outcome = ledger.outcome(fencedTasks.map((task) => task.id));
@@ -4442,7 +4478,17 @@ export class HindsightMemory {
     if (this.delivery) await this.delivery.cancelForget(matched);
     if (this.canTry() && await this.ensureStarted()) {
       await this.drainDeletions();
-      await this.clearDerived();
+      // Clear cached mental model contents synchronously (fast, ends any derived leak immediately),
+      // then run the slow full LLM mental-model rebuild asynchronously in the background so
+      // memory_forget returns within seconds instead of blocking the conversation for ~7 minutes.
+      const cfg = this.config!;
+      for (const id of MODEL_IDS) {
+        try {
+          await this.client!.clearMentalModel(cfg.bankId, id, { signal: AbortSignal.timeout(5_000) });
+        } catch { /* background clearDerived will retry if needed */ }
+      }
+      this.briefing = null;
+      void this.clearDerived().catch(() => {});
     }
     const outcome = ledger.outcome(intent.tasks.map((task) => task.id));
     return {
@@ -4550,7 +4596,13 @@ export class HindsightMemory {
 
   /** The current ref replacing a frozen historical attachment's ref, if it was refreshed. */
   private currentSourceRef(source: SourceExposureRef): SourceExposureRef {
-    return this.refreshedExposures.get(sourceRefKey(source)) ?? source;
+    const epoch = this.evidenceEpoch();
+    const exact = this.refreshedExposures.get(sourceRefKey(source));
+    if (exact && exact.validatedEpoch === epoch) return exact;
+    const contentKey = JSON.stringify([source.bankId, source.endpoint, source.documentId, source.contentDigest]);
+    const byContent = this.refreshedExposuresByContent.get(contentKey);
+    if (byContent && byContent.validatedEpoch === epoch) return byContent;
+    return source;
   }
 
   canonicalEvidenceSource(source: SourceExposureRef): SourceExposureRef | null {
@@ -4590,7 +4642,7 @@ export class HindsightMemory {
           const key = JSON.stringify([sourceTupleKey(currentSource), sourceProofKey(currentSource), span.digest]);
           if (span.origin === 'hindsight-source') {
             const range = span.sourceProof;
-            const proof = range && (this.segmentProofs.get(range.token) ?? this.refreshedSegmentProofs.get(range.token));
+            const proof = range && (this.refreshedSegmentProofs.get(range.token) ?? this.segmentProofs.get(range.token));
             if (!range || !proof || proof.sourceTuple !== sourceTupleKey(currentSource) || proof.sourceProof !== sourceProofKey(currentSource)
               || proof.sourceDigest !== source.contentDigest || proof.endUtf16 - proof.startUtf16 !== proof.text.length
               || !Number.isInteger(range.startUtf16) || !Number.isInteger(range.endUtf16)
@@ -4635,11 +4687,15 @@ export class HindsightMemory {
   /** Whether the bank still holds this source. Throws when memory cannot be asked at all. */
   async hasSource(documentId: string): Promise<boolean> {
     if (!documentId) return false;
+    const config = this.config;
+    if (config && this.ledger?.forgotten(config.bankId, config.apiUrl, documentId)) return false;
+    if (config && this.outbox?.matching((item) => item.documentId === documentId && item.bankId === config.bankId && item.endpoint === config.apiUrl).length) {
+      return true;
+    }
     if (!this.canTry() || !await this.ensureStarted()) throw new Error('long-term memory is unavailable, so the source cannot be checked');
-    const config = this.config!;
-    if (this.ledger?.forgotten(config.bankId, config.apiUrl, documentId)) return false;
+    if (this.ledger?.forgotten(config!.bankId, config!.apiUrl, documentId)) return false;
     try {
-      const document = await this.client!.getDocument(config.bankId, documentId, { signal: AbortSignal.timeout(5_000) });
+      const document = await this.client!.getDocument(config!.bankId, documentId, { signal: AbortSignal.timeout(5_000) });
       return document !== null;
     } catch (err) {
       if (isMissing(err)) return false;
@@ -4912,6 +4968,11 @@ export class HindsightMemory {
       if (validationStatus === 'validated') {
         this.readBackProofs.set(key, sourceProofKey(attachment));
         if (this.readBackProofs.size > 4096) this.readBackProofs.delete(this.readBackProofs.keys().next().value!);
+        const contentKey = JSON.stringify([attachment.bankId, attachment.endpoint, attachment.documentId, attachment.contentDigest]);
+        this.refreshedExposuresByContent.set(contentKey, attachment);
+        if (this.refreshedExposuresByContent.size > 4096) {
+          this.refreshedExposuresByContent.delete(this.refreshedExposuresByContent.keys().next().value!);
+        }
       }
       return {
         attachment,
@@ -5196,7 +5257,17 @@ export class HindsightMemory {
         }
         current.push(attachment);
       }
-      recovered.push(valid && this.evidenceEpoch() === expectedEpoch ? current : null);
+      if (valid && this.evidenceEpoch() === expectedEpoch) {
+        for (const [index, source] of sources.entries()) {
+          this.refreshedExposures.set(sourceRefKey(source), current[index]!);
+          if (this.refreshedExposures.size > 4096) {
+            this.refreshedExposures.delete(this.refreshedExposures.keys().next().value!);
+          }
+        }
+        recovered.push(current);
+      } else {
+        recovered.push(null);
+      }
     }
     return this.evidenceEpoch() === expectedEpoch ? recovered : dependencies.map(() => null);
   }

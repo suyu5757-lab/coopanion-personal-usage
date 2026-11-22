@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { OperationExperienceLog } from '../growth/operation-experience.ts';
-import { DouyinOpsStore, normalizeTags, recallDouyinLessons, type DouyinPostTaskStatus } from './douyin-ops.ts';
+import { DouyinOpsStore, normalizeTags, recallDouyinLessonEntries, recallDouyinLessons, type DouyinPostTaskStatus } from './douyin-ops.ts';
 import type { ToolCallContext, ToolDef, ToolOutcome, World, WorldEnvPromptValue, WorldEnvPromptVars, WorldHost, WorldWebUiDecl } from 'cortico/core/types.ts';
 import type { Language } from 'cortico/core/language.ts';
 import { nowIso } from 'cortico/core/util.ts';
@@ -2138,7 +2138,15 @@ export class BrowserWorld implements World {
       if (action === 'get') {
         const task = store.getTask(taskId);
         if (!task) return this.toast(this.t.failed('browser_douyin_task', `task not found: ${taskId}`), true);
-        return this.toast(`[抖音运营任务] ${JSON.stringify({ task, taskFile: store.taskFile(taskId) })}`);
+        const liveEntries = recallDouyinLessonEntries(expLog, 6, [task.topic, task.title, ...task.tags, task.music ?? '']);
+        const liveExperienceLessons = liveEntries.map((entry) => expLog?.formatLesson(entry) ?? entry.lesson);
+        const liveExperienceIds = liveEntries.map((entry) => entry.id);
+        return this.toast(`[抖音运营任务] ${JSON.stringify({
+          task,
+          taskFile: store.taskFile(taskId),
+          liveExperienceLessons,
+          liveExperienceIds,
+        })}`);
       }
 
       if (action === 'update') {
@@ -2391,7 +2399,7 @@ export class BrowserWorld implements World {
       }
 
       if (action === 'check_posts' || action === 'fetch_metrics') {
-        const blocked = this.begin('browser_douyin_ops');
+        const blocked = this.begin(this.started === null ? 'browser_open' : 'browser_douyin_ops');
         if (blocked) return blocked;
         const title = (typeof args.title === 'string' && args.title.trim()) || task?.title || '';
         const postId = (typeof args.postId === 'string' && args.postId.trim()) || task?.postId || '';
@@ -2435,7 +2443,7 @@ export class BrowserWorld implements World {
       }
 
       if (action === 'fetch_comments') {
-        const blocked = this.begin('browser_douyin_ops');
+        const blocked = this.begin(this.started === null ? 'browser_open' : 'browser_douyin_ops');
         if (blocked) return blocked;
         const res = asRecord(await this.call('douyin-fetch-comments', { expectedAccount, refresh: true }, ctx.signal));
         const comments = Array.isArray(res?.comments) ? res.comments as Array<{ commentId: string; user: string; text: string; isReplied?: boolean }> : [];

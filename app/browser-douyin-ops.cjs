@@ -15,11 +15,13 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const UPLOAD_IMAGE_URL = 'https://creator.douyin.com/creator-micro/content/upload?default-tab=3';
 const MANAGE_URL = 'https://creator.douyin.com/creator-micro/content/manage';
 const COMMENT_URL = 'https://creator.douyin.com/creator-micro/interactive/comment';
-const CHECK_POSTS_TIMEOUT_MS = 20_000;
+const CHECK_POSTS_TIMEOUT_MS = 25_000;
 const PUBLISH_LOCK_TTL_MS = 30 * 60_000;
+const MANAGE_REUSE_TTL_MS = 15_000;
 
 /** Process-scoped idempotency lock: contentHash -> { publishedAt, status, postId, postUrl }. */
 const publishLocks = new Map();
+let lastManageLoadedAt = 0;
 
 function normalizeStr(value) {
   return String(value ?? '').replace(/[\u200b\u200c\u200d\ufeff]/g, '').replace(/\s+/g, ' ').trim();
@@ -1229,37 +1231,97 @@ function createDouyinOpsHandlers({ getWin, openUrl, uploadMedia, settle, capture
     let account = null;
     try {
       let win = getWin();
+      let shouldNavigate = false;
+      let onManage = false;
       if (!win || win.isDestroyed()) {
+        shouldNavigate = true;
         await raceDeadline(openUrl(MANAGE_URL), 'open-manage');
         win = getWin();
       } else {
         const currentUrl = win.webContents.getURL() || '';
-        const onManage = /creator\.douyin\.com\/creator-micro\/content\/manage/i.test(currentUrl);
+        onManage = /creator\.douyin\.com\/creator-micro\/content\/manage/i.test(currentUrl);
         const wc = win.webContents;
-        if (!onManage || message.refresh === true) {
+        const recentlyLoaded = onManage && (Date.now() - lastManageLoadedAt < MANAGE_REUSE_TTL_MS);
+        shouldNavigate = !onManage || (message.refresh === true && !recentlyLoaded);
+        if (shouldNavigate) {
           await raceDeadline(new Promise((resolveNav) => {
             let done = false;
             const finish = () => { if (!done) { done = true; resolveNav(); } };
-            wc.once('did-finish-load', finish);
-            setTimeout(finish, 5000);
+            wc.once('dom-ready', finish);
+            setTimeout(finish, 4500);
             wc.loadURL(MANAGE_URL).then(finish, finish);
           }), 'open-manage');
-          await sleep(800);
-        }
-        const cardDeadline = Math.min(deadline - 3000, Date.now() + (onManage && message.refresh !== true ? 1500 : 7500));
-        while (Date.now() < cardDeadline) {
-          const hasList = await raceDeadline(wc.executeJavaScript(`(() => {
-            const txt = (document.body?.innerText || '');
-            if (/编辑作品|删除作品|没有更多作品|暂无作品/.test(txt)) return true;
-            return Boolean(document.querySelector('[class*="video-card"], [class*="content-card"], [class*="article-card"], [class*="item-card"], [class*="works-item"], [data-e2e*="item"]'));
-          })()`, true), 'wait-cards').catch(() => false);
-          if (hasList) break;
           await sleep(600);
         }
       }
       if (!win || win.isDestroyed()) throw new Error('browser window is closed');
 
-      const extracted = await raceDeadline(win.webContents.executeJavaScript(`(() => {
+      const wc = win.webContents;
+      // Fast-path: query Douyin Creator Center's own authenticated work_list API directly (~300ms, immune to DOM hydration delays).
+      const apiExtracted = await raceDeadline(wc.executeJavaScript(`(async () => {
+        const urls = [
+          '/janus/douyin/creator/pc/work_list?status=0&count=15&max_cursor=0&scene=star_atlas&device_platform=android&aid=1128',
+          '/web/api/media/aweme/post/?status=0&count=15&max_cursor=0',
+        ];
+        for (const u of urls) {
+          try {
+            const ac = new AbortController();
+            const timer = setTimeout(() => ac.abort(), 3500);
+            const res = await fetch(u, { credentials: 'include', signal: ac.signal });
+            clearTimeout(timer);
+            if (!res.ok) continue;
+            const j = await res.json();
+            const list = j?.aweme_list || j?.data?.aweme_list || j?.item_info_list || j?.data?.item_info_list || [];
+            if (!Array.isArray(list) || list.length === 0) continue;
+            const posts = list.slice(0, 20).map((item) => {
+              const info = item?.aweme_info || item?.item_info || item || {};
+              const stats = info.statistics || item.statistics || item.metrics || {};
+              const postId = String(info.aweme_id || info.item_id_plain || info.item_id || info.group_id || '').trim();
+              const title = String(info.desc || info.title || info.caption || '').trim().slice(0, 120);
+              const stObj = info.status || item.status || {};
+              const inReview = stObj.in_reviewing === true || stObj.review_status === 1 || /审核中/.test(String(item.status_desc || ''));
+              const isFailed = stObj.is_delete === true || stObj.review_status === 2 || /未通过|违规/.test(String(item.status_desc || ''));
+              const rawStatus = inReview ? '审核中' : isFailed ? '未通过' : '已发布';
+              const status = inReview ? 'UNDER_REVIEW' : isFailed ? 'FAILED' : 'PUBLISHED';
+              const isImage = info.aweme_type === 68 || info.media_type === 2 || Array.isArray(info.images);
+              const postUrl = postId ? ('https://www.douyin.com/' + (isImage ? 'note/' : 'video/') + postId) : '';
+              return {
+                title,
+                status,
+                rawStatus,
+                postId,
+                postUrl,
+                publishedAtText: info.create_time ? new Date(Number(info.create_time) * 1000).toISOString() : '',
+                metrics: {
+                  views: Number(stats.play_count ?? stats.view_count ?? 0) || 0,
+                  likes: Number(stats.digg_count ?? stats.like_count ?? 0) || 0,
+                  collections: Number(stats.collect_count ?? stats.favorite_count ?? 0) || 0,
+                  comments: Number(stats.comment_count ?? 0) || 0,
+                  shares: Number(stats.share_count ?? 0) || 0,
+                },
+              };
+            }).filter((p) => p.postId || p.title);
+            if (posts.length > 0) return { url: location.href, posts, via: 'api' };
+          } catch { /* fallback to next URL or DOM */ }
+        }
+        return null;
+      })()`, true), 'api-posts').catch(() => null);
+
+      let extracted = apiExtracted;
+      if (!extracted || !Array.isArray(extracted.posts) || extracted.posts.length === 0) {
+        const cardDeadline = Math.min(deadline - 4500, Date.now() + (onManage && !shouldNavigate ? 1500 : 9000));
+        while (Date.now() < cardDeadline) {
+          const hasList = await raceDeadline(wc.executeJavaScript(`(() => {
+            const txt = (document.body?.textContent || '');
+            if (/编辑作品|删除作品|没有更多作品|暂无作品/.test(txt)) return true;
+            return Boolean(document.querySelector('[class*="video-card"], [class*="content-card"], [class*="article-card"], [class*="item-card"], [class*="works-item"], [data-e2e*="item"]'));
+          })()`, true), 'wait-cards').catch(() => false);
+          if (hasList) break;
+          await sleep(450);
+        }
+
+        extracted = await raceDeadline(win.webContents.executeJavaScript(`(() => {
+        const scriptDeadline = Date.now() + 3500;
         const parseCount = (raw) => {
           if (!raw) return 0;
           const s = String(raw).replace(/,/g, '').trim();
@@ -1274,14 +1336,14 @@ function createDouyinOpsHandlers({ getWin, openUrl, uploadMedia, settle, capture
         };
         const isNumericId = (v) => (typeof v === 'string' && /^\\d{15,24}$/.test(v.trim())) || (typeof v === 'number' && Number.isSafeInteger(v) && String(v).length >= 15);
         const findIdInObject = (obj, depth = 0, seen = new Set()) => {
-          if (!obj || typeof obj !== 'object' || depth > 3 || seen.has(obj)) return '';
+          if (!obj || typeof obj !== 'object' || depth > 2 || seen.has(obj) || Date.now() > scriptDeadline) return '';
           seen.add(obj);
           const idKeys = ['aweme_id', 'item_id_plain', 'item_id', 'group_id', 'note_id', 'video_id', 'awemeId', 'itemId', 'groupId', 'id'];
           for (const k of idKeys) {
             const v = obj[k];
             if (isNumericId(v)) return String(v).trim();
           }
-          const keys = Object.keys(obj).slice(0, 20);
+          const keys = Object.keys(obj).slice(0, 14);
           for (const k of keys) {
             if (k.startsWith('_') || k === 'children' || k === 'stateNode' || k === 'return' || k === 'sibling' || k === 'child' || k === 'alternate') continue;
             const v = obj[k];
@@ -1293,16 +1355,17 @@ function createDouyinOpsHandlers({ getWin, openUrl, uploadMedia, settle, capture
           return '';
         };
         const extractIdFromFiber = (el) => {
+          if (Date.now() > scriptDeadline) return '';
           const targets = [el, el.firstElementChild].filter(Boolean);
           for (const node of targets) {
             for (const k of Object.keys(node)) {
               if (!k.startsWith('__reactFiber$') && !k.startsWith('__reactProps$')) continue;
               let cur = node[k];
-              for (let hop = 0; cur && hop < 6; hop++, cur = cur.return) {
+              for (let hop = 0; cur && hop < 5 && Date.now() < scriptDeadline; hop++, cur = cur.return) {
                 const propsHit = findIdInObject(cur.memoizedProps || cur);
                 if (propsHit) return propsHit;
                 let st = cur.memoizedState;
-                for (let sHop = 0; st && sHop < 3; sHop++, st = st.next) {
+                for (let sHop = 0; st && sHop < 2 && Date.now() < scriptDeadline; sHop++, st = st.next) {
                   const stHit = findIdInObject(st.memoizedState || st);
                   if (stHit) return stHit;
                 }
@@ -1313,10 +1376,12 @@ function createDouyinOpsHandlers({ getWin, openUrl, uploadMedia, settle, capture
         };
         const collectFiberItemMap = () => {
           const map = new Map();
-          const roots = Array.from(document.querySelectorAll('[data-scrollable]')).slice(0, 4);
+          const fiberDeadline = Math.min(scriptDeadline, Date.now() + 1800);
+          const roots = Array.from(document.querySelectorAll('[data-scrollable]')).slice(0, 3);
           const inspectArray = (arr) => {
-            if (!Array.isArray(arr) || arr.length === 0 || arr.length > 60) return;
+            if (!Array.isArray(arr) || arr.length === 0 || arr.length > 60 || Date.now() > fiberDeadline) return;
             for (const entry of arr) {
+              if (Date.now() > fiberDeadline) break;
               if (!entry || typeof entry !== 'object') continue;
               const id = findIdInObject(entry, 0, new Set());
               const desc = String(entry.desc || entry.title || entry.item_info?.desc || entry.item_info?.title || entry.aweme_info?.desc || entry.caption || '').trim();
@@ -1327,13 +1392,14 @@ function createDouyinOpsHandlers({ getWin, openUrl, uploadMedia, settle, capture
             }
           };
           const scanObjForLists = (obj, depth = 0, seen = new Set()) => {
-            if (!obj || typeof obj !== 'object' || depth > 3 || seen.has(obj)) return;
+            if (!obj || typeof obj !== 'object' || depth > 2 || seen.has(obj) || Date.now() > fiberDeadline) return;
             seen.add(obj);
             if (Array.isArray(obj)) {
               inspectArray(obj);
               return;
             }
-            for (const k of Object.keys(obj).slice(0, 20)) {
+            for (const k of Object.keys(obj).slice(0, 14)) {
+              if (Date.now() > fiberDeadline) break;
               if (k.startsWith('_') || k === 'children' || k === 'stateNode' || k === 'return' || k === 'sibling' || k === 'child' || k === 'alternate') continue;
               const v = obj[k];
               if (Array.isArray(v)) inspectArray(v);
@@ -1341,16 +1407,17 @@ function createDouyinOpsHandlers({ getWin, openUrl, uploadMedia, settle, capture
             }
           };
           for (const rootEl of roots) {
+            if (Date.now() > fiberDeadline) break;
             for (const k of Object.keys(rootEl)) {
               if (!k.startsWith('__reactFiber$') && !k.startsWith('__reactProps$')) continue;
               let cur = rootEl[k];
-              for (let hop = 0; cur && hop < 10; hop++, cur = cur.return) {
+              for (let hop = 0; cur && hop < 8 && Date.now() < fiberDeadline; hop++, cur = cur.return) {
                 scanObjForLists(cur.memoizedProps);
                 let st = cur.memoizedState;
-                for (let sHop = 0; st && sHop < 6; sHop++, st = st.next) {
+                for (let sHop = 0; st && sHop < 4 && Date.now() < fiberDeadline; sHop++, st = st.next) {
                   scanObjForLists(st.memoizedState);
                 }
-                if (map.size >= 5) return map;
+                if (map.size >= 8) return map;
               }
             }
           }
@@ -1359,16 +1426,17 @@ function createDouyinOpsHandlers({ getWin, openUrl, uploadMedia, settle, capture
 
         let cards = Array.from(document.querySelectorAll('[class*="video-card"], [class*="content-card"], [class*="article-card"], [class*="item-card"], [class*="works-item"], tr, [data-e2e*="item"]'))
           .filter((el) => {
+            const txt = (el.textContent || '').trim();
+            if (txt.length < 6) return false;
             const r = el.getBoundingClientRect();
-            const txt = (el.innerText || '').trim();
-            return r.width > 200 && r.height > 48 && r.height < 600 && txt.length >= 6;
+            return r.width > 200 && r.height > 48 && r.height < 600;
           });
 
         if (cards.length === 0) {
-          // Anchor-based discovery: locate each post's action button ("编辑作品" / "删除作品") and climb to the tightest single-card container.
+          // Anchor-based discovery using textContent (no layout reflow storm across thousands of DOM nodes).
           const anchors = Array.from(document.querySelectorAll('button, span, a, div')).filter((el) => {
             if (el.children.length > 2) return false;
-            const t = (el.innerText || '').trim();
+            const t = (el.textContent || '').trim();
             return /^(?:编辑作品|删除作品)$/.test(t);
           });
           const discovered = [];
@@ -1377,13 +1445,15 @@ function createDouyinOpsHandlers({ getWin, openUrl, uploadMedia, settle, capture
             let best = null;
             let cur = anchor.parentElement;
             for (let depth = 0; cur && cur !== document.body && depth < 12; depth++, cur = cur.parentElement) {
-              const r = cur.getBoundingClientRect();
-              const txt = (cur.innerText || '').trim();
+              const txt = (cur.textContent || '').trim();
               const delCount = (txt.match(/删除作品/g) || []).length;
               const editCount = (txt.match(/编辑作品/g) || []).length;
               if (delCount > 1 || editCount > 1) break;
-              if (r.width >= 260 && r.height >= 64 && r.height <= 560 && /(?:已发布|审核中|未通过|草稿|播放|点赞|\\d{1,2}月\\d{1,2}日|\\d{4}年)/.test(txt)) {
-                best = cur;
+              if (/(?:已发布|审核中|未通过|草稿|播放|点赞|\\d{1,2}月\\d{1,2}日|\\d{4}年)/.test(txt)) {
+                const r = cur.getBoundingClientRect();
+                if (r.width >= 260 && r.height >= 64 && r.height <= 560) {
+                  best = cur;
+                }
               }
             }
             if (best && !seenEl.has(best)) {
@@ -1477,7 +1547,9 @@ function createDouyinOpsHandlers({ getWin, openUrl, uploadMedia, settle, capture
         }
         return { url: location.href, posts };
       })()`, true), 'extract-posts');
+      }
 
+      if (extracted.posts.length > 0) lastManageLoadedAt = Date.now();
       const matchPostId = normalizeStr(message.postId);
       const matchTitle = normalizeStr(message.title).toLowerCase();
       let matchedPost = null;

@@ -1722,6 +1722,24 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
         if (!Array.isArray(attachments) || attachments.length === 0) continue;
         if (await memory.refreshEvidenceAttachments(textOf(record), attachments)) refreshedEvidence.add(record);
       }
+      // Also refresh any still-visible sources cited in persisted generationEvidenceProofs (e.g.
+      // reasoning/tool-call items) so an epoch bump from memory_forget canonicalizes them cleanly.
+      const proofSourcesByDoc = new Map<string, SourceExposureRef>();
+      for (const record of records) {
+        const proofSources = record.context.generationEvidenceProof?.exposedSources;
+        if (!Array.isArray(proofSources)) continue;
+        for (const source of proofSources) {
+          if (source?.documentId && !proofSourcesByDoc.has(source.documentId) && memory.sourceVisible(source.documentId)) {
+            proofSourcesByDoc.set(source.documentId, source);
+          }
+        }
+      }
+      if (proofSourcesByDoc.size > 0) {
+        // Refresh each proof source independently so one forgotten/missing doc never aborts the rest.
+        for (const source of proofSourcesByDoc.values()) {
+          await memory.revalidateSourceExposures([source]).catch(() => null);
+        }
+      }
       await this.recoverHandoffFiles();
       const handoffFiles = memory.listHandoffArtifacts().flatMap((artifact) => {
         // A forgotten source marks the mixed note stale. Its still-current parts may be
@@ -1807,19 +1825,6 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
             && span.exposedSources.every((source) => file.sources.some((dependency) => dependency.bankId === source.bankId
               && dependency.endpoint === source.endpoint && dependency.documentId === source.documentId
               && dependency.contentDigest === source.contentDigest)))) continue;
-          if (!belongsToHandoff && record.item.type === 'message' && record.item.role === 'user'
-            && /^\[system\] \d+ new events?\.$/.test(segment)
-            && handoffFiles.some((file) => span.exposedSources.every((source) => file.sources.some((dependency) =>
-              dependency.bankId === source.bankId && dependency.endpoint === source.endpoint
-              && dependency.documentId === source.documentId && dependency.contentDigest === source.contentDigest)))) {
-            sourceFree.push({
-              proofId: span.proofId,
-              digest: span.digest,
-              persistedSources: span.exposedSources,
-              currentSources: span.exposedSources,
-            });
-            continue;
-          }
           inputs.push({ text: segment, digest: span.digest, exposedSources: span.exposedSources });
           spans.push({ proofId: span.proofId, digest: span.digest, exposedSources: span.exposedSources });
         }
@@ -2240,9 +2245,11 @@ export function coopanionPersona(Base: typeof Cormini, deps: MemoryDeps = {}) {
       if (typeof value === 'string') {
         // A fixed Host status line is not file material, but it still has to be mapped or the
         // next request is blocked. The text is written by this wrapper, not by the file.
-        return /^\[(?:not found|read failed|search failed|workspace read failed)/iu.test(value)
-          ? workspaceToolOutcome(value)
-          : value;
+        if (/^\[(?:not found|read failed|search failed|workspace read failed)/iu.test(value)) {
+          this.workspaceIssuedText.issueRead(tool, value);
+          return workspaceToolOutcome(value);
+        }
+        return value;
       }
       if (!value.sourceMapSpans?.length) return value;
       const spans = value.sourceMapSpans.map((span) => {
